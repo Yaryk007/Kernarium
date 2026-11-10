@@ -39,6 +39,8 @@ jobs:
             -Wall -Wextra -Werror \
             -target arm64-apple-ios27.0 \
             -DUML_ENABLE_IOS_STIKDEBUG_JIT=1 \
+            -DDARWIN_UML_GUEST_PAGE_SIZE=4096 \
+            -DDARWIN_UML_GUEST_PAGE_SHIFT=12 \
             -Idarwin \
             -Idarwin/include \
             -c darwin/cpu/arm64/jit/jit_arena.cpp \
