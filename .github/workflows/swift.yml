@@ -1,0 +1,333 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Build and check Kernarium on GitHub-hosted Apple silicon runners.
+#
+# The order is the dependency order, so nothing expensive runs before a cheap
+# check can fail:
+#
+#   audit          repository policy checks; needs only Python and Git
+#   tooling        the tooling CTest suite; needs no dependency prefix
+#   dependencies   dependencies/prepare.sh + build.sh into the private prefixes
+#   unit           the unit CTest suite, on the macOS prefix
+#   gpu-unit       the GPU ownership tests, on both prefixes
+#
+# The unit factories pull zlib and the x86-64 gadgets pull SoftFloat and
+# Cephes128 out of .build/dependencies/macos-arm64-27 (a missing prefix is a
+# configure error, not a skip), so dependencies/ is a hard precondition of the
+# two test jobs rather than a step inside them. The prefixes are cached: the
+# first run pays hours of compiling, later runs pay a cache restore.
+#
+# check-integration is deliberately absent. It needs a guest rootfs image
+# (UML_INTEGRATION_ROOTFS) that this workflow does not build, and it boots a
+# guest, so it belongs on a self-hosted Mac rather than a 3-core runner.
+
+name: Build
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Targets link only the verified private prefixes; no Homebrew library may
+  # leak in. These settings only keep brew fast and quiet.
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_INSTALL_CLEANUP: "1"
+  HOMEBREW_NO_ANALYTICS: "1"
+  # One key for every job that needs the prefixes: a moved manifest pin, a
+  # changed patch series or a changed build recipe misses the cache.
+  PREFIX_KEY: prefixes-${{ runner.os }}-${{ hashFiles('dependencies/manifest.tsv', 'dependencies/patches/**/series.tsv', 'dependencies/platforms/**', 'dependencies/build.sh', 'dependencies/build-apple-gpu.sh') }}
+
+jobs:
+  audit:
+    name: Repository audit
+    runs-on: xcode-27
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # Tooling tests commit fixtures as whoever Git resolves, and patch export
+      # refuses a placeholder or host-derived address, so the identity has to
+      # look like a person's. It never becomes a topic author: a contributor's
+      # commit keeps its own author.
+      - name: Configure Git identity
+        run: |
+          git config user.name  "Kernarium CI"
+          git config user.email "kernarium-ci@kernarium.dev"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # The runners ship CMake and Ninja already; the dependency recipes need
+      # the autotools to build GLib and friends, which come later.
+      - name: Install host tools
+        run: |
+          brew install ninja meson pkg-config rsync autoconf automake gettext \
+            libtool gperf groff
+
+      - name: Record the Apple SDK in use
+        run: |
+          xcodebuild -version
+          xcrun --show-sdk-path
+          xcrun --show-sdk-version
+
+      # The same checks the tooling suite runs, reached in seconds and without
+      # a configure: they catch the mistakes a pull request most often makes.
+      - name: Repository file policies
+        run: |
+          tests/tooling/cmake/check_license_headers.py --source-root .
+          tests/tooling/cmake/check_environment_portability.py --source-root .
+          tests/tooling/cmake/validate_json_inputs.py --source-root .
+          tests/tooling/cmake/check_adb_server_policy.py --source-root .
+
+  tooling:
+    name: Tooling checks
+    needs: audit
+    runs-on: xcode-27
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure Git identity
+        run: |
+          git config user.name  "Kernarium CI"
+          git config user.email "kernarium-ci@kernarium.dev"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install host tools
+        run: |
+          brew install ninja meson pkg-config rsync autoconf automake gettext \
+            libtool gperf groff
+
+      - name: Configure
+        run: cmake --preset macos-tooling -DPython3_EXECUTABLE="$(command -v python3)"
+
+      - name: Build test binaries
+        run: cmake --build --preset tooling-test-binaries --parallel
+
+      - name: Run tooling tests
+        run: ctest --preset tooling
+
+      - name: Test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tooling-test-log
+          path: .build/presets/macos-tooling/Testing/**/LastTest.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  dependencies:
+    name: Dependency prefixes
+    needs: audit
+    # The Apple GPU prefix is a Mesa, virglrenderer and LLVM build; it needs the
+    # larger runner's cores and disk, and it is the slowest thing in the
+    # repository. Nothing else here is worth splitting off: one prefix build
+    # serves both test jobs.
+    runs-on: xcode-27-xlarge
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure Git identity
+        run: |
+          git config user.name  "Kernarium CI"
+          git config user.email "kernarium-ci@kernarium.dev"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # Meson, Mako and PyYAML come from the optional .build/gpu-tools-venv the
+      # GPU recipe prefers, so they are installed there rather than globally.
+      - name: Install host tools
+        run: |
+          brew install ninja meson mako pyyaml pkg-config rsync autoconf \
+            automake gettext libtool gperf groff cmake
+
+      - name: Metal toolchain
+        run: xcodebuild -downloadComponent MetalToolchain
+
+      # Verification is exact and cheap, so a restored prefix is believed only
+      # after dependencies/verify-prefix.sh and the GPU verifier accept it. Both
+      # builders do that themselves; a stale prefix makes them refuse, which is
+      # the signal to bump the key above.
+      - name: Restore prefixes
+        id: prefixes
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            .build/dependencies/macos-arm64-27
+            .build/dependencies/apple-gpu-vulkan-experiment/macos-arm64
+          key: ${{ env.PREFIX_KEY }}
+          restore-keys: prefixes-${{ runner.os }}-
+
+      - name: Verify restored prefixes
+        id: verify
+        if: steps.prefixes.outputs.cache-hit != ''
+        # A restore-key hit is a prefix built from other inputs: it must not be
+        # used, or the test jobs would build against the wrong libraries.
+        env:
+          RESTORED_KEY: ${{ steps.prefixes.outputs.cache-matched-key }}
+        run: |
+          if [ "$RESTORED_KEY" != "$PREFIX_KEY" ]; then
+            echo "restored $RESTORED_KEY, want $PREFIX_KEY: rebuilding"
+            rm -rf .build/dependencies/macos-arm64-27 \
+                   .build/dependencies/apple-gpu-vulkan-experiment/macos-arm64
+            echo "usable=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          dependencies/prepare.sh --product macos --verify
+          dependencies/verify-prefix.sh \
+            --prefix .build/dependencies/macos-arm64-27 \
+            --manifest dependencies/manifest.tsv \
+            --deployment-target 27.0
+          dependencies/build-apple-gpu.sh --platform macos --verify-only
+          echo "usable=true" >> "$GITHUB_OUTPUT"
+
+      # prepare.sh is the only dependency step allowed to touch the network.
+      - name: Prepare sources
+        if: steps.verify.outputs.usable != 'true'
+        run: |
+          dependencies/prepare.sh --product macos
+          dependencies/prepare.sh --product apple-gpu-vulkan-experiment
+
+      - name: Build macOS dependencies
+        if: steps.verify.outputs.usable != 'true'
+        run: dependencies/build.sh --jobs "$(sysctl -n hw.ncpu)"
+
+      # The product is named first: --platform alone leaves it to a default.
+      - name: Build Apple GPU dependencies
+        if: steps.verify.outputs.usable != 'true'
+        run: >-
+          dependencies/build-apple-gpu.sh
+          --product apple-gpu-vulkan-experiment
+          --platform macos
+          --jobs "$(sysctl -n hw.ncpu)"
+
+      - name: Save prefixes
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .build/dependencies/macos-arm64-27
+            .build/dependencies/apple-gpu-vulkan-experiment/macos-arm64
+          key: ${{ env.PREFIX_KEY }}
+
+  unit:
+    name: Unit tests
+    needs: dependencies
+    runs-on: xcode-27-xlarge
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure Git identity
+        run: |
+          git config user.name  "Kernarium CI"
+          git config user.email "kernarium-ci@kernarium.dev"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install host tools
+        run: |
+          brew install ninja meson pkg-config rsync autoconf automake gettext \
+            libtool gperf groff
+
+      - name: Restore prefixes
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            .build/dependencies/macos-arm64-27
+            .build/dependencies/apple-gpu-vulkan-experiment/macos-arm64
+          key: ${{ env.PREFIX_KEY }}
+          fail-on-cache-miss: true
+
+      - name: Configure
+        run: cmake --preset macos-unit -DPython3_EXECUTABLE="$(command -v python3)"
+
+      - name: Build test binaries
+        run: cmake --build --preset unit-test-binaries --parallel "$(sysctl -n hw.ncpu)"
+
+      - name: Run unit tests
+        run: ctest --preset unit
+
+      - name: Test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-log
+          path: .build/presets/macos-unit/Testing/**/LastTest.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  gpu-unit:
+    name: GPU ownership tests
+    needs: dependencies
+    runs-on: xcode-27-xlarge
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure Git identity
+        run: |
+          git config user.name  "Kernarium CI"
+          git config user.email "kernarium-ci@kernarium.dev"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install host tools
+        run: |
+          brew install ninja meson pkg-config rsync autoconf automake gettext \
+            libtool gperf groff
+
+      - name: Metal toolchain
+        run: xcodebuild -downloadComponent MetalToolchain
+
+      - name: Restore prefixes
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            .build/dependencies/macos-arm64-27
+            .build/dependencies/apple-gpu-vulkan-experiment/macos-arm64
+          key: ${{ env.PREFIX_KEY }}
+          fail-on-cache-miss: true
+
+      - name: Configure
+        run: cmake --preset macos-unit-gpu -DPython3_EXECUTABLE="$(command -v python3)"
+
+      - name: Build test binaries
+        run: cmake --build --preset gpu-unit-test-binaries --parallel "$(sysctl -n hw.ncpu)"
+
+      - name: Run GPU tests
+        run: ctest --preset unit-gpu
+
+      - name: Test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-test-log
+          path: .build/presets/macos-unit-gpu/Testing/**/LastTest.log
+          if-no-files-found: ignore
+          retention-days: 7
