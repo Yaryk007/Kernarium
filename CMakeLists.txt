@@ -82,6 +82,18 @@ set(UML_DEPENDENCY_PREFIX
     "${PROJECT_SOURCE_DIR}/.build/dependencies/macos-arm64-27"
     CACHE PATH "Private prefix containing source-built host dependencies")
 option(UML_BUILD_GPU "Build the host GPU/display provider" ${UML_TARGET_MACOS})
+# A development-signed iOS process can publish JIT memory only after a debugger
+# has attached and, on iOS 26 and later, prepared the region through the
+# StikDebug universal-script protocol. Stock and App Store runtimes keep this
+# off. The option changes executable-memory policy; signing must separately
+# provide get-task-allow.
+option(UML_ENABLE_IOS_STIKDEBUG_JIT
+    "Enable experimental StikDebug JIT publication on iOS devices" OFF)
+if(UML_ENABLE_IOS_STIKDEBUG_JIT AND
+   NOT UML_APPLE_PLATFORM STREQUAL "ios")
+    message(FATAL_ERROR
+        "UML_ENABLE_IOS_STIKDEBUG_JIT requires an iOS device build")
+endif()
 option(UML_BUILD_AUDIO "Build the host Virtio Sound playback provider"
     ${UML_BUILD_GPU})
 option(UML_BUILD_KERNARIUM_RUNTIME
@@ -97,6 +109,10 @@ option(UML_KERNARIUM_AUTOMATION_HARNESS
 option(UML_APP_STORE_RUNTIME
     "Build the App Store Kernarium runtime: it reads no environment variable that tunes, observes or drives a run, and carries no debugging or automation support"
     OFF)
+if(UML_ENABLE_IOS_STIKDEBUG_JIT AND UML_APP_STORE_RUNTIME)
+    message(FATAL_ERROR
+        "UML_ENABLE_IOS_STIKDEBUG_JIT cannot be used in an App Store runtime")
+endif()
 option(UML_BUILD_NETWORK_PROVIDER
     "Build the optional SLiRP network provider"
     ${UML_BUILD_KERNEL_RUNNER})

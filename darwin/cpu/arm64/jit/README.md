@@ -1,7 +1,9 @@
 # arm64 JIT engine
 
 The JIT emits native blocks for A64, A32 and T32 guest code into its executable
-arena. It runs on macOS only. The gadget engine includes none of it. Exclusives,
+arena. It runs on macOS and in an explicitly opted-in, development-signed iOS
+device runtime prepared by StikDebug's universal script. Stock iOS, Simulator,
+and App Store runtimes do not expose it. The gadget engine includes none of it. Exclusives,
 alignment, the SME profile, the AArch32 profile and the semantic slow path's
 role are cross-engine contracts in
 [`docs/architecture.md`](../../../../docs/architecture.md). This file records
@@ -28,8 +30,8 @@ space, the shared tier opens only while two executors live and is keyed by
 guest PC, and the guest's ASLR moves every image anyway. Each exec'd process
 therefore compiles its whole startup path again, several times what it costs
 the gadget engine, and the LTP runner scales its case bounds for it
-([testing](../../../../docs/testing.md#ltp)). The JIT runs only on macOS, so the
-cold path is not optimized
+([testing](../../../../docs/testing.md#ltp)). The JIT's measured and tested
+production path remains macOS, so the cold path is not optimized
 ([history](../../../../docs/optimization-history.md#jit-cold-code-per-process)).
 
 ## Top-byte ignore
@@ -111,7 +113,7 @@ family's lowering; these contracts span them.
 cmake --workflow --preset check-unit
 ```
 
-The JIT's tests run on macOS only: `ctest -R '^arm64-jit-'` (the AArch32 ones
+The JIT's automated tests run on macOS: `ctest -R '^arm64-jit-'` (the AArch32 ones
 are `arm64-jit-a32-*` and `arm64-jit-executor-paths`). Instruction coverage is
 in [`docs/a64-instruction-coverage.md`](../../../../docs/a64-instruction-coverage.md)
 and [`docs/a32-instruction-coverage.md`](../../../../docs/a32-instruction-coverage.md);

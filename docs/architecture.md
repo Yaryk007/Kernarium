@@ -170,7 +170,12 @@ installs) reach it only through that file, and the `native` engine kind and the
 source audit keep the gadget engines and shared CPU code from linking or
 including it. The one exception is Mesa llvmpipe's own LLVM JIT in the iOS
 Simulator product, whose GPU prefix alone carries LLVM; prefix verification and
-packaging reject it in the macOS and iOS device slices. On macOS the owner serves
+packaging reject it in the macOS and iOS device slices. An experimental iOS
+device runtime can opt in with `UML_ENABLE_IOS_STIKDEBUG_JIT`; it admits JIT
+only after a `get-task-allow` process is attached through StikDebug's universal
+region-preparation protocol. Debugserver creates its RX window and the runtime
+remaps the same VM object as a distinct RW alias, preserving W^X while allowing
+code generation on the iOS 26+ trusted-execution monitor. On macOS the owner serves
 JIT memory from a window near the host image, because generated code calls into
 it and a far buffer made x87-heavy FEXCore code about a third slower; memory
 served again may hold its old bytes.

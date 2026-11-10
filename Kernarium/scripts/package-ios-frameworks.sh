@@ -35,6 +35,10 @@
 # carries the name of one. It conflicts with both automation options, with the
 # Simulator and with --runtimes all.
 #
+# --stikdebug-jit packages the experimental development Android runtime built
+# from kernarium-ios-device-android-stikdebug-jit. It is device-only, Android-
+# only, and conflicts with App Store and automation packaging.
+#
 # No packaged framework keeps the linker's debug map: it names the object files
 # of the build host (N_OSO stabs, absolute paths of the checkout and the
 # dependency trees) and would ship in the application. Each framework's dSYM,
@@ -68,9 +72,10 @@ fail()
 AUTOMATION=0
 ANDROID_AUTOMATION=0
 APP_STORE=0
+STIKDEBUG_JIT=0
 RUNTIMES=all
 SDKS=
-USAGE="usage: package-ios-frameworks.sh [--sdk device|simulator]... [--automation] [--android-automation] [--app-store] [--runtimes all|android]"
+USAGE="usage: package-ios-frameworks.sh [--sdk device|simulator]... [--automation] [--android-automation] [--app-store] [--stikdebug-jit] [--runtimes all|android]"
 while [ "$#" -gt 0 ]; do
 	case "$1" in
 	--sdk)
@@ -88,6 +93,7 @@ while [ "$#" -gt 0 ]; do
 	--automation) AUTOMATION=1 ;;
 	--android-automation) ANDROID_AUTOMATION=1 ;;
 	--app-store) APP_STORE=1 ;;
+	--stikdebug-jit) STIKDEBUG_JIT=1 ;;
 	--runtimes)
 		[ "$#" -ge 2 ] || fail "$USAGE"
 		RUNTIMES=$2
@@ -112,6 +118,16 @@ if [ "$APP_STORE" -eq 1 ]; then
 		fail "--app-store conflicts with the automation options"
 	case " $SDKS " in
 	*" simulator "*) fail "--app-store packages the device alone" ;;
+	esac
+fi
+if [ "$STIKDEBUG_JIT" -eq 1 ]; then
+	[ "$RUNTIMES" = android ] ||
+		fail "--stikdebug-jit packages the Android runtime alone; add --runtimes android"
+	[ "$APP_STORE" -eq 0 ] && [ "$AUTOMATION" -eq 0 ] &&
+		[ "$ANDROID_AUTOMATION" -eq 0 ] ||
+		fail "--stikdebug-jit conflicts with App Store and automation packaging"
+	case " $SDKS " in
+	*" simulator "*) fail "--stikdebug-jit packages the device alone" ;;
 	esac
 fi
 
@@ -159,6 +175,8 @@ ANDROID_TREE=kernarium-runtime-ios-device-android-4k
 	ANDROID_TREE=kernarium-runtime-ios-device-android-4k-automation
 [ "$APP_STORE" -eq 0 ] ||
 	ANDROID_TREE=kernarium-runtime-ios-device-android-4k-app-store
+[ "$STIKDEBUG_JIT" -eq 0 ] ||
+	ANDROID_TREE=kernarium-runtime-ios-device-android-4k-stikdebug-jit
 DEVICE_RUNTIME_4K="$ROOT_DIR/.build/$RUNTIME_TREE/Kernarium/Runtime/$RUNTIME_4K.framework"
 DEVICE_RUNTIME_ANDROID="$ROOT_DIR/.build/$ANDROID_TREE/Kernarium/Runtime/$RUNTIME_ANDROID_4K.framework"
 # KERNARIUM_DEVICE_GPU_PREFIX and KERNARIUM_SIMULATOR_GPU_PREFIX name a GPU

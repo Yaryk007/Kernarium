@@ -828,11 +828,14 @@ bool immutableExt4Rootfs(const char* path)
  *
  * "auto" defers to the build's platform default and its availability check
  * rather than deciding here, which keeps executable-memory policy with its
- * single owner in the CPU layer. Both Apple products resolve that to the
- * data-only gadget engine: a device cannot publish into a MAP_JIT mapping at
- * all, and while the Simulator can, measurement rejects the JIT for the
- * browser workloads that matter (G157). The override exists so that choice
- * stays re-testable without a rebuild.
+ * single owner in the CPU layer. Stock Apple builds resolve that to the
+ * data-only gadget engine, but iOS device builds may opt into the StikDebug
+ * publication route with UML_ENABLE_IOS_STIKDEBUG_JIT. That route still needs
+ * a development signature carrying get-task-allow and an attached universal
+ * script. While the
+ * Simulator can publish, measurement rejects the JIT for the browser
+ * workloads that matter (G157). The override exists so that choice stays
+ * re-testable without a rebuild.
  */
 const char* selectedExecutionEngine()
 {

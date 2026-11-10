@@ -89,6 +89,33 @@ xcodebuild -project Andarium/Andarium.xcodeproj -scheme Andarium \
     -destination 'generic/platform=iOS' build
 ```
 
+### Experimental StikDebug JIT
+
+The sideload-only runtime can use the native arm64 JIT on iOS 27 when the app
+is development-signed with `get-task-allow` and launched from StikDebug with
+`universal.js`. It creates one RX window through the iOS 26+ region protocol,
+then the runtime remaps the same memory as a separate RW alias before StikDebug
+detaches. Generated instructions are written through the alias and executed
+through the RX view. Opening the app normally does not grant JIT; the runtime
+then falls back to the gadget interpreter.
+
+```sh
+cmake --preset kernarium-ios-device-android-stikdebug-jit
+cmake --build --preset kernarium-ios-device-android-stikdebug-jit
+Kernarium/scripts/package-ios-frameworks.sh --sdk device \
+    --runtimes android --stikdebug-jit
+Andarium/scripts/stage-system-image.py
+xcodebuild -project Andarium/Andarium.xcodeproj -scheme Andarium \
+    -configuration Release -destination 'generic/platform=iOS' build
+```
+
+Release uses `Config/Andarium.StikDebug.entitlements`; the provisioning profile
+must permit every requested entitlement. AppStore continues to use the normal
+entitlements and interpreter runtime. The manually triggered GitHub workflow
+builds an unsigned IPA after receiving the accepted Android release and
+Android kernel-artifact archives; sign the artifact with a development profile
+before installing it.
+
 The frameworks go to `.build/kernarium-xcframeworks`, which Kernarium shares,
 so package the runtime a build needs just before it. The staging script checks
 the accepted release against its manifest and layout and stages the system

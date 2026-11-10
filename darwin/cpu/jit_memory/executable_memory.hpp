@@ -19,13 +19,20 @@ namespace uml::cpu::jit_memory {
  */
 [[nodiscard]] bool available() noexcept;
 
-/* Returns size bytes of JIT memory, readable, writable and executable, or
- * nullptr. A thread writes it only inside its write window. On macOS the
- * memory comes from one window near this image, because Apple cores predict
- * an indirect branch's target cheaply only near the branch; memory released
- * and served again may still hold its old bytes.
+/* Returns the executable address of size bytes of JIT memory, or nullptr. A
+ * thread writes through writable_alias only inside its write window. On macOS
+ * the memory comes from one window near this image, because Apple cores
+ * predict an indirect branch's target cheaply only near the branch; memory
+ * released and served again may still hold its old bytes.
  */
 [[nodiscard]] void *allocate(std::size_t size) noexcept;
+
+/* Returns the address through which code at executable_address must be
+ * written. On macOS this is the executable address itself while its thread
+ * write window is open. StikDebug iOS builds use a permanently writable alias
+ * of the debugger-created RX mapping so they preserve W^X on iOS 26+.
+ */
+[[nodiscard]] void *writable_alias(void *executable_address) noexcept;
 
 /* The calls below end in the C library, which the compiler cannot prove
  * nothrow. They are not noexcept, so none compiles to a frame with its own
@@ -36,7 +43,9 @@ namespace uml::cpu::jit_memory {
 void release(void *mapping, std::size_t size);
 
 /* Opens (true) or closes (false) the calling thread's write window over every
- * JIT mapping. While the window is open, the thread cannot execute JIT code.
+ * macOS JIT mapping. This is a no-op for the permanently distinct iOS RW/RX
+ * aliases. While a macOS write window is open, the thread cannot execute JIT
+ * code.
  */
 void set_writable(bool writable);
 

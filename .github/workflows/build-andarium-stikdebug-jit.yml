@@ -1,0 +1,121 @@
+name: Build Andarium StikDebug JIT IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      android_release_url:
+        description: HTTPS URL of the accepted Android release tar archive
+        required: true
+        type: string
+      android_release_sha256:
+        description: SHA-256 of the Android release archive
+        required: true
+        type: string
+      kernel_artifact_url:
+        description: HTTPS URL of the accepted Android kernel artifact tar archive
+        required: true
+        type: string
+      kernel_artifact_sha256:
+        description: SHA-256 of the Android kernel artifact archive
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  unsigned-ipa:
+    name: Unsigned Andarium IPA
+    runs-on: xcode-27
+    timeout-minutes: 355
+    env:
+      DERIVED_DATA: ${{ github.workspace }}/.build/andarium-device-derived
+      KERNARIUM_XCFRAMEWORK_OUTPUT: ${{ github.workspace }}/.build/kernarium-xcframeworks
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify build tools
+        run: |
+          xcodebuild -version
+          cmake --version
+          ninja --version
+          python3 --version
+
+      - name: Cache pinned dependency builds
+        uses: actions/cache@v4
+        with:
+          path: |
+            external/sources
+            .build/dependency-cache
+            .build/dependencies
+          key: andarium-ios27-${{ runner.os }}-${{ hashFiles('dependencies/manifest.tsv', 'dependencies/platforms/**', 'dependencies/patches/**') }}
+          restore-keys: |
+            andarium-ios27-${{ runner.os }}-
+
+      - name: Fetch accepted Android release
+        env:
+          RELEASE_URL: ${{ inputs.android_release_url }}
+          RELEASE_SHA256: ${{ inputs.android_release_sha256 }}
+          KERNEL_URL: ${{ inputs.kernel_artifact_url }}
+          KERNEL_SHA256: ${{ inputs.kernel_artifact_sha256 }}
+        run: |
+          mkdir -p .build/android/releases
+          mkdir -p .build/kernel/artifacts
+          curl --fail --location --retry 3 "$RELEASE_URL" --output "$RUNNER_TEMP/andarium-release.tar"
+          printf '%s  %s\n' "$RELEASE_SHA256" "$RUNNER_TEMP/andarium-release.tar" | shasum -a 256 --check
+          tar -xf "$RUNNER_TEMP/andarium-release.tar" -C .build/android/releases
+          curl --fail --location --retry 3 "$KERNEL_URL" --output "$RUNNER_TEMP/andarium-kernel.tar"
+          printf '%s  %s\n' "$KERNEL_SHA256" "$RUNNER_TEMP/andarium-kernel.tar" | shasum -a 256 --check
+          tar -xf "$RUNNER_TEMP/andarium-kernel.tar" -C .build/kernel/artifacts
+          Andarium/scripts/stage-system-image.py
+
+      - name: Prepare pinned dependency sources
+        run: |
+          dependencies/prepare.sh --validate-manifest-only
+          dependencies/prepare.sh --product apple-gpu-vulkan-experiment
+          dependencies/prepare.sh --product ios-storage
+          dependencies/prepare.sh --product ios-compression
+          dependencies/prepare.sh --product ios-network
+
+      - name: Build iOS dependencies
+        run: |
+          dependencies/build-ios-storage.sh
+          dependencies/build-ios-zstd.sh
+          dependencies/build-ios-network.sh --platform ios
+          dependencies/build-apple-gpu.sh --platform ios --jobs "$(sysctl -n hw.ncpu)"
+
+      - name: Build experimental Android JIT runtime
+        run: |
+          cmake --preset kernarium-ios-device-android-stikdebug-jit
+          cmake --build --preset kernarium-ios-device-android-stikdebug-jit
+          Kernarium/scripts/package-ios-frameworks.sh --sdk device --runtimes android --stikdebug-jit
+
+      - name: Build Andarium without signing
+        run: |
+          xcodebuild build \
+            -project Andarium/Andarium.xcodeproj \
+            -scheme Andarium \
+            -destination 'generic/platform=iOS' \
+            -configuration Release \
+            -derivedDataPath "$DERIVED_DATA" \
+            -jobs "$(sysctl -n hw.ncpu)" \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Package unsigned IPA
+        run: |
+          mkdir -p "$RUNNER_TEMP/andarium-ipa/Payload"
+          cp -R "$DERIVED_DATA/Build/Products/Release-iphoneos/Andarium.app" \
+            "$RUNNER_TEMP/andarium-ipa/Payload/Andarium.app"
+          ditto -c -k --keepParent \
+            "$RUNNER_TEMP/andarium-ipa/Payload" \
+            "$GITHUB_WORKSPACE/Andarium-StikDebug-JIT-unsigned.ipa"
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Andarium-StikDebug-JIT-unsigned
+          path: |
+            Andarium-StikDebug-JIT-unsigned.ipa
+            Andarium/Config/Andarium.StikDebug.entitlements
+          if-no-files-found: error
+          retention-days: 14

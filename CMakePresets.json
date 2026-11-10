@@ -194,6 +194,15 @@
       }
     },
     {
+      "name": "kernarium-ios-device-android-stikdebug-jit",
+      "displayName": "Kernarium iOS device Android runtime with experimental StikDebug JIT (4 KiB)",
+      "inherits": "kernarium-ios-device-android",
+      "binaryDir": "${sourceDir}/.build/kernarium-runtime-ios-device-android-4k-stikdebug-jit",
+      "cacheVariables": {
+        "UML_ENABLE_IOS_STIKDEBUG_JIT": true
+      }
+    },
+    {
       "name": "kernarium-ios-device-android-automation",
       "displayName": "Kernarium iOS device Android automation runtime (4 KiB)",
       "inherits": "kernarium-ios-device-android",
@@ -337,6 +346,11 @@
     {
       "name": "kernarium-ios-device-android",
       "configurePreset": "kernarium-ios-device-android",
+      "targets": ["KernariumRuntime", "architecture-audit"]
+    },
+    {
+      "name": "kernarium-ios-device-android-stikdebug-jit",
+      "configurePreset": "kernarium-ios-device-android-stikdebug-jit",
       "targets": ["KernariumRuntime", "architecture-audit"]
     },
     {
