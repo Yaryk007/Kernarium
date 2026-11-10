@@ -40,5 +40,6 @@ jobs:
             -target arm64-apple-ios27.0 \
             -DUML_ENABLE_IOS_STIKDEBUG_JIT=1 \
             -Idarwin \
+            -Idarwin/include \
             -c darwin/cpu/arm64/jit/jit_arena.cpp \
             -o .build/jit-source-check/jit_arena.o
