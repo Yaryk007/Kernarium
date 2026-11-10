@@ -2,9 +2,6 @@
 #include "executable_memory.hpp"
 
 #include <sys/mman.h>
-#if defined(UML_ENABLE_IOS_STIKDEBUG_JIT)
-#include <sys/codesign.h>
-#endif
 
 #include <libkern/OSCacheControl.h>
 #include <os/lock.h>
@@ -14,6 +11,17 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+
+#if defined(UML_ENABLE_IOS_STIKDEBUG_JIT)
+/* csops and its flags are XNU interfaces present on iOS but omitted from the
+ * public device SDK headers. This sideload-only build uses status query 0 and
+ * CS_DEBUGGED from xnu/bsd/sys/codesign.h; it does not mutate code-signing
+ * state.
+ */
+extern "C" int csops(pid_t, unsigned int, void *, std::size_t);
+constexpr unsigned int jit_cs_ops_status = 0;
+constexpr std::uint32_t jit_cs_debugged = 0x10000000U;
+#endif
 
 namespace uml::cpu::jit_memory {
 namespace {
@@ -77,8 +85,8 @@ void uml_stikdebug_detach()
 [[nodiscard]] bool debugger_attached() noexcept
 {
 	std::uint32_t status = 0;
-	return csops(getpid(), CS_OPS_STATUS, &status, sizeof(status)) == 0 &&
-	       (status & CS_DEBUGGED) != 0;
+	return csops(getpid(), jit_cs_ops_status, &status, sizeof(status)) == 0 &&
+	       (status & jit_cs_debugged) != 0;
 }
 #endif
 
