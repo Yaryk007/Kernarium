@@ -5,17 +5,22 @@
 # The order is the dependency order, so nothing expensive runs before a cheap
 # check can fail:
 #
-#   audit          repository policy checks; needs only Python and Git
-#   tooling        the tooling CTest suite; needs no dependency prefix
-#   dependencies   dependencies/prepare.sh + build.sh into the private prefixes
-#   unit           the unit CTest suite, on the macOS prefix
-#   gpu-unit       the GPU ownership tests, on both prefixes
+#   audit           repository policy checks; needs only Python and Git
+#   tooling         the tooling CTest suite; needs no dependency prefix
+#   swift-packages  GuestHostCore and AndariumCore, the app's model, on the host
+#   ios-app         AndariumPreview for the iOS Simulator: a real app build
+#   dependencies    dependencies/prepare.sh + build.sh into the private prefixes
+#   unit            the unit CTest suite, on the macOS prefix
+#   gpu-unit        the GPU ownership tests, on both prefixes
+#   andarium-app    the full Andarium application; off until the repository can
+#                   hand this job a packaged runtime and a staged system image
 #
-# The unit factories pull zlib and the x86-64 gadgets pull SoftFloat and
-# Cephes128 out of .build/dependencies/macos-arm64-27 (a missing prefix is a
-# configure error, not a skip), so dependencies/ is a hard precondition of the
-# two test jobs rather than a step inside them. The prefixes are cached: the
-# first run pays hours of compiling, later runs pay a cache restore.
+# `ios-app` is the app build that works today: AndariumPreview is compiled from
+# Andarium/Shared and Andarium/Preview alone, imports no runtime framework, has
+# no .build input and runs no script phase (Andarium/README.md). The full
+# `Andarium` and `Kernarium` targets embed XCFrameworks that this repository
+# builds from source and a system image staged from an accepted Android
+# release; see docs/ci.md for what each one still needs.
 #
 # check-integration is deliberately absent. It needs a guest rootfs image
 # (UML_INTEGRATION_ROOTFS) that this workflow does not build, and it boots a
@@ -43,9 +48,6 @@ env:
   HOMEBREW_NO_AUTO_UPDATE: "1"
   HOMEBREW_NO_INSTALL_CLEANUP: "1"
   HOMEBREW_NO_ANALYTICS: "1"
-  # One key for every job that needs the prefixes: a moved manifest pin, a
-  # changed patch series or a changed build recipe misses the cache.
-  PREFIX_KEY: prefixes-${{ runner.os }}-${{ hashFiles('dependencies/manifest.tsv', 'dependencies/patches/**/series.tsv', 'dependencies/platforms/**', 'dependencies/build.sh', 'dependencies/build-apple-gpu.sh') }}
 
 jobs:
   audit:
@@ -132,6 +134,85 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  swift-packages:
+    name: Swift packages
+    needs: audit
+    runs-on: xcode-27
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        # Both packages declare macOS 27.0 as their floor, so the toolchain has
+        # to be the one the runners ship as Xcode 27, not macos-26's default.
+        run: |
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-version
+
+      # These are the commands the CMake suite registers as `guest-host-core`
+      # and `andarium-core` (tests/unit/guesthost, tests/unit/andarium), run
+      # the same way: same scratch paths, so a local and a CI run agree.
+      - name: Test GuestHostCore
+        run: |
+          xcrun swift test \
+            --package-path GuestHost/Core \
+            --scratch-path .build/guest-host-core-swiftpm
+
+      - name: Test AndariumCore
+        run: |
+          xcrun swift test \
+            --package-path Andarium/AndariumCore \
+            --scratch-path .build/andarium-core-swiftpm
+
+  ios-app:
+    name: Andarium preview app
+    needs: swift-packages
+    runs-on: xcode-27
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      # AndariumPreview builds over Andarium/Shared and Andarium/Preview with
+      # state from AndariumCore; it embeds no runtime, boots nothing and has no
+      # script phase, which is why it needs none of the .build inputs the
+      # `Andarium` target does.
+      - name: Configure the project
+        run: |
+          xcodebuild -project Andarium/Andarium.xcodeproj \
+            -scheme AndariumPreview \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath .build/andarium-preview-dd \
+            build
+        # The scheme needs no signing identity on a Simulator destination, so a
+        # fork's pull request builds it without a secret.
+        env:
+          # A generic Simulator destination may offer x86_64; no product here is
+          # built for it (docs/testing.md#apple-builds-and-kernarium).
+          EXCLUDED_ARCHS: x86_64
+
+      - name: Note the product
+        run: |
+          APP=.build/andarium-preview-dd/Build/Products/Debug-iphonesimulator/AndariumPreview.app
+          test -d "$APP"
+          du -sh "$APP"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist"
+
+      - name: Upload the app
+        uses: actions/upload-artifact@v4
+        with:
+          name: AndariumPreview-simulator
+          path: .build/andarium-preview-dd/Build/Products/Debug-iphonesimulator/AndariumPreview.app
+          retention-days: 7
+
+      - name: Build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: andarium-preview-log
+          path: .build/andarium-preview-dd/Logs/Build/*.xcactivitylog
+          if-no-files-found: ignore
+          retention-days: 7
+
   dependencies:
     name: Dependency prefixes
     needs: audit
@@ -154,8 +235,8 @@ jobs:
         with:
           python-version: "3.13"
 
-      # Meson, Mako and PyYAML come from the optional .build/gpu-tools-venv the
-      # GPU recipe prefers, so they are installed there rather than globally.
+      # The GPU recipe prefers Meson, Mako and PyYAML from .build/gpu-tools-venv
+      # when it exists; these are the PATH fallbacks for when it does not.
       - name: Install host tools
         run: |
           brew install ninja meson mako pyyaml pkg-config rsync autoconf \
@@ -164,10 +245,9 @@ jobs:
       - name: Metal toolchain
         run: xcodebuild -downloadComponent MetalToolchain
 
-      # Verification is exact and cheap, so a restored prefix is believed only
-      # after dependencies/verify-prefix.sh and the GPU verifier accept it. Both
-      # builders do that themselves; a stale prefix makes them refuse, which is
-      # the signal to bump the key above.
+      # The key hashes the inputs a prefix receipt records. hashFiles is only
+      # allowed in a step, not in the workflow's env, so the expression is
+      # repeated where it is used rather than named once.
       - name: Restore prefixes
         id: prefixes
         uses: actions/cache/restore@v4
@@ -175,8 +255,8 @@ jobs:
           path: |
             .build/dependencies/macos-arm64-27
             .build/dependencies/apple-gpu-vulkan-experiment/macos-arm64
-          key: ${{ env.PREFIX_KEY }}
-          restore-keys: prefixes-${{ runner.os }}-
+          key: prefixes-${{ hashFiles('dependencies/manifest.tsv', 'dependencies/patches/**/series.tsv', 'dependencies/platforms/**', 'dependencies/build.sh', 'dependencies/build-apple-gpu.sh') }}
+          restore-keys: prefixes-
 
       - name: Verify restored prefixes
         id: verify
@@ -185,20 +265,25 @@ jobs:
         # used, or the test jobs would build against the wrong libraries.
         env:
           RESTORED_KEY: ${{ steps.prefixes.outputs.cache-matched-key }}
+          WANTED_KEY: ${{ steps.prefixes.outputs.cache-primary-key }}
         run: |
-          if [ "$RESTORED_KEY" != "$PREFIX_KEY" ]; then
-            echo "restored $RESTORED_KEY, want $PREFIX_KEY: rebuilding"
+          if [ "$RESTORED_KEY" != "$WANTED_KEY" ]; then
+            echo "restored $RESTORED_KEY, want $WANTED_KEY: rebuilding"
             rm -rf .build/dependencies/macos-arm64-27 \
                    .build/dependencies/apple-gpu-vulkan-experiment/macos-arm64
             echo "usable=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # The receipts, the manifest rows and the patched source trees the
+          # prefix records have to match this checkout, and the prefix itself
+          # has to hold no build-host path.
           dependencies/prepare.sh --product macos --verify
           dependencies/verify-prefix.sh \
             --prefix .build/dependencies/macos-arm64-27 \
             --manifest dependencies/manifest.tsv \
             --deployment-target 27.0
-          dependencies/build-apple-gpu.sh --platform macos --verify-only
+          dependencies/build-apple-gpu.sh \
+            --product apple-gpu-vulkan-experiment --platform macos --verify-only
           echo "usable=true" >> "$GITHUB_OUTPUT"
 
       # prepare.sh is the only dependency step allowed to touch the network.
@@ -222,12 +307,14 @@ jobs:
           --jobs "$(sysctl -n hw.ncpu)"
 
       - name: Save prefixes
+        # Only a prefix this run built or repaired; an exact hit is already saved.
+        if: steps.verify.outputs.usable != 'true'
         uses: actions/cache/save@v4
         with:
           path: |
             .build/dependencies/macos-arm64-27
             .build/dependencies/apple-gpu-vulkan-experiment/macos-arm64
-          key: ${{ env.PREFIX_KEY }}
+          key: prefixes-${{ hashFiles('dependencies/manifest.tsv', 'dependencies/patches/**/series.tsv', 'dependencies/platforms/**', 'dependencies/build.sh', 'dependencies/build-apple-gpu.sh') }}
 
   unit:
     name: Unit tests
@@ -258,7 +345,7 @@ jobs:
           path: |
             .build/dependencies/macos-arm64-27
             .build/dependencies/apple-gpu-vulkan-experiment/macos-arm64
-          key: ${{ env.PREFIX_KEY }}
+          key: prefixes-${{ hashFiles('dependencies/manifest.tsv', 'dependencies/patches/**/series.tsv', 'dependencies/platforms/**', 'dependencies/build.sh', 'dependencies/build-apple-gpu.sh') }}
           fail-on-cache-miss: true
 
       - name: Configure
@@ -311,7 +398,7 @@ jobs:
           path: |
             .build/dependencies/macos-arm64-27
             .build/dependencies/apple-gpu-vulkan-experiment/macos-arm64
-          key: ${{ env.PREFIX_KEY }}
+          key: prefixes-${{ hashFiles('dependencies/manifest.tsv', 'dependencies/patches/**/series.tsv', 'dependencies/platforms/**', 'dependencies/build.sh', 'dependencies/build-apple-gpu.sh') }}
           fail-on-cache-miss: true
 
       - name: Configure
@@ -330,4 +417,52 @@ jobs:
           name: gpu-test-log
           path: .build/presets/macos-unit-gpu/Testing/**/LastTest.log
           if-no-files-found: ignore
+          retention-days: 7
+
+  andarium-app:
+    name: Andarium application
+    needs: dependencies
+    # Off by default. Turn it on with the repository variable
+    # KERNARIUM_APP_BUILDS=true once the runner can hand the project what the
+    # target embeds; docs/ci.md#the-full-applications lists the six inputs and
+    # the two ways to get them.
+    if: vars.KERNARIUM_APP_BUILDS == 'true'
+    # A packaged device build needs a signing identity, and only a self-hosted
+    # Mac can hold one this workflow may use. Point this label at that machine;
+    # the stock hosted runners have no team and would stop at "requires a
+    # development team".
+    runs-on: [self-hosted, macOS, arm64, kernarium-ios]
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Package the Android runtime
+        run: |
+          cmake --preset kernarium-ios-device-android \
+            -DPython3_EXECUTABLE="$(command -v python3)"
+          cmake --build --preset kernarium-ios-device-android --parallel
+          Kernarium/scripts/package-ios-frameworks.sh --runtimes android
+
+      # The staged image is a copy of an accepted Android release. A release
+      # build costs hours and tens of gigabytes, so the machine this job runs on
+      # keeps them in .build/android/releases; the script checks the release it
+      # stages against the manifest and layout the acceptance names.
+      - name: Stage the system image
+        run: Andarium/scripts/stage-system-image.py
+
+      - name: Build the application
+        run: |
+          xcodebuild -project Andarium/Andarium.xcodeproj \
+            -scheme Andarium \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath .build/andarium-dd \
+            -allowProvisioningUpdates \
+            build
+
+      - name: Upload the app
+        uses: actions/upload-artifact@v4
+        with:
+          name: Andarium-ios
+          path: .build/andarium-dd/Build/Products/Release-iphoneos/Andarium.app
           retention-days: 7
