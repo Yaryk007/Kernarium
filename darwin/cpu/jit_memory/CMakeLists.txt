@@ -5,4 +5,8 @@
 # engines link it and keeps the gadget engines and shared CPU code, which stay
 # data-only, from doing so.
 add_library(uml_cpu_executable_memory OBJECT executable_memory.cpp)
+if(UML_ENABLE_IOS_STIKDEBUG_JIT)
+    target_compile_definitions(uml_cpu_executable_memory PRIVATE
+        UML_ENABLE_IOS_STIKDEBUG_JIT=1)
+endif()
 uml_declare_architecture_target(uml_cpu_executable_memory cpu native)

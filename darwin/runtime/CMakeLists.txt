@@ -43,7 +43,9 @@ target_include_directories(uml_runtime_context PRIVATE
 # JIT, but measurement rejects it for the workloads that matter: see G157.
 # The x86-64 product defaults to the gadget engine until its JIT measures
 # ahead; `--execution-engine jit` selects the x86-64 JIT there.
-if(UML_TARGET_MACOS AND NOT UML_X86_64_USERSPACE_ONLY)
+if((UML_TARGET_MACOS OR
+     UML_ENABLE_IOS_STIKDEBUG_JIT) AND
+     NOT UML_X86_64_USERSPACE_ONLY)
     set(_uml_default_execution_engine_jit ON)
 else()
     set(_uml_default_execution_engine_jit OFF)

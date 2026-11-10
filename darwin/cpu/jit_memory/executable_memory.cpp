@@ -2,6 +2,9 @@
 #include "executable_memory.hpp"
 
 #include <sys/mman.h>
+#if defined(UML_ENABLE_IOS_STIKDEBUG_JIT)
+#include <sys/codesign.h>
+#endif
 
 #include <libkern/OSCacheControl.h>
 #include <os/lock.h>
@@ -17,10 +20,11 @@ namespace {
 
 /* Publication route for MAP_JIT memory.
  *
- * macOS declares pthread_jit_write_protect_np and calls it directly. No iOS
- * product has a publication route: a physical device cannot obtain the
- * entitlement, so JIT memory reports itself unavailable there rather than
- * mapping memory it could never publish into.
+ * macOS declares pthread_jit_write_protect_np and calls it directly. Physical
+ * devices normally cannot publish MAP_JIT memory, so JIT reports itself
+ * unavailable there. UML_ENABLE_IOS_STIKDEBUG_JIT compiles the same W^X
+ * toggle for a development-signed iOS process whose executable window is
+ * prepared by StikDebug's universal script.
  *
  * The Simulator is deliberately held to the same answer even though it runs on
  * macOS and could reach the toggle dynamically. Letting it translate through a
@@ -28,7 +32,8 @@ namespace {
  * of the product it exists to stand in for.
  */
 #if defined(__APPLE__) && defined(__aarch64__) && defined(MAP_JIT) && \
-	!defined(__IPHONE_OS_VERSION_MAX_ALLOWED)
+	(!defined(__IPHONE_OS_VERSION_MAX_ALLOWED) || \
+	 defined(UML_ENABLE_IOS_STIKDEBUG_JIT))
 void jit_write_protect(int enable)
 {
 	pthread_jit_write_protect_np(enable);
@@ -44,6 +49,36 @@ constexpr void jit_write_protect(int) {}
 constexpr bool jit_publication_supported() noexcept
 {
 	return false;
+}
+#endif
+
+#if defined(UML_ENABLE_IOS_STIKDEBUG_JIT)
+/* StikDebug universal.js protocol. x0 and x1 carry the normal function
+ * arguments; x16 selects prepare-region (1) or detach (0). Calling either
+ * breakpoint without universal.js attached is a configuration error and may
+ * stop the process, so available() first requires CS_DEBUGGED.
+ */
+extern "C" __attribute__((noinline, optnone, naked))
+void *uml_stikdebug_prepare_region(void *, std::size_t)
+{
+	__asm__("mov x16, #1\n"
+	        "brk #0xf00d\n"
+	        "ret\n");
+}
+
+extern "C" __attribute__((noinline, optnone, naked))
+void uml_stikdebug_detach()
+{
+	__asm__("mov x16, #0\n"
+	        "brk #0xf00d\n"
+	        "ret\n");
+}
+
+[[nodiscard]] bool debugger_attached() noexcept
+{
+	std::uint32_t status = 0;
+	return csops(getpid(), CS_OPS_STATUS, &status, sizeof(status)) == 0 &&
+	       (status & CS_DEBUGGED) != 0;
 }
 #endif
 
@@ -131,6 +166,16 @@ public:
 		mark(first, count, false);
 		os_unfair_lock_unlock(&lock_);
 		return true;
+	}
+
+	[[nodiscard]] void *mapping() const noexcept
+	{
+		return base_;
+	}
+
+	[[nodiscard]] std::size_t size() const noexcept
+	{
+		return granules_ * granule;
 	}
 
 private:
@@ -228,6 +273,24 @@ bool available() noexcept
 		 */
 		if (!jit_publication_supported())
 			return false;
+#if defined(UML_ENABLE_IOS_STIKDEBUG_JIT)
+		/* universal.js must prepare every executable region before it
+		 * detaches. The window is the JIT's only iOS executable mapping, so
+		 * preparing it once also covers every later arena allocation.
+		 */
+		if (!debugger_attached())
+			return false;
+		window.claim();
+		void *const mapping = window.mapping();
+		const std::size_t size = window.size();
+		if (mapping == nullptr || size == 0) {
+			uml_stikdebug_detach();
+			return false;
+		}
+		void *const prepared = uml_stikdebug_prepare_region(mapping, size);
+		uml_stikdebug_detach();
+		return prepared == mapping;
+#else
 		void *mapping = mmap(nullptr, 16U * 1024U,
 			PROT_READ | PROT_WRITE | PROT_EXEC,
 			MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
@@ -236,6 +299,7 @@ bool available() noexcept
 		(void)munmap(mapping, 16U * 1024U);
 		window.claim();
 		return true;
+#endif
 #else
 		return false;
 #endif
@@ -249,9 +313,14 @@ void *allocate(std::size_t size) noexcept
 		if (void *mapping = window.allocate(size); mapping != nullptr)
 			return mapping;
 	}
+#if defined(UML_ENABLE_IOS_STIKDEBUG_JIT)
+	/* universal.js has detached, so a later mapping cannot be prepared. */
+	return nullptr;
+#else
 	void *mapping = mmap(nullptr, size, PROT_READ | PROT_WRITE | PROT_EXEC,
 		MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
 	return mapping == MAP_FAILED ? nullptr : mapping;
+#endif
 }
 
 void release(void *mapping, std::size_t size)
@@ -260,7 +329,12 @@ void release(void *mapping, std::size_t size)
 		if (window.release(mapping, size))
 			return;
 	}
+#if !defined(UML_ENABLE_IOS_STIKDEBUG_JIT)
 	(void)munmap(mapping, size);
+#else
+	(void)mapping;
+	(void)size;
+#endif
 }
 
 void set_writable(bool writable)
