@@ -13,6 +13,9 @@
 #include <cstdint>
 
 #if defined(UML_ENABLE_IOS_STIKDEBUG_JIT)
+#include <mach/mach.h>
+#include <mach/vm_map.h>
+
 /* csops and its flags are XNU interfaces present on iOS but omitted from the
  * public device SDK headers. This sideload-only build uses status query 0 and
  * CS_DEBUGGED from xnu/bsd/sys/codesign.h; it does not mutate code-signing
@@ -30,9 +33,8 @@ namespace {
  *
  * macOS declares pthread_jit_write_protect_np and calls it directly. Physical
  * devices normally cannot publish MAP_JIT memory, so JIT reports itself
- * unavailable there. UML_ENABLE_IOS_STIKDEBUG_JIT compiles the same W^X
- * toggle for a development-signed iOS process whose executable window is
- * prepared by StikDebug's universal script.
+ * unavailable there. UML_ENABLE_IOS_STIKDEBUG_JIT instead uses an RX mapping
+ * prepared by StikDebug and writes it through a separate RW alias.
  *
  * The Simulator is deliberately held to the same answer even though it runs on
  * macOS and could reach the toggle dynamically. Letting it translate through a
@@ -40,12 +42,18 @@ namespace {
  * of the product it exists to stand in for.
  */
 #if defined(__APPLE__) && defined(__aarch64__) && defined(MAP_JIT) && \
-	(!defined(__IPHONE_OS_VERSION_MAX_ALLOWED) || \
-	 defined(UML_ENABLE_IOS_STIKDEBUG_JIT))
+	!defined(__IPHONE_OS_VERSION_MAX_ALLOWED)
 void jit_write_protect(int enable)
 {
 	pthread_jit_write_protect_np(enable);
 }
+
+constexpr bool jit_publication_supported() noexcept
+{
+	return true;
+}
+#elif defined(UML_ENABLE_IOS_STIKDEBUG_JIT)
+constexpr void jit_write_protect(int) {}
 
 constexpr bool jit_publication_supported() noexcept
 {
@@ -151,6 +159,65 @@ public:
 		return mapping;
 	}
 
+#if defined(UML_ENABLE_IOS_STIKDEBUG_JIT)
+	/* iOS 26's trusted-execution monitor does not make a caller-created
+	 * mapping executable. Ask universal.js/debugserver to create the RX
+	 * mapping, then make a second view of the same VM object for writes.
+	 */
+	[[nodiscard]] bool prepare_ios() noexcept
+	{
+		os_unfair_lock_lock(&lock_);
+		if (claimed_) {
+			const bool ready = base_ != nullptr && writable_base_ != nullptr;
+			os_unfair_lock_unlock(&lock_);
+			return ready;
+		}
+		claimed_ = true;
+		os_unfair_lock_unlock(&lock_);
+
+		void *const executable =
+			uml_stikdebug_prepare_region(nullptr, ios_window_bytes);
+		if (executable == nullptr)
+			return false;
+		vm_address_t writable = 0;
+		vm_prot_t current = VM_PROT_NONE;
+		vm_prot_t maximum = VM_PROT_NONE;
+		const auto executable_address = reinterpret_cast<vm_address_t>(
+			executable);
+		kern_return_t result = vm_remap(mach_task_self(), &writable,
+			ios_window_bytes, 0, VM_FLAGS_ANYWHERE, mach_task_self(),
+			executable_address, FALSE, &current, &maximum,
+			VM_INHERIT_NONE);
+		if (result == KERN_SUCCESS)
+			result = vm_protect(mach_task_self(), writable,
+				ios_window_bytes, FALSE, VM_PROT_READ | VM_PROT_WRITE);
+		if (result != KERN_SUCCESS) {
+			if (writable != 0)
+				(void)vm_deallocate(
+					mach_task_self(), writable, ios_window_bytes);
+			(void)vm_deallocate(mach_task_self(), executable_address,
+				ios_window_bytes);
+			return false;
+		}
+
+		os_unfair_lock_lock(&lock_);
+		base_ = static_cast<std::byte *>(executable);
+		writable_base_ = reinterpret_cast<std::byte *>(writable);
+		granules_ = ios_window_bytes / granule;
+		os_unfair_lock_unlock(&lock_);
+		return true;
+	}
+
+	[[nodiscard]] void *writable_alias(void *executable) const noexcept
+	{
+		auto *const address = static_cast<std::byte *>(executable);
+		if (base_ == nullptr || writable_base_ == nullptr || address < base_ ||
+		    address >= base_ + granules_ * granule)
+			return nullptr;
+		return writable_base_ + (address - base_);
+	}
+#endif
+
 	/* Whether mapping came from the window; if so its pages return to it. */
 	[[nodiscard]] bool release(void *mapping, std::size_t size) noexcept
 	{
@@ -191,6 +258,13 @@ private:
 	static constexpr std::size_t granule = 16U * 1024U;
 	static constexpr std::size_t step_bytes = 64U * 1024U * 1024U;
 	static constexpr std::size_t max_bytes = 24U * step_bytes;
+#if defined(UML_ENABLE_IOS_STIKDEBUG_JIT)
+	/* Four production-size executor caches plus their auxiliary arenas fit in
+	 * 768 MiB. Keeping the prepared region bounded also keeps universal.js's
+	 * page preparation time practical on a phone.
+	 */
+	static constexpr std::size_t ios_window_bytes = 12U * step_bytes;
+#endif
 	static constexpr std::uintptr_t prediction_block = std::uintptr_t{1} << 29U;
 	static constexpr std::uintptr_t near_block = std::uintptr_t{1} << 32U;
 	static constexpr std::size_t none = ~std::size_t{0};
@@ -262,6 +336,9 @@ private:
 	os_unfair_lock lock_ = OS_UNFAIR_LOCK_INIT;
 	bool claimed_{};
 	std::byte *base_{};
+#if defined(UML_ENABLE_IOS_STIKDEBUG_JIT)
+	std::byte *writable_base_{};
+#endif
 	std::size_t granules_{};
 	std::array<std::uint64_t, max_bytes / granule / 64U> used_{};
 };
@@ -282,22 +359,16 @@ bool available() noexcept
 		if (!jit_publication_supported())
 			return false;
 #if defined(UML_ENABLE_IOS_STIKDEBUG_JIT)
-		/* universal.js must prepare every executable region before it
-		 * detaches. The window is the JIT's only iOS executable mapping, so
-		 * preparing it once also covers every later arena allocation.
+		/* universal.js/debugserver creates the executable view. A remapped
+		 * writable view of the same VM object receives all generated bytes.
+		 * The window is the only iOS executable allocation, so the debugger
+		 * can detach once both views exist.
 		 */
 		if (!debugger_attached())
 			return false;
-		window.claim();
-		void *const mapping = window.mapping();
-		const std::size_t size = window.size();
-		if (mapping == nullptr || size == 0) {
-			uml_stikdebug_detach();
-			return false;
-		}
-		void *const prepared = uml_stikdebug_prepare_region(mapping, size);
+		const bool prepared = window.prepare_ios();
 		uml_stikdebug_detach();
-		return prepared == mapping;
+		return prepared;
 #else
 		void *mapping = mmap(nullptr, 16U * 1024U,
 			PROT_READ | PROT_WRITE | PROT_EXEC,
@@ -328,6 +399,15 @@ void *allocate(std::size_t size) noexcept
 	void *mapping = mmap(nullptr, size, PROT_READ | PROT_WRITE | PROT_EXEC,
 		MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
 	return mapping == MAP_FAILED ? nullptr : mapping;
+#endif
+}
+
+void *writable_alias(void *executable_address) noexcept
+{
+#if defined(UML_ENABLE_IOS_STIKDEBUG_JIT)
+	return window.writable_alias(executable_address);
+#else
+	return executable_address;
 #endif
 }
 

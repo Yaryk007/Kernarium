@@ -93,9 +93,11 @@ xcodebuild -project Andarium/Andarium.xcodeproj -scheme Andarium \
 
 The sideload-only runtime can use the native arm64 JIT on iOS 27 when the app
 is development-signed with `get-task-allow` and launched from StikDebug with
-`universal.js`. It prepares one executable window through the iOS 26+ region
-protocol before StikDebug detaches. Opening the app normally does not grant JIT;
-the runtime then falls back to the gadget interpreter.
+`universal.js`. It creates one RX window through the iOS 26+ region protocol,
+then the runtime remaps the same memory as a separate RW alias before StikDebug
+detaches. Generated instructions are written through the alias and executed
+through the RX view. Opening the app normally does not grant JIT; the runtime
+then falls back to the gadget interpreter.
 
 ```sh
 cmake --preset kernarium-ios-device-android-stikdebug-jit

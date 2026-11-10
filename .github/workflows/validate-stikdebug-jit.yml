@@ -34,3 +34,11 @@ jobs:
             -Idarwin/cpu/jit_memory \
             -c darwin/cpu/jit_memory/executable_memory.cpp \
             -o .build/jit-source-check/executable_memory.o
+          xcrun --sdk iphoneos clang++ \
+            -std=c++20 \
+            -Wall -Wextra -Werror \
+            -target arm64-apple-ios27.0 \
+            -DUML_ENABLE_IOS_STIKDEBUG_JIT=1 \
+            -Idarwin \
+            -c darwin/cpu/arm64/jit/jit_arena.cpp \
+            -o .build/jit-source-check/jit_arena.o
