@@ -88,10 +88,10 @@ jobs:
       # a configure: they catch the mistakes a pull request most often makes.
       - name: Repository file policies
         run: |
-          tests/tooling/cmake/check_license_headers.py --source-root .
-          tests/tooling/cmake/check_environment_portability.py --source-root .
-          tests/tooling/cmake/validate_json_inputs.py --source-root .
-          tests/tooling/cmake/check_adb_server_policy.py --source-root .
+          python3 tests/tooling/cmake/check_license_headers.py --source-root .
+          python3 tests/tooling/cmake/check_environment_portability.py --source-root .
+          python3 tests/tooling/cmake/validate_json_inputs.py --source-root .
+          python3 tests/tooling/cmake/check_adb_server_policy.py --source-root .
 
   tooling:
     name: Tooling checks
