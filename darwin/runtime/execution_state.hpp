@@ -10,8 +10,8 @@
 #endif
 #if DARWIN_UML_X86_64_JIT
 #include "runtime/x86_jit_runtime.hpp"
-#include "runtime/x86_tier.hpp"
 #endif
+#include "runtime/jit_tier.hpp"
 #include "memory/static_guest_memory.hpp"
 #include "platform/apple/host_features.hpp"
 
@@ -91,9 +91,13 @@ struct ThreadExecutionState final {
 #endif
 #if DARWIN_UML_X86_64_JIT
 	/* The tier state of the address space this vCPU last ran in. */
-	std::shared_ptr<X86TierState> x86_tier;
+	std::shared_ptr<JitTierState> x86_tier;
 	unsigned long x86_tier_generation{};
 #endif
+	/* The arm64 tier state of the address space this vCPU last ran in,
+	 * for a run with an arm64 tier threshold. */
+	std::shared_ptr<JitTierState> arm64_tier;
+	unsigned long arm64_tier_generation{};
 };
 
 } // namespace uml::runtime

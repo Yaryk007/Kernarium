@@ -31,14 +31,28 @@ space, the shared tier opens only while two executors live and is keyed by
 guest PC, and the guest's ASLR moves every image anyway. Each exec'd process
 therefore compiles its whole startup path again, several times what it costs
 the gadget engine, and the LTP runner scales its case bounds for it
-([testing](../../../../docs/testing.md#ltp)). An Android guest never stops
-translating: its processes' working sets together outgrow the cache at any
-budget a device can afford, so the arena is emptied every few seconds and the
-guest's boot, launches and background work run several times slower than on
-gadgets, while a long single-process computation runs faster in CPU time. The
-JIT's products are macOS and development builds, so the cold path is not
-optimized
+([testing](../../../../docs/testing.md#ltp)). Run from the first instruction,
+an Android guest never stops translating: its processes' working sets together
+outgrow the cache at any budget a device can afford, so the arena is emptied
+every few seconds
 ([history](../../../../docs/optimization-history.md#jit-cold-code-per-process)).
+
+## Tiered execution
+
+`--arm64-jit-tier=N` starts each arm64 address space on the gadget engine and
+gives it to the JIT once the gadgets have retired N instructions in it, with
+the draining handover of the x86-64 JIT's
+[tiered execution](../../x86_64/jit/README.md#tiered-execution)
+([`jit_tier.hpp`](../../../runtime/jit_tier.hpp)). Zero, the default, runs the
+JIT from the first instruction; the Kernarium runtime tiers every JIT run.
+Short-lived processes then never reach the arena, which the long-lived ones
+keep. Both engines present the profile they both implement while a tier is
+set, so a process sees the same identification registers and HWCAPs on each.
+The engines share the exclusive monitor's host memory: a gadget
+store-exclusive is a host store-exclusive or compare-and-swap, the JIT's a
+fused host pair or a compare-and-swap, so a pair stays atomic against a
+process on the other engine; only a store that restores the reserved value
+goes unseen there, as in the gadgets' software completion.
 
 ## Top-byte ignore
 

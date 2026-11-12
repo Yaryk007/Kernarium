@@ -402,7 +402,7 @@ void save_x86_fault_flags(darwin_uml_guest_registers &registers) noexcept
 /* The tier state of `generation` for this vCPU, or null when the run has no
  * tier threshold. The vCPU keeps the one it last used, which it asks the
  * table for again only when it moves to another address space. */
-[[nodiscard]] ::uml::runtime::X86TierState *x86_tier_state(
+[[nodiscard]] ::uml::runtime::JitTierState *x86_tier_state(
 	::uml::runtime::Context &context,
 	::uml::runtime::ThreadExecutionState &runtime,
 	unsigned long generation) noexcept
@@ -451,7 +451,7 @@ int run_x86_guest(darwin_uml_guest_registers &registers,
 	 * default, compiles none of this. With a tier threshold the JIT takes an
 	 * address space over only after it has retired that many instructions on
 	 * the gadget engine. */
-	::uml::runtime::X86TierState::Entry tier;
+	::uml::runtime::JitTierState::Entry tier;
 	if constexpr (Kind == uml::cpu::EngineKind::jit) {
 		if (auto *state = x86_tier_state(context, runtime, generation)) {
 			tier = state->enter([&]() noexcept {
@@ -467,7 +467,7 @@ int run_x86_guest(darwin_uml_guest_registers &registers,
 					stepping, run);
 			}
 		}
-		if (tier.engine() == ::uml::runtime::X86TierState::Engine::jit) {
+		if (tier.engine() == ::uml::runtime::JitTierState::Engine::jit) {
 			auto run = ::uml::runtime::run_x86_jit(cpu, runtime.memory,
 				runtime.x86_jit, generation,
 				stepping ? 1 : dispatch_budget, {
@@ -522,27 +522,62 @@ void save_floating_point_trap(
  * carry the creation. */
 template<uml::cpu::EngineKind Kind>
 [[gnu::cold, gnu::noinline]] void create_common_engine(
-	std::unique_ptr<uml::cpu::CpuEngine> &slot)
+	std::unique_ptr<uml::cpu::CpuEngine> &slot,
+	const ::uml::runtime::Context &context)
 {
+	/* A tiered arm64 JIT run presents the profile both engines implement
+	 * from both, since one process runs on each in turn. */
+	const auto profile = context.presented_engine() ==
+			::uml::runtime::ExecutionEngine::automatic ?
+		::uml::runtime::ExecutionEngine::automatic :
+		Kind == uml::cpu::EngineKind::jit ?
+			::uml::runtime::ExecutionEngine::jit :
+			::uml::runtime::ExecutionEngine::gadgets;
 	slot = uml::cpu::make_cpu_engine(Kind,
 		uml::cpu::EngineConfiguration{
 			.host_capabilities =
-				::uml::runtime::guest_host_capabilities(
-					Kind == uml::cpu::EngineKind::jit ?
-						::uml::runtime::ExecutionEngine::jit :
-						::uml::runtime::ExecutionEngine::gadgets),
+				::uml::runtime::guest_host_capabilities(profile),
 		});
 }
 
 template<uml::cpu::EngineKind Kind>
 uml::cpu::CpuEngine *common_engine(
-	::uml::runtime::ThreadExecutionState &runtime)
+	::uml::runtime::ThreadExecutionState &runtime,
+	const ::uml::runtime::Context &context)
 {
 	auto &slot = runtime.engines.slot<Kind>();
 	if (!slot) [[unlikely]]
-		create_common_engine<Kind>(slot);
+		create_common_engine<Kind>(slot, context);
 	return slot.get();
 }
+
+#ifndef UML_APP_STORE_RUNTIME
+/* Whether the host still has the generation; one that cannot say counts as
+ * live. */
+[[nodiscard]] bool arm64_generation_live(unsigned long generation) noexcept
+{
+	return darwin_uml_static_vm_generation_live(generation) != 0;
+}
+
+/* The arm64 tier state of `generation` for this vCPU, or null when the run
+ * has no arm64 tier threshold. The vCPU keeps the one it last used, which it
+ * asks the table for again only when it moves to another address space. */
+[[nodiscard]] ::uml::runtime::JitTierState *arm64_tier_state(
+	::uml::runtime::Context &context,
+	::uml::runtime::ThreadExecutionState &runtime,
+	unsigned long generation) noexcept
+{
+	auto *table = context.arm64_tier_table(&arm64_generation_live);
+	if (table == nullptr)
+		return nullptr;
+	if (runtime.arm64_tier == nullptr ||
+	    runtime.arm64_tier_generation != generation) {
+		runtime.arm64_tier = table->acquire(generation);
+		runtime.arm64_tier_generation = generation;
+	}
+	return runtime.arm64_tier.get();
+}
+#endif
 
 bool signal_return_boundary(arm64::CpuState &cpu, void *) noexcept
 {
@@ -572,12 +607,12 @@ template<uml::cpu::EngineKind Kind>
 	darwin_uml_guest_fp_registers &fp,
 	unsigned long generation, unsigned long *tls,
 	::uml::runtime::Context &context,
-	::uml::runtime::ThreadExecutionState &runtime)
+	::uml::runtime::ThreadExecutionState &runtime, std::size_t &retired)
 {
 	namespace a32 = ::uml::runtime::aarch32;
 	if (!a32::entry_is_valid(registers))
 		return DARWIN_UML_EVENT_FATAL;
-	auto *engine = common_engine<Kind>(runtime);
+	auto *engine = common_engine<Kind>(runtime, context);
 	if (engine == nullptr)
 		return DARWIN_UML_EVENT_FATAL;
 	auto &cpu = runtime.cpu;
@@ -603,12 +638,21 @@ template<uml::cpu::EngineKind Kind>
 	debug_check_host_streaming_state();
 	const auto result = engine->run_aarch32(request);
 	debug_check_host_streaming_state();
+	retired = result.retired_instructions;
 	::uml::cpu::materialize_architectural_state(cpu);
 	a32::save_a32_cpu(cpu, registers, fp, *tls);
 	return a32::exit_event(registers, cpu, result,
 		result.reason == uml::cpu::ExitReason::interrupt &&
 			context.stop_requested());
 }
+
+template<uml::cpu::EngineKind Kind>
+int run_arm64_guest(
+	void *register_pointer, void *fp_pointer,
+	unsigned long fp_size, unsigned long generation, unsigned long *tls,
+	::uml::runtime::Context &context_reference,
+	::uml::runtime::ThreadExecutionState &runtime_reference,
+	std::size_t &retired);
 
 template<uml::cpu::EngineKind Kind>
 int run_common_guest(
@@ -618,26 +662,73 @@ int run_common_guest(
 	if (register_pointer == nullptr || fp_pointer == nullptr || tls == nullptr ||
 		fp_size < sizeof(darwin_uml_guest_fp_registers))
 		return DARWIN_UML_EVENT_FATAL;
-	auto &mutable_registers =
-		*static_cast<darwin_uml_guest_registers *>(register_pointer);
-	auto &fp = *static_cast<darwin_uml_guest_fp_registers *>(fp_pointer);
 	auto *context = ::uml::runtime::current_context();
 	if (context == nullptr)
 		return DARWIN_UML_EVENT_FATAL;
 	auto runtime = context->thread_execution_state();
+#if DARWIN_UML_X86_64_USERSPACE_ONLY || DARWIN_UML_X86_64_GUEST
+	{
+		auto &mutable_registers =
+			*static_cast<darwin_uml_guest_registers *>(register_pointer);
+		auto &fp =
+			*static_cast<darwin_uml_guest_fp_registers *>(fp_pointer);
 #if DARWIN_UML_X86_64_USERSPACE_ONLY
-	return run_x86_guest<Kind>(mutable_registers, fp, generation,
-		*context, *runtime);
-#elif DARWIN_UML_X86_64_GUEST
-	if (mutable_registers.padding == x86_64_guest_isa) {
 		return run_x86_guest<Kind>(mutable_registers, fp, generation,
 			*context, *runtime);
+#else
+		if (mutable_registers.padding == x86_64_guest_isa) {
+			return run_x86_guest<Kind>(mutable_registers, fp,
+				generation, *context, *runtime);
+		}
+#endif
 	}
 #endif
 	if constexpr (Kind == uml::cpu::EngineKind::jit) {
 		if (!uml::cpu::cpu_engine_available(uml::cpu::EngineKind::jit))
 			return DARWIN_UML_EVENT_FATAL;
+#ifndef UML_APP_STORE_RUNTIME
+		/* With an arm64 tier threshold, an address space runs on the
+		 * gadget engine until it has retired that many instructions there,
+		 * and on the JIT from then on (runtime/jit_tier.hpp). */
+		if (auto *state = arm64_tier_state(*context, *runtime, generation)) {
+			auto tier = state->enter([&]() noexcept {
+				return context->stop_requested();
+			});
+			if (tier.abandoned())
+				return DARWIN_UML_EVENT_STOP;
+			if (tier.engine() ==
+			    ::uml::runtime::JitTierState::Engine::gadgets) {
+				std::size_t retired = 0;
+				const int event = run_arm64_guest<
+					uml::cpu::EngineKind::gadgets>(
+					register_pointer, fp_pointer, fp_size,
+					generation, tls, *context, *runtime, retired);
+				tier.leave(retired);
+				return event;
+			}
+		}
+#endif
 	}
+	std::size_t retired = 0;
+	return run_arm64_guest<Kind>(register_pointer, fp_pointer, fp_size,
+		generation, tls, *context, *runtime, retired);
+}
+
+/* An arm64 task's dispatch on engine `Kind`, which reports in `retired` the
+ * instructions it retired. */
+template<uml::cpu::EngineKind Kind>
+int run_arm64_guest(
+	void *register_pointer, void *fp_pointer,
+	unsigned long fp_size, unsigned long generation, unsigned long *tls,
+	::uml::runtime::Context &context_reference,
+	::uml::runtime::ThreadExecutionState &runtime_reference,
+	std::size_t &retired)
+{
+	auto &mutable_registers =
+		*static_cast<darwin_uml_guest_registers *>(register_pointer);
+	auto &fp = *static_cast<darwin_uml_guest_fp_registers *>(fp_pointer);
+	auto *context = &context_reference;
+	auto *runtime = &runtime_reference;
 	/* An arm64 task's tail is its FP registers and then its SME
 	 * registers, whether or not the run implements SME. */
 	if (fp_size != DARWIN_UML_ABI_GUEST_ARM64_TAIL_SIZE)
@@ -645,7 +736,7 @@ int run_common_guest(
 	/* A 32-bit task: PSTATE.nRW in the SPSR layout the kernel hands over. */
 	if (mutable_registers.pstate & pstate_mode32) [[unlikely]]
 		return run_aarch32_guest<Kind>(mutable_registers, fp,
-			generation, tls, *context, *runtime);
+			generation, tls, *context, *runtime, retired);
 	auto &sme = *reinterpret_cast<darwin_uml_guest_sme_registers *>(
 		static_cast<std::byte *>(fp_pointer) +
 		DARWIN_UML_ABI_GUEST_SME_REGISTERS_OFFSET);
@@ -666,7 +757,7 @@ int run_common_guest(
 		return DARWIN_UML_EVENT_FATAL;
 	if constexpr (Kind != uml::cpu::EngineKind::gadgets)
 		cpu.access_fp_state();
-	auto *engine = common_engine<Kind>(*runtime);
+	auto *engine = common_engine<Kind>(*runtime, *context);
 	if (engine == nullptr)
 		return DARWIN_UML_EVENT_FATAL;
 
@@ -689,6 +780,7 @@ int run_common_guest(
 	debug_check_host_streaming_state();
 	const auto result = engine->run(request);
 	debug_check_host_streaming_state();
+	retired = result.retired_instructions;
 	save_cpu(cpu, mutable_registers, fp, sme, *tls);
 
 	switch (result.reason) {

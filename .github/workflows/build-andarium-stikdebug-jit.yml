@@ -48,10 +48,14 @@ jobs:
 
       - name: Install build tools
         run: |
-          brew install make cmake ninja meson pkg-config rsync autoconf automake gettext libtool gperf groff
+          brew install make cmake ninja meson pkg-config rsync autoconf automake gettext libtool gperf groff bison flex
           python3 -m venv .build/gpu-tools-venv
-          .build/gpu-tools-venv/bin/pip install mako pyyaml
+          .build/gpu-tools-venv/bin/pip install mako pyyaml packaging meson
+          .build/gpu-tools-venv/bin/python -c 'import mako, packaging, yaml'
           echo "$PWD/.build/gpu-tools-venv/bin" >> "$GITHUB_PATH"
+          # Mesa's parsers need a newer bison and flex than the system's.
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix flex)/bin" >> "$GITHUB_PATH"
           xcodebuild -downloadComponent MetalToolchain
 
       - name: Verify build tools

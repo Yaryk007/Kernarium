@@ -3,7 +3,7 @@
  * it opens once the address space has retired its threshold, no dispatch on
  * the gadgets overlaps one on the JIT, and it never closes. */
 #include "require.hpp"
-#include "runtime/x86_tier.hpp"
+#include "runtime/jit_tier.hpp"
 #include "wait_until.hpp"
 
 #include <atomic>
@@ -15,9 +15,9 @@
 
 namespace {
 
-using uml::runtime::X86TierState;
-using uml::runtime::X86TierTable;
-using Engine = X86TierState::Engine;
+using uml::runtime::JitTierState;
+using uml::runtime::JitTierTable;
+using Engine = JitTierState::Engine;
 using uml::testing::require;
 using uml::testing::waitUntil;
 
@@ -26,7 +26,7 @@ using uml::testing::waitUntil;
  * got it there has left. */
 void test_the_threshold_opens_the_jit()
 {
-	X86TierState state{1000};
+	JitTierState state{1000};
 	{
 		auto entry = state.enter();
 		require(entry.engine() == Engine::gadgets, "first dispatch not on gadgets");
@@ -57,7 +57,7 @@ void test_the_threshold_opens_the_jit()
  * starts meanwhile is held until then. */
 void test_the_handover_drains_running_dispatches()
 {
-	X86TierState state{10};
+	JitTierState state{10};
 	auto first = state.enter();
 	auto second = state.enter();
 	require(first.engine() == Engine::gadgets &&
@@ -87,7 +87,7 @@ void test_the_handover_drains_running_dispatches()
 /* A run being stopped does not wait out a handover. */
 void test_a_stopping_run_does_not_wait()
 {
-	X86TierState state{1};
+	JitTierState state{1};
 	auto running = state.enter();
 	auto crossing = state.enter();
 	crossing.leave(5);
@@ -109,7 +109,7 @@ void test_a_stopping_run_does_not_wait()
 void test_no_dispatch_overlaps_across_the_handover()
 {
 	constexpr unsigned threads = 8;
-	X86TierState state{20'000};
+	JitTierState state{20'000};
 	std::atomic<int> on_gadgets{};
 	std::atomic_bool jit_seen{};
 	std::atomic_bool broken{};
@@ -147,7 +147,7 @@ bool is_live(unsigned long generation) noexcept
  * ones once it is large, and keeps a state something still holds. */
 void test_the_table_prunes_dead_address_spaces()
 {
-	X86TierTable table{500, &is_live};
+	JitTierTable table{500, &is_live};
 	require(table.threshold() == 500, "threshold lost");
 	const auto held = table.acquire(1);
 	require(held != nullptr && table.acquire(1) == held, "state not shared");

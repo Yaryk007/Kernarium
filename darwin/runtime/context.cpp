@@ -377,16 +377,46 @@ std::uint64_t Context::x86_jit_tier() const noexcept
 	return x86_jit_tier_.load(std::memory_order_acquire);
 }
 
-X86TierTable *Context::x86_tier_table(X86TierTable::Live live) noexcept
+JitTierTable *Context::x86_tier_table(JitTierTable::Live live) noexcept
 {
 	const auto threshold = x86_jit_tier();
 	if (threshold == 0)
 		return nullptr;
 	std::call_once(x86_tier_once_, [&]() noexcept {
-		x86_tier_table_ = std::unique_ptr<X86TierTable>{
-			new (std::nothrow) X86TierTable{threshold, live}};
+		x86_tier_table_ = std::unique_ptr<JitTierTable>{
+			new (std::nothrow) JitTierTable{threshold, live}};
 	});
 	return x86_tier_table_.get();
+}
+
+void Context::set_arm64_jit_tier(std::uint64_t instructions) noexcept
+{
+	arm64_jit_tier_.store(instructions, std::memory_order_release);
+}
+
+std::uint64_t Context::arm64_jit_tier() const noexcept
+{
+	return arm64_jit_tier_.load(std::memory_order_acquire);
+}
+
+JitTierTable *Context::arm64_tier_table(JitTierTable::Live live) noexcept
+{
+	const auto threshold = arm64_jit_tier();
+	if (threshold == 0)
+		return nullptr;
+	std::call_once(arm64_tier_once_, [&]() noexcept {
+		arm64_tier_table_ = std::unique_ptr<JitTierTable>{
+			new (std::nothrow) JitTierTable{threshold, live}};
+	});
+	return arm64_tier_table_.get();
+}
+
+ExecutionEngine Context::presented_engine() const noexcept
+{
+	const auto engine = execution_engine();
+	if (engine == ExecutionEngine::jit && arm64_jit_tier() != 0)
+		return ExecutionEngine::automatic;
+	return engine;
 }
 
 bool Context::top_byte_ignore() const noexcept
@@ -516,7 +546,7 @@ current_guest_host_capabilities() noexcept
 {
 	const auto *context = current_context();
 	return guest_host_capabilities(context != nullptr ?
-		context->execution_engine() : ExecutionEngine::automatic);
+		context->presented_engine() : ExecutionEngine::automatic);
 }
 
 namespace {

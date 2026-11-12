@@ -7,7 +7,7 @@
 #include "memory/mmu/word_shared_mutex.hpp"
 #include "platform/host_capabilities.hpp"
 #include "platform/run_routing.hpp"
-#include "x86_tier.hpp"
+#include "jit_tier.hpp"
 
 #include <atomic>
 #include <cstddef>
@@ -112,8 +112,20 @@ public:
 	[[nodiscard]] std::uint64_t x86_jit_tier() const noexcept;
 	/* The tier state of each address space of the run, for a nonzero
 	 * threshold. */
-	[[nodiscard]] X86TierTable *x86_tier_table(
-		X86TierTable::Live live) noexcept;
+	[[nodiscard]] JitTierTable *x86_tier_table(
+		JitTierTable::Live live) noexcept;
+	/* The same for the arm64 JIT: instructions an AArch64 or AArch32
+	 * address space runs on the gadget engine before the JIT takes it over,
+	 * in a run that selected the JIT; zero runs the JIT from the first. While
+	 * it is nonzero both engines present the profile they both implement
+	 * (guest_host_capabilities), since one process sees both. */
+	void set_arm64_jit_tier(std::uint64_t instructions) noexcept;
+	[[nodiscard]] std::uint64_t arm64_jit_tier() const noexcept;
+	[[nodiscard]] JitTierTable *arm64_tier_table(
+		JitTierTable::Live live) noexcept;
+	/* The engine whose profile the guest sees: the selected one, or
+	 * automatic (the profile both implement) for a tiered arm64 JIT run. */
+	[[nodiscard]] ExecutionEngine presented_engine() const noexcept;
 	[[nodiscard]] GuestEntry guest_entry() const noexcept;
 	[[nodiscard]] std::uint64_t memory_domain() const noexcept;
 
@@ -140,7 +152,10 @@ private:
 	std::atomic_bool top_byte_ignore_{false};
 	std::atomic_uint64_t x86_jit_tier_{0};
 	std::once_flag x86_tier_once_;
-	std::unique_ptr<X86TierTable> x86_tier_table_;
+	std::unique_ptr<JitTierTable> x86_tier_table_;
+	std::atomic_uint64_t arm64_jit_tier_{0};
+	std::once_flag arm64_tier_once_;
+	std::unique_ptr<JitTierTable> arm64_tier_table_;
 	std::atomic_uint64_t memory_domain_;
 	std::atomic_bool stop_requested_{false};
 	int stop_notification_read_{-1};

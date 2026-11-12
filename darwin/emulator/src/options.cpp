@@ -20,6 +20,7 @@ constexpr std::string_view jit_cache_budget_prefix{"--jit-cache-budget="};
 constexpr std::string_view jit_executor_cache_budget_prefix{
 	"--jit-executor-cache-budget="};
 constexpr std::string_view jit_tier_prefix{"--jit-tier="};
+constexpr std::string_view arm64_jit_tier_prefix{"--arm64-jit-tier="};
 constexpr std::string_view gadget_cache_budget_prefix{
 	"--gadget-cache-budget="};
 constexpr std::string_view guest_hibernation_prefix{"--guest-hibernation="};
@@ -328,6 +329,18 @@ EmulatorOptions prepare_emulator_options(
 			if (!parse_guest_hibernation(
 					argument.substr(guest_hibernation_prefix.size()),
 					prepared.guest_hibernation)) {
+				prepared.valid = false;
+				return prepared;
+			}
+			continue;
+		}
+		if (argument.starts_with(arm64_jit_tier_prefix)) {
+			const auto count = argument.substr(arm64_jit_tier_prefix.size());
+			const auto *end = count.data() + count.size();
+			const auto parsed = std::from_chars(count.data(), end,
+				prepared.arm64_jit_tier_instructions);
+			if (count.empty() || parsed.ec != std::errc{} ||
+			    parsed.ptr != end) {
 				prepared.valid = false;
 				return prepared;
 			}

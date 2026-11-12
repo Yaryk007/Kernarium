@@ -401,6 +401,30 @@ void test_jit_tier_option()
 	}
 }
 
+void test_arm64_jit_tier_option()
+{
+	const char *absent[]{"uml-test"};
+	require(uml::emulator::prepare_emulator_options(1, absent,
+		"/tmp/rootfs.erofs").arm64_jit_tier_instructions == 0,
+		"the arm64 JIT tier defaulted to something other than off");
+	const char *tiered[]{"uml-test", "--arm64-jit-tier=150000000",
+		"ip=dhcp"};
+	auto options = uml::emulator::prepare_emulator_options(
+		3, tiered, "/tmp/rootfs.erofs");
+	require(options.valid &&
+		options.arm64_jit_tier_instructions == 150000000ULL &&
+		options.jit_tier_instructions == 0 &&
+		!contains(options, tiered[1]) && contains(options, "ip=dhcp"),
+		"the arm64 JIT tier was not consumed by the host");
+	for (const char *invalid : {"--arm64-jit-tier=",
+		"--arm64-jit-tier=20M", "--arm64-jit-tier=-1"}) {
+		const char *arguments[]{"uml-test", invalid};
+		require(!uml::emulator::prepare_emulator_options(
+			2, arguments, "/tmp/rootfs.erofs").valid,
+			"a malformed arm64 JIT tier was accepted");
+	}
+}
+
 void test_scalable_native_kernel_layout_geometry()
 {
 	constexpr std::uint64_t kib = 1024ULL;
@@ -769,6 +793,7 @@ int main()
 		test_gadget_cache_budget_option();
 		test_memory_limit_option();
 		test_jit_tier_option();
+		test_arm64_jit_tier_option();
 		test_guest_hibernation_option();
 		test_session_record_option();
 		test_scalable_native_kernel_layout_geometry();

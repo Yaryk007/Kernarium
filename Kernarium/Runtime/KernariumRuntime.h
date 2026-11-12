@@ -102,7 +102,9 @@ enum {
  * prepare_jit for this request's guest memory and vCPU count with a result of
  * KERNARIUM_RUNTIME_JIT_READY. A boot that asks for it when that is not so
  * runs on gadgets, with a line on stderr: an engine never fails a boot. The
- * runtime reads it only from a request whose struct_size covers it. */
+ * JIT is tiered: each guest process starts on gadgets and moves to the JIT
+ * once it has run long enough to repay the compile. The runtime reads it only
+ * from a request whose struct_size covers it. */
 typedef struct kernarium_runtime_boot {
     uint32_t struct_size;
     uint32_t width;

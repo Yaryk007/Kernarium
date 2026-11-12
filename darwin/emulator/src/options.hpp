@@ -49,6 +49,9 @@ struct EmulatorOptions final {
 	 * gadget engine before the x86-64 JIT takes it over. Zero is the JIT from
 	 * the first instruction. */
 	std::uint64_t jit_tier_instructions{};
+	/* --arm64-jit-tier=: the same for an arm64 address space in a run that
+	 * selected the JIT. Zero is the JIT from the first instruction. */
+	std::uint64_t arm64_jit_tier_instructions{};
 	/* --guest-hibernation=auto|off|on: whether quiescing also writes the
 	 * guest's RAM to a file and takes it out of the process
 	 * (runtime/guest_hibernation.hpp). Auto is physical iOS, the one host

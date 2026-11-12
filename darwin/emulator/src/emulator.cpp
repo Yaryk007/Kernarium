@@ -444,6 +444,7 @@ public:
 		if (!prepared.informational)
 			prepare_guest_hibernation(prepared.guest_hibernation);
 		runtime_.set_x86_jit_tier(prepared.jit_tier_instructions);
+		runtime_.set_arm64_jit_tier(prepared.arm64_jit_tier_instructions);
 		const bool jit_run = !prepared.informational &&
 			runtime_.execution_engine() ==
 				::uml::runtime::ExecutionEngine::jit;

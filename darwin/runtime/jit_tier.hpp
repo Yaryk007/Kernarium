@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 
-/* Tiered execution of an x86-64 address space: the gadget engine runs it
- * until it has retired a threshold of instructions, and the JIT runs it from
- * then on. A process that exits first never pays the JIT's compile cost, and
- * one that stays pays it once.
+/* Tiered execution of an address space: the gadget engine runs it until it
+ * has retired a threshold of instructions, and the JIT runs it from then on.
+ * A process that exits first never pays the JIT's compile cost, and one that
+ * stays pays it once. The x86-64 JIT (--jit-tier) and the arm64 JIT
+ * (--arm64-jit-tier) each keep their own table of these.
  *
  * Neither engine keeps state of its own across a dispatch: both read and
  * write the vCPU's architectural state and the address space. So the engine
@@ -30,7 +31,7 @@
 
 namespace uml::runtime {
 
-class X86TierState final {
+class JitTierState final {
 public:
 	enum class Engine : std::uint8_t {
 		gadgets,
@@ -75,14 +76,14 @@ public:
 		}
 
 	private:
-		friend class X86TierState;
+		friend class JitTierState;
 
-		X86TierState *state_{};
+		JitTierState *state_{};
 		Engine engine_{Engine::jit};
 		bool abandoned_{};
 	};
 
-	explicit X86TierState(std::uint64_t threshold) noexcept
+	explicit JitTierState(std::uint64_t threshold) noexcept
 		: threshold_{threshold}
 	{
 	}
@@ -170,11 +171,11 @@ private:
 /* The state of each address space the run has seen. A generation never comes
  * back, so a dead one's state is dropped once the table is large; a state
  * still held by a vCPU stays alive through it. */
-class X86TierTable final {
+class JitTierTable final {
 public:
 	using Live = bool (*)(unsigned long generation) noexcept;
 
-	X86TierTable(std::uint64_t threshold, Live live) noexcept
+	JitTierTable(std::uint64_t threshold, Live live) noexcept
 		: threshold_{threshold}, live_{live}
 	{
 	}
@@ -186,7 +187,7 @@ public:
 
 	/* The state of `generation`, made on first use; null when the table
 	 * cannot hold one. */
-	[[nodiscard]] std::shared_ptr<X86TierState> acquire(
+	[[nodiscard]] std::shared_ptr<JitTierState> acquire(
 		unsigned long generation) noexcept
 	{
 		try {
@@ -201,7 +202,7 @@ public:
 				prune_at_ = std::max<std::size_t>(
 					minimum_prune, states_.size() * 2);
 			}
-			auto state = std::make_shared<X86TierState>(threshold_);
+			auto state = std::make_shared<JitTierState>(threshold_);
 			states_.emplace(generation, state);
 			return state;
 		} catch (...) {
@@ -221,7 +222,7 @@ private:
 	const std::uint64_t threshold_;
 	const Live live_;
 	mutable std::mutex mutex_;
-	std::unordered_map<unsigned long, std::shared_ptr<X86TierState>> states_;
+	std::unordered_map<unsigned long, std::shared_ptr<JitTierState>> states_;
 	std::size_t prune_at_{minimum_prune};
 };
 

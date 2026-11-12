@@ -48,7 +48,7 @@ Neither engine keeps state across a dispatch, so the engine can change between
 dispatches, provided no gadget dispatch is still running in the address space.
 The handover drains: once a space crosses its threshold no dispatch of it
 starts on the gadgets, each one running leaves, the last opens the JIT, and
-dispatches that begin meanwhile wait ([`x86_tier.hpp`](../../../runtime/x86_tier.hpp)).
+dispatches that begin meanwhile wait ([`jit_tier.hpp`](../../../runtime/jit_tier.hpp)).
 Every exec'd process compiles its startup path from scratch on the JIT, so the
 LTP runner scales its case bounds ([testing](../../../../docs/testing.md#ltp)).
 
