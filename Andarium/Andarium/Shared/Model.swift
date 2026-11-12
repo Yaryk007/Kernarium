@@ -12,8 +12,8 @@ enum StatisticsViewer: Hashable {
     case settings
 }
 
-enum SheetKind: String, Identifiable, Hashable {
-    case create, resize, info, system
+enum SheetKind: String, Identifiable, Hashable, CaseIterable {
+    case create, resize, info, system, whatsNew
 
     var id: String { rawValue }
 }
@@ -58,6 +58,10 @@ final class SessionState {
     /// The guest's USB debugging setting as last read; nil until it has
     /// been. ADB over network needs it on.
     var usbDebugging: Bool?
+    /// Whether the guest's internal storage is up, as last read; nil until it
+    /// has been. Android ends its boot some seconds before it, and the file
+    /// browser waits for it.
+    var storageReady: Bool?
     var showStats = false
     var readout = Readout()
     /// The side keys are open. The session owns it because a touch on the
@@ -90,6 +94,10 @@ final class AppModel {
         }
     }
     var host: HostDevice
+    /// The guest's files, when the runtime behind the screens can reach them.
+    var fileBrowser: FileBrowserModel? {
+        didSet { fileBrowser?.isAvailable = { [weak self] in self?.filesAvailable ?? false } }
+    }
     /// The system this build of Andarium carries.
     var system: SystemInfo
     /// What the runtime behind the screens can do; a screen shows only the
@@ -143,12 +151,149 @@ final class AppModel {
 
     var sessionPreset = SessionPreset()
     var session = SessionState()
+    /// The release notes: Info's history and the ribbon above Start after an
+    /// update.
+    var whatsNew = WhatsNewModel()
     /// The launch decided whether the statistics show (automation, see
     /// `StatsPreference.launch`): the value belongs to that run and is not kept.
     var statsDecidedByLaunch = false
     /// What is kept of Settings' "Show on screen" across launches
     /// (`StatsPreference`); nil where the launch decided it.
     var showStatsToKeep: Bool? { statsDecidedByLaunch ? nil : session.showStats }
+    #if !APP_STORE
+    // JIT (Home's JIT row): the guest runs on the JIT engine when the person
+    // turned it on and a debugger they attached has prepared the executable
+    // memory. A development build only; an App Store build has no JIT.
+    /// This build on this device can run the guest on the JIT engine: a
+    /// development build on a device. The Simulator and the preview offer it
+    /// only as a mock.
+    var jitAvailable = false
+    /// Whether the person wants the JIT. It applies to the next start.
+    var jitOn = false
+    /// The launch decided it (automation): the value belongs to that run and
+    /// is not kept.
+    var jitDecidedByLaunch = false
+    /// What is kept of the JIT row across launches (`JitPreference`); nil
+    /// where the launch decided it.
+    var jitToKeep: Bool? { jitDecidedByLaunch ? nil : jitOn }
+    /// A debugger is attached to Andarium, as last read.
+    var jitDebuggerAttached = false
+    /// What the executable memory was prepared for, once a start has done it.
+    var jitPrepared: JitShape?
+    /// How the last start answered, when it ran without the JIT it was asked
+    /// for.
+    var jitLastStart: JitAnswer?
+    /// The debugger is preparing the executable memory, which the boot screen
+    /// says while it takes the seconds it takes.
+    var preparingJit = false
+    /// How the attempt made when Andarium opened ended, when it left the
+    /// memory unprepared (`prepareJitAtLaunch`).
+    var jitLaunch: JitAnswer?
+    /// The attempt made when Andarium opened, which a start that comes while
+    /// it runs waits for.
+    @ObservationIgnored private var jitLaunchWork: Task<Void, Never>?
+    @ObservationIgnored private var jitLaunchAsked = false
+    /// What Home says under the JIT row.
+    var jitStatus: JitStatus {
+        JitStatus(
+            debuggerAttached: jitDebuggerAttached, prepared: jitPrepared,
+            guest: guest.map { JitShape(memoryMiB: $0.memoryMiB, processorCount: $0.cores) },
+            lastStart: jitLastStart, launch: jitLaunch)
+    }
+    /// Asks the debugger attached to Andarium for what the JIT row says now,
+    /// once per process, as the application opens: StikDebug spins while it
+    /// waits for the request and the system ends it within a minute. With the
+    /// row on, the executable memory is prepared for the guest (`standard`
+    /// when there is none yet, or when `replacingGuest` says the launch is
+    /// about to make another); with the row off, the debugger is told to go.
+    /// The work is off the main thread, Home does not wait for it, and a start
+    /// that comes while it runs waits for it.
+    func prepareJitAtLaunch(standard: JitShape, replacingGuest: Bool = false) {
+        guard !jitLaunchAsked else { return }
+        jitLaunchAsked = true
+        guard jitAvailable, let driver else { return }
+        refreshJit()
+        let current = replacingGuest
+            ? nil : guest.map { JitShape(memoryMiB: $0.memoryMiB, processorCount: $0.cores) }
+        let wanted = jitOn
+        guard let request = JitLaunchRequest.atLaunch(
+            wanted: wanted, debuggerAttached: jitDebuggerAttached, guest: current, standard: standard)
+        else { return }
+        let shape: JitShape
+        switch request {
+        case .prepare(let target): shape = target
+        case .detach: shape = current ?? standard
+        }
+        jitLaunchWork = Task { [weak self] in
+            let answer = await driver.prepareJit(wanted: wanted, shape: shape)
+            self?.jitLaunchEnded(answer, shape: shape)
+        }
+    }
+    /// Waits for the attempt made at launch, if it is still under way.
+    func waitForJitLaunch() async {
+        await jitLaunchWork?.value
+    }
+    private func jitLaunchEnded(_ answer: JitAnswer, shape: JitShape) {
+        switch answer {
+        case .ready:
+            jitPrepared = shape
+            print("Andarium: JIT prepared at launch for \(shape.memoryMiB) MiB, \(shape.processorCount) vCPUs")
+        case .disabled:
+            print("Andarium: JIT is off; the debugger was told to detach at launch")
+        case .noDebugger, .failed, .otherSettings, .unsupported:
+            jitLaunch = answer
+            print("Andarium: JIT was not prepared at launch (\(answer))")
+        }
+        refreshJit()
+    }
+    /// What a start does about the JIT for a guest of `shape`; true when the
+    /// guest boots on it. The memory was prepared for this guest when
+    /// Andarium opened, or is prepared here when no attempt was made then. A
+    /// start that comes while the attempt at launch runs waits for it, and the
+    /// boot says "Preparing JIT" meanwhile. A JIT that is off lets an attached
+    /// debugger go, so that the guest does not run under it. A start that
+    /// cannot have the JIT runs on gadgets and says why; it never fails.
+    func startOnJit(_ shape: JitShape) async -> Bool {
+        let wanted = jitOn
+        if wanted { preparingJit = true }
+        await waitForJitLaunch()
+        let answer: JitAnswer
+        if wanted, jitPrepared == shape {
+            answer = .ready
+        } else if let driver {
+            answer = await driver.prepareJit(wanted: wanted, shape: shape)
+        } else {
+            answer = .unsupported
+        }
+        preparingJit = false
+        refreshJit()
+        switch answer {
+        case .ready:
+            jitPrepared = shape
+            jitLastStart = nil
+            print("Andarium: JIT ready")
+            return true
+        case .disabled:
+            jitLastStart = nil
+            return false
+        case .noDebugger, .failed, .otherSettings, .unsupported:
+            // A fall-back is only worth a sentence to a person who asked for the JIT.
+            jitLastStart = wanted ? answer : nil
+            if wanted { print("Andarium: \(answer.fallbackSentence ?? "started without JIT")") }
+            return false
+        }
+    }
+    /// The person turns the JIT on or off. It changes nothing until a start.
+    func setJit(_ on: Bool) {
+        jitOn = on
+    }
+    /// Reads whether a debugger is attached now. The preview plays one.
+    func refreshJit() {
+        jitDebuggerAttached = driver?.jitDebuggerAttached() ?? previewJitDebugger
+    }
+    /// Whether the preview, which has no runtime, plays a debugger.
+    var previewJitDebugger = true
+    #endif
     /// How the last run ended, for the screen that says so.
     var runEnd = RunEnd(result: 0)
     var runUptimeSeconds: Int?
@@ -205,6 +350,7 @@ final class AppModel {
     /// Looks after ADB over network while it is on.
     private var adbWatcher: Task<Void, Never>?
     private var readingUsbDebugging = false
+    private var readingStorage = false
     /// How often the watcher looks while ADB over network is on: the address
     /// every time, the USB debugging setting every fifth. A test shortens it.
     var adbWatchInterval = Duration.seconds(2)
@@ -221,6 +367,9 @@ final class AppModel {
             if applicationActive != oldValue {
                 refreshStatistics()
                 refreshGraphicsNotice()
+                #if !APP_STORE
+                refreshJit()
+                #endif
             }
         }
     }
@@ -430,6 +579,7 @@ final class AppModel {
     func guestPausingForSpace(freeBytes: UInt64) {
         host.freeStorageBytes = freeBytes
         abandonOperation()
+        fileBrowser?.reset()
         stopAdbOverNetwork()
         spacePause = SpacePause(freeBytes: freeBytes, stage: .pausing)
     }
@@ -528,6 +678,14 @@ final class AppModel {
         driver == nil ? session.usbDebugging != false : session.usbDebugging == true
     }
 
+    /// The file browser may list and move files: Android has its storage up.
+    /// The guest's USB debugging setting does not matter, since the browser
+    /// uses the application's own channel. The preview has no guest to ask
+    /// and says yes unless a screen says no.
+    var filesAvailable: Bool {
+        driver == nil ? session.storageReady != false : session.storageReady == true
+    }
+
     /// The toggle in Settings. Turning it on opens the listener on the
     /// device's network addresses, which the guest's USB debugging being on
     /// allows; turning it off, USB debugging going off, or the run ending
@@ -570,6 +728,7 @@ final class AppModel {
     private func endAdbOverNetwork() {
         stopAdbOverNetwork()
         session.usbDebugging = nil
+        session.storageReady = nil
         session.adbProblem = nil
     }
 
@@ -596,12 +755,29 @@ final class AppModel {
         if !value, current.adb { stopAdbOverNetwork() }
     }
 
-    /// While Settings is open: the address and the setting, read again every
-    /// few seconds until the sheet goes and the task is cancelled.
+    /// Reads whether Android has its internal storage up, until it has: once
+    /// it is, it stays up for the run.
+    func refreshStorage() async {
+        guard let driver, case .running(.normal) = phase, spacePause == nil, !readingStorage,
+              session.storageReady != true else { return }
+        readingStorage = true
+        defer { readingStorage = false }
+        let current = session
+        let value = await driver.storageReady()
+        guard session === current, case .running(.normal) = phase, let value else { return }
+        if current.storageReady != value { current.storageReady = value }
+    }
+
+    /// While Settings is open: the address and the settings, read again every
+    /// few seconds until the sheet goes and the task is cancelled. The two
+    /// readings are independent, so the file browser's storage check never
+    /// waits for the USB debugging one.
     func watchSettings() async {
         while !Task.isCancelled {
             refreshAdbAddress()
-            await refreshUsbDebugging()
+            async let debugging: Void = refreshUsbDebugging()
+            async let storage: Void = refreshStorage()
+            _ = await (debugging, storage)
             try? await Task.sleep(for: .seconds(3))
         }
     }
@@ -727,7 +903,7 @@ final class AppModel {
     /// (minutes, under emulation) and the finished zip goes to the share
     /// sheet, where Save to Files is one of the actions.
     func createBugReport() {
-        guard capabilities.bugReport, case .running(.normal) = phase else { return }
+        guard capabilities.bugReport, case .running(.normal) = phase, fileBrowser?.busy != true else { return }
         runOperation(
             BusyState(
                 title: "Creating bug report",
@@ -791,6 +967,11 @@ final class AppModel {
     /// scope is held to the end of the install.
     func installPicked(_ url: URL) {
         guard busy == nil else { return }
+        guard fileBrowser?.busy != true else {
+            alert = AppAlert(
+                title: Self.installFailure, message: "Wait for the file transfer to finish, then install the app.")
+            return
+        }
         let name = url.lastPathComponent
         if let refusal = InstallRefusal(fileName: name) {
             busy = ended(title: Self.installFailure, detail: refusal.message, failed: true)
@@ -834,7 +1015,10 @@ final class AppModel {
     }
 
     /// Starts the guest in `mode`. Start on an update that did not finish
-    /// tries the update again.
+    /// tries the update again. The start carries any storage growth the
+    /// person chose: the lifecycle applies it as the start begins, and the
+    /// guest is saved with the new capacity before the runtime, which grows
+    /// the data disk in every kind of start, is handed it.
     func start(_ mode: StartMode) {
         switch lifecycle.start(mode, host: host, plan: plan) {
         case let .allowed(kind):
@@ -842,6 +1026,10 @@ final class AppModel {
             bootTracker = BootTracker()
             preparingDisk = false
             diskProgress = nil
+            #if !APP_STORE
+            jitLastStart = nil
+            preparingJit = false
+            #endif
             if case let .update(from, _) = plan { bootFrom = from } else { bootFrom = nil }
             if let driver, let guest {
                 persistNow()
@@ -889,6 +1077,7 @@ final class AppModel {
     /// reason the failure screen reports.
     func runEnded(_ end: RunEnd, uptimeSeconds: Int?) {
         abandonOperation()
+        fileBrowser?.reset()
         endAdbOverNetwork()
         spacePause = nil
         graphicsNotice = GraphicsNotice()
@@ -903,6 +1092,7 @@ final class AppModel {
             session.showStats = showStats
         }
         lifecycle.phase = end.phase
+        lifecycle.grewFromGiB = nil
         // The run changed the data disk: what Home states of the storage is
         // what the disk holds now, not what it held when the guest loaded.
         if let driver { lifecycle.guest?.usedBytes = driver.measuredUsedBytes() }
@@ -914,6 +1104,7 @@ final class AppModel {
     /// install list belong to the run that ended.
     func restart() {
         abandonOperation()
+        fileBrowser?.reset()
         endAdbOverNetwork()
         spacePause = nil
         graphicsNotice = GraphicsNotice()
@@ -1155,9 +1346,18 @@ final class AppModel {
         graphicsNotice.record(refusals: 1, at: now)
     }
 
+    /// The debugger is preparing the JIT, which keeps the boot at its first step.
+    private var preparingJitNow: Bool {
+        #if APP_STORE
+        false
+        #else
+        preparingJit
+        #endif
+    }
+
     /// The step of the boot under way, from the runtime's milestones.
     func liveBootStage() -> Int {
-        BootSteps.current(preparingDisk: preparingDisk, milestone: bootTracker.milestone)
+        BootSteps.current(preparingDisk: preparingDisk || preparingJitNow, milestone: bootTracker.milestone)
     }
 
     /// The failure screen's copyable report.

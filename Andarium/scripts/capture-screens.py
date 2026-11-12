@@ -122,11 +122,14 @@ def boot_stages(prefix: str, screen: str, names: list[str], what: str, dark_step
 
 SHOTS: list[Shot] = [
     # Home
-    s("home", "Home", "home", "Home with a configured guest: Guest system (two matched rows: CPU and memory with Edit, then Storage with its usage bar and Resize), Display, Capabilities, Backup, Recovery and erase, and the Start bar.", dark=True),
+    s("home", "Home", "home", "Home with a configured guest: Guest system (two matched rows: CPU and memory with Edit, then Storage with its usage bar and Resize), JIT (in the builds that have it), Display, Capabilities, Backup, Recovery and erase, and the Start bar.", dark=True),
     s("home-welcome", "Home", "welcome", "Home before any guest exists: the welcome and Set up guest. First screen of the initial setup."),
     s("home-first-start", "Home", "home-new", "A guest just created and not yet started: Home as it is before the first start."),
     s("home-display", "Home", "home-display", "Home scrolled to Display: the Retina mode toggle.", dark=True),
     s("home-capabilities", "Home", "home-capabilities", "Home scrolled to Capabilities: Microphone off and Gyroscope on (its default), no notes.", dark=True),
+    s("home-jit", "Home", "home-jit", "Home scrolled to JIT: the toggle on and a debugger attached, so the note says it is ready for the next start.", dark=True),
+    s("home-jit-no-debugger", "Home", "home-jit-no-debugger", "JIT on with no debugger attached: the note says to open Andarium from StikDebug."),
+    s("home-jit-fallback", "Home", "home-jit-fallback", "Home after a start that ran without the JIT it was asked for: the note says StikDebug was not connected."),
     s("home-capabilities-mic-on", "Home", "home-mic-on", "Capabilities with Microphone on, iOS having allowed it."),
     s("home-capabilities-mic-denied", "Home", "home-mic-denied", "Capabilities after iOS refused the microphone or its app permission was removed: the row is dimmed and says it is not allowed in Settings.", dark=True),
     s("home-capabilities-mic-alert", "Home", "home-mic-alert", "Turning Microphone on while iOS refuses it: the alert that offers Settings."),
@@ -156,6 +159,7 @@ SHOTS: list[Shot] = [
     s("system-edit-memory-high", "Sheets", "system-memory-warning", "The System sheet with memory above what a new guest gets (the most the device offers): the ticks past the default are orange, the line beneath the ruler says iOS is likely to close Andarium above it and the VRAM estimate is orange.", dark=True),
     s("system-edit-vram-warning", "Sheets", "system-edit", "The System sheet on a device whose default is held below the line where iOS is likely to close Andarium (an iPhone 18 Pro Max mock) with memory between the two: the ticks past the default are orange and beyond the closing size red, the line beneath says games may run out of graphics memory and the VRAM estimate is orange. Home shows no notice at this size.", "-device", "iphone-18-pro-max", "-memoryMiB", "3584", dark=True),
     s("system-edit-ipad-mini", "Sheets", "system-edit", "The System sheet on an iPad mini 6 mock at its default memory (1.5 GiB): the two sizes coincide, so no graphics warning shows and the VRAM estimate is plain.", "-device", "ipad-mini-6"),
+    s("system-edit-memory-mac-64", "Sheets", "system-edit", "The System sheet on a Mac mock with 64 GiB and a guest of 24 GiB: the memory ruler has about a thousand positions, so its labels thin out to round numbers of gibibytes that do not touch, and no short ticks are drawn.", "-device", "mac-64-gib", "-memoryMiB", "24576"),
     s("erase-alert", "Alerts", "erase", "Erase guest: the standard destructive confirmation over Home. Confirming returns to the first-launch screen (home-welcome).", dark=True),
     s("info", "Info", "info", "Info: the app and version, System info (Build, Android version, Security patch, Kernel, Architecture, Supported architectures), Project on GitHub and Acknowledgements.", dark=True),
     s("info-acknowledgements", "Info", "info-acknowledgements", "Acknowledgements: projects by group; the names and marks line is at the bottom.", dark=True),
@@ -167,6 +171,8 @@ SHOTS: list[Shot] = [
     s("boot-first-start", "Boot", "boot-first", "First start: Storage prepares the disk and Startup sets up for the first time."),
     s("boot-update", "Boot", "boot-upgrade", "The first start after an update: Startup updates the apps."),
     s("boot-restart", "Boot", "boot-restart", "The guest restarting."),
+    s("boot-jit", "Boot", "boot-jit", "The debugger preparing the JIT: the System image step says Preparing JIT."),
+    s("boot-jit-fallback", "Boot", "boot-jit-fallback", "A boot that ran without the JIT it was asked for: a note under the steps says why."),
     *boot_stages("boot-recovery", "boot-recovery", ["System image", "Linux kernel", "Storage", "Recovery"], "Recovery boot (opaque, own stage list, no progress bar)", dark_step=3),
     # Running guest
     s("session", "Guest", "session", "The running guest with the side keys closed."),
@@ -191,7 +197,7 @@ SHOTS: list[Shot] = [
     s("recovery", "Guest", "recovery", "Recovery running."),
     s("recovery-side-keys", "Guest", "recovery-open", "Recovery with the side keys open."),
     # Settings during a session
-    s("settings", "Settings", "settings", "Settings at full height: Stats, Apps, Developer and Diagnostics.", dark=True),
+    s("settings", "Settings", "settings", "Settings at full height: Stats, Apps, File browser, Developer and Diagnostics.", dark=True),
     s("settings-stats", "Settings", "settings-stats", "Settings scrolled to Stats: CPU, Memory and VRAM with bars of their share, and Frame rate.", dark=True),
     s("settings-stats-short", "Settings", "settings-stats", "Settings scrolled to Stats after three CPU readings: the bars fill from the right.", "-statsReadings", "3"),
     system_mic("home-mic-system-prompt", "Capabilities", "home-mic-alert", "The system's own question when Microphone is turned on for the first time (the Simulator's alert).", "reset"),

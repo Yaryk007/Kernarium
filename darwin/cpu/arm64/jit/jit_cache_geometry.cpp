@@ -192,6 +192,28 @@ std::size_t JitCacheGeometry::total_bytes() const noexcept
 	return total;
 }
 
+std::size_t JitCacheGeometry::executable_bytes() const noexcept
+{
+	const auto granules = [](std::size_t bytes) noexcept {
+		return (bytes + mapping_granule - 1U) / mapping_granule;
+	};
+	return (granules(arena_bytes) + granules(tracked_store_arena_bytes) +
+		granules(single_instruction_arena_size)) * mapping_granule;
+}
+
+bool jit_cache_budget_publishable(std::size_t total_bytes,
+	unsigned executors, std::size_t per_executor_bytes) noexcept
+{
+	if (!derive_jit_cache_geometry(
+			total_bytes, executors, per_executor_bytes).valid())
+		return false;
+	auto &registry = budget_registry();
+	std::lock_guard lock{registry.mutex};
+	return !registry.published ||
+		*registry.published ==
+			JitCacheBudget{total_bytes, executors, per_executor_bytes};
+}
+
 bool set_jit_cache_budget(std::size_t total_bytes,
 	unsigned executors, std::size_t per_executor_bytes) noexcept
 {
@@ -525,45 +547,6 @@ void release_jit_cache_run_session() noexcept
 			registry.run_session_release_pending = true;
 		}
 	}
-}
-
-std::size_t parse_byte_quantity(const char *text) noexcept
-{
-	if (text == nullptr || *text == '\0')
-		return 0;
-	std::uint64_t value = 0;
-	const char *cursor = text;
-	for (; *cursor >= '0' && *cursor <= '9'; ++cursor) {
-		const auto digit =
-			static_cast<std::uint64_t>(*cursor - '0');
-		if (value > (~std::uint64_t{} - digit) / 10U)
-			return 0;
-		value = value * 10U + digit;
-	}
-	if (cursor == text)
-		return 0;
-	std::uint64_t multiplier = 1;
-	switch (std::tolower(static_cast<unsigned char>(*cursor))) {
-	case 'k':
-		multiplier = 1024U;
-		++cursor;
-		break;
-	case 'm':
-		multiplier = 1024U * 1024U;
-		++cursor;
-		break;
-	case 'g':
-		multiplier = 1024U * 1024U * 1024U;
-		++cursor;
-		break;
-	default:
-		break;
-	}
-	if (*cursor != '\0')
-		return 0;
-	if (value > ~std::uint64_t{} / multiplier)
-		return 0;
-	return static_cast<std::size_t>(value * multiplier);
 }
 
 } // namespace uml::cpu::arm64

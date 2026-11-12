@@ -83,15 +83,16 @@ constexpr uint32_t blob_flag_shareable = 2;
 
 constexpr uint64_t missing_blob_id = 0x7ffffff0;
 
-/* A 2D render target 12288 pixels square: 576 MiB, which fits the aperture but
- * not the GPU budget of a 1 GiB guest (at most half its memory). */
+/* A 2D render target 16384 pixels square: 1 GiB, which fits the aperture but
+ * not the GPU budget of a 1 GiB guest, whose pool refuses what passes 16 MiB
+ * under it (without a memory limit the budget is the guest's memory). */
 constexpr uint32_t virgl_capset = 2;
 constexpr uint32_t command_pipe_resource_create = 48;
 constexpr uint32_t pipe_texture_2d = 2;
 constexpr uint32_t virgl_format_r8g8b8a8_unorm = 67;
 constexpr uint32_t virgl_bind_render_target = 1u << 1;
 constexpr uint32_t virgl_bind_sampler_view = 1u << 3;
-constexpr uint32_t too_large_side = 12288;
+constexpr uint32_t too_large_side = 16384;
 constexpr int refusals = 64;
 
 int failures = 0;

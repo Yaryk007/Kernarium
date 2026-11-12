@@ -23,10 +23,13 @@ public enum Limits {
         return Array(stride(from: capacityRangeGiB.lowerBound, through: top, by: capacityStepGiB))
     }
 
-    /// What the runtime accepts for a guest's memory, in steps of 64 MiB. It
-    /// is the runtime Kernarium's guests use too, so the range is the
-    /// runtime's and Andarium narrows it only below.
-    public static let runtimeMemoryRangeMiB = 512...4096
+    /// What the runtime accepts for a guest's memory, in steps of 64 MiB: the
+    /// top is the largest range any host offers, 1 TiB
+    /// (`guest_memory_range_maximum_mib`). It is the runtime Kernarium's
+    /// guests use too, so the range is the runtime's and Andarium narrows it
+    /// only below, to what the host's memory leaves at a vCPU count
+    /// (`MemoryPolicy`).
+    public static let runtimeMemoryRangeMiB = 512...(1 << 20)
     public static let runtimeMemoryStepMiB = 64
     /// The least memory the application offers Android, the size below which
     /// Android is not usable. The memory ruler starts here and counts in
@@ -37,9 +40,14 @@ public enum Limits {
     public static let memoryStepMiB = runtimeMemoryStepMiB
     /// The range a new guest's memory is held within, in half gibibytes:
     /// `MemoryPolicy.defaultMemoryMiB` states the figure, from the runtime's
-    /// own rule. A device whose limit leaves less than the bottom of it takes
-    /// the bound of its vCPU count instead.
+    /// own rule, and it stops at the top however much the host offers. A
+    /// device whose limit leaves less than the bottom of it takes the bound
+    /// of its vCPU count instead.
     public static let defaultMemoryRangeMiB = 1536...4096
+    /// The graphics memory (VRAM) a new guest keeps where the device has room
+    /// for it (`default_gpu_budget_minimum_mib`): a guest above the default
+    /// is warned about only where its estimate is under this.
+    public static let minimumDefaultGraphicsMemoryMiB = 1024
 
     /// Free space a new guest needs for Android's first start, on top of the
     /// space its storage takes.

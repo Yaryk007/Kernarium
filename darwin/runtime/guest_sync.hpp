@@ -22,8 +22,9 @@ struct GuestSyncResult final {
 [[nodiscard]] bool guest_file_registry_idle() noexcept;
 
 [[nodiscard]] unsigned release_guest_file_locks(bool retiring = false) noexcept;
-/* Ends the process if a disk cannot be relocked unchanged: the guest must
- * never resume on storage another process modified during suspension. */
+/* Ends the process if a disk cannot be relocked unchanged, after recording the
+ * refusal as the session's end: the guest must never resume on storage
+ * another process modified during suspension. */
 void restore_guest_file_locks() noexcept;
 
 } // namespace uml::runtime

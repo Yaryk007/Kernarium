@@ -68,10 +68,10 @@ launch for lack of memory. The settings ask the loader
 (`kernarium_runtime_loader_maximum_guest_memory_mib`) for the RAM bound and a
 new configuration's guest RAM
 (`kernarium_runtime_loader_default_guest_memory_mib` at the loaded vCPU count,
-which also keeps the GPU 1 GiB on a device that offers 4 GiB), because the
-runtime framework is loaded once per process. The parameters default to the
-conservative launch set the default is measured with; the RAM bound counts none
-of them. The `KERNARIUM_GPU_BUDGET_*_MIB` and `KERNARIUM_GUEST_MEMORY_MIB`
+which stops at 4 GiB and also keeps the GPU 1 GiB on a device that offers 4
+GiB), because the runtime framework is loaded once per process. The parameters
+default to the conservative launch set the default is measured with; the RAM
+bound counts none of them. The `KERNARIUM_GPU_BUDGET_*_MIB` and `KERNARIUM_GUEST_MEMORY_MIB`
 environment variables state values for one measurement launch and are never
 stored.
 
@@ -95,8 +95,9 @@ directory itself, which can flatten the bundle or destroy other guests.
 Launch does not compare kernel, runtime, or rootfs release identities; missing
 or malformed inputs fail at their ordinary file or image boundary. The
 application chooses the Android data disk's capacity and passes it with the
-boot request; the runtime creates the disk or grows it to that capacity, never
-shrinks it, and attaches exactly the system disk and the data disk (the
+boot request; the runtime creates the disk or grows it to that capacity, keeps
+a disk that is already larger, and attaches exactly the system disk and the
+data disk (the
 [static disk contract](../android/lineage-24/README.md#static-disk-and-boot-contract)
 owns the layout). Compressed delivery is an application concern: `ZstdUtil`
 publishes its destination only after a complete decode.
@@ -160,8 +161,9 @@ none of the settings below.
   `TMPDIR` stays). It also carries none of the debugging support, so a shipped
   application cannot capture its screen, inject input, profile itself or log
   its memory: the frame mirror, console input (the console output relay stays),
-  the guest sampler, the footprint log, the virtual Jetsam, the activity logs
-  and the frame statistics reports. Configuring it with
+  the guest sampler, the footprint log, the virtual Jetsam, the activity logs,
+  the frame statistics reports and the JIT (no engine, no executable-memory
+  owner; `prepare_jit` answers unsupported and `use_jit` is ignored). Configuring it with
   `UML_GADGET_CACHE_CENSUS` or `UML_GADGET_EXECUTION_HISTOGRAM` fails. The
   runtime API table keeps its layout and version, so `set_frame_sink` and
   `send_console_input` answer `-ENOTSUP`; touch and key input, adb over vsock,

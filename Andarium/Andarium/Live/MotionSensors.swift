@@ -3,6 +3,7 @@
 import AndariumCore
 import CoreMotion
 import Foundation
+import os
 
 private nonisolated struct MotionConnector: GuestStreamOpener {
     func openStream() throws -> Int32 {
@@ -14,14 +15,27 @@ private nonisolated struct MotionConnector: GuestStreamOpener {
 
 /// The device's accelerometer and gyroscope. Core Motion needs no iOS
 /// permission for raw readings.
+///
+/// The manager is the process's one and is never released: Core Motion asks
+/// for one per application, and releasing a manager crashes inside Core
+/// Motion, in work on its own threads (reproduced with the manager alone, in
+/// a loop). A model built and released over again reaches it. A device
+/// starts and stops its sensors on the manager and stops the ones it started
+/// when it goes.
 private final class CoreMotionDevice: MotionDevice, @unchecked Sendable {
-    private let manager = CMMotionManager()
+    private static let sharedManager = CMMotionManager()
+    private var manager: CMMotionManager { Self.sharedManager }
     private let queue: OperationQueue = {
         let queue = OperationQueue()
         queue.name = "andarium-motion"
         queue.maxConcurrentOperationCount = 1
         return queue
     }()
+    private let started = OSAllocatedUnfairLock(initialState: Set<MotionSample.Sensor>())
+
+    deinit {
+        for sensor in started.withLock({ $0 }) { stop(sensor) }
+    }
 
     var hasAccelerometer: Bool { manager.isAccelerometerAvailable }
     var hasGyroscope: Bool { manager.isGyroAvailable }
@@ -36,6 +50,7 @@ private final class CoreMotionDevice: MotionDevice, @unchecked Sendable {
         case .accelerometer:
             guard manager.isAccelerometerAvailable else { return }
             manager.accelerometerUpdateInterval = interval
+            started.withLock { _ = $0.insert(sensor) }
             manager.startAccelerometerUpdates(to: queue) { data, error in
                 if error != nil { failure() }
                 guard let a = data?.acceleration else { return }
@@ -44,6 +59,7 @@ private final class CoreMotionDevice: MotionDevice, @unchecked Sendable {
         case .gyroscope:
             guard manager.isGyroAvailable else { return }
             manager.gyroUpdateInterval = interval
+            started.withLock { _ = $0.insert(sensor) }
             manager.startGyroUpdates(to: queue) { data, error in
                 if error != nil { failure() }
                 guard let g = data?.rotationRate else { return }
@@ -53,6 +69,7 @@ private final class CoreMotionDevice: MotionDevice, @unchecked Sendable {
     }
 
     func stop(_ sensor: MotionSample.Sensor) {
+        started.withLock { _ = $0.remove(sensor) }
         switch sensor {
         case .accelerometer: manager.stopAccelerometerUpdates()
         case .gyroscope: manager.stopGyroUpdates()

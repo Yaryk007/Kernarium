@@ -124,7 +124,7 @@ struct EmulatorSettingsView: View {
                     .accessibilityIdentifier("guestMemoryStepper")
 
                     if maximumGuestMemoryMiB <
-                        EmulatorConfiguration.guestMemoryRangeMiB.upperBound {
+                        EmulatorConfiguration.guestMemoryCeilingMiB {
                         Text(
                             "With \(configuration.vCPUCount) \(configuration.vCPUCount == 1 ? "vCPU" : "vCPUs") the " +
                                 "system leaves room for at most " +

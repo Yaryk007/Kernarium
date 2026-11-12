@@ -350,6 +350,9 @@ public:
             /* A one-shot timer is gone once it has fired. */
             idleTrimTimerArmed_ = false;
             gpu_.trimIdleContexts();
+            /* What a trim gives back reaches the pool's figure without
+             * passing the ledger, so the memory report reads it again. */
+            armMemoryTick(false);
             armIdleTrimTimer();
         }
         if (!fenceTimerReady)

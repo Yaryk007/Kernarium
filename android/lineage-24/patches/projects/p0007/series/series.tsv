@@ -16,3 +16,4 @@ patch	adb-record-the-USB-debugging-setting-in-persist.sys.usb.config.patch
 patch	adb-restart-adbd-instead-of-stopping-it-when-debugging-is-turned-off.patch
 patch	storage-report-exact-virtual-filesystem-sizes.patch
 patch	adb-raise-the-USB-debugging-dialog-again-when-it-died-unanswered.patch
+patch	pm-let-microG-present-Google-s-certificate-on-user-builds.patch

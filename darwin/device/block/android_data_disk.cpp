@@ -203,12 +203,9 @@ PreparedDataDisk prepareDataDisk(const Layout &layout,
 		return {DataDiskChange::created, capacity};
 	}
 	const auto current = validateDataDisk(layout, path);
-	if (gib == 0 || gib == current)
+	/* A disk never shrinks: a request it already meets keeps it. */
+	if (gib <= current)
 		return {DataDiskChange::none, current};
-	if (gib < current)
-		throw std::invalid_argument(
-			"the Android data disk only grows: " + std::to_string(current) +
-			" GiB now, " + std::to_string(gib) + " GiB requested");
 	growDataDisk(layout, path, gib);
 	return {DataDiskChange::grown, gib};
 }

@@ -152,7 +152,7 @@ index dd3e79ec0460f4e6dfac3a0320b326b83ff99521..b601917ca76a2a4a5e87f62dd804db76
  struct kk_device {
     struct vk_device vk;
 diff --git a/src/kosmickrisp/vulkan/kk_device_memory_pool.h b/src/kosmickrisp/vulkan/kk_device_memory_pool.h
-index 3050ebacfdfb8db012fa9c288ba30c2615c4562c..9b089e9c7158a3d10cbcca20a56852701750a7be 100644
+index f21696bb1fc2c433c702fb1c1b6adc3500b3554b..fdbdb142593fa181ad86b426707481c54952f795 100644
 --- a/src/kosmickrisp/vulkan/kk_device_memory_pool.h
 +++ b/src/kosmickrisp/vulkan/kk_device_memory_pool.h
 @@ -89,6 +89,14 @@ void kk_set_device_memory_pool(const VkDeviceMemoryPoolCreateInfoKK *pPool);

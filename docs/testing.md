@@ -295,16 +295,17 @@ whatever the device's tip store says, except in an `ANDARIUM_HOLD_SECONDS`
 harness launch, which hides it.
 
 The opt-in suites each need a `TEST_RUNNER_ANDARIUM_*` switch that the suite's
-header names: rotation, motion compatibility and over-vsock, shutdown flow,
-low-space pause (a real guest paused through a free-space number the test
+header names: rotation, motion compatibility, power-off and over-vsock,
+shutdown flow, low-space pause (a real guest paused through a free-space number the test
 sets, its CPU time standing still), the graphics-memory notice (a real refusal
 in Chrome's WebGL under the host's GPU budget, on a guest with Chrome
 installed), the graphics-memory reading and the process list the reclaim
 parses (any guest), Retina memory, the ADB-over-vsock guest
 tests (including Android storage and the touch-cancel path), the side keys'
-pass-through of touches to Android, the ADB-over-network hold and the
+pass-through of touches to Android, the ADB-over-network hold, the
 background disk locks (which also requires a guest that was allocating
-buffers when the GPU was held to suspend). The storage test signs its helper
+buffers when the GPU was held to suspend) and the resume after a save while
+the application is away. The storage test signs its helper
 APK with the AOSP test key, never a release key. When derived data is on a
 removable volume, macOS prompts once for access and the launch hangs until
 answered; build to the internal disk instead.
@@ -313,8 +314,13 @@ Tooling tests cover `scripts/check-privacy-manifests.py`
 (`ios-privacy-manifests`, which `package-ios-frameworks.sh` also runs on every
 device slice it packages), `Andarium/scripts/check-app-store-bundle.py`
 (`andarium-app-store-bundle`, the last build phase of the AppStore
-configuration, [configurations](../Andarium/README.md#configurations)) and the
-Acknowledgements resource (`andarium-acknowledgements`).
+configuration, [configurations](../Andarium/README.md#configurations)), the
+Acknowledgements resource (`andarium-acknowledgements`) and the stand-in
+debugger that serves the JIT's request for executable memory on a device
+(`andarium-ios-jit-debugger`). The JIT's region route has host tests that run
+on macOS (`arm64-jit-debugger-region`, `arm64-jit-debugger-request` for a
+request no debugger serves, `arm64-jit-memory-preparation`); a run on a device
+needs a debugger, so `run_ios_device_android.py --engine jit` is its lane.
 
 ### UI automation on a device
 
@@ -448,8 +454,9 @@ M4 Mac) runs that path only on a host with the feature. Check a change to such
 a path by hand on an iOS device that has it: launch Kernarium with the
 `guest-hwcap-sanity` payload and the touched families' corpus cases built into
 one static guest program, and require the results of a gadget-engine run on a
-Mac. The device runs only the gadget engine, so a JIT path needing one of these
-features runs only on an M4 or newer Mac.
+Mac. The device runs the gadget engine, and the JIT only in a development build
+whose debugger serves it, so a JIT path needing one of these features is checked
+on an M4 or newer Mac.
 
 ## Android
 
@@ -503,10 +510,16 @@ anywhere is a blocker. The candidate must show:
 
 `android-oobe`, `android-adb-debugging` (integration) each register only when
 `UML_ANDROID_OOBE_RELEASE` or `UML_ANDROID_ADB_DEBUGGING_RELEASE` names the
-release and the Android macOS executable is built. They boot blank instances
-and check the setup wizard's flow and end state, and the product's adb
+release and the Android macOS executable is built (`UML_BUILD_ANDROID17_CLI`
+with `UML_KERNEL_PRODUCT=android-17`: the executable embeds its product's
+kernel, and the Linux default cannot start Android's init). They boot blank
+instances and check the setup wizard's flow and end state, and the product's adb
 defaults; `tests/integration/android/run_guest_android_adb_vsock.py` is the
 opt-in ADB-over-vsock counterpart of `guest-vsock-stream`.
+`android-microg-spoofing` (integration) additionally needs
+`UML_ANDROID_MICROG_PROBE_DIR`, the output of
+[`microg/build-apks.sh`](../tests/integration/android/microg/README.md), and
+checks that only microG's own packages present Google's certificate.
 
 Every first-party script that reaches a guest over adb uses the one shared adb
 server, names the guest with `-s 127.0.0.1:<port>` and at the end only

@@ -813,7 +813,7 @@ struct KernariumTests {
         #expect(defaults(limitMiB: 2867) == Array(repeating: 1536, count: 8))
         #expect(defaults(limitMiB: 3584) == Array(repeating: 2048, count: 8))
         #expect(defaults(limitMiB: 4096) == Array(repeating: 2560, count: 8))
-        #expect(defaults(limitMiB: 5120) == Array(repeating: 3584, count: 8))
+        #expect(defaults(limitMiB: 5120) == Array(repeating: 3072, count: 8))
         #expect(defaults(limitMiB: 6144) == Array(repeating: 4096, count: 8))
         #expect(defaults(limitMiB: 0) == Array(repeating: 4096, count: 8))
         // A limit under the range's bottom keeps the default on the
@@ -1091,14 +1091,40 @@ struct KernariumTests {
                 application_mib: 80, engine_mib: 644, headroom_mib: 192
             )) == [1408, 1344, 1344, 1280, 1280, 1280, 1216, 1216]
         )
-        // No limit: the whole range, whatever the vCPU count.
+        // No limit: the whole range, up to the host's ceiling, whatever the
+        // vCPU count. The ceiling is the window the runtime puts the kernel in
+        // and the host's RAM, on the steps and never under 4096.
+        let ceiling = kernarium_runtime_loader_guest_memory_ceiling_mib()
+        #expect(ceiling >= 4096 && ceiling <= 1 << 20)
+        #expect((Int(ceiling) - EmulatorConfiguration.guestMemoryRangeMiB.lowerBound)
+            % EmulatorConfiguration.guestMemoryStepMiB == 0)
+        #expect(Int(ceiling) == EmulatorConfiguration.guestMemoryCeilingMiB)
         for vCPUs: UInt32 in [0, 1, 6, 8, 64] {
             #expect(
                 kernarium_runtime_loader_maximum_guest_memory_mib_for_limit(
                     0, vCPUs, none
-                ) == 4096
+                ) == ceiling
+            )
+            // A limit larger than any host admits is bounded by the ceiling
+            // alone.
+            #expect(
+                kernarium_runtime_loader_maximum_guest_memory_mib_for_limit(
+                    1 << 40, vCPUs, none
+                ) <= ceiling
             )
         }
+        // A limit that leaves more than 4096 offers more than the old top,
+        // and the default stays where it was.
+        #expect(
+            kernarium_runtime_loader_maximum_guest_memory_mib_for_limit(
+                6144 << 20, 4, maximumSet
+            ) == 5504
+        )
+        #expect(
+            kernarium_runtime_loader_default_guest_memory_mib_for_limit(
+                6144 << 20, 4, launch
+            ) == 4096
+        )
         // The launch set the loader reports is the one the GPU budget
         // defaults follow.
         #expect(
@@ -1257,7 +1283,9 @@ struct KernariumTests {
 
         // The maximum is a size of the stepper's range, whatever the bound
         // says.
-        for (said, expected) in [(0, 512), (600, 576), (2150, 2112), (99999, 4096)] {
+        for (said, expected) in [
+            (0, 512), (600, 576), (2150, 2112), (99999, 99968), (9_999_999, 1_048_576),
+        ] {
             #expect(
                 configuration.maximumGuestMemoryMiB(
                     vCPUCount: 4, bound: { _ in said }

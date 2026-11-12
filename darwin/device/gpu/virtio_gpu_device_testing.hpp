@@ -41,6 +41,13 @@ public:
     {
         return 0;
     }
+    /* The allocations that waited for the guest's reclaimer
+     * (Display::memoryWaits). */
+    [[nodiscard]] virtual std::uint64_t memoryWaits() const noexcept
+    {
+        return 0;
+    }
+    void setGuestReclaimTerms(std::uint64_t, std::uint32_t) noexcept {}
     /* A display keeps whether a guest reclaimer acts on the memory reports
      * (Display::guestReclaims); the device's test double keeps it here. */
     void setGuestReclaims(bool reclaims) noexcept { guestReclaims_ = reclaims; }

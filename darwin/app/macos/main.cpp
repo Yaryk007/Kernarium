@@ -950,8 +950,8 @@ public:
 		emulator_.reset(created);
 		/* GPU memory is charged to the process like guest RAM: the GPU's
 		 * budget is what the process limit leaves after the guest, the
-		 * gadget cache and the launch's own allowances, at least 384 MiB and
-		 * at most half of the guest's allocation. */
+		 * gadget cache and the launch's own allowances, and at least 384 MiB;
+		 * without a limit it is the guest's allocation. */
 		const auto plan = uml::emulator::plan_gpu_budget(
 			prepared_.kernel, prepared_.gpu_budget);
 		device_memory_limit_ = plan.budget.bytes;

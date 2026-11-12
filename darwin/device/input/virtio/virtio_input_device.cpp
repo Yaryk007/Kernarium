@@ -65,7 +65,12 @@ void EventQueue::enqueue(
     bool wake = false;
     {
         std::lock_guard lock(mutex_);
-        if (events.size() > maximumQueuedEvents - events_.size()) {
+        /* After a drop, the guest first gets the release of what it holds,
+         * so the room needed is the release's and the report's. */
+        const auto release = dropped_ ? guestHolds_.releaseSize() : 0;
+        const auto room = maximumQueuedEvents - events_.size();
+        if (release > room || events.size() > room - release) {
+            dropped_ = true;
             if (!reportedOverflow_) {
                 std::fputs(
                     "Kernarium: dropping input because the virtio queue is full\n",
@@ -75,7 +80,12 @@ void EventQueue::enqueue(
             return;
         }
         wake = events_.empty();
+        if (dropped_) {
+            guestHolds_.appendRelease(events_);
+            dropped_ = false;
+        }
         events_.insert(events_.end(), events.begin(), events.end());
+        guestHolds_.observe(events);
     }
     if (wake && !wake_.notify()) {
         std::fprintf(
@@ -88,6 +98,15 @@ void EventQueue::enqueue(
 bool EventQueue::take(protocol::InputEvent& event) noexcept
 {
     std::lock_guard lock(mutex_);
+    if (events_.empty() && dropped_) {
+        /* The guest has read everything and the host may have nothing more
+         * to send: a lift that was dropped must not wait for a later report.
+         * The queue is empty, so the release fits. appendRelease forgets
+         * what it ends, so the report that comes next, and the lock that
+         * orders it with this call, owe no second one. */
+        guestHolds_.appendRelease(events_);
+        dropped_ = false;
+    }
     if (events_.empty())
         return false;
     event = events_.front();
@@ -119,6 +138,8 @@ void EventQueue::clear() noexcept
 {
     std::lock_guard lock(mutex_);
     events_.clear();
+    guestHolds_.reset();
+    dropped_ = false;
 }
 
 VirtioInputDevice::VirtioInputDevice(

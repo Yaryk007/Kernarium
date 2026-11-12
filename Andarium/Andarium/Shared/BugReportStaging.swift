@@ -87,12 +87,19 @@ enum BugReportSharing {
     /// window to present from.
     @discardableResult
     static func present(_ file: URL, finished: @escaping @MainActor () -> Void) -> Bool {
+        present([file]) { _ in finished() }
+    }
+
+    /// Shows the sheet on several files; `completed` says whether an action
+    /// took them.
+    @discardableResult
+    static func present(_ files: [URL], completed: @escaping @MainActor (Bool) -> Void) -> Bool {
         guard let root = rootViewController() else { return false }
         var top = root
         while let presented = top.presentedViewController, !presented.isBeingDismissed { top = presented }
-        let sheet = UIActivityViewController(activityItems: [file], applicationActivities: nil)
-        sheet.completionWithItemsHandler = { _, _, _, _ in
-            Task { @MainActor in finished() }
+        let sheet = UIActivityViewController(activityItems: files, applicationActivities: nil)
+        sheet.completionWithItemsHandler = { _, done, _, _ in
+            Task { @MainActor in completed(done) }
         }
         if let popover = sheet.popoverPresentationController {
             popover.sourceView = root.view

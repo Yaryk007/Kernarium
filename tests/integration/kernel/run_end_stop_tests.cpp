@@ -17,9 +17,13 @@
  * SIGALRM blocked on its own threads; only vCPU0 may take it. One more child
  * thread breaks that rule on purpose once the kernel handles SIGALRM: it
  * unblocks the signal and sends it to itself. The kernel must refuse to run a
- * guest tick there and leave SIGALRM blocked on that thread.
+ * guest tick there and leave SIGALRM blocked on that thread. The same thread
+ * then sends itself SIGTRAP, SIGILL and SIGFPE, the signals a trap in an
+ * app's own code raises on its own thread. The kernel must report each one
+ * and leave it to the host's default action rather than relay it to a guest
+ * task, which panicked the guest.
  *
- * The run-end and SIGALRM contracts are in kernel/common/README.md.
+ * The run-end and host-signal contracts are in kernel/common/README.md.
  */
 #include "uml/emulator.h"
 
@@ -33,6 +37,7 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <fstream>
+#include <initializer_list>
 #include <mach/mach.h>
 #include <memory>
 #include <pthread.h>
@@ -138,14 +143,32 @@ std::vector<std::byte> read_file(const char *path)
 
 /* The kernel's handler has replaced the default action, which would end the
  * process. */
-bool kernel_handles_alarm()
+bool kernel_handles(int signal)
 {
 	struct sigaction current {};
-	return sigaction(SIGALRM, nullptr, &current) == 0 &&
+	return sigaction(signal, nullptr, &current) == 0 &&
 		current.sa_handler != SIG_DFL && current.sa_handler != SIG_IGN;
 }
 
 enum class ForeignAlarm { not_sent, refused, handled };
+enum class ForeignTraps { not_sent, left_to_host, kept };
+
+/* Sends each trap signal to this non-vCPU thread. A self-directed signal is
+ * handled before pthread_kill() returns, so the disposition then shows
+ * whether the kernel left the trap to the host. */
+ForeignTraps take_foreign_traps()
+{
+	for (const int trap : {SIGTRAP, SIGILL, SIGFPE}) {
+		if (!kernel_handles(trap))
+			return ForeignTraps::kept;
+		(void)pthread_kill(pthread_self(), trap);
+		struct sigaction now {};
+		if (sigaction(trap, nullptr, &now) != 0 ||
+		    now.sa_handler != SIG_DFL)
+			return ForeignTraps::kept;
+	}
+	return ForeignTraps::left_to_host;
+}
 
 /* The foreign alarm and the stop exclude each other: the run end restores
  * SIGALRM's default action, which would end the process if the alarm came
@@ -153,14 +176,14 @@ enum class ForeignAlarm { not_sent, refused, handled };
  * an alarm already under way. */
 enum AlarmGate : int { gate_open, alarm_sending, alarm_done, stop_claimed };
 
-/* Sends SIGALRM to this non-vCPU thread with the signal unblocked. A
- * self-directed signal is handled before pthread_kill() returns, so the mask
- * then shows whether the kernel refused it. */
+/* Sends SIGALRM to this non-vCPU thread with the signal unblocked, then the
+ * trap signals. A self-directed signal is handled before pthread_kill()
+ * returns, so the mask then shows whether the kernel refused it. */
 ForeignAlarm take_foreign_alarm(std::atomic_int &gate,
-	const std::atomic_bool &returned)
+	const std::atomic_bool &returned, ForeignTraps &traps)
 {
 	for (;;) {
-		if (kernel_handles_alarm()) {
+		if (kernel_handles(SIGALRM)) {
 			int expected = gate_open;
 			if (!gate.compare_exchange_strong(expected, alarm_sending,
 				    std::memory_order_acq_rel))
@@ -184,13 +207,15 @@ ForeignAlarm take_foreign_alarm(std::atomic_int &gate,
 	const bool refused = sigismember(&now, SIGALRM) == 1;
 	if (!refused && pthread_sigmask(SIG_BLOCK, &timer, nullptr) != 0)
 		std::_Exit(10);
+	traps = take_foreign_traps();
 	gate.store(alarm_done, std::memory_order_release);
 	return refused ? ForeignAlarm::refused : ForeignAlarm::handled;
 }
 
 /* One guest, stopped after the given delay. Exits 0 only when the run
- * returned 0, the kernel refused any tick a foreign thread took, and nothing
- * faulted while the process lingered after it. */
+ * returned 0, the kernel refused any tick a foreign thread took and left its
+ * traps to the host, and nothing faulted while the process lingered after
+ * it. */
 [[noreturn]] void run_child(const char *kernel_path, const char *disk_path,
 	unsigned int delay_ms)
 {
@@ -216,8 +241,9 @@ ForeignAlarm take_foreign_alarm(std::atomic_int &gate,
 	std::atomic_bool returned{};
 	std::atomic_int gate{gate_open};
 	auto foreign_alarm = ForeignAlarm::not_sent;
+	auto foreign_traps = ForeignTraps::not_sent;
 	std::thread alarm_taker{[&] {
-		foreign_alarm = take_foreign_alarm(gate, returned);
+		foreign_alarm = take_foreign_alarm(gate, returned, foreign_traps);
 	}};
 	std::thread stopper{[&] {
 		while (!kernel_called.load(std::memory_order_acquire) &&
@@ -247,11 +273,17 @@ ForeignAlarm take_foreign_alarm(std::atomic_int &gate,
 		"run on the foreign thread"};
 	std::fprintf(stderr, "run-end-test: foreign alarm %s\n",
 		alarm_outcome[static_cast<int>(foreign_alarm)]);
+	static constexpr const char *trap_outcome[]{"not sent",
+		"left to the host", "kept by the kernel"};
+	std::fprintf(stderr, "run-end-test: foreign traps %s\n",
+		trap_outcome[static_cast<int>(foreign_traps)]);
 	std::this_thread::sleep_for(linger_after_run);
 	if (result != 0)
 		std::_Exit(11);
 	if (foreign_alarm == ForeignAlarm::handled)
 		std::_Exit(13);
+	if (foreign_traps == ForeignTraps::kept)
+		std::_Exit(14);
 	/* Only this thread may remain. */
 	const std::size_t threads = thread_count();
 	if (threads != 1) {
@@ -292,6 +324,7 @@ int run_driver(const char *self, const char *kernel_path,
 
 	unsigned int failures = 0;
 	unsigned int refused_alarms = 0;
+	unsigned int left_traps = 0;
 	for (unsigned int iteration = 0; iteration < iterations; ++iteration) {
 		const unsigned int delay =
 			stop_delays_ms[iteration % std::size(stop_delays_ms)];
@@ -333,6 +366,8 @@ int run_driver(const char *self, const char *kernel_path,
 		}
 		if (log_contains(log, "run-end-test: foreign alarm refused"))
 			++refused_alarms;
+		if (log_contains(log, "run-end-test: foreign traps left to the host"))
+			++left_traps;
 		if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
 			continue;
 		std::fprintf(stderr, "attempt %u (stop after %u ms) ended with "
@@ -343,10 +378,12 @@ int run_driver(const char *self, const char *kernel_path,
 	std::fprintf(stderr, "%u of %u stopped runs ended cleanly\n",
 		iterations - failures, iterations);
 	/* Early stops end a run before the kernel handles SIGALRM, but the later
-	 * ones must have checked a foreign thread's tick. */
+	 * ones must have checked a foreign thread's tick and traps. */
 	std::fprintf(stderr, "%u runs refused a foreign thread's SIGALRM\n",
 		refused_alarms);
-	if (refused_alarms == 0)
+	std::fprintf(stderr, "%u runs left a foreign thread's traps to the host\n",
+		left_traps);
+	if (refused_alarms == 0 || left_traps == 0)
 		return EXIT_FAILURE;
 	return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

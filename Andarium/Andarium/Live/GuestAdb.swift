@@ -238,6 +238,13 @@ nonisolated struct AdbGuestOperations: Sendable {
         return UsbDebugging.parse(result)
     }
 
+    /// Whether the guest's internal storage is mounted and made (`InternalStorage`);
+    /// nil when it cannot be read now.
+    func storageReady() async -> Bool? {
+        guard let result = try? await shell(InternalStorage.command, limit: .seconds(15)) else { return nil }
+        return InternalStorage.parse(result)
+    }
+
     /// Runs a command in the guest's shell and returns what it printed.
     func shell(_ command: String, limit: Duration = .seconds(60)) async throws -> ShellResult {
         guard let identity else { throw AdbFailure(.keyRejected, activity: .bugReport) }

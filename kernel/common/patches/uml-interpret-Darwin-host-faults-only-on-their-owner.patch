@@ -3,21 +3,25 @@ From: Yi Xie <imxieyi@users.noreply.github.com>
 Date: Sat, 29 Aug 2026 19:38:15 +0900
 Subject: [PATCH] uml: interpret Darwin host faults only on their owner
 
-Signal dispositions are process-wide, so UML's SIGSEGV and SIGBUS handlers
-also cover the host threads the emulator runs for its own devices and
-renderers.  uml_curr_cpu() answers CPU0 for a thread that holds no carrier,
-which is the right answer for a read on the boot path but not for a fault:
-a fault taken on one of those threads was attributed to whatever task CPU0
-was running and panicked as though that task had faulted, after
-block_signals() had already masked CPU0's interrupts from a foreign thread.
+Signal dispositions are process-wide, so UML's SIGSEGV, SIGBUS, SIGTRAP,
+SIGILL and SIGFPE handlers also cover the host threads the emulator runs for
+its own devices and renderers, and an embedding app's own threads.
+uml_curr_cpu() answers CPU0 for a thread that holds no carrier, which is the
+right answer for a read on the boot path but not for a fault: a fault taken
+on one of those threads was attributed to whatever task CPU0 was running and
+panicked as though that task had faulted, after block_signals() had already
+masked CPU0's interrupts from a foreign thread.
 
 Qualify ownership instead.  darwin_carrier_cpu() reports the virtual CPU a
 thread carries, or -1 when it carries none; the boot thread is claimed
 before the process-wide handlers exist and released once CPU0's carrier
-does.  A synchronous fault from an unowned thread is reported against its
-real thread and address and left to the host disposition, which terminates
-the process on the faulting instruction rather than repairing a guest
-mapping for it.
+does.  A synchronous fault or trap from an unowned thread is reported against
+its real thread and address and left to the host disposition, which
+terminates the process on the faulting instruction rather than repairing a
+guest mapping for it or relaying it to CPU0's task.  An app's uncaught
+exception or a runtime trap on its main thread executes brk there, and
+relay_signal() turned that into "Kernel mode signal 5", a guest panic that
+hid the host's own crash.
 
 Refuse a timer tick on such a thread too.  ITIMER_REAL is process-directed,
 so the host hands SIGALRM to any thread that leaves it unblocked, and the
@@ -37,14 +41,16 @@ two lines to the emulator's slow and lossy stderr: a single sysrq t on a
 two-vCPU guest printed 272.  segv_resumes_at_recovery() follows segv()'s own
 first two branches, and every other signal is still reported before it is
 handled, so a handler that wedges still leaves its fault behind.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
 ---
- arch/um/include/shared/kern_util.h |  1 +
- arch/um/kernel/trap.c              | 21 +++++++
- arch/um/os-Darwin/internal.h       |  6 ++
- arch/um/os-Darwin/process.c        |  5 ++
- arch/um/os-Darwin/signal.c         | 98 +++++++++++++++++++++++++++---
- arch/um/os-Darwin/smp.c            | 42 ++++++++++++-
- 6 files changed, 163 insertions(+), 10 deletions(-)
+ arch/um/include/shared/kern_util.h |   1 +
+ arch/um/kernel/trap.c              |  21 ++++++
+ arch/um/os-Darwin/internal.h       |   6 ++
+ arch/um/os-Darwin/process.c        |   5 ++
+ arch/um/os-Darwin/signal.c         | 100 ++++++++++++++++++++++++++---
+ arch/um/os-Darwin/smp.c            |  42 +++++++++++-
+ 6 files changed, 165 insertions(+), 10 deletions(-)
 
 diff --git a/arch/um/include/shared/kern_util.h b/arch/um/include/shared/kern_util.h
 index 260f69b22aa5cc7a5633bf1975299e73a35020b3..5a09df19640fde539603624516fa61d37268d333 100644
@@ -131,7 +137,7 @@ index 538eb50c2acde4c10a7db2939ae2ce940f459c84..c2354aa094ced8022b9286c0e09c2535
  	set_handler(SIGTRAP);
  	set_handler(SIGFPE);
 diff --git a/arch/um/os-Darwin/signal.c b/arch/um/os-Darwin/signal.c
-index 20c840f9c1f9e5ff1179ede34e13412ec79e2a30..28ab8dbe589f95dfba5654a2fb08c756c190bf19 100644
+index 20c840f9c1f9e5ff1179ede34e13412ec79e2a30..445785ad9f7d919d26afa87b5cf8992dacfdba75 100644
 --- a/arch/um/os-Darwin/signal.c
 +++ b/arch/um/os-Darwin/signal.c
 @@ -15,6 +15,7 @@
@@ -173,14 +179,15 @@ index 20c840f9c1f9e5ff1179ede34e13412ec79e2a30..28ab8dbe589f95dfba5654a2fb08c756
  	}
  	if (sig_info[signal] != NULL)
  		sig_info[signal](signal, (struct siginfo *)info, &registers,
-@@ -127,12 +137,82 @@ static void run_timer(ucontext_t *context)
+@@ -127,12 +137,84 @@ static void run_timer(ucontext_t *context)
  	timer_handler(SIGALRM, NULL, &registers);
  }
  
 +/* Signal dispositions are process-wide, so the emulator's own host threads
-+ * share UML's SIGSEGV and SIGBUS handlers.  Report such a fault against its
-+ * real thread and address, then let the host disposition terminate the process
-+ * on the faulting instruction rather than repairing a guest mapping for it.
++ * share UML's SIGSEGV, SIGBUS, SIGTRAP, SIGILL and SIGFPE handlers.  Report
++ * such a fault or trap against its real thread and address, then let the host
++ * disposition terminate the process on the faulting instruction rather than
++ * repairing a guest mapping for it or panicking the guest.
 + */
 +static void darwin_report_foreign_fault(int signal, const siginfo_t *info,
 +					const ucontext_t *context)
@@ -241,7 +248,8 @@ index 20c840f9c1f9e5ff1179ede34e13412ec79e2a30..28ab8dbe589f95dfba5654a2fb08c756
 +	 * state to speak for, so any other thread's fault must neither enter the
 +	 * guest fault path nor mask CPU0's interrupts.
 +	 */
-+	if ((signal == SIGSEGV || signal == SIGBUS) &&
++	if ((signal == SIGSEGV || signal == SIGBUS || signal == SIGTRAP ||
++	     signal == SIGILL || signal == SIGFPE) &&
 +	    darwin_carrier_cpu() < 0) {
 +		darwin_report_foreign_fault(signal, info, context);
 +		errno = saved_errno;

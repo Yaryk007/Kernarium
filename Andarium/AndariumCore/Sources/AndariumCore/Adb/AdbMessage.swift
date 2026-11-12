@@ -25,7 +25,7 @@ public enum AdbWire {
 
     /// The features this host asks for. The device answers with the subset it
     /// has.
-    public static let hostBanner = "host::features=shell_v2,cmd,stat_v2,abb_exec"
+    public static let hostBanner = "host::features=shell_v2,cmd,stat_v2,ls_v2,abb_exec"
 
     /// A four-character tag as the little-endian number adb uses for commands.
     public static func fourCC(_ tag: String) -> UInt32 {

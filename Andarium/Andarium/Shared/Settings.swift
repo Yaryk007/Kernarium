@@ -15,6 +15,9 @@ struct SessionSettingsSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var importing = false
     @State private var copied = false
+    @State private var confirmingStop = false
+    @State private var filesBarInset: CGFloat = 0
+    @State private var filesBarHeight: CGFloat = 0
     @State private var detent: PresentationDetent
 
     init(large: Bool) {
@@ -23,11 +26,12 @@ struct SessionSettingsSheet: View {
 
     var body: some View {
         let session = model.session
-        NavigationStack {
+        NavigationStack(path: fileRoute) {
             ScrollViewReader { proxy in
                 List {
                     if model.capabilities.statistics { stats(session) }
                     if normalSession, model.capabilities.apkInstall { apps }
+                    if normalSession, model.capabilities.guestFiles, model.fileBrowser != nil { files }
                     if normalSession, model.capabilities.adbOverNetwork { developer(session) }
                     if normalSession, model.capabilities.bugReport { diagnostics }
                 }
@@ -38,15 +42,46 @@ struct SessionSettingsSheet: View {
                 }
             }
             .listSectionSpacing(.compact)
+            .endingAboveFilesBar(filesBarHeight)
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Done", systemImage: "checkmark") { dismiss() }
+                    Button("Done", systemImage: "checkmark", action: close)
+                }
+            }
+            .navigationDestination(for: FolderRoute.self) { route in
+                if let browser = model.fileBrowser {
+                    FolderPage(browser: browser, route: route, close: close)
                 }
             }
         }
+        .environment(\.filesBarHeight, filesBarHeight)
+        // The bar is outside the pages, so folders slide under it.
+        .safeAreaBar(edge: .bottom) {
+            if let browser = model.fileBrowser,
+               (model.filesAvailable && browser.browsing) || browser.transfer != nil || browser.conflict != nil {
+                FilesBar(browser: browser, usable: model.filesAvailable, bottomInset: filesBarInset)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+        .readFilesBarHeight(into: $filesBarHeight)
+        .onGeometryChange(for: CGFloat.self) { $0.safeAreaInsets.bottom } action: { filesBarInset = $0 }
+        .animation(.snappy, value: model.fileBrowser?.browsing)
+        .interactiveDismissDisabled(model.fileBrowser?.running == true)
+        .confirmationDialog("Stop the transfer?", isPresented: $confirmingStop, titleVisibility: .visible) {
+            Button("Stop and Close", role: .destructive) {
+                model.fileBrowser?.closeTransfer()
+                dismiss()
+            }
+            Button("Keep Going", role: .cancel) {}
+        }
+        // A browser wants the room.
+        .onChange(of: model.fileBrowser?.browsing) { _, browsing in
+            if browsing == true { detent = .large }
+        }
         .task { await model.watchSettings() }
+        .onDisappear { model.fileBrowser?.sheetClosed() }
         .presentationDetents([.medium, .large], selection: $detent)
         .presentationBackground(Color(.systemGroupedBackground))
         .presentationBackgroundInteraction(.enabled(upThrough: .medium))
@@ -59,10 +94,37 @@ struct SessionSettingsSheet: View {
         }
     }
 
+    private var fileRoute: Binding<[FolderRoute]> {
+        Binding(get: { model.fileBrowser?.route ?? [] }, set: { model.fileBrowser?.route = $0 })
+    }
+
+    /// Done, here or on a folder. A running transfer would end with the
+    /// sheet, so that is asked first.
+    private func close() {
+        if model.fileBrowser?.running == true {
+            confirmingStop = true
+        } else {
+            dismiss()
+        }
+    }
+
     /// Recovery runs no adb: its operations are for a normal session.
     private var normalSession: Bool {
         if case .running(.normal) = model.phase { return true }
         return false
+    }
+
+    // MARK: File browser
+
+    private var files: some View {
+        Section("File browser") {
+            NavigationLink(value: FolderRoute(path: GuestPath.root)) {
+                HStack(spacing: 12) {
+                    IconTile(symbol: "folder.fill")
+                    Text("Internal storage")
+                }
+            }
+        }
     }
 
     // MARK: Diagnostics
@@ -81,6 +143,8 @@ struct SessionSettingsSheet: View {
                     Spacer()
                 }
             }
+            // The guest's one adb channel is busy with the transfer.
+            .disabled(model.fileBrowser?.busy == true)
         }
     }
 
@@ -101,6 +165,7 @@ struct SessionSettingsSheet: View {
                         .foregroundStyle(Color(.secondaryLabel))
                 }
             }
+            .disabled(model.fileBrowser?.busy == true)
         }
     }
 
@@ -245,5 +310,21 @@ struct SessionSettingsSheet: View {
             .monospacedDigit()
             .foregroundStyle(.secondary)
             .contentTransition(.numericText())
+    }
+}
+
+extension View {
+    /// Settings over a session, which hides the status bar. The sheet is
+    /// handed the model and keeps the status bar hidden too: on a Mac, SwiftUI
+    /// reads a sheet's presentation preferences before the sheet inherits the
+    /// session's environment, and a full-height sheet whose status bar differs
+    /// from the session's flips its visibility on every layout until AppKit
+    /// ends the application.
+    func sessionSettings(isPresented: Binding<Bool>, large: Bool, model: AppModel) -> some View {
+        sheet(isPresented: isPresented) {
+            SessionSettingsSheet(large: large)
+                .environment(model)
+                .statusBarHidden(true)
+        }
     }
 }

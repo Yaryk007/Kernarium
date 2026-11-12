@@ -222,6 +222,25 @@
     uml_add_arm64_unit_test(jit_memory_window NAME arm64-jit-memory-window
         WITHOUT_HARNESS OBJECTS $<TARGET_OBJECTS:uml_cpu_executable_memory>)
 
+    # The region an iOS device's debugger prepares, without a debugger: its
+    # mapping, alias and allocation, and the arena writing through the alias.
+    uml_add_arm64_unit_test(jit_debugger_region NAME arm64-jit-debugger-region
+        WITHOUT_HARNESS
+        OBJECTS $<TARGET_OBJECTS:uml_cpu_executable_memory_region_test>
+                $<TARGET_OBJECTS:uml_arm64_jit_arena_region_test>)
+    # The request to the debugger when none serves it: the breakpoint is
+    # stepped over, P_TRACED is read right before it, and a trap that is not a
+    # request goes on.
+    uml_add_arm64_unit_test(jit_debugger_request NAME arm64-jit-debugger-request
+        WITHOUT_HARNESS
+        OBJECTS $<TARGET_OBJECTS:uml_cpu_executable_memory_region_test>)
+    # The size of that region from the JIT cache's geometry, and the
+    # preparation seam on a host without the route.
+    uml_add_arm64_unit_test(jit_memory_preparation
+        NAME arm64-jit-memory-preparation WITHOUT_HARNESS NO_OBJECTS)
+    target_link_libraries(uml_arm64_jit_memory_preparation_tests PRIVATE
+        uml_cpu_jit_component)
+
     foreach(JIT_CACHE_TEST IN ITEMS cache_geometry shared_translation_cache)
         uml_add_arm64_unit_test(jit_${JIT_CACHE_TEST} WITHOUT_HARNESS NO_OBJECTS
             LABELS tsan)

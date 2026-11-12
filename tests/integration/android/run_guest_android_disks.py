@@ -19,7 +19,7 @@ root filesystem, sees exactly the layout the release describes:
   disk is the release's bytes, and the data disk is still sparse;
 - the host grows the data disk, a second guest sees the larger table with the
   first guest's file intact, grows the filesystem into the new space, and
-  the library refuses to shrink the disk.
+  a smaller request leaves the disk as it was.
 
 The contract is darwin/device/block/README.md.
 """
@@ -366,13 +366,13 @@ def main() -> int:
             raise RuntimeError(
                 f"the data disk holds {allocated} bytes of its {FIRST_GIB} GiB"
             )
-        shrink = tool(disk_tool, "prepare", release, data_path, FIRST_GIB - 1)
-        if shrink.returncode == 0 or os.stat(data_path).st_size != FIRST_GIB * GIB:
-            raise RuntimeError("the library accepted a smaller data disk")
+        smaller = tool_must_succeed(disk_tool, "prepare", release, data_path, FIRST_GIB - 1)
+        if smaller["capacity-gib"] != str(FIRST_GIB) or os.stat(data_path).st_size != FIRST_GIB * GIB:
+            raise RuntimeError("the library changed the data disk for a smaller request")
         tool_must_succeed(disk_tool, "prepare", release, data_path, GROWN_GIB)
         if os.stat(data_path).st_size != GROWN_GIB * GIB:
             raise RuntimeError("the data disk did not grow")
-        print(f"host: guest left both disks valid; grown to {GROWN_GIB} GiB; shrink refused")
+        print(f"host: guest left both disks valid; grown to {GROWN_GIB} GiB; smaller request kept it")
 
         with boot(emulator, rootfs, system_disk, data_disk, arguments.engine) as guest:
             guest.boot_to_shell(180)

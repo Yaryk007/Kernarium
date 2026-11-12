@@ -9,6 +9,8 @@ Run a real Linux kernel natively on iOS, through the magic of [User-mode Linux](
 
 An Android emulator app built on the Kernarium runtime is available in [TestFlight beta](https://testflight.apple.com/join/qyPvJTUE). Source code is available under [`Andarium/`](/Andarium/).
 
+The TestFlight beta only has 10,000 tester slots and gets filled up quickly. Alternatively, you can sideload IPA from [releases](https://github.com/imxieyi/Kernarium/releases).
+
 ### Kernarium
 
 A generic Linux emulator app capable of running various Linux distributions. It's still at an early stage of development and isn't ready for release yet. Source code is available under [`Kernarium/`](/Kernarium/).
@@ -42,6 +44,8 @@ This emulator architecture sits between a full system emulator (like [UTM](https
 ## Build or Embed
 
 Point your coding agent at this repo if you want to build the project or embed its runtime in other apps. The agent guide is [`AGENTS.md`](/AGENTS.md), and the documentation is under [`docs/`](/docs/).
+
+Building Android system image requires a powerful remote x86_64 Linux building machine ([requirements](https://source.android.com/docs/setup/start/requirements)). Alternatively, you can download prebuilt images from [releases](https://github.com/imxieyi/Kernarium/releases) and point your coding agent at it.
 
 ## License
 

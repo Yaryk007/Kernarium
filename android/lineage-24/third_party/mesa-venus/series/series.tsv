@@ -6,3 +6,6 @@ patch	egl-android-advertise-EXT_pixel_format_float-only-with-a-float-confi.patch
 patch	Mesa-Venus-generated-Soong-port.patch
 patch	venus-android-leave-VK_KHR_device_address_commands-to-a-platform-tha.patch
 patch	dri-android-offer-a-config-whose-only-buffer-is-eight-bits-of-stenci.patch
+patch	venus-give-an-oversized-shmem-allocation-a-shmem-of-its-own.patch
+patch	venus-let-go-of-a-large-command-and-reply-once-the-host-has-consumed.patch
+patch	venus-size-the-shmem-of-an-oversized-allocation-to-its-need.patch

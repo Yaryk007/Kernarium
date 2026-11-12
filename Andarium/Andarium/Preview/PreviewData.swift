@@ -38,6 +38,11 @@ enum PreviewData {
                 name: "iPad", processorCount: 6, memory: iPadMini6Memory,
                 freeStorageBytes: gibibytes(lowSpace ? 1.2 : 118.3)
             )
+        case "mac-64-gib":
+            return HostDevice(
+                name: "Mac", processorCount: 8, memory: mac64GiBMemory,
+                freeStorageBytes: gibibytes(lowSpace ? 1.2 : 412.6)
+            )
         default:
             break
         }
@@ -77,20 +82,30 @@ enum PreviewData {
     /// application.
     static let iPhone18ProMaxMemory = MemoryPolicy(
         maximumsMiB: Array(repeating: 4096, count: 6), defaultsMiB: Array(repeating: 3072, count: 6),
-        safeMiB: Array(repeating: 3584, count: 6),
+        safeMiB: Array(repeating: 3584, count: 6), defaultHoldsGraphics: Array(repeating: true, count: 6),
         graphicsMiB: { memory, count in budget(limitMiB: 5120, memoryMiB: memory, vCPUs: count) }
+    )
+
+    /// An iOS app on a Mac with 64 GiB: the host's RAM is on offer at every
+    /// count (about a thousand positions on the memory ruler), a new guest gets
+    /// 4 GiB, nothing is likely to end the application, and with no memory
+    /// limit the host GPU's budget is the guest's memory.
+    static let mac64GiBMemory = MemoryPolicy(
+        maximumsMiB: Array(repeating: 65536, count: 8), defaultsMiB: Array(repeating: 4096, count: 8),
+        safeMiB: Array(repeating: 65536, count: 8),
+        graphicsMiB: { memory, _ in memory }
     )
 
     /// B for a mock: L less A (64), E_rest (320), S (149), the gadget cache at
     /// its cap of the vCPU count and 4 MiB of slot tags per vCPU and the
-    /// guest, between 384 MiB and half of the guest. The cap is the table in
+    /// guest, and at least 384 MiB. The cap is the table in
     /// `runtime/guest_memory_budget.hpp`, which holds for the guests the sheet
     /// offers (1.5 GiB and up).
     private static func budget(limitMiB: Int, memoryMiB: Int, vCPUs: Int) -> Int {
         let caps = [128, 160, 192, 224, 240, 240, 272, 272]
         let engine = 320 + caps[min(max(vCPUs, 1), caps.count) - 1] + 4 * max(vCPUs, 1)
         let available = limitMiB - 64 - memoryMiB - engine - 149
-        return min(max(available, 384), memoryMiB / 2)
+        return max(available, 384)
     }
 
     /// A mock size, in gibibytes.

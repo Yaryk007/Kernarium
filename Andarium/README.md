@@ -3,11 +3,10 @@
 Andarium is the iOS application that runs one Android (LineageOS 24, Android
 17) guest on the Darwin runtime. Android ships inside the app; what the user
 creates, sizes and erases is the guest. [Kernarium](../Kernarium/README.md)
-stays the developer application for Linux guests and for Android bundles. In
-its development configurations Andarium also runs on an Apple silicon Mac in
-Designed for iPad mode (the App Store configuration is not offered to Macs),
-and it builds for the iOS Simulator, where the guest renders on the CPU for UI
-tests ([`graphics.md`](../docs/graphics.md#ios-simulator-software-renderer)).
+stays the developer application for Linux guests and for Android bundles.
+Andarium also runs on an Apple silicon Mac in Designed for iPad mode, and it
+builds for the iOS Simulator, where the guest renders on the CPU for UI tests
+([`graphics.md`](../docs/graphics.md#ios-simulator-software-renderer)).
 
 ## Ownership
 
@@ -36,15 +35,14 @@ no team.
 
 ## Targets
 
-`Andarium` is the device application (iPhone and iPad, and in Debug and
-Release an Apple silicon Mac in Designed for iPad mode). It embeds the Android
-runtime frameworks and carries the system image. It has no background mode:
-the guest runs while Andarium is in the foreground and is paused when it
-leaves. It runs one scene and one guest per process, and needs the increased
-memory limit and extended virtual addressing entitlements
-(`Config/Andarium.entitlements`). The model and the runtime belong to the
-process (`AndariumProcess`), so a scene that connects again shows the same
-ones.
+`Andarium` is the device application (iPhone and iPad, and an Apple silicon
+Mac in Designed for iPad mode). It embeds the Android runtime frameworks and
+carries the system image. It has no background mode: the guest runs while
+Andarium is in the foreground and is paused when it leaves. It runs one scene
+and one guest per process, and needs the increased memory limit and extended
+virtual addressing entitlements (`Config/Andarium.entitlements`). The model
+and the runtime belong to the process (`AndariumProcess`), so a scene that
+connects again shows the same ones.
 
 `AndariumPreview` is a Simulator-only target built from `Shared` and `Preview`
 with mock data. It embeds no runtime and boots nothing. Its launch arguments
@@ -62,8 +60,11 @@ The guest is drawn with Metal 4, which the A14 and later chips have. No
 capability key names the chip, so `UIRequiredDeviceCapabilities` names `metal`
 and the application asks the GPU for the Metal 4 family at launch
 (`HostDevice.runsGuestGraphics`), refusing to start a guest without it; the
-Simulator draws on the CPU and always passes. iPhone and iPad are supported;
-the AppStore configuration sets `SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD` to NO.
+Simulator draws on the CPU and always passes. iPhone and iPad are supported,
+and so is an Apple silicon Mac in Designed for iPad mode: TestFlight and the
+App Store offer the application to Macs, and every configuration sets
+`SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD` to YES, which gives Xcode its Mac
+destination and adds nothing to the built application.
 `ITSAppUsesNonExemptEncryption` is NO in `Config/Info.plist`.
 
 The iPhone interface is portrait-only. On iPad, a guest session whose scene
@@ -89,32 +90,13 @@ xcodebuild -project Andarium/Andarium.xcodeproj -scheme Andarium \
     -destination 'generic/platform=iOS' build
 ```
 
-### Experimental StikDebug JIT
-
-The sideload-only runtime can use the native arm64 JIT on iOS 27 when the app
-is development-signed with `get-task-allow` and launched from StikDebug with
-`universal.js`. It creates one RX window through the iOS 26+ region protocol,
-then the runtime remaps the same memory as a separate RW alias before StikDebug
-detaches. Generated instructions are written through the alias and executed
-through the RX view. Opening the app normally does not grant JIT; the runtime
-then falls back to the gadget interpreter.
-
-```sh
-cmake --preset kernarium-ios-device-android-stikdebug-jit
-cmake --build --preset kernarium-ios-device-android-stikdebug-jit
-Kernarium/scripts/package-ios-frameworks.sh --sdk device \
-    --runtimes android --stikdebug-jit
-Andarium/scripts/stage-system-image.py
-xcodebuild -project Andarium/Andarium.xcodeproj -scheme Andarium \
-    -configuration Release -destination 'generic/platform=iOS' build
-```
-
-Release uses `Config/Andarium.StikDebug.entitlements`; the provisioning profile
-must permit every requested entitlement. AppStore continues to use the normal
-entitlements and interpreter runtime. The manually triggered GitHub workflow
-builds an unsigned IPA after receiving the accepted Android release and
-Android kernel-artifact archives; sign the artifact with a development profile
-before installing it.
+The fork's `build-andarium-stikdebug-jit.yml` workflow packages the optimized
+Release development runtime from this preset. It verifies the generated CMake
+compile commands with `scripts/check-ios-jit-build.py` and checks the accepted
+Android and kernel artifacts before and after application packaging. Its
+unsigned IPA needs a development signature with the accompanying
+`Andarium.StikDebug.entitlements`; JIT remains an explicit Home setting and
+requires launching through StikDebug. The AppStore product remains separate.
 
 The frameworks go to `.build/kernarium-xcframeworks`, which Kernarium shares,
 so package the runtime a build needs just before it. The staging script checks
@@ -154,13 +136,18 @@ everything that exists for automation or only pretends:
   console lines (`Shared/ConsoleReport.swift`), the launch's deferred work
   (create, erase, start) and the isolated guest instance.
 - It defines `UML_APP_STORE_APPLICATION` for the loader it compiles, which
-  leaves out the display mirror, console input and the automation lookups
-  ([`GuestHost/README.md`](../GuestHost/README.md)).
+  leaves out the display mirror, console input, the automation lookups and the
+  JIT's preparation entries ([`GuestHost/README.md`](../GuestHost/README.md)).
+  The JIT's policy and words (`Shared/Jit.swift`), debugger side
+  (`Live/JitDebugger.swift`) and Home row are under `!APP_STORE`, in the
+  application and not in AndariumCore, which the package builds without that
+  condition.
 - It embeds the App Store runtime, which reads no environment knob and carries
   no debugging or automation support (the `kernarium-ios-device-android-app-store`
   preset, packaged with `package-ios-frameworks.sh --app-store --runtimes
   android`; [`Kernarium/README.md`](../Kernarium/README.md#automation-runs)).
-- It is not offered to Macs, and its Archive action uses it.
+- Its Archive action uses it, and the archive is the build TestFlight and the
+  App Store offer to Macs.
 - It refuses an embedded artifact that is behind the archived commit: a build
   phase runs [`scripts/check-embedded-artifacts.py`](../scripts/check-embedded-artifacts.py),
   which compares the accepted Android release and kernel descriptors with the
@@ -173,7 +160,8 @@ everything that exists for automation or only pretends:
   release ID in `PENDING_INPUTS_DECISION`.
 - Its last build phase runs `scripts/check-app-store-bundle.py`, which fails the
   build on a missing Info.plist key, an environment knob, a symbol or log text
-  of the debugging and automation support, a test bundle or XCTest framework, a
+  of the debugging and automation support, the JIT (its symbols and text and
+  the `brk #0xf00d` instruction), a test bundle or XCTest framework, a
   trace of the build host, a harness console line, or a privacy manifest that
   does not cover a binary
   ([`scripts/check-privacy-manifests.py`](../scripts/check-privacy-manifests.py));
@@ -208,7 +196,7 @@ control out.
   [vCPU limit](../docs/architecture.md#memory-and-executable-code) and the RAM
   the runtime loader answers for that count
   (`kernarium_runtime_loader_maximum_guest_memory_mib`); a new guest gets the
-  loader's default for it
+  loader's default for it, which stops at 4 GiB however much is offered
   (`kernarium_runtime_loader_default_guest_memory_mib`). Android is usable
   from 1.5 GiB, so a guest has at least that (`Limits.minimumMemoryMiB`,
   Andarium's own: the runtime still accepts less for Kernarium's guests); a
@@ -218,17 +206,30 @@ control out.
   runtime's conservative size for its vCPU count (`safeMemoryMiB`) is likely
   to be closed by iOS: Home shows a notice and the memory ruler a line and red
   ticks, both following the guest's memory and vCPU count (`MemoryWarning`).
-  Where the default is lower, a guest with more than the default has less than
-  1 GiB of graphics memory (VRAM, the host GPU's budget): the System sheet
-  turns the ticks past the default orange and warns that games may run out of
-  it (`GraphicsMemoryWarning`), and Home says nothing. The sheet also shows
-  the loader's estimate of VRAM for the chosen memory and vCPUs and says it is
-  separate from the guest's RAM.
+  A guest above the graphics line (`MemoryPolicy.graphicsLineMiB`) may run out
+  of graphics memory (VRAM, the host GPU's budget): the System sheet turns the
+  ticks past it orange and warns that games may (`GraphicsMemoryWarning`), and
+  Home says nothing. The line is the default where the runtime lowered the
+  default to keep the GPU 1 GiB
+  (`kernarium_runtime_loader_default_guest_memory_holds_gpu_budget`), and
+  elsewhere the largest size whose estimate of VRAM is still 1 GiB or more
+  (`Limits.minimumDefaultGraphicsMemoryMiB`), so a range above 4 GiB warns
+  only where the estimate falls. The sheet also shows the loader's estimate of
+  VRAM for the chosen memory and vCPUs and says it is separate from the
+  guest's RAM.
+  The memory ruler follows the range, which on a Mac with much RAM has about
+  a thousand positions: it labels only the round numbers of gibibytes that do
+  not touch and draws the ticks that have room (`RulerThinning`), and
+  VoiceOver's increment and decrement then move to the next labelled one.
 - **Storage.** A guest's files live in `Library/Guest/` of the application's
   container behind `GuestStorage`. The system disk is Android's, read-only, and
   stays in the release directory; the runtime creates the data disk `data.img`
   at the first start, sized by the guest's capacity, and only grows it after;
   Home disables Start in recovery until then (`StartPlan.offersRecovery`).
+  A larger size chosen in Resize waits on Home and applies as the next start,
+  of any kind, is handed to the runtime (`Lifecycle.start`), which grows the
+  disk then; the guest records the new capacity at that point, so a start that
+  ends early leaves no growth pending beside a disk that already has it.
   The runtime passes both paths to Linux in a kernel argument, so they stay at
   paths free of spaces and the other characters `DiskPath` refuses (which is
   why the guest is not in `Application Support`).
@@ -239,6 +240,14 @@ control out.
   the snapshot and the adb key included.
 - **Backup.** The guest is left out of iCloud and computer backups unless the
   user turns on Back up guest data.
+- **Release notes.** `Shared/WhatsNew.json` bundles the notes per build,
+  from build 9 (build 5, the first public release, and builds 6 to 8 have
+  none).
+  The first launch of an update that carries notes shows a ribbon above Start,
+  on at most three launches, that opens them; a build shows the notes up to its
+  own number and no later ones. Info keeps every release's notes
+  (`WhatsNewRules`, `WhatsNewStore`). A launch with a launch setting, or one a
+  test runs, shows no ribbon and keeps no record.
 
 ## Runtime
 
@@ -266,10 +275,41 @@ requires reopening Andarium.
 - **Retina.** Retina mode applies at the next start and uses the screen's
   native pixels, whose host allocations count against the same iOS process
   limit as guest RAM (`DisplayOptions`).
+- **JIT.** A development build on a device has a JIT row on Home, off until
+  the person turns it on and kept for the install (`JitPreference`). An iOS
+  device gives the JIT its executable memory only through a debugger attached to
+  the process ([`docs/architecture.md`](../docs/architecture.md#executable-code)):
+  the person assigns StikDebug's universal script to Andarium once in StikDebug
+  and opens Andarium from it. StikDebug spins until its request is served and
+  the system ends it within a minute, so Andarium asks as it opens
+  (`AppModel.prepareJitAtLaunch`), on a worker, and Home does not wait for it.
+  With the row on it prepares the memory for the guest, or for the guest Create
+  offers when there is none yet, and the debugger leaves within seconds; with
+  the row off it tells the debugger to leave at once, and turning the row on
+  later in that process says to open Andarium from StikDebug. A start uses the
+  memory prepared at launch (or waits for the attempt, with "Preparing JIT" on
+  the boot screen) and boots on the JIT engine; without a debugger, or if the
+  preparation fails, it boots on gadgets and says why on the boot screen and
+  under the row. A guest changed after the memory was prepared needs Andarium
+  opened from StikDebug again, and the memory stays wired for the process
+  whether the start uses it or not (the runtime's GPU plan counts it). No
+  debugger request is made while none is attached, and one that goes unanswered
+  because the debugger vanished is a start on gadgets, never a crash. Starting a
+  Debug build from Xcode attaches lldb, which would stop at the request, so
+  Debug serves the request only when the launch says a servicing debugger is
+  attached (`ANDARIUM_JIT_DEBUGGER=1`). `ANDARIUM_JIT` (`1` or `0`) states the
+  row for a harness launch, which keeps nothing; a launch with another setting
+  starts it off. The JIT compiles every process's code again for itself
+  ([cold code](../darwin/cpu/arm64/jit/README.md#cold-code)), so an Android
+  guest's boot, application launches and background work run several times
+  slower than on gadgets, and a long single-process computation runs faster. An
+  App Store build carries none of this: its runtime has no JIT and the
+  application has no row, preference, entries or sentences.
 - **Motion.** Gyroscope needs no permission. The host reads a sensor only while
-  a guest application uses it and sends samples over private vsock port 5556;
-  the system image must include the
-  [motion sub-HAL](../android/lineage-24/README.md#motion-sensors).
+  a guest application uses it and sends samples over private vsock port 5556
+  from the process's one Core Motion manager, which is never released (a
+  released manager crashes inside Core Motion); the system image must include
+  the [motion sub-HAL](../android/lineage-24/README.md#motion-sensors).
 - **Free space.** Once Android has booted a normal start, the application
   reads the device's free space (`RunSpace.nextCheck`: every 2 s near the
   limit, every 30 s on a roomy device) and pauses the guest below 1 GiB
@@ -343,6 +383,24 @@ is on. `AndariumCore/Adb` speaks the protocol.
   MetricKit reports added under `andarium/`, the application's container paths
   taken out (`BugReportAttachments`); a zip that cannot be amended safely is
   shared as Android made it.
+- **File browser** in Settings browses the guest's internal storage
+  (`/storage/emulated/0/`, the guest Files app's root) and imports and exports
+  files over the same channel, in a normal session and whatever the guest's USB
+  debugging setting is, since adbd serves the application's key either way
+  (`Live/LiveGuestFiles.swift`, `AdbSync`, `GuestFiles`). One transfer runs
+  at a time; Install APK and Create bug report wait for it. An import is
+  written to a hidden `.andarium-*.part` name beside its destination and moved
+  into place, so a stopped or failed one leaves nothing and a Replace keeps the
+  original until the new file is whole. The move's own shell command then has
+  the guest's media index complete the file's row (a file the shell user
+  writes has only a pending one, which MediaStore keeps from other apps).
+  A transfer stops when the application leaves the foreground, and its files
+  say so. Turning USB debugging off restarts adbd, which ends a transfer in
+  flight: it fails, and Try Again runs it whole. Android reports its boot done
+  before internal storage is mounted, so the browser is unavailable until a
+  check in the guest finds the storage mounted, writable and holding a
+  standard folder (`InternalStorage`); nothing is imported or exported before
+  then.
 - **ADB over network** is off at every run and never persisted, and is
   available only while the guest's USB debugging is on. `AdbNetworkBridge`
   listens on TCP 5555 and relays each computer to a fresh vsock stream, serving
@@ -351,7 +409,10 @@ is on. `AndariumCore/Adb` speaks the protocol.
   `NSLocalNetworkUsageDescription`. Nothing listens before the toggle.
 - **Privacy.** The adb features add no required-reason API beyond the
   disk-space API with reason E174.1 (the start's own space check already uses
-  it).
+  it) and, for the file browser, the file-timestamp API: an import reads the
+  date of a file the person picked (3B52.1) and an export sets the date of its
+  staged copy inside the application's container (C617.1), so both keep the
+  file's own date.
 
 ## Acknowledgements
 
@@ -383,6 +444,10 @@ in that directory, holding a number, stands for the device's free space in the
 run's low-space watch while it exists, so a harness drives the pause without
 filling the disk; a file `space-answer` there (`resume`, `shutdown` or
 `check`) answers the screen over a paused guest once it offers that answer.
+`run_ios_device_android.py --engine jit` runs the guest on the JIT, with the
+stand-in debugger of `tests/integration/support/ios_jit_debugger.py` serving
+the request that StikDebug serves for a person (`--jit-debugger none` shows the
+fall back to gadgets).
 
 On an Apple silicon Mac, `xcodebuild test -scheme Andarium -destination
 'platform=macOS,variant=Designed for iPad'

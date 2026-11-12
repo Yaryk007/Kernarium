@@ -202,6 +202,6 @@ public enum BugReport {
     public static let stopCommand = "setprop ctl.stop dumpstatez"
 
     static func shellQuoted(_ value: String) -> String {
-        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        quotedForShell(value)
     }
 }

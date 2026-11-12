@@ -43,6 +43,9 @@ public struct Lifecycle: Equatable, Sendable {
     /// and the tests set it to reach a screen directly.
     public var phase: Phase = .home
     public var notice: HomeNotice?
+    /// The capacity the start now booting grew the guest's storage from, for
+    /// its boot screen; nil when it grew nothing. Never stored.
+    public var grewFromGiB: Int?
 
     public init(guest: Guest?) {
         self.guest = guest
@@ -89,7 +92,11 @@ public struct Lifecycle: Equatable, Sendable {
         }
     }
 
-    /// Starts the guest if the host allows it; the verdict says why not.
+    /// Starts the guest if the host allows it; the verdict says why not. An
+    /// allowed start is handed to the runtime next, which grows the data disk
+    /// to the capacity the start carries, Recovery included: a pending growth
+    /// applies here (`Guest.applyPendingGrowth`), and the caller saves the
+    /// guest before it hands the start over.
     @discardableResult
     public mutating func start(
         _ mode: StartMode, host: HostDevice, plan: StartPlan = .normal
@@ -97,25 +104,32 @@ public struct Lifecycle: Equatable, Sendable {
         let verdict = startVerdict(mode, host: host, plan: plan)
         if case let .allowed(kind) = verdict {
             phase = .booting(kind)
+            grewFromGiB = guest?.applyPendingGrowth()
         }
         return verdict
     }
 
-    /// The boot reached Android (or Recovery). A recovery boot changes
-    /// nothing in the guest; any other applies a pending growth.
+    /// The boot reached Android (or Recovery).
     public mutating func finishBoot(_ kind: BootKind) {
-        if kind != .recovery {
-            guest?.didBoot()
-        }
+        grewFromGiB = nil
         phase = .running(kind == .recovery ? .recovery : .normal)
     }
 
-    public mutating func powerOff() { phase = .home }
+    public mutating func powerOff() {
+        grewFromGiB = nil
+        phase = .home
+    }
 
-    public mutating func fail() { phase = .failed }
+    public mutating func fail() {
+        grewFromGiB = nil
+        phase = .failed
+    }
 
     /// Android's own Restart boots the guest again in place.
-    public mutating func restart() { phase = .booting(.restart) }
+    public mutating func restart() {
+        grewFromGiB = nil
+        phase = .booting(.restart)
+    }
 }
 
 /// How a run ended, from the runtime's result.

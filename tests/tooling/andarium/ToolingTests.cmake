@@ -21,6 +21,16 @@ uml_add_tooling_test(
     LABELS andarium;android
     TIMEOUT 90)
 
+# The stand-in debugger that serves the JIT's request for executable memory on
+# an iOS device: its decisions on a fake memory, and the host side's parts that
+# need no device.
+uml_add_tooling_test(
+    NAME andarium-ios-jit-debugger
+    COMMAND ${Python3_EXECUTABLE} -B
+        ${PROJECT_SOURCE_DIR}/tests/tooling/andarium/test_ios_jit_debugger.py
+    LABELS andarium;android
+    TIMEOUT 30)
+
 # The App Store configuration builds an application that passes this check as
 # its last build phase; the fixtures show it finds each problem the script's
 # header lists, and leaves the guest kernel image alone.
@@ -59,3 +69,10 @@ uml_add_tooling_test(
         ${PROJECT_SOURCE_DIR}/tests/tooling/andarium/test_capture_screens.py
     LABELS andarium
     TIMEOUT 60)
+
+uml_add_tooling_test(
+    NAME andarium-ios-jit-build
+    COMMAND ${Python3_EXECUTABLE} -B
+        ${PROJECT_SOURCE_DIR}/tests/tooling/andarium/test_ios_jit_build.py
+    LABELS andarium;package
+    TIMEOUT 30)

@@ -133,8 +133,9 @@ def parse_arguments(arguments: Sequence[str] | None = None) -> argparse.Namespac
         type=positive_integer,
         help=(
             "capacity of the data disk in GiB: a new disk is created at it, an "
-            "existing one grown to it, and one never shrinks (default: the "
-            "release's default for a new disk, otherwise unchanged)"
+            "existing one grown to it, and a larger one is kept, never shrunk "
+            "(default: the release's default for a new disk, otherwise "
+            "unchanged)"
         ),
     )
     update = parser.add_mutually_exclusive_group()

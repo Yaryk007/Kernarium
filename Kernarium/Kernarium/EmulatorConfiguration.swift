@@ -40,7 +40,7 @@ struct EmulatorConfiguration: Equatable {
     static let retinaEnvironmentKey = "KERNARIUM_RETINA_MODE"
     static let autoResizeGuestEnvironmentKey = "KERNARIUM_GPU_AUTO_RESIZE"
     // The three launch parameters of the host GPU's fixed budget
-    // B = clamp(L - A - G - E - S, 384 MiB, G / 2): A, the application's own
+    // B = max(L - A - G - E - S, 384 MiB): A, the application's own
     // expected ceiling; E_rest, the guest side's memory beyond the gadget
     // cache; and S, the headroom left unused. Only the environment states
     // them, for a measurement run.
@@ -70,8 +70,17 @@ struct EmulatorConfiguration: Equatable {
         Int(launchMemorySet.headroom_mib)
     }
     static let gpuBudgetParameterRangeMiB = 0...16384
-    static let guestMemoryRangeMiB = 512...4096
+    // The sizes the stepper steps through: from 512 MiB in 64 MiB steps, through
+    // the top of any range, 1 TiB (`guest_memory_range_maximum_mib`). The most
+    // it offers at a vCPU count is the runtime's budget answer
+    // (`systemGuestMemoryBound`), which the host's ceiling bounds.
+    static let guestMemoryRangeMiB = 512...(1 << 20)
     static let guestMemoryStepMiB = 64
+    /// The most guest RAM this host admits whatever the memory limit says: the
+    /// window the runtime puts the kernel in and the host's RAM, as the loader
+    /// answers. The settings' note about the limit shows below it.
+    static let guestMemoryCeilingMiB =
+        Int(kernarium_runtime_loader_guest_memory_ceiling_mib())
     static let overlaySizeRangeGiB = 1...32
     // The release's data disk template allows 4 through 64 GiB; the setting
     // keeps its established floor.
@@ -79,10 +88,10 @@ struct EmulatorConfiguration: Equatable {
     /// The guest RAM a new configuration takes at `vCPUCount` vCPUs, as the
     /// runtime's own rule gives it, read through the loader against the memory
     /// limit the system sets this process: the most the conservative launch
-    /// set leaves the host GPU its floor for, in half-gibibyte steps within
-    /// 1536...4096 MiB and never above the maximum the settings offer. A
-    /// device takes less than a Mac, which sets no limit and has 4096. A value
-    /// the user stored is kept.
+    /// set leaves the host GPU its floor for, in half-gibibyte steps from
+    /// 1536 MiB, held to 4096 and never above the maximum the settings offer.
+    /// A device takes less than a Mac, which sets no limit and has 4096. A
+    /// value the user stored is kept.
     typealias DefaultGuestMemory = (_ vCPUCount: Int) -> Int
 
     static let systemDefaultGuestMemory: DefaultGuestMemory = { vCPUCount in
@@ -114,7 +123,8 @@ struct EmulatorConfiguration: Equatable {
 
     /// What the system allows: the runtime's own budget formula with the
     /// maximum set, read through the loader against the memory limit the
-    /// system sets this process, 4096 where it sets none (a Mac).
+    /// system sets this process, the host's ceiling where it sets none (a
+    /// Mac).
     static let systemGuestMemoryBound: GuestMemoryBound = { vCPUCount in
         Int(kernarium_runtime_loader_maximum_guest_memory_mib(
             UInt32(clamping: max(vCPUCount, 1)),

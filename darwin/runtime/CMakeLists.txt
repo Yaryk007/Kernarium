@@ -43,9 +43,7 @@ target_include_directories(uml_runtime_context PRIVATE
 # JIT, but measurement rejects it for the workloads that matter: see G157.
 # The x86-64 product defaults to the gadget engine until its JIT measures
 # ahead; `--execution-engine jit` selects the x86-64 JIT there.
-if((UML_TARGET_MACOS OR
-     UML_ENABLE_IOS_STIKDEBUG_JIT) AND
-     NOT UML_X86_64_USERSPACE_ONLY)
+if(UML_TARGET_MACOS AND NOT UML_X86_64_USERSPACE_ONLY)
     set(_uml_default_execution_engine_jit ON)
 else()
     set(_uml_default_execution_engine_jit OFF)
@@ -155,10 +153,23 @@ target_link_libraries(uml_runtime_guest_selector PRIVATE
 target_include_directories(uml_runtime_guest_selector PRIVATE
     ${PROJECT_SOURCE_DIR}/darwin)
 
+# What the host does with the guest's disk files at a quiesce and a resume: the
+# flush, the lock release and the verifying restore, which records a refusal
+# in the session record and ends the process.
+add_library(uml_runtime_guest_sync OBJECT
+    ${PROJECT_SOURCE_DIR}/darwin/runtime/guest_sync.cpp)
+add_library(UML::RuntimeGuestSync ALIAS uml_runtime_guest_sync)
+uml_declare_architecture_target(uml_runtime_guest_sync runtime)
+target_link_libraries(uml_runtime_guest_sync PRIVATE
+    UML::GuestFiles
+    UML::RuntimeSessionRecord)
+target_include_directories(uml_runtime_guest_sync PUBLIC
+    ${PROJECT_SOURCE_DIR}/darwin/runtime
+    ${PROJECT_SOURCE_DIR}/darwin/platform)
+
 add_library(uml_runtime_entry OBJECT
     ${PROJECT_SOURCE_DIR}/darwin/runtime/bridge.cpp
-    ${PROJECT_SOURCE_DIR}/darwin/runtime/guest_hand_back.cpp
-    ${PROJECT_SOURCE_DIR}/darwin/runtime/guest_sync.cpp)
+    ${PROJECT_SOURCE_DIR}/darwin/runtime/guest_hand_back.cpp)
 uml_declare_architecture_target(uml_runtime_entry runtime)
 target_link_libraries(uml_runtime_entry PRIVATE
     UML::DeviceGuestEnd
@@ -187,6 +198,7 @@ target_sources(uml_runtime_objects INTERFACE
     $<TARGET_OBJECTS:uml_runtime_virtual_jetsam>
     $<TARGET_OBJECTS:uml_runtime_guest_statistics>
     $<TARGET_OBJECTS:uml_runtime_guest_selector>
+    $<TARGET_OBJECTS:uml_runtime_guest_sync>
     $<TARGET_OBJECTS:uml_runtime_entry>
     $<TARGET_OBJECTS:uml_static_runtime>)
 

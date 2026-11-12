@@ -122,12 +122,18 @@ kernarium_launch_memory_set kernarium_runtime_loader_launch_memory_set(void);
 /* The parameters the most guest RAM a person may choose is measured with: they
  * count none of A, E_rest and S. Only the maximum uses them. */
 kernarium_launch_memory_set kernarium_runtime_loader_maximum_memory_set(void);
+/* The most guest RAM, in MiB, this host admits whatever the budget says (C of
+ * runtime/guest_memory_budget.hpp): the RAM the runtime's native kernel window
+ * holds for this process, 9152 on an iOS device or the Simulator and 1 TiB in
+ * a macOS window, and no more than the host's own RAM, on the 64 MiB steps. The
+ * settings' ruler ends here at most. */
+uint32_t kernarium_runtime_loader_guest_memory_ceiling_mib(void);
 /* The most guest RAM, in MiB, the settings offer at `guest_processor_count`
  * vCPUs with `parameters` (zero vCPUs count as one): the largest multiple of 64
- * from 512 through 4096 that leaves the host GPU its 384 MiB floor under the
- * memory limit the system sets this process. 4096 where the system sets none,
- * the Mac included; 512 where even that leaves less than the floor. The
- * settings pass the maximum set. */
+ * from 512 through the ceiling above that leaves the host GPU its 384 MiB floor
+ * under the memory limit the system sets this process. The ceiling where the
+ * system sets none, the Mac included; 512 where even that leaves less than the
+ * floor. The settings pass the maximum set. */
 uint32_t kernarium_runtime_loader_maximum_guest_memory_mib(
     uint32_t guest_processor_count,
     kernarium_launch_memory_set parameters);
@@ -140,8 +146,9 @@ uint32_t kernarium_runtime_loader_maximum_guest_memory_mib_for_limit(
  * (zero counts as one): the conservative size below, and where the system's
  * limit lets a guest have 4096 MiB at one vCPU also no more than the largest
  * multiple of 512 that leaves the host GPU a budget of 1024 MiB with
- * `parameters`, the launch set. 4096 where the system sets no limit. A guest
- * with more is likely to run short of graphics memory. */
+ * `parameters`, the launch set. Never more than 4096, whatever is offered;
+ * 4096 where the system sets no limit. A guest with more is likely to run
+ * short of graphics memory. */
 uint32_t kernarium_runtime_loader_default_guest_memory_mib(
     uint32_t guest_processor_count,
     kernarium_launch_memory_set parameters);
@@ -150,11 +157,24 @@ uint32_t kernarium_runtime_loader_default_guest_memory_mib_for_limit(
     uint64_t limit_bytes,
     uint32_t guest_processor_count,
     kernarium_launch_memory_set parameters);
+/* Nonzero where the default above is the size the host GPU's 1024 MiB budget
+ * rule lowered, below the conservative size: a guest with more has less than
+ * that for the GPU from the next multiple of 512, which the applications warn
+ * about. Zero where the default is the conservative size, and then it says
+ * nothing of the GPU's budget. The same choice makes the default. */
+uint32_t kernarium_runtime_loader_default_guest_memory_holds_gpu_budget(
+    uint32_t guest_processor_count,
+    kernarium_launch_memory_set parameters);
+/* The same for a memory limit the caller states in bytes, zero for none. */
+uint32_t kernarium_runtime_loader_default_guest_memory_holds_gpu_budget_for_limit(
+    uint64_t limit_bytes,
+    uint32_t guest_processor_count,
+    kernarium_launch_memory_set parameters);
 /* The most guest RAM, in MiB, before the system is likely to end the process
  * at `guest_processor_count` vCPUs: the most guest RAM with `parameters`, the
- * launch set, taken down to a multiple of 512 and held within 1536 through
- * 4096, and never above the maximum the settings offer. 4096 where the system
- * sets no limit. A guest with more is likely to be ended by the system. */
+ * launch set, taken down to a multiple of 512, at least 1536, and never above
+ * the maximum the settings offer. The maximum where the system sets no limit. A
+ * guest with more is likely to be ended by the system. */
 uint32_t kernarium_runtime_loader_conservative_guest_memory_mib(
     uint32_t guest_processor_count,
     kernarium_launch_memory_set parameters);
@@ -167,7 +187,7 @@ uint32_t kernarium_runtime_loader_conservative_guest_memory_mib_for_limit(
  * at `guest_processor_count` vCPUs gets with `parameters` (zero vCPUs count as
  * one) under the memory limit the system sets this process: the evaluation the
  * run itself makes (kernarium_runtime_plan_gpu_budget_function), rounded down.
- * Half the guest RAM where the system sets no limit. */
+ * The guest RAM where the system sets no limit. */
 uint32_t kernarium_runtime_loader_gpu_budget_mib(
     uint32_t guest_memory_mib,
     uint32_t guest_processor_count,
@@ -185,6 +205,21 @@ uint32_t kernarium_runtime_loader_gpu_budget_mib_for_limit(
  * it too, for the same reason. */
 uint32_t kernarium_runtime_loader_application_vcpu_limit(
     uint32_t physical_processor_count);
+#ifndef UML_APP_STORE_APPLICATION
+/* Prepares the JIT for a guest of `guest_memory_mib` and `guest_processor_count`
+ * vCPUs when `enable` is nonzero, or tells an attached debugger to detach when
+ * it is zero; see kernarium_runtime_prepare_jit_function. Returns the runtime's
+ * KERNARIUM_RUNTIME_JIT_ answer, or KERNARIUM_RUNTIME_JIT_UNSUPPORTED when no
+ * runtime is loaded. It blocks for the seconds a debugger takes, so call it
+ * away from the main thread. */
+int kernarium_runtime_loader_prepare_jit(
+    int enable,
+    uint32_t guest_memory_mib,
+    uint32_t guest_processor_count);
+/* Whether a debugger is attached to this process, which the application knows
+ * before any runtime is loaded. */
+int kernarium_runtime_loader_debugger_attached(void);
+#endif
 /* Turns the guest's microphone on (nonzero) or off (zero), as
  * kernarium_runtime_set_microphone_function does, and returns the resulting
  * KERNARIUM_RUNTIME_MICROPHONE_ value, or -1 when no runtime is loaded. It

@@ -1,9 +1,12 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
 name: Validate StikDebug JIT port
 
 on:
   push:
     branches:
+      - main
       - codex/stikdebug-ios-jit
+      - codex/andarium-jit-build-fix
   pull_request:
   workflow_dispatch:
 
@@ -23,6 +26,11 @@ jobs:
           sh -n Kernarium/scripts/package-ios-frameworks.sh
           plutil -lint Andarium/Config/Andarium.StikDebug.entitlements
 
+      - name: Test build validation and debugger protocol
+        run: |
+          python3 -B tests/tooling/andarium/test_ios_jit_build.py
+          python3 -B tests/tooling/andarium/test_ios_jit_debugger.py
+
       - name: Compile iOS 27 executable-memory owner
         run: |
           mkdir -p .build/jit-source-check
@@ -30,7 +38,7 @@ jobs:
             -std=c++20 \
             -Wall -Wextra -Werror \
             -target arm64-apple-ios27.0 \
-            -DUML_ENABLE_IOS_STIKDEBUG_JIT=1 \
+            -DUML_JIT_MEMORY_REGION_ROUTE=1 \
             -Idarwin/cpu/jit_memory \
             -c darwin/cpu/jit_memory/executable_memory.cpp \
             -o .build/jit-source-check/executable_memory.o
@@ -38,10 +46,15 @@ jobs:
             -std=c++20 \
             -Wall -Wextra -Werror \
             -target arm64-apple-ios27.0 \
-            -DUML_ENABLE_IOS_STIKDEBUG_JIT=1 \
             -DDARWIN_UML_GUEST_PAGE_SIZE=4096 \
             -DDARWIN_UML_GUEST_PAGE_SHIFT=12 \
             -Idarwin \
             -Idarwin/include \
             -c darwin/cpu/arm64/jit/jit_arena.cpp \
             -o .build/jit-source-check/jit_arena.o
+
+      - name: Test the region and preparation on the host
+        run: |
+          cmake --preset macos-unit --fresh
+          ctest --test-dir .build/presets/macos-unit \
+            -R '^arm64-jit-(debugger-region|debugger-request|memory-preparation)$' --output-on-failure

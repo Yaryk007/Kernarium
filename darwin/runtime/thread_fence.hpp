@@ -23,13 +23,17 @@ namespace uml::runtime {
  * long as it is held, and the hibernation itself, or whoever logs about it,
  * would then wait on that lock forever. A thread is therefore held only when
  * neither its program counter nor any return address on its frame chain lies
- * in those libraries; otherwise it is let go and tried again. Likewise a
- * thread that is inside `kernel_pthread_create` is not held until the thread
- * it is creating has been listed, so no thread of the kernel can be started
- * and missed. A lock of the caller's own that a held thread could be inside
- * is the caller's to rule out, as the `settled` condition below. While
- * threads are held, nothing here, and nothing the caller does between `hold`
- * and `release`, may allocate or write to a stream.
+ * in those libraries; otherwise it is let go and tried again. A thread the
+ * fence must hold therefore waits in poll, kevent, a condition variable or
+ * mach_wait_until, which it accepts, and never in nanosleep, usleep, sleep or
+ * std::this_thread::sleep_for: they live in libsystem_c, and a thread inside
+ * one is deferred on every pass. Likewise a thread that is inside
+ * `kernel_pthread_create` is not held until the thread it is creating has
+ * been listed, so no thread of the kernel can be started and missed. A lock of
+ * the caller's own that a held thread could be inside is the caller's to rule
+ * out, as the `settled` condition below. While threads are held, nothing
+ * here, and nothing the caller does between `hold` and `release`, may
+ * allocate or write to a stream.
  *
  * `hold` returns true only when every such thread is held and `settled` (if
  * given) has confirmed the moment. A caller whose condition can only be

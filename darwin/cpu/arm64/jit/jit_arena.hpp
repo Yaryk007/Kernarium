@@ -12,6 +12,8 @@ namespace uml::cpu::arm64::jit::detail {
 
 /* The arm64 JIT's block store, link tables and literal patching, over memory
  * from cpu/jit_memory. The gadget engines do not include or call this.
+ * Instructions are written at the arena's writable address and execute at its
+ * mapping; the arena never writes the mapping itself.
  */
 class ExecutableArena final {
 public:
@@ -67,6 +69,10 @@ public:
 
 private:
 	void *mapping_{};
+	/* Where the arena's instructions are written: mapping_ on macOS, inside
+	 * the write window, and its writable alias on an iOS device. Code executes
+	 * and is made visible at mapping_ either way. */
+	std::byte *writable_{};
 	std::size_t used_{};
 	std::size_t size_{};
 };

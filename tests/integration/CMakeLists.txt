@@ -571,6 +571,18 @@ uml_add_guest_integration_test(
     TIMEOUT 900
     CPUS 2)
 
+# A management-console command that sends what the kernel prints to its client,
+# "sysrq s" as the host asks for it before a suspend, ends with its final reply
+# again and again while three other vCPUs keep printing, that reply names the
+# command and says it ran, and the guest runs on with no fault. A guest booted
+# with SysRq off ends the same command with an error that says so.
+uml_add_guest_integration_test(
+    NAME guest-mconsole-console-clients
+    SCRIPT kernel/run_guest_mconsole_console_clients.py
+    LABELS guest;kernel;smoke
+    TIMEOUT 300
+    CPUS 4)
+
 # Removing the Virtio video decoder and encoder by unbind, management-console
 # halt or forced power-off, while files are open and buffers queued, resets
 # each first, returns everything it held and frees nothing an open file still
@@ -903,8 +915,8 @@ uml_add_guest_integration_test(
 # blob waits for the host's answer and fails with EINVAL or ENOMEM, in the
 # host3d and guest-blob branches alike, instead of returning a GEM handle that
 # no host resource stands behind. The guest has the GPU. The probe names host
-# objects that do not exist (EINVAL), and asks for a resource larger than the
-# GPU budget of a 1 GiB guest, made inside the blob's command buffer as gralloc
+# objects that do not exist (EINVAL), and asks for a resource the GPU budget of
+# a 1 GiB guest cannot hold, made inside the blob's command buffer as gralloc
 # does (ENOMEM).
 uml_add_guest_integration_test(
     NAME guest-virtgpu-blob-refusal
@@ -917,6 +929,23 @@ uml_add_guest_integration_test(
     LABELS guest;kernel;gpu
     TIMEOUT 600
     CPUS 4
+    GPUS 1)
+
+# A system call that copies from or into a mapped host-visible Virtio-GPU blob,
+# whose frames lie in the vhost-user shared-memory aperture outside guest RAM,
+# fails with EFAULT, while the process's own access to the blob works, and the
+# guest runs on.
+uml_add_guest_integration_test(
+    NAME guest-virtgpu-blob-uaccess
+    SCRIPT support/run_guest_probe.py
+    ARGS --probe ${PROJECT_SOURCE_DIR}/tests/integration/kernel/virtgpu_blob_uaccess_probe.cpp
+        "--cxxflags=-Wall -Wextra -Werror"
+        --guest-argument=--gpu --guest-argument=--gpu-display=vnc
+        --guest-argument=--gpu-vnc-bind=127.0.0.1 --guest-argument=--gpu-vnc-port=0
+        --ncpus 2 --probe-timeout 240
+    LABELS guest;kernel;gpu
+    TIMEOUT 600
+    CPUS 2
     GPUS 1)
 
 # A Virtio-GPU context names the process that created it: the kernel appends

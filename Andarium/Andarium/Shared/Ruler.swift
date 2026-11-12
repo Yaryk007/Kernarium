@@ -17,6 +17,12 @@ struct Ruler: View {
     var majorOffset: Int = 0
     /// Draw a short tick only every this many positions.
     var minorEvery: Int = 1
+    /// The whole number a long tick stands for (the gibibytes of a memory
+    /// ruler), where the ruler may have more positions than room. Its labels
+    /// then thin out to the round numbers (multiples of 1, 2, 5, 10 ...) that
+    /// do not touch, and so do its ticks (`RulerThinning`). Without it every
+    /// long tick is labelled.
+    var majorNumber: ((Int) -> Int)?
     let label: (Int) -> String
     /// What VoiceOver reads for a position, where its label leaves out a unit.
     var valueText: ((Int) -> String)?
@@ -27,6 +33,9 @@ struct Ruler: View {
     var accessibilityName: String = ""
 
     @State private var dragging = false
+    /// The width the ruler is laid out at, which decides how much of it is
+    /// thinned, for the accessibility steps outside the layout pass.
+    @State private var width: CGFloat = 0
     /// A drag that starts mostly vertical belongs to the scroll view.
     @State private var horizontal: Bool?
 
@@ -37,6 +46,8 @@ struct Ruler: View {
         GeometryReader { geo in
             let step = (geo.size.width - inset * 2) / CGFloat(max(count - 1, 1))
             let x = { (i: Int) -> CGFloat in inset + CGFloat(i) * step }
+            let thinning = makeThinning(positionWidth: step)
+            let shortEvery: Int? = if let thinning { thinning.shortEvery } else { minorEvery }
             ZStack(alignment: .topLeading) {
                 Capsule()
                     .fill(Color.primary.opacity(0.06))
@@ -71,16 +82,21 @@ struct Ruler: View {
                 }
                 ForEach(0..<count, id: \.self) { i in
                     let major = (i - majorOffset) % majorEvery == 0
+                    // A long tick is drawn and labelled unless the ruler is
+                    // crowded and its number is not one of the round ones.
+                    let long = major && (thinning.map { $0.drawsLong(number(i)) } ?? true)
+                    let labelled = major && (thinning.map { $0.labels(number(i)) } ?? true)
+                    let short = !major && (shortEvery.map { (i - majorOffset) % $0 == 0 } ?? false)
                     let warn = warnFrom.map { i >= $0 } ?? false
                     let severe = severeFrom.map { i >= $0 } ?? false
                     let below = i < floor
-                    if major || (i - majorOffset) % minorEvery == 0 {
+                    if long || short {
                         Capsule()
-                            .fill(tickColor(major: major, warn: warn, severe: severe, below: below))
-                            .frame(width: 2, height: major ? 14 : 8)
+                            .fill(tickColor(major: long, warn: warn, severe: severe, below: below))
+                            .frame(width: 2, height: long ? 14 : 8)
                             .position(x: x(i), y: track / 2)
                     }
-                    if major {
+                    if labelled {
                         Text(label(i))
                             .font(.system(size: 12, weight: i == index ? .bold : .medium, design: .rounded).monospacedDigit())
                             .foregroundStyle(labelStyle(selected: i == index, warn: warn, severe: severe, below: below))
@@ -117,18 +133,46 @@ struct Ruler: View {
             )
         }
         .frame(height: 52)
+        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width = $0 }
         .sensoryFeedback(.selection, trigger: index)
         .accessibilityElement()
         .accessibilityLabel(accessibilityName)
         .accessibilityValue((valueText ?? label)(index))
         .accessibilityAdjustableAction { direction in
             switch direction {
-            case .increment: index = min(count - 1, index + 1)
-            case .decrement: index = max(floor, index - 1)
+            case .increment: index = adjusted(forward: true)
+            case .decrement: index = adjusted(forward: false)
             @unknown default: break
             }
         }
     }
+
+    /// Where VoiceOver's increment or decrement goes: one position, or on a
+    /// ruler whose labels are thinned the next labelled one.
+    private func adjusted(forward: Bool) -> Int {
+        let positionWidth = (width - inset * 2) / CGFloat(max(count - 1, 1))
+        guard let thinning = makeThinning(positionWidth: positionWidth), thinning.labelEvery > 1 else {
+            return forward ? min(count - 1, index + 1) : max(floor, index - 1)
+        }
+        return thinning.adjusted(from: index, forward: forward, floor: floor, count: count) { position in
+            (position - majorOffset) % majorEvery == 0 && thinning.labels(number(position))
+        }
+    }
+
+    /// How much of a crowded ruler is drawn; nil where the ruler states no
+    /// numbers to thin by, and then all of it is. A label is about 7.5 points
+    /// to a character.
+    private func makeThinning(positionWidth: CGFloat) -> RulerThinning? {
+        guard majorNumber != nil, count > 1, positionWidth > 0 else { return nil }
+        let longest = stride(from: max(majorOffset, 0), to: count, by: majorEvery)
+            .map { label($0).count }.max() ?? 1
+        return RulerThinning(
+            positionWidth: Double(positionWidth), longEvery: majorEvery, shortEvery: minorEvery,
+            labelWidth: Double(longest) * 7.5
+        )
+    }
+
+    private func number(_ i: Int) -> Int { majorNumber?(i) ?? 0 }
 
     private func set(at x: CGFloat, step: CGFloat) {
         let raw = Int(((x - inset) / step).rounded())
@@ -217,14 +261,15 @@ struct SystemControls: View {
         // many steps above the bottom of the ruler.
         let bottom = stops.first ?? Limits.minimumMemoryMiB
         let steps = (1024 - bottom % 1024) % 1024 / Limits.memoryStepMiB
-        // Sizes past what a new guest gets turn orange, and past the size
-        // where iOS is likely to close Andarium red where that is a higher
-        // one; the line beneath says why while the chosen size is one of
-        // them, the worse risk alone. Both sizes follow the vCPU count as the
-        // top does.
-        let defaultMiB = host.memory.defaultMemoryMiB(vCPUs: guest.cores)
+        // Sizes past the graphics line (what a new guest gets, or more where
+        // the graphics memory does not fall below a gibibyte above it) turn
+        // orange, and past the size where iOS is likely to close Andarium red
+        // where that is a higher one; the line beneath says why while the
+        // chosen size is one of them, the worse risk alone. Both sizes follow
+        // the vCPU count as the top does.
+        let graphicsLineMiB = host.memory.graphicsLineMiB(vCPUs: guest.cores)
         let safeMiB = host.memory.safeMemoryMiB(vCPUs: guest.cores)
-        let distinct = safeMiB > defaultMiB
+        let distinct = safeMiB > graphicsLineMiB
         let risk = host.memory.risk(guest.memoryMiB, vCPUs: guest.cores)
         return ControlRow(title: "Memory", symbol: "memorychip", value: Formats.size(mib: guest.memoryMiB)) {
             Ruler(
@@ -236,9 +281,10 @@ struct SystemControls: View {
                 majorEvery: 1024 / Limits.memoryStepMiB,
                 majorOffset: steps,
                 minorEvery: 256 / Limits.memoryStepMiB,
+                majorNumber: { stops[$0] / 1024 },
                 label: { Formats.gibibytes(mib: stops[$0]) },
                 valueText: { Formats.size(mib: stops[$0]) },
-                warnFrom: stops.firstIndex { $0 > defaultMiB },
+                warnFrom: stops.firstIndex { $0 > graphicsLineMiB },
                 severeFrom: distinct ? stops.firstIndex { $0 > safeMiB } : nil,
                 accessibilityName: "Memory"
             )
@@ -248,7 +294,7 @@ struct SystemControls: View {
                 Label(MemoryWarning.note(safeMiB: safeMiB), systemImage: "exclamationmark.triangle.fill")
                     .foregroundStyle(distinct ? Color.red : Color.orange)
             case .graphics:
-                Label(GraphicsMemoryWarning.note(defaultMiB: defaultMiB), systemImage: "exclamationmark.triangle.fill")
+                Label(GraphicsMemoryWarning.note(aboveMiB: graphicsLineMiB), systemImage: "exclamationmark.triangle.fill")
                     .foregroundStyle(.orange)
             case .none:
                 EmptyView()
@@ -258,8 +304,9 @@ struct SystemControls: View {
 }
 
 /// The third row of the System sheet: the estimate of the guest's graphics
-/// memory, orange while the chosen memory is above what a new guest gets, with
-/// the note that it is not part of the RAM.
+/// memory, orange while the chosen memory leaves it short
+/// (`MemoryPolicy.isShortOfGraphicsMemory`), with the note that it is not part
+/// of the RAM.
 struct GraphicsMemoryRow: View {
     let estimateMiB: Int
     let warns: Bool

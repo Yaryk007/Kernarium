@@ -74,6 +74,14 @@ if(TARGET uml_gpu_memory_pressure)
         LIBRARIES UML::GpuMemoryPressure)
 endif()
 
+# Whether a refused Venus allocation waits for the guest's reclaimer: the
+# policy needs no GPU device either.
+if(TARGET uml_gpu_reclaim_wait)
+    uml_add_gpu_unit_test(gpu-reclaim-wait
+        uml_gpu_reclaim_wait_tests reclaim_wait_tests.cpp
+        LIBRARIES UML::GpuReclaimWait Threads::Threads)
+endif()
+
 uml_add_gpu_unit_test(gpu-metal-submit-timing-collector
     uml_gpu_metal_submit_timing_tests metal_submit_timing_tests.cpp
     LIBRARIES Threads::Threads
@@ -109,6 +117,13 @@ if(TARGET uml_gpu_device_memory_pool)
         uml_gpu_device_memory_pool_tests device_memory_pool_tests.cpp
         LIBRARIES UML::GpuDeviceMemoryPool Threads::Threads
         TIMEOUT 60)
+endif()
+
+# Whether the pool's reclaim hook has a free to wait for.
+if(TARGET uml_gpu_freed_memory_watch)
+    uml_add_gpu_unit_test(gpu-freed-memory-watch
+        uml_gpu_freed_memory_watch_tests freed_memory_watch_tests.cpp
+        LIBRARIES UML::GpuFreedMemoryWatch Threads::Threads)
 endif()
 
 # The graphics footprint counts host GPU memory that Metal's allocated size
@@ -225,6 +240,15 @@ if(TARGET uml_gpu_service AND UML_TARGET_MACOS)
 endif()
 
 if(TARGET uml_gpu_service)
+    # A guest that destroys a framebuffer's attachment image view, or its
+    # image, and then begins a render pass on that framebuffer must lose its
+    # context, not crash the host in the driver's render-pass setup.
+    uml_add_gpu_unit_test(gpu-venus-render-pass-lifetime
+        uml_gpu_venus_render_pass_lifetime_tests
+        venus_render_pass_lifetime_tests.cpp
+        LIBRARIES ${_uml_host_gl_libraries}
+        VULKAN UNIT_DIRECTORY TIMEOUT 120)
+
     uml_add_gpu_unit_test(gpu-host-gl-provider-lifetime
         uml_gpu_host_gl_provider_tests host_gl_provider_lifetime_tests.cpp
         LIBRARIES uml_gpu_renderer UML::ThirdPartyVirglrenderer
@@ -380,6 +404,15 @@ if(TARGET uml_gpu_service)
     uml_add_gpu_unit_test(gpu-host-gl-batch-storage
         uml_gpu_host_gl_batch_storage_tests
         host_gl_batch_storage_tests.cpp
+        LIBRARIES ${_uml_host_gl_libraries} UML::HostGpuMemory
+        INCLUDES ${_uml_gpu_device_directory}
+        UNIT_DIRECTORY TIMEOUT 120)
+
+    # What the driver caches for a context that is idle or destroyed goes
+    # back while other contexts go on drawing.
+    uml_add_gpu_unit_test(gpu-host-gl-idle-release
+        uml_gpu_host_gl_idle_release_tests
+        host_gl_idle_release_tests.cpp
         LIBRARIES ${_uml_host_gl_libraries} UML::HostGpuMemory
         INCLUDES ${_uml_gpu_device_directory}
         UNIT_DIRECTORY TIMEOUT 120)

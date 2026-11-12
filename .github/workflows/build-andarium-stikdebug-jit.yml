@@ -1,8 +1,13 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
 name: Build Andarium StikDebug JIT IPA
 
 on:
   workflow_dispatch:
     inputs:
+      build_number:
+        description: Build number above every previously distributed fork build
+        required: true
+        type: string
       android_release_url:
         description: HTTPS URL of the accepted Android release tar archive
         required: true
@@ -33,6 +38,16 @@ jobs:
       KERNARIUM_XCFRAMEWORK_OUTPUT: ${{ github.workspace }}/.build/kernarium-xcframeworks
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install build tools
+        run: |
+          brew install make cmake ninja meson pkg-config rsync autoconf automake gettext libtool gperf groff
+          python3 -m venv .build/gpu-tools-venv
+          .build/gpu-tools-venv/bin/pip install mako pyyaml
+          echo "$PWD/.build/gpu-tools-venv/bin" >> "$GITHUB_PATH"
+          xcodebuild -downloadComponent MetalToolchain
 
       - name: Verify build tools
         run: |
@@ -40,6 +55,34 @@ jobs:
           cmake --version
           ninja --version
           python3 --version
+          test "$(uname -m)" = arm64
+          xcodebuild -version | head -1 | grep -Eq '^Xcode 27([. ]|$)'
+
+      - name: Validate build number
+        env:
+          BUILD_NUMBER: ${{ inputs.build_number }}
+        run: |
+          python3 - <<'PYTHON'
+          import json, os, sys
+          from pathlib import Path
+          sys.path.insert(0, "tests/tooling/cmake")
+          from validate_json_inputs import strip_jsonc_comments, strip_jsonc_trailing_commas
+          number = os.environ["BUILD_NUMBER"]
+          project = json.loads(strip_jsonc_trailing_commas(strip_jsonc_comments(
+              Path("Andarium/Andarium.xcodeproj/project.xcproj").read_text())))
+          def builds(node):
+              if isinstance(node, dict):
+                  for key, value in node.items():
+                      if key == "CURRENT_PROJECT_VERSION":
+                          yield int(value)
+                      else:
+                          yield from builds(value)
+              elif isinstance(node, list):
+                  for value in node:
+                      yield from builds(value)
+          if not number.isascii() or not number.isdecimal() or int(number) <= max(builds(project)):
+              raise SystemExit("Choose a numeric build number above the checked-in versions and all previous fork builds")
+          PYTHON
 
       - name: Cache pinned dependency builds
         uses: actions/cache@v4
@@ -48,9 +91,7 @@ jobs:
             external/sources
             .build/dependency-cache
             .build/dependencies
-          key: andarium-ios27-${{ runner.os }}-${{ hashFiles('dependencies/manifest.tsv', 'dependencies/platforms/**', 'dependencies/patches/**') }}
-          restore-keys: |
-            andarium-ios27-${{ runner.os }}-
+          key: andarium-ios27-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('dependencies/**', 'tools/rootfs/**', 'scripts/patch_series.py') }}
 
       - name: Fetch accepted Android release
         env:
@@ -67,7 +108,8 @@ jobs:
           curl --fail --location --retry 3 "$KERNEL_URL" --output "$RUNNER_TEMP/andarium-kernel.tar"
           printf '%s  %s\n' "$KERNEL_SHA256" "$RUNNER_TEMP/andarium-kernel.tar" | shasum -a 256 --check
           tar -xf "$RUNNER_TEMP/andarium-kernel.tar" -C .build/kernel/artifacts
-          Andarium/scripts/stage-system-image.py
+          python3 Andarium/scripts/stage-system-image.py
+          python3 scripts/check-embedded-artifacts.py --android-release --kernel android
 
       - name: Prepare pinned dependency sources
         run: |
@@ -84,13 +126,16 @@ jobs:
           dependencies/build-ios-network.sh --platform ios
           dependencies/build-apple-gpu.sh --platform ios --jobs "$(sysctl -n hw.ncpu)"
 
-      - name: Build experimental Android JIT runtime
+      - name: Build optimized Android development runtime
         run: |
-          cmake --preset kernarium-ios-device-android-stikdebug-jit
-          cmake --build --preset kernarium-ios-device-android-stikdebug-jit
-          Kernarium/scripts/package-ios-frameworks.sh --sdk device --runtimes android --stikdebug-jit
+          cmake --preset kernarium-ios-device-android --fresh -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+          python3 Andarium/scripts/check-ios-jit-build.py .build/kernarium-runtime-ios-device-android-4k
+          cmake --build --preset kernarium-ios-device-android --parallel "$(sysctl -n hw.ncpu)"
+          Kernarium/scripts/package-ios-frameworks.sh --sdk device --runtimes android
 
       - name: Build Andarium without signing
+        env:
+          BUILD_NUMBER: ${{ inputs.build_number }}
         run: |
           xcodebuild build \
             -project Andarium/Andarium.xcodeproj \
@@ -99,7 +144,10 @@ jobs:
             -configuration Release \
             -derivedDataPath "$DERIVED_DATA" \
             -jobs "$(sysctl -n hw.ncpu)" \
+            CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
             CODE_SIGNING_ALLOWED=NO
+          python3 scripts/check-embedded-artifacts.py --android-release --kernel android \
+            --app "$DERIVED_DATA/Build/Products/Release-iphoneos/Andarium.app"
 
       - name: Package unsigned IPA
         run: |

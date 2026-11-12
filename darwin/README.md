@@ -139,7 +139,8 @@ patches provide the behaviors the `slirp-network-*` tests check.
   the common termination cleanup.
 - A forward queues up to the host's `SOMAXCONN` pending connections; the
   advertised receive window never exceeds the free buffer; a connection whose
-  guest end stops answering is closed; a connect the host stack refuses is
+  guest end stops answering is closed; a host connection that dies in both
+  directions is reset toward the guest; a connect the host stack refuses is
   answered with ICMP net-unreachable (port 0 excepted); ICMP echo is forwarded
   as a router would.
 - The provider answers the guest's name server itself, through the host's system

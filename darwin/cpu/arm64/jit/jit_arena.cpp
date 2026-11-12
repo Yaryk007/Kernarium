@@ -14,6 +14,7 @@ namespace uml::cpu::arm64::jit::detail {
 ExecutableArena::ExecutableArena(std::size_t size) noexcept : size_{size}
 {
 	mapping_ = jit_memory::allocate(size_);
+	writable_ = static_cast<std::byte *>(jit_memory::writable_alias(mapping_));
 }
 
 ExecutableArena::~ExecutableArena()
@@ -36,11 +37,8 @@ void *ExecutableArena::store(
 	    bytes > size_ - aligned)
 		return nullptr;
 	auto *destination = static_cast<std::byte *>(mapping_) + aligned;
-	auto *writable = jit_memory::writable_alias(destination);
-	if (writable == nullptr)
-		return nullptr;
 	jit_memory::set_writable(true);
-	std::memcpy(writable, words.data(), bytes);
+	std::memcpy(writable_ + aligned, words.data(), bytes);
 	jit_memory::set_writable(false);
 	jit_memory::invalidate_instruction_cache(destination, bytes);
 	used_ = aligned + bytes;
@@ -100,12 +98,9 @@ ExecutableArena::StoredBlock ExecutableArena::store_block(
 	for (std::size_t index = 0; index < missing_count; ++index)
 		(void)links.find_or_create(missing_keys[index], generation);
 	auto *destination = static_cast<std::byte *>(mapping_) + aligned;
-	auto *writable = jit_memory::writable_alias(destination);
-	if (writable == nullptr)
-		return {};
 	jit_memory::set_writable(true);
-	std::memcpy(writable, words.data(), bytes);
-	auto *stored = reinterpret_cast<std::uint32_t *>(writable);
+	std::memcpy(writable_ + aligned, words.data(), bytes);
+	auto *stored = reinterpret_cast<std::uint32_t *>(writable_ + aligned);
 	auto *target_link = links.find(key, generation);
 	std::size_t direct_refusals = 0;
 	for (std::size_t index = 0; index < relocations.size(); ++index) {

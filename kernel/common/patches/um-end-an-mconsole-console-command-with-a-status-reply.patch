@@ -1,0 +1,122 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 10:33:12 +0900
+Subject: [PATCH] um: end an mconsole console command with a status reply
+
+A command that answers with what the kernel prints, sysrq and stack,
+ended with an empty final reply, so its client could not tell that the
+command ran. The only sign was the text the kernel printed, which a
+console may write after the final reply, from another CPU, or not at
+all; and with SysRq off the command printed nothing, which is the same
+as text that was lost.
+
+Make with_console() end with a final reply that names the command and
+what it did: "<name> ok", or "<name> disabled" when SysRq or the
+operation is refused and "<name> failed" for any other error, both sent
+as errors. A sysrq command is named "sysrq <key>" and stack "stack".
+Console text still comes before the final reply and none follows it.
+The early reply of "sysrq b" is unchanged, since the guest restarts
+without a chance to send another.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ arch/um/drivers/mconsole_kern.c | 33 ++++++++++++++++++++++++---------
+ 1 file changed, 24 insertions(+), 9 deletions(-)
+
+diff --git a/arch/um/drivers/mconsole_kern.c b/arch/um/drivers/mconsole_kern.c
+index e646c62e091d8d749cd73c59219ab0611ebe9d7c..0e5ab13e62997431059c989692bb4de116b2976c 100644
+--- a/arch/um/drivers/mconsole_kern.c
++++ b/arch/um/drivers/mconsole_kern.c
+@@ -753,40 +753,53 @@ static int mc_add_console(void)
+ 
+ late_initcall(mc_add_console);
+ 
+-static void with_console(struct mc_request *req, void (*proc)(void *),
+-			 void *arg)
++/*
++ * Run @proc, sending the client what the kernel prints meanwhile, then end
++ * with a final reply that names the command and what @proc returned: "<name>
++ * ok", or "<name> disabled" or "<name> failed" as an error. The client keys
++ * on that reply, not on the printed text: a console may print the text after
++ * the final reply, from another CPU, or not at all.
++ */
++static void with_console(struct mc_request *req, int (*proc)(void *),
++			 void *arg, const char *name)
+ {
+ 	struct mconsole_output entry;
++	char status[64];
+ 	unsigned long flags;
++	int result;
+ 
+ 	entry.req = req;
+ 	spin_lock_irqsave(&client_lock, flags);
+ 	list_add(&entry.list, &clients);
+ 	spin_unlock_irqrestore(&client_lock, flags);
+ 
+-	(*proc)(arg);
++	result = (*proc)(arg);
+ 
+ 	/* No console text follows the final reply. */
+ 	spin_lock_irqsave(&client_lock, flags);
+ 	list_del(&entry.list);
+ 	spin_unlock_irqrestore(&client_lock, flags);
+ 
+-	mconsole_reply_len(req, "", 0, 0, 0);
++	snprintf(status, sizeof(status), "%s %s", name,
++		 !result ? "ok" : result == -EPERM ? "disabled" : "failed");
++	mconsole_reply(req, status, result != 0, 0);
+ }
+ 
+ #ifdef CONFIG_MAGIC_SYSRQ
+ 
+ #include <linux/sysrq.h>
+ 
+-static void sysrq_proc(void *arg)
++static int sysrq_proc(void *arg)
+ {
+ 	char *op = arg;
+-	handle_sysrq(*op);
++
++	return handle_sysrq_result(*op);
+ }
+ 
+ void mconsole_sysrq(struct mc_request *req)
+ {
+ 	char *ptr = req->request.data;
++	char name[sizeof("sysrq ?")];
+ 
+ 	ptr += strlen("sysrq");
+ 	ptr = skip_spaces(ptr);
+@@ -798,7 +811,8 @@ void mconsole_sysrq(struct mc_request *req)
+ 	if (*ptr == 'b')
+ 		mconsole_reply(req, "", 0, 0);
+ 
+-	with_console(req, sysrq_proc, ptr);
++	snprintf(name, sizeof(name), "sysrq %c", *ptr ? *ptr : '?');
++	with_console(req, sysrq_proc, ptr, name);
+ }
+ #else
+ void mconsole_sysrq(struct mc_request *req)
+@@ -807,11 +821,12 @@ void mconsole_sysrq(struct mc_request *req)
+ }
+ #endif
+ 
+-static void stack_proc(void *arg)
++static int stack_proc(void *arg)
+ {
+ 	struct task_struct *task = arg;
+ 
+ 	show_stack(task, NULL, KERN_INFO);
++	return 0;
+ }
+ 
+ /*
+@@ -849,7 +864,7 @@ void mconsole_stack(struct mc_request *req)
+ 		mconsole_reply(req, "Couldn't find that pid", 1, 0);
+ 		return;
+ 	}
+-	with_console(req, stack_proc, to);
++	with_console(req, stack_proc, to, "stack");
+ }
+ 
+ void mconsole_trim(struct mc_request *req)

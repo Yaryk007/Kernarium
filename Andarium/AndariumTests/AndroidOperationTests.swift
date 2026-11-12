@@ -217,6 +217,10 @@ struct AndroidOperationTests {
             == "The guest\u{2019}s debugging service restarted before the app was installed. Try again.")
         #expect(AdbFailure(.streamClosed, activity: .bugReport).message
             == "The guest\u{2019}s debugging service restarted before the bug report was finished. Try again.")
+        // Turning USB debugging off restarts adbd under a transfer; the browser
+        // works either way, so it is not told to check the setting.
+        #expect(AdbFailure(.guestGone, activity: .files).message
+            == "The guest\u{2019}s debugging service restarted before the transfer finished. Try again.")
         #expect(BugReportStaging.NoRoom(bytes: 300 << 20, device: "iPad").errorDescription
             == "There isn\u{2019}t enough free space on this iPad for the report (300 MiB).")
     }

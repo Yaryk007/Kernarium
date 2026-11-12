@@ -3,6 +3,7 @@
 #include "native_window_test_support.hpp"
 #include "options.hpp"
 #include "require.hpp"
+#include "runtime/guest_memory_budget.hpp"
 #include "runtime/native_kernel_layout.hpp"
 
 #include <algorithm>
@@ -458,6 +459,27 @@ void test_scalable_native_kernel_layout_geometry()
 		"the largest guest did not exactly fill the signed envelope");
 	require(!Device::derive(envelope_fill + 4ULL * kib).valid,
 		"RAM and its capped auxiliary window exceeded the signed envelope");
+	/* The most RAM an iOS device admits is the budget's named bound: one
+	 * step more does not fit the envelope. */
+	constexpr std::uint64_t device_maximum =
+		std::uint64_t{uml::runtime::guest_memory::
+				      device_window_guest_memory_maximum_mib} * mib;
+	constexpr std::uint64_t step =
+		std::uint64_t{uml::runtime::guest_memory::guest_memory_step_mib} *
+		mib;
+	require(Device::derive(device_maximum).valid &&
+		!Device::derive(device_maximum + step).valid,
+		"the budget's bound is not the largest RAM the device window admits");
+	require(device_maximum <= envelope_fill &&
+		device_maximum + step > envelope_fill,
+		"the device bound is not the envelope's fill taken down to the steps");
+	/* A macOS window sits in the 128 TiB range: the largest RAM any range
+	 * holds fits there. */
+	require(uml::runtime::MacosNativeKernelGeometry::derive_at(
+			std::uint64_t{uml::runtime::guest_memory::
+					      guest_memory_range_maximum_mib} * mib,
+			96ULL * 1024ULL * gib).valid,
+		"a macOS window does not admit the largest RAM of the range");
 	const auto rounded = Device::derive(1);
 	require(rounded.valid && rounded.window_end - rounded.window_start ==
 		gib + 4ULL * kib + product_reserved,

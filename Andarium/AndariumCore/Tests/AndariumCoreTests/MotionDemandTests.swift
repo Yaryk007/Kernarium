@@ -178,7 +178,16 @@ struct MotionDemandTests {
     private final class FakeGuest: GuestStreamOpener, @unchecked Sendable {
         private let lock = NSLock()
         private var ends: [Int32] = []
+        /// Nothing listens: the guest is down, or its image has no service.
+        private var down: Bool
+        private var refusals = 0
+        init(down: Bool = false) { self.down = down }
         func openStream() throws -> Int32 {
+            let refused = lock.withLock { () -> Bool in
+                if down { refusals += 1 }
+                return down
+            }
+            if refused { throw POSIXError(.ECONNREFUSED) }
             var sockets: [Int32] = [-1, -1]
             guard socketpair(AF_UNIX, SOCK_STREAM, 0, &sockets) == 0 else { throw POSIXError(.EIO) }
             lock.withLock { ends.append(sockets[1]) }
@@ -235,6 +244,14 @@ struct MotionDemandTests {
         func hangUp() {
             if let end = current { shutdown(end, SHUT_RDWR) }
         }
+
+        /// Android powers off: the service's connection ends and nothing
+        /// listens any more.
+        func goDown() {
+            lock.withLock { down = true }
+            hangUp()
+        }
+        var refused: Int { lock.withLock { refusals } }
     }
 
     private func eventually(_ timeout: Double = 3, _ condition: () -> Bool) -> Bool {
@@ -380,11 +397,44 @@ struct MotionDemandTests {
         guest.say(MotionDemand(accelerometer: 20_000))
         #expect(eventually { device.intervals == [.accelerometer: 0.01] })
         guest.hangUp()
-        #expect(eventually { problems.all.contains(.guestUnavailable) })
         // A new connection, and the new service is read as it says (here, nothing yet).
         #expect(eventually { guest.connections >= 2 && device.intervals.count == 2 })
-        #expect(eventually { problems.all.last == .some(nil) })
+        // The service answered, so losing it says nothing is missing.
+        session.settle()
+        #expect(!problems.all.contains(.guestUnavailable))
+        #expect(problems.all.last == .some(nil))
         session.update(enabled: false, foreground: false, axes: .portrait)
+    }
+
+    @Test func aGuestGoingDownAfterItsServiceAnsweredLeavesNoProblem() {
+        let guest = FakeGuest()
+        let device = FakeDevice()
+        let problems = Problems()
+        let session = session(guest, device, problems: problems)
+        session.update(enabled: true, foreground: true, axes: .portrait)
+        #expect(eventually { guest.connections == 1 })
+        guest.say(MotionDemand())
+        #expect(eventually { session.demand != nil })
+        // Android powers off and the run ends after a few refused connections.
+        guest.goDown()
+        #expect(eventually { guest.refused >= 2 })
+        session.update(enabled: false, foreground: false, axes: .portrait)
+        session.settle()
+        #expect(!problems.all.contains(.guestUnavailable))
+        #expect(problems.all.last == .some(nil))
+    }
+
+    @Test func aServiceThatNeverAnswersIsReportedPastTheRun() {
+        let guest = FakeGuest(down: true)
+        let device = FakeDevice()
+        let problems = Problems()
+        let session = session(guest, device, problems: problems)
+        session.update(enabled: true, foreground: true, axes: .portrait)
+        #expect(eventually { guest.refused >= 2 && problems.all.last == .guestUnavailable })
+        session.update(enabled: false, foreground: false, axes: .portrait)
+        session.settle()
+        #expect(problems.all.last == .guestUnavailable)
+        #expect(device.starts == 0)
     }
 
     @Test func aGarbledFrameDropsTheConnection() {

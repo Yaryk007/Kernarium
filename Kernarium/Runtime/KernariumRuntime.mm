@@ -43,6 +43,7 @@
 #include "block/ubd_path.hpp"
 #include "gpu_budget_plan.hpp"
 #include "options.hpp"
+#include "runtime/execution_engine.hpp"
 #include "uml/emulator.h"
 #include "uml_slirp_net.h"
 
@@ -828,14 +829,11 @@ bool immutableExt4Rootfs(const char* path)
  *
  * "auto" defers to the build's platform default and its availability check
  * rather than deciding here, which keeps executable-memory policy with its
- * single owner in the CPU layer. Stock Apple builds resolve that to the
- * data-only gadget engine, but iOS device builds may opt into the StikDebug
- * publication route with UML_ENABLE_IOS_STIKDEBUG_JIT. That route still needs
- * a development signature carrying get-task-allow and an attached universal
- * script. While the
- * Simulator can publish, measurement rejects the JIT for the browser
- * workloads that matter (G157). The override exists so that choice stays
- * re-testable without a rebuild.
+ * single owner in the CPU layer. Both Apple products resolve that to the
+ * data-only gadget engine: a device cannot publish into a MAP_JIT mapping at
+ * all, and while the Simulator can, measurement rejects the JIT for the
+ * browser workloads that matter (G157). The override exists so that choice
+ * stays re-testable without a rebuild.
  */
 const char* selectedExecutionEngine()
 {
@@ -1076,6 +1074,10 @@ struct GuestRequest final {
     std::string timeZone;
     /* Where the run records how the session ended, empty for nowhere. */
     std::string sessionRecordPath;
+    /* The JIT cache budget of a run on the JIT engine, in bytes, or zero for
+     * the gadget engine. Only a request that asked for the JIT, on a runtime
+     * that has one and found its executable memory ready, sets it. */
+    std::size_t jitCacheBudget {};
 #if KERNARIUM_RUNTIME_ANDROID_GUEST
     /* The guest's two disks: the release's system disk and the instance's
      * data disk. */
@@ -1335,6 +1337,16 @@ private:
         if (!request_.sessionRecordPath.empty())
             arguments.emplace_back(
                 "--session-record=" + request_.sessionRecordPath);
+#ifndef UML_APP_STORE_RUNTIME
+        if (request_.jitCacheBudget != 0) {
+            /* The later engine argument wins, and the budget is the one the
+             * executable memory was prepared for. */
+            arguments.emplace_back("--execution-engine=jit");
+            arguments.emplace_back(
+                "--jit-cache-budget=" +
+                std::to_string(request_.jitCacheBudget));
+        }
+#endif
 #if KERNARIUM_RUNTIME_ANDROID_GUEST
         /* Android tags heap pointers, so the guest must run with the top byte
          * ignored exactly as it does on the macOS Android product. */
@@ -1484,12 +1496,29 @@ constexpr std::uint64_t mebibyte = 1024ULL * 1024ULL;
 
 /* The host GPU's budget for a guest of `guestMemoryMiB` and
  * `guestProcessorCount` vCPUs with the launch parameters `boot` states, which
- * is what both the application's warning and the run use. */
+ * is what both the application's warning and the run use.
+ *
+ * `usesPreparedJitMemory` says whether the guest runs on the executable memory
+ * a debugger prepared for this process. That memory is wired from the moment
+ * it is prepared, which may be long before the start, and it stays so. A JIT
+ * run's cache term is that memory, so the plan holds it already. A run that
+ * does not use it (the JIT is off, or the guest changed after the memory was
+ * prepared) carries it beside its own cache, and the plan counts it as engine
+ * memory so the GPU does not take what it holds. The application's estimate
+ * before a start takes the memory as used. */
 uml::emulator::GpuBudgetPlan planGpuBudget(
     const kernarium_runtime_boot* boot,
     std::uint32_t guestMemoryMiB,
-    std::uint32_t guestProcessorCount)
+    std::uint32_t guestProcessorCount,
+    bool usesPreparedJitMemory)
 {
+    std::uint64_t unusedJitMemory = 0;
+#ifndef UML_APP_STORE_RUNTIME
+    if (!usesPreparedJitMemory)
+        unusedJitMemory = uml::runtime::prepared_jit_region_bytes();
+#else
+    (void)usesPreparedJitMemory;
+#endif
     auto plan = uml::emulator::plan_gpu_budget(
         static_cast<std::uint64_t>(guestMemoryMiB) * mebibyte,
         /* The host sets the limit; a launch states neither it nor the
@@ -1499,7 +1528,8 @@ uml::emulator::GpuBudgetPlan planGpuBudget(
         guestProcessorCount,
         {
             .application = boot->gpu_budget_application_mib * mebibyte,
-            .engine_rest = boot->gpu_budget_engine_mib * mebibyte,
+            .engine_rest =
+                boot->gpu_budget_engine_mib * mebibyte + unusedJitMemory,
             .headroom = boot->gpu_budget_headroom_mib * mebibyte,
         });
 #if UML_GPU_SOFTWARE_RENDERER
@@ -1531,7 +1561,7 @@ int runtimePlanGpuBudget(
     parameters.gpu_budget_engine_mib = engineMiB;
     parameters.gpu_budget_headroom_mib = headroomMiB;
     const auto planned = planGpuBudget(
-        &parameters, guestMemoryMiB, guestProcessorCount);
+        &parameters, guestMemoryMiB, guestProcessorCount, true);
     const std::uint32_t size = plan->struct_size;
     *plan = {};
     plan->struct_size = size;
@@ -1559,6 +1589,47 @@ constexpr std::size_t bootSizeBeforeTimeZone =
 /* What a request states before the session record was added to it. */
 constexpr std::size_t bootSizeBeforeSessionRecord =
     offsetof(kernarium_runtime_boot, session_record_path);
+
+/* What a request states before the JIT choice was added to it: everything but
+ * use_jit, the session record included. */
+constexpr std::size_t bootSizeBeforeJit =
+    offsetof(kernarium_runtime_boot, use_jit);
+
+#ifndef UML_APP_STORE_RUNTIME
+/* The JIT cache budget a boot that asks for the JIT runs with, or zero when it
+ * runs on gadgets. Preparing again is cheap when an earlier prepare_jit
+ * succeeded, and it is what prepares the memory for a caller that never called
+ * prepare_jit. */
+std::size_t readyJitCacheBudget(
+    std::uint32_t guestMemoryMiB, std::uint32_t guestProcessorCount)
+{
+    const std::size_t memory =
+        static_cast<std::size_t>(guestMemoryMiB) * mebibyte;
+    const char* reason = nullptr;
+    switch (uml::runtime::prepare_jit_memory(
+        memory, guestProcessorCount,
+        uml::emulator::default_jit_executor_cache_budget)) {
+    case uml::runtime::JitMemoryStatus::ready:
+        return uml::runtime::jit_cache_budget_for(
+            memory, guestProcessorCount);
+    case uml::runtime::JitMemoryStatus::unsupported:
+        reason = "this runtime cannot make executable memory";
+        break;
+    case uml::runtime::JitMemoryStatus::no_debugger:
+        reason = "no debugger is attached";
+        break;
+    case uml::runtime::JitMemoryStatus::failed:
+        reason = "the executable memory could not be prepared";
+        break;
+    case uml::runtime::JitMemoryStatus::other_settings:
+        reason = "the executable memory was prepared for other settings";
+        break;
+    }
+    std::printf(
+        "Kernarium: running on gadgets, not the JIT: %s\n", reason);
+    return 0;
+}
+#endif
 
 int runtimeRun(
     KernariumMetalView view,
@@ -1640,7 +1711,7 @@ int runtimeRun(
         GuestRequest request;
         request.adbPublicKey = std::move(adbPublicKey);
         request.timeZone = std::move(timeZone);
-        if (boot->struct_size >= sizeof(kernarium_runtime_boot) &&
+        if (boot->struct_size >= bootSizeBeforeJit &&
             boot->session_record_path != nullptr) {
             const std::size_t length =
                 ::strnlen(boot->session_record_path, PATH_MAX);
@@ -1655,6 +1726,13 @@ int runtimeRun(
         request.dotsPerInch = dotsPerInch;
         request.guestMemoryMiB = guestMemoryMiB;
         request.guestProcessorCount = guestProcessorCount;
+#ifndef UML_APP_STORE_RUNTIME
+        if (boot->struct_size >=
+                bootSizeBeforeJit + sizeof(boot->use_jit) &&
+            boot->use_jit != 0)
+            request.jitCacheBudget =
+                readyJitCacheBudget(guestMemoryMiB, guestProcessorCount);
+#endif
 #if KERNARIUM_RUNTIME_ANDROID_GUEST
         if (boot->android_data_disk_path == nullptr ||
             boot->android_release_path == nullptr) {
@@ -1738,12 +1816,13 @@ int runtimeRun(
                 std::make_shared<uml::virtio::SharedMemoryRegions>();
             /* GPU memory is charged to the application like guest RAM: the GPU's
              * budget is what the application's memory limit leaves after the
-             * guest, the gadget cache and the launch's allowances, at least 384 MiB
-             * and at most half of the guest's allocation. The application has
-             * already warned the user when the limit leaves less than the floor
-             * (runtimePlanGpuBudget); the guest boots with the floor. */
+             * guest, the gadget cache and the launch's allowances, and at least
+             * 384 MiB. The application has already warned the user when the limit
+             * leaves less than the floor (runtimePlanGpuBudget); the guest boots
+             * with the floor. */
             const auto gpuBudget = planGpuBudget(
-                boot, guestMemoryMiB, guestProcessorCount);
+                boot, guestMemoryMiB, guestProcessorCount,
+                request.jitCacheBudget != 0);
             const std::uint64_t deviceMemoryLimit = gpuBudget.budget.bytes;
             if (gpuBudget.budget.short_of_floor) {
                 std::fprintf(
@@ -2327,6 +2406,42 @@ void runtimeSetRestartCallback(
     restartContext = context;
 }
 
+int runtimePrepareJit(
+    int enable,
+    std::uint32_t guestMemoryMiB,
+    std::uint32_t guestProcessorCount)
+{
+#ifdef UML_APP_STORE_RUNTIME
+    (void)enable;
+    (void)guestMemoryMiB;
+    (void)guestProcessorCount;
+    return KERNARIUM_RUNTIME_JIT_UNSUPPORTED;
+#else
+    if (enable == 0) {
+        uml::runtime::release_jit_debugger();
+        return KERNARIUM_RUNTIME_JIT_DISABLED;
+    }
+    if (guestMemoryMiB == 0 || guestProcessorCount == 0)
+        return KERNARIUM_RUNTIME_JIT_FAILED;
+    switch (uml::runtime::prepare_jit_memory(
+        static_cast<std::size_t>(guestMemoryMiB) * mebibyte,
+        guestProcessorCount,
+        uml::emulator::default_jit_executor_cache_budget)) {
+    case uml::runtime::JitMemoryStatus::ready:
+        return KERNARIUM_RUNTIME_JIT_READY;
+    case uml::runtime::JitMemoryStatus::unsupported:
+        return KERNARIUM_RUNTIME_JIT_UNSUPPORTED;
+    case uml::runtime::JitMemoryStatus::no_debugger:
+        return KERNARIUM_RUNTIME_JIT_NO_DEBUGGER;
+    case uml::runtime::JitMemoryStatus::other_settings:
+        return KERNARIUM_RUNTIME_JIT_OTHER_SETTINGS;
+    case uml::runtime::JitMemoryStatus::failed:
+        break;
+    }
+    return KERNARIUM_RUNTIME_JIT_FAILED;
+#endif
+}
+
 const kernarium_runtime_api runtimeApi {
     .abi_version = KERNARIUM_RUNTIME_API_VERSION,
     .struct_size = sizeof(kernarium_runtime_api),
@@ -2355,6 +2470,7 @@ const kernarium_runtime_api runtimeApi {
     .cancel_touch = runtimeCancelTouch,
     .quiesce_resident = runtimeQuiesceResident,
     .read_graphics_memory = runtimeReadGraphicsMemory,
+    .prepare_jit = runtimePrepareJit,
 };
 
 } // namespace

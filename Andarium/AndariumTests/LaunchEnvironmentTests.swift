@@ -10,7 +10,7 @@ import Testing
 /// App Store build has none (`Andarium/README.md#automation`).
 struct LaunchEnvironmentTests {
     @Test func everySettingHasItsOwnName() {
-        let names = LaunchOverrides.Setting.allCases.map(LaunchOverrides.environmentName)
+        let names = LaunchOverrides.Setting.allCases.map { LaunchOverrides.environmentName($0) }
         #expect(Set(names).count == LaunchOverrides.Setting.allCases.count)
     }
 

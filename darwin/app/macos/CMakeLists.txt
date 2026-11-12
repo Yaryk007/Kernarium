@@ -7,6 +7,52 @@
 # share a cache as well.
 set(UML_MACOS_APP_BUNDLE_IDENTIFIER "com.imxieyi.uml-darwin")
 
+# Every launcher loads the Apple GPU frameworks from the one Frameworks
+# directory beside it, so one target stages that directory and each launcher
+# depends on it. A staging step in each launcher's own post-build replaced the
+# directory while the other's was copying into or checking it, and the build
+# of both launchers in one invocation failed. The stamp is outside the
+# directory, which the runtime closure check requires to hold the frameworks
+# and nothing else.
+function(uml_stage_macos_gpu_frameworks)
+    if(TARGET uml_macos_gpu_frameworks)
+        return()
+    endif()
+    set(_uml_frameworks_dir "${PROJECT_BINARY_DIR}/bin/Frameworks")
+    set(_uml_frameworks_stamp "${PROJECT_BINARY_DIR}/bin/Frameworks.staged")
+    set(_uml_stage_inputs)
+    set(_uml_stage_commands)
+    foreach(_uml_gl_framework IN LISTS UML_APPLE_GPU_GL_FRAMEWORK_NAMES)
+        list(APPEND _uml_stage_inputs
+            "${UML_APPLE_GPU_FRAMEWORK_DIRECTORY}/${_uml_gl_framework}.framework/${_uml_gl_framework}"
+            "${UML_APPLE_GPU_FRAMEWORK_DIRECTORY}/${_uml_gl_framework}.framework/Info.plist")
+        list(APPEND _uml_stage_commands
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                ${UML_APPLE_GPU_FRAMEWORK_DIRECTORY}/${_uml_gl_framework}.framework
+                ${_uml_frameworks_dir}/${_uml_gl_framework}.framework)
+    endforeach()
+    if(TARGET uml_third_party_kosmickrisp)
+        list(APPEND _uml_stage_inputs
+            "${UML_APPLE_GPU_KOSMICKRISP_FRAMEWORK}/KosmicKrisp"
+            "${UML_APPLE_GPU_KOSMICKRISP_FRAMEWORK}/Info.plist")
+        list(APPEND _uml_stage_commands
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                ${UML_APPLE_GPU_KOSMICKRISP_FRAMEWORK}
+                ${_uml_frameworks_dir}/KosmicKrisp.framework)
+    endif()
+    add_custom_command(OUTPUT "${_uml_frameworks_stamp}"
+        COMMAND ${CMAKE_COMMAND} -E rm -rf ${_uml_frameworks_dir}
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${_uml_frameworks_dir}
+        ${_uml_stage_commands}
+        COMMAND ${CMAKE_COMMAND} -E touch "${_uml_frameworks_stamp}"
+        DEPENDS ${_uml_stage_inputs}
+        COMMENT "Staging the Apple GPU frameworks"
+        VERBATIM)
+    add_custom_target(uml_macos_gpu_frameworks DEPENDS "${_uml_frameworks_stamp}")
+    uml_declare_architecture_target(uml_macos_gpu_frameworks app)
+    add_dependencies(uml_macos_gpu_frameworks uml_dependency_prefix_verify)
+endfunction()
+
 function(uml_add_macos_embedded_kernel_app
         TARGET_NAME MAIN_SOURCE ARTIFACT_TARGET)
     if(NOT TARGET "${ARTIFACT_TARGET}")
@@ -49,25 +95,17 @@ function(uml_add_macos_embedded_kernel_app
         "${_uml_kernel_image}"
         "${PROJECT_SOURCE_DIR}/dependencies/verify-runtime-dependencies.sh"
         "${UML_DEPENDENCY_PREFIX}/share/uml-dependencies/receipt.tsv")
-    set(_uml_gl_stage_commands)
+    uml_stage_macos_gpu_frameworks()
+    add_dependencies("${TARGET_NAME}" uml_macos_gpu_frameworks)
     foreach(_uml_gl_framework IN LISTS UML_APPLE_GPU_GL_FRAMEWORK_NAMES)
         set_property(TARGET "${TARGET_NAME}" APPEND PROPERTY LINK_DEPENDS
             "${UML_APPLE_GPU_FRAMEWORK_DIRECTORY}/${_uml_gl_framework}.framework/${_uml_gl_framework}"
             "${UML_APPLE_GPU_FRAMEWORK_DIRECTORY}/${_uml_gl_framework}.framework/Info.plist")
-        list(APPEND _uml_gl_stage_commands
-            COMMAND ${CMAKE_COMMAND} -E copy_directory
-                ${UML_APPLE_GPU_FRAMEWORK_DIRECTORY}/${_uml_gl_framework}.framework
-                $<TARGET_FILE_DIR:${TARGET_NAME}>/Frameworks/${_uml_gl_framework}.framework)
     endforeach()
-    set(_uml_kosmickrisp_stage_commands)
     if(TARGET uml_third_party_kosmickrisp)
         set_property(TARGET "${TARGET_NAME}" APPEND PROPERTY LINK_DEPENDS
             "${UML_APPLE_GPU_KOSMICKRISP_FRAMEWORK}/KosmicKrisp"
             "${UML_APPLE_GPU_KOSMICKRISP_FRAMEWORK}/Info.plist")
-        list(APPEND _uml_kosmickrisp_stage_commands
-            COMMAND ${CMAKE_COMMAND} -E copy_directory
-                ${UML_APPLE_GPU_KOSMICKRISP_FRAMEWORK}
-                $<TARGET_FILE_DIR:${TARGET_NAME}>/Frameworks/KosmicKrisp.framework)
     endif()
     target_link_libraries("${TARGET_NAME}" PRIVATE
         UML::Emulator
@@ -131,17 +169,11 @@ function(uml_add_macos_embedded_kernel_app
         INSTALL_RPATH "@executable_path/Frameworks"
         INSTALL_RPATH_USE_LINK_PATH FALSE)
     add_custom_command(TARGET "${TARGET_NAME}" POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E rm -rf
-            $<TARGET_FILE_DIR:${TARGET_NAME}>/Frameworks
-        COMMAND ${CMAKE_COMMAND} -E make_directory
-            $<TARGET_FILE_DIR:${TARGET_NAME}>/Frameworks
-        ${_uml_gl_stage_commands}
-        ${_uml_kosmickrisp_stage_commands}
         COMMAND ${PROJECT_SOURCE_DIR}/dependencies/verify-runtime-dependencies.sh
             --binary $<TARGET_FILE:${TARGET_NAME}>
             --apple-gpu-prefix ${UML_APPLE_GPU_DEPENDENCY_PREFIX}
             --framework-directory $<TARGET_FILE_DIR:${TARGET_NAME}>/Frameworks
-        COMMENT "Staging and checking the ${TARGET_NAME} Apple GPU runtime closure"
+        COMMENT "Checking the ${TARGET_NAME} Apple GPU runtime closure"
         VERBATIM)
 endfunction()
 

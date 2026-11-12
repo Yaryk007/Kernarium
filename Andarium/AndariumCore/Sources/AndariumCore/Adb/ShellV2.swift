@@ -115,3 +115,9 @@ extension AdbConnection {
         return result
     }
 }
+
+/// `value` as one word of the guest's shell: in single quotes, with each
+/// quote in it closed, escaped and opened again.
+func quotedForShell(_ value: String) -> String {
+    "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+}

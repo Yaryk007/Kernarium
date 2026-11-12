@@ -13,19 +13,26 @@
  *
  *     E(v, G) = c(v, G) + t * v + E_rest
  *     c(v, G) = min(derive_budget(G, L), cap(v))      (the cap only where L != 0)
- *     G_max(v) = the largest G in {512, 576, ..., 4096} MiB with
- *                L - G - A - E(v, G) - S >= 384 MiB
+ *     G_max(v) = the largest G in {512, 576, ..., C} MiB with
+ *                L - G - A - E(v, G) - S >= 384 MiB; C where L is zero
  *     conservative(v) = G_max(v) under the launch set, in 512 MiB steps and
- *                  within 1536...4096 MiB, and never above G_max(v) under the
+ *                  at least 1536 MiB, and never above G_max(v) under the
  *                  maximum set
- *     default(v) = conservative(v), and on a device whose G_max(1) under the
- *                  maximum set is 4096 MiB also no more than the largest 512
- *                  MiB step of G with B(G, v) >= 1024 MiB under the launch set
+ *     default(v) = conservative(v) held to 4096 MiB, and on a device whose
+ *                  G_max(1) under the maximum set reaches 4096 MiB also no
+ *                  more than the largest 512 MiB step of G with B(G, v) >=
+ *                  1024 MiB under the launch set
  *
  * L is the process's memory limit (platform::process_memory_limit_bytes), zero
  * for none. cap(v) is seven eighths of the cache's measured worst ceiling at v
  * vCPUs, rounded up to 16 MiB. t is the slot tags each executor keeps outside
  * the cache's ledger. A, E_rest and S come from a LaunchMemorySet.
+ *
+ * C is the host's ceiling (guest_memory_ceiling_mib): the most RAM the host
+ * admits whatever the budget says. Nothing else bounds G_max(v): the offered
+ * maximum is what the budget gives the device at the vCPU count. The default
+ * is held to 4096 MiB (default_guest_memory_maximum_mib) however much is
+ * offered, and its rules are the ones that held for a range ending there.
  *
  * Header-only and standard library only, so the application's loader includes
  * it too and answers the settings without the runtime, which is loaded once
@@ -46,13 +53,29 @@ namespace uml::runtime::guest_memory {
 
 inline constexpr std::uint64_t mebibyte = std::uint64_t{1} << 20;
 
-/* The guest RAM a launch offers: 512 through 4096 MiB in 64 MiB steps. */
+/* The guest RAM a launch offers: 512 MiB up to the host's ceiling, in 64 MiB
+ * steps. */
 inline constexpr std::uint32_t guest_memory_minimum_mib = 512;
-inline constexpr std::uint32_t guest_memory_maximum_mib = 4096;
 inline constexpr std::uint32_t guest_memory_step_mib = 64;
+/* The top of any range: 1 TiB, the most a memory limit may state
+ * (platform::parse_memory_limit_mib). No host's ceiling is above it. */
+inline constexpr std::uint32_t guest_memory_range_maximum_mib =
+	std::uint32_t{1} << 20;
+
+/* The most guest RAM an iOS device or the iOS Simulator admits: 9152 MiB. The
+ * native kernel window is packed into the signed 14 GiB envelope
+ * (runtime/native_kernel_layout.hpp), and it holds the RAM, an auxiliary
+ * allowance of the same size up to 4 GiB, and a fixed span of 1 GiB and 44
+ * KiB for the shared-memory aperture and the stub pages, so the RAM that fits
+ * is 14 GiB - 4 GiB - 1 GiB - 44 KiB, taken down to the 64 MiB steps. The
+ * layout tests pin it. A macOS window (a Mac, or an iOS application on one)
+ * sits in the 128 TiB range and has no such bound. */
+inline constexpr std::uint32_t device_window_guest_memory_maximum_mib = 9152;
 
 /* The default guest RAM of a new guest: a multiple of 512 MiB within this
- * range (default_guest_memory_mib). */
+ * range (default_guest_memory_mib). Its top is no cap on what is offered: it
+ * is the largest default, and the line the rule that keeps a gibibyte for the
+ * host GPU applies from. */
 inline constexpr std::uint32_t default_guest_memory_minimum_mib = 1536;
 inline constexpr std::uint32_t default_guest_memory_maximum_mib = 4096;
 inline constexpr std::uint32_t default_guest_memory_step_mib = 512;
@@ -181,10 +204,11 @@ inline constexpr LaunchMemorySet maximum_memory_set =
 	launch_memory_mib(0, 0, 0);
 
 /* B: the host GPU's budget a launch of `guest_mib` MiB of guest RAM gets at
- * `executors` vCPUs under `memory_limit` bytes (zero for none) with `set`, and
- * whether the limit leaves it less than its floor. It is the evaluation the
- * run makes (emulator/src/gpu_budget_plan.hpp) when the launch states no gadget
- * cache budget of its own, so the settings can show what a guest will get. */
+ * `executors` vCPUs under `memory_limit` bytes (zero for none, which gives the
+ * guest's RAM) with `set`, and whether the limit leaves it less than its
+ * floor. It is the evaluation the run makes (emulator/src/gpu_budget_plan.hpp)
+ * when the launch states no gadget cache budget of its own, so the settings can
+ * show what a guest will get. */
 [[nodiscard]] constexpr ::uml::platform::GpuBudget gpu_budget(
 	std::uint64_t memory_limit, std::uint32_t guest_mib, unsigned executors,
 	const LaunchMemorySet &set = launch_memory_set) noexcept
@@ -201,20 +225,63 @@ inline constexpr LaunchMemorySet maximum_memory_set =
 	});
 }
 
-/* G_max(v), in MiB: the largest guest RAM of the offered range for which
- * `memory_limit` bytes (zero for none) leave the host GPU at least its floor
- * once the guest, A, E(v, G) and S of `set` are counted. Where the host sets no
- * limit it is the whole range. Where even the smallest guest leaves less than
- * the floor it is the smallest, and the launch says the process is likely to be
- * ended. Without a set it is the most a person may choose
- * (maximum_memory_set). */
-[[nodiscard]] constexpr std::uint32_t maximum_guest_memory_mib(
-	std::uint64_t memory_limit, unsigned executors,
-	const LaunchMemorySet &set = maximum_memory_set) noexcept
+/* C: the most guest RAM, in MiB, the host admits whatever the budget says,
+ * taken down to the 64 MiB steps. `window_maximum_mib` is what the product's
+ * native kernel window holds (device_window_guest_memory_maximum_mib on an iOS
+ * device or the Simulator, guest_memory_range_maximum_mib where the window is
+ * a macOS one); `physical_memory` is the host's RAM in bytes, zero when
+ * unknown. A host never admits more RAM than it has. It never admits less than
+ * default_guest_memory_maximum_mib, the range every host offered before
+ * there was a ceiling, so the default is always one of the sizes on offer. */
+[[nodiscard]] constexpr std::uint32_t guest_memory_ceiling_mib(
+	std::uint64_t window_maximum_mib,
+	std::uint64_t physical_memory) noexcept
 {
+	std::uint64_t top = std::min<std::uint64_t>(window_maximum_mib,
+		guest_memory_range_maximum_mib);
+	if (physical_memory != 0)
+		top = std::min(top, physical_memory / mebibyte);
+	top = std::max<std::uint64_t>(top, default_guest_memory_maximum_mib);
+	return static_cast<std::uint32_t>(guest_memory_minimum_mib +
+		(top - guest_memory_minimum_mib) / guest_memory_step_mib *
+			guest_memory_step_mib);
+}
+
+namespace detail {
+
+/* `mib` taken up into the steps' range and down onto its steps. */
+[[nodiscard]] constexpr std::uint32_t on_guest_memory_steps(
+	std::uint64_t mib) noexcept
+{
+	mib = std::clamp<std::uint64_t>(mib, guest_memory_minimum_mib,
+		guest_memory_range_maximum_mib);
+	return static_cast<std::uint32_t>(guest_memory_minimum_mib +
+		(mib - guest_memory_minimum_mib) / guest_memory_step_mib *
+			guest_memory_step_mib);
+}
+
+/* The largest guest RAM up to `ceiling_mib` for which `memory_limit` bytes
+ * (zero for none) leave the host GPU at least its floor with `set`: the
+ * ceiling where there is no limit, the smallest guest where none leaves it. A
+ * larger guest leaves the GPU less, so the search starts at the ceiling, or at
+ * the limit less the floor where that is lower, since no term of the sum is
+ * negative. */
+[[nodiscard]] constexpr std::uint32_t largest_fitting_guest_memory_mib(
+	std::uint64_t memory_limit, unsigned executors,
+	const LaunchMemorySet &set, std::uint32_t ceiling_mib) noexcept
+{
+	const auto top = on_guest_memory_steps(ceiling_mib);
 	if (memory_limit == 0)
-		return guest_memory_maximum_mib;
-	for (auto mib = guest_memory_maximum_mib; mib > guest_memory_minimum_mib;
+		return top;
+	constexpr std::uint64_t floor_mib =
+		::uml::platform::gpu_budget_floor_bytes / mebibyte;
+	const std::uint64_t limit_mib = memory_limit / mebibyte;
+	auto start = top;
+	if (limit_mib < std::uint64_t{top} + floor_mib)
+		start = limit_mib < guest_memory_minimum_mib + floor_mib ?
+			guest_memory_minimum_mib :
+			on_guest_memory_steps(limit_mib - floor_mib);
+	for (auto mib = start; mib > guest_memory_minimum_mib;
 	     mib -= guest_memory_step_mib)
 		if (!gpu_budget(memory_limit, mib, executors, set)
 				.short_of_floor)
@@ -222,36 +289,63 @@ inline constexpr LaunchMemorySet maximum_memory_set =
 	return guest_memory_minimum_mib;
 }
 
-/* The most RAM a guest may have before the process is likely to be ended:
- * G_max(v) under `set`, taken down to a multiple of 512 MiB and held within
- * 1536 to 4096 MiB. A limit that leaves less than the lower bound does not
- * take it above what the settings offer (G_max(v) under maximum_memory_set),
- * so it stays on the picker's steps and inside its range. Without a set it is
- * the conservative launch set, the one the host GPU's budget uses. A guest
- * above this is likely to be ended by the system. */
-[[nodiscard]] constexpr std::uint32_t conservative_guest_memory_mib(
+} // namespace detail
+
+/* G_max(v), in MiB: the largest guest RAM of the offered range, up to the
+ * host's ceiling (guest_memory_ceiling_mib), for which `memory_limit` bytes
+ * (zero for none) leave the host GPU at least its floor once the guest, A,
+ * E(v, G) and S of `set` are counted. Where the host sets no limit it is the
+ * ceiling. Where even the smallest guest leaves less than the floor it is the
+ * smallest, and the launch says the process is likely to be ended. Without a
+ * set it is the most a person may choose (maximum_memory_set). Without a
+ * ceiling it is the one an iOS device admits. */
+[[nodiscard]] constexpr std::uint32_t maximum_guest_memory_mib(
 	std::uint64_t memory_limit, unsigned executors,
-	const LaunchMemorySet &set = launch_memory_set) noexcept
+	const LaunchMemorySet &set = maximum_memory_set,
+	std::uint32_t ceiling_mib =
+		device_window_guest_memory_maximum_mib) noexcept
 {
-	const auto safe = maximum_guest_memory_mib(memory_limit, executors, set);
-	const auto stepped = safe / default_guest_memory_step_mib *
-		default_guest_memory_step_mib;
-	const auto held = std::clamp(stepped, default_guest_memory_minimum_mib,
-		default_guest_memory_maximum_mib);
-	return std::min(held,
-		maximum_guest_memory_mib(memory_limit, executors));
+	return detail::largest_fitting_guest_memory_mib(
+		memory_limit, executors, set, ceiling_mib);
 }
 
-/* The most guest RAM, a multiple of 512 MiB within the range, for which `set`
- * leaves the host GPU a budget of at least default_gpu_budget_minimum_mib;
- * zero where no such RAM exists. B is at most half the guest's RAM, so none
- * below 2048 MiB qualifies. */
+/* The most RAM a guest may have before the process is likely to be ended:
+ * G_max(v) under `set`, taken down to a multiple of 512 MiB and no lower than
+ * 1536 MiB. A limit that leaves less than that does not take it above what the
+ * settings offer (G_max(v) under maximum_memory_set), so it stays on the
+ * picker's steps and inside its range. Where the host sets no limit nothing is
+ * likely to end the process, and it is the whole offered range. Without a set
+ * it is the conservative launch set, the one the host GPU's budget uses. A
+ * guest above this is likely to be ended by the system. */
+[[nodiscard]] constexpr std::uint32_t conservative_guest_memory_mib(
+	std::uint64_t memory_limit, unsigned executors,
+	const LaunchMemorySet &set = launch_memory_set,
+	std::uint32_t ceiling_mib =
+		device_window_guest_memory_maximum_mib) noexcept
+{
+	const auto maximum = maximum_guest_memory_mib(
+		memory_limit, executors, maximum_memory_set, ceiling_mib);
+	if (memory_limit == 0)
+		return maximum;
+	const auto safe = detail::largest_fitting_guest_memory_mib(
+		memory_limit, executors, set, ceiling_mib);
+	const auto stepped = safe / default_guest_memory_step_mib *
+		default_guest_memory_step_mib;
+	return std::min(std::max(stepped, default_guest_memory_minimum_mib),
+		maximum);
+}
+
+/* The most guest RAM, a multiple of 512 MiB within the range a new guest's RAM
+ * is held to (default_guest_memory_minimum_mib through
+ * default_guest_memory_maximum_mib), for which `set` leaves the host GPU a
+ * budget of at least default_gpu_budget_minimum_mib; zero where no such RAM
+ * exists. */
 [[nodiscard]] constexpr std::uint32_t graphics_guest_memory_mib(
 	std::uint64_t memory_limit, unsigned executors,
 	const LaunchMemorySet &set = launch_memory_set) noexcept
 {
 	for (auto mib = default_guest_memory_maximum_mib;
-	     mib >= default_gpu_budget_minimum_mib * 2U;
+	     mib >= default_guest_memory_minimum_mib;
 	     mib -= default_guest_memory_step_mib)
 		if (gpu_budget(memory_limit, mib, executors, set).bytes >=
 			default_gpu_budget_minimum_mib * mebibyte)
@@ -259,32 +353,57 @@ inline constexpr LaunchMemorySet maximum_memory_set =
 	return 0;
 }
 
-/* The RAM a new guest gets. On a device whose limit lets a guest have the top
- * of the range (G_max(1) under maximum_memory_set is 4096 MiB, the largest
- * maximum any vCPU count has), a guest of that size runs the host GPU short
- * long before it runs the process short, so at every vCPU count the default is
- * also held to what keeps B at default_gpu_budget_minimum_mib: the lesser of
- * conservative_guest_memory_mib and graphics_guest_memory_mib. Both fall with
- * the vCPU count, so the default does too. That bound is never under 2048 MiB
- * with the launch set, since every limit that offers 4096 MiB at one vCPU
- * leaves a guest of 2048 more than 1024 for the GPU at every count the
- * applications offer; for a set that leaves none, or for a limit that offers
- * less than 4096 MiB or none at all, the default is the conservative one. A
- * guest above the conservative one is likely to be ended by the system; one
- * between the two is likely to run out of graphics memory. */
+/* The RAM a new guest gets, and whether the GPU budget rule below is what set
+ * it. Never above default_guest_memory_maximum_mib however much the host
+ * offers. On a device whose limit lets a guest have that much (G_max(1) under
+ * maximum_memory_set is 4096 MiB when the range ends there), a guest of that
+ * size runs the host GPU short long before it runs the process short, so at
+ * every vCPU count the default is also held to what keeps B at
+ * default_gpu_budget_minimum_mib: the lesser of conservative_guest_memory_mib
+ * and graphics_guest_memory_mib. Both fall with the vCPU count, so the default
+ * does too. That bound is never under 2048 MiB with the launch set, since
+ * every limit that offers 4096 MiB at one vCPU leaves a guest of 2048 more
+ * than 1024 for the GPU at every count the applications offer; for a set that
+ * leaves none in the range, or for a limit that offers less than 4096 MiB or
+ * none at all, the default is the conservative one. A guest above the
+ * conservative one is likely to be ended by the system; one between the two is
+ * likely to run out of graphics memory. The rules read the range as ending at
+ * 4096 MiB, so a larger ceiling changes none of the defaults.
+ *
+ * holds_gpu_budget is true where the graphics rule is what lowered the
+ * default, below the conservative size the default would be otherwise. Above
+ * such a default B is under default_gpu_budget_minimum_mib from the next
+ * multiple of 512 MiB, which is what the applications warn about. Where the
+ * default is the conservative size (a ceiling of 4096 MiB held it, or the
+ * limit lets no guest have that much) it says nothing of B. */
+struct DefaultGuestMemory {
+	std::uint32_t mib;
+	bool holds_gpu_budget;
+};
+
+[[nodiscard]] constexpr DefaultGuestMemory default_guest_memory(
+	std::uint64_t memory_limit, unsigned executors,
+	const LaunchMemorySet &set = launch_memory_set) noexcept
+{
+	constexpr auto top = default_guest_memory_maximum_mib;
+	const auto conservative = conservative_guest_memory_mib(
+		memory_limit, executors, set, top);
+	const auto reach = maximum_guest_memory_mib(
+		memory_limit, 1, maximum_memory_set, top);
+	if (memory_limit == 0 || reach != top)
+		return {conservative, false};
+	const auto graphics =
+		graphics_guest_memory_mib(memory_limit, executors, set);
+	if (graphics == 0 || graphics >= conservative)
+		return {conservative, false};
+	return {graphics, true};
+}
+
 [[nodiscard]] constexpr std::uint32_t default_guest_memory_mib(
 	std::uint64_t memory_limit, unsigned executors,
 	const LaunchMemorySet &set = launch_memory_set) noexcept
 {
-	const auto conservative =
-		conservative_guest_memory_mib(memory_limit, executors, set);
-	if (memory_limit == 0 ||
-	    maximum_guest_memory_mib(memory_limit, 1) !=
-		    guest_memory_maximum_mib)
-		return conservative;
-	const auto graphics =
-		graphics_guest_memory_mib(memory_limit, executors, set);
-	return graphics == 0 ? conservative : std::min(conservative, graphics);
+	return default_guest_memory(memory_limit, executors, set).mib;
 }
 
 } // namespace uml::runtime::guest_memory

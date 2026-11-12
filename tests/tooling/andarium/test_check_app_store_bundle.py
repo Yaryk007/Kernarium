@@ -59,6 +59,23 @@ DEBUG_SUPPORT = (
     ("automation", 'const char *fixture(void) { return "removed the boot payload"; }\n'),
     ("test tooling", "int _rfbGetScreen(void) { return 1; }\n"),
     ("launch harness", "int _s8Andarium8AppEntryV13applyDeferred2toyyF(void) { return 1; }\n"),
+    # The arm64 JIT: its owner of executable memory, its engine and its
+    # entries, the runtime's and the loader's, the options that select it, and
+    # the instruction that asks a debugger for JIT memory.
+    ("JIT", "int _ZN3uml3cpu10jit_memory7releaseEPvm(void) { return 1; }\n"),
+    ("JIT", "int _ZN3uml3cpu5arm6411JitExecutorC1Ev(void) { return 1; }\n"),
+    ("JIT", "int _ZN3uml3cpu5arm643jit19JitCompilerFamilies13emit_bitfieldEj(void) { return 1; }\n"),
+    ("JIT", "int uml_arm64_jit_sme_leave(void) { return 1; }\n"),
+    ("JIT", "int darwin_uml_jit_enter_guest(void) { return 1; }\n"),
+    ("JIT", "int kernarium_runtime_loader_prepare_jit(void) { return 1; }\n"),
+    ("JIT", "int kernarium_runtime_loader_debugger_attached(void) { return 1; }\n"),
+    ("JIT", 'const char *fixture(void) { return "--jit-cache-budget="; }\n'),
+    ("JIT", 'const char *fixture(void) { return "Kernarium: running on gadgets, not the JIT: %s"; }\n'),
+    ("JIT", 'void fixture(void) { __asm__ volatile(".inst 0xd43e01a0"); }\n'),
+    ("JIT", "int _s8Andarium13JitPreferenceV5isOnSbvg(void) { return 1; }\n"),
+    ("JIT", "int _s8Andarium11JitDebuggerO8attachedSbyFZ(void) { return 1; }\n"),
+    ("JIT", 'const char *fixture(void) { return "To use JIT, open Andarium from StikDebug."; }\n'),
+    ("JIT", 'const char *fixture(void) { return "Started without JIT: StikDebug is not connected."; }\n'),
 )
 # What an App Store runtime keeps so that the runtime API table's layout and
 # version stay: its entries answer -ENOTSUP, and a virtual Jetsam that never
@@ -70,6 +87,10 @@ STAND_INS = (
     "int _ZN12_GLOBAL__N_121runtimeSendConsoleInputEPKvm(void) { return -45; }\n"
     "int _ZN3uml7runtime24start_virtual_jetsam_watchEm(void) { return 0; }\n"
     "int _ZN3uml7runtime18VirtualJetsamWatchD1Ev(void) { return 0; }\n"
+    # The runtime API's JIT entry, which answers "unsupported", and a word of
+    # data that is the debugger request's encoding: only an instruction asks.
+    "int _ZN12_GLOBAL__N_117runtimePrepareJitEijj(void) { return 1; }\n"
+    "unsigned int fixture_data[] = { 0xd43e01a0u, 0xd43e01a0u };\n"
 )
 # What a dependency compiles in from the prefix it was built under: a locale
 # directory on the volume that held the dependency prefixes, and a path in the

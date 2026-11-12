@@ -768,6 +768,7 @@ extern "C" int darwin_uml_static_guest_interrupt_sequence(
 	}
 }
 
+#ifndef UML_APP_STORE_RUNTIME
 extern "C" int darwin_uml_jit_enter_guest(
 	void *register_pointer, void *fp_pointer, unsigned long fp_size,
 	unsigned long generation, unsigned long *tls)
@@ -780,6 +781,7 @@ extern "C" int darwin_uml_jit_enter_guest(
 		return DARWIN_UML_EVENT_FATAL;
 	}
 }
+#endif
 
 extern "C" int darwin_uml_static_enter_guest(
 	void *register_pointer, void *fp_pointer, unsigned long fp_size,

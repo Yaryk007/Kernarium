@@ -77,6 +77,13 @@ UML implementation. `Build.SOC_MANUFACTURER` and `SOC_MODEL` are `Kernarium` and
   restriction, Google or microG. Applications that need absent hardware or
   LineageOS cloud services are excluded by name in the product makefile, and the
   build and the verifier assert that list.
+- **Signature spoofing.** The image ships no Google or microG software, and
+  no guest or iOS interface names Google's services. LineageOS's restricted
+  spoofing is on in the `user` build as well as in debuggable ones (route
+  `p0007`): only `com.google.android.gms` and `com.android.vending`, signed with
+  microG's own key and carrying Google's certificate as their `fake-signature`
+  meta-data, present that certificate, and nothing else does. It has no
+  setting, permission or API.
 - **Settings.** Settings is the stock application apart from route `p0009`,
   which removes the pages for hardware the product lacks (the Connected devices
   entry, the Bluetooth developer option, the media output switcher, and the
@@ -175,7 +182,11 @@ transport. The primary output has a 5 ms HAL buffer, so AudioFlinger gives it a
 fast mixer, and its writer runs at `SCHED_FIFO` priority 3 and writes straight
 into an ALSA ring of four such periods (route `p0005` and the
 `ro.hardware.audio.tinyalsa.*` vendor properties); the boot command line lowers
-the Virtio sound driver's minimum period to 5 ms for it. A low-latency AAudio
+the Virtio sound driver's minimum period to 5 ms for it. The output reports its
+position from its ALSA device, less the frames in the ring and the latency the
+host reports for its output (route `p0005`). The input's ALSA read alone
+paces its I/O thread, and a read waits 100 to 250 ms for its frames rather
+than making silence up (route `p0005`). A low-latency AAudio
 stream with a data callback that leaves its capacity unspecified starts with a
 two-burst buffer and grows it by one burst per underrun until the app sets a
 size (route `p0028`). A Virtio battery device reports the Apple host's

@@ -9,7 +9,9 @@
  * reports at a bounded rate, a fence outstanding holds it back
  * however long it takes, a retired fence starts the interval, contexts the
  * tracker was not told of are ignored, and the delay it names is the time to
- * the next context that could be reported. */
+ * the next context that could be reported or the driver's caches released.
+ * The caches are released once, after the reports a destroyed context's
+ * survivors owe, and a destruction before then moves the release later. */
 
 #include "context_idle_tracker.hpp"
 #include "require.hpp"
@@ -347,6 +349,68 @@ void checkSeveralContexts()
         "a reset left a context behind");
 }
 
+void checkTheReleaseAfterADestruction()
+{
+    ContextIdleTracker tracker(1s);
+    tracker.add(first, origin);
+    tracker.add(second, origin);
+    require(!tracker.takeRelease(origin + 1h),
+        "a release was due although no context was destroyed");
+
+    /* The survivors owe two reports after the drop, and the release is due
+     * when they have been made, not before. */
+    tracker.remove(second);
+    tracker.activity(first, origin + 10s);
+    tracker.noteRelease(origin + 10s);
+    tracker.noteDestroyed(origin + 10s);
+    require(tracker.nextDelay(origin + 10s) == 1s,
+        "the first report was not the next thing due");
+    require(!tracker.takeRelease(origin + 11s),
+        "the caches were released with the survivors' reports outstanding");
+    require(tracker.takeIdle(origin + 11s) == std::vector {first},
+        "the survivor's first report is missing");
+    require(!tracker.takeRelease(origin + 11999ms),
+        "the caches were released before the second report was due");
+    require(tracker.nextDelay(origin + 11s) == 1s,
+        "the delay did not name the second report and the release");
+    require(tracker.takeIdle(origin + 12s) == std::vector {first},
+        "the survivor's second report is missing");
+    require(tracker.takeRelease(origin + 12s),
+        "the caches were not released once the reports were made");
+    require(!tracker.takeRelease(origin + 12s),
+        "a release was taken twice");
+    require(!tracker.takeRelease(origin + 1h),
+        "a release came back after it was taken");
+    require(!tracker.nextDelay(origin + 12s).has_value(),
+        "a release that was taken still had a delay");
+
+    /* Another destruction before the release is due moves it later, and the
+     * delay names the release when nothing else is due. */
+    tracker.noteDestroyed(origin + 100s);
+    require(tracker.nextDelay(origin + 100s) == 2s,
+        "the delay was not the two intervals to the release");
+    tracker.noteDestroyed(origin + 101s);
+    require(!tracker.takeRelease(origin + 102s),
+        "a destruction did not move the release later");
+    require(tracker.nextDelay(origin + 102s) == 1s,
+        "the delay did not follow the release that moved");
+    require(tracker.takeRelease(origin + 103s),
+        "the release that moved never came");
+
+    /* A late poll takes it as soon as it runs; nothing is lost by waiting. */
+    tracker.noteDestroyed(origin + 200s);
+    require(tracker.nextDelay(origin + 500s) == Clock::duration::zero(),
+        "an overdue release did not have a zero delay");
+    require(tracker.takeRelease(origin + 500s),
+        "an overdue release was not taken");
+
+    /* A renderer that starts over owes nothing. */
+    tracker.noteDestroyed(origin + 600s);
+    tracker.reset();
+    require(!tracker.takeRelease(origin + 1h),
+        "a release survived a reset");
+}
+
 void checkThreads()
 {
     /* Retirements come from whichever thread polls the renderer while the
@@ -380,6 +444,7 @@ int main()
     checkActivityMakesTheContextEligibleAgain();
     checkPendingFences();
     checkSeveralContexts();
+    checkTheReleaseAfterADestruction();
     checkThreads();
     return EXIT_SUCCESS;
 }

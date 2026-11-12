@@ -6,11 +6,13 @@ import SwiftUI
 enum InfoPage: Hashable {
     case acknowledgements
     case license(String)
+    case whatsNew
 
     /// The pages to push, in order, to land on this one.
     var trail: [InfoPage] {
         switch self {
         case .acknowledgements: [.acknowledgements]
+        case .whatsNew: [.whatsNew]
         case .license: [.acknowledgements, self]
         }
     }

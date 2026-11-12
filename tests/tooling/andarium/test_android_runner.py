@@ -498,6 +498,18 @@ class AndroidRunnerTests(unittest.TestCase):
             self.assertIn(message, outcome.err)
             self.assertEqual(outcome.commands, [])
 
+    def test_the_stand_in_debugger_serves_the_jit_unless_told_otherwise(
+            self) -> None:
+        for arguments, debugger in (
+            (["--engine", "jit"], "stand-in"),
+            (["--engine", "jit", "--jit-debugger", "none"], "none"),
+            ([], "none"),
+            (["--engine", "gadgets", "--jit-debugger", "stand-in"],
+             "stand-in"),
+        ):
+            options = runner.parse_arguments(["--device", DEVICE, *arguments])
+            self.assertEqual(options.jit_debugger, debugger, arguments)
+
 
 if __name__ == "__main__":
     unittest.main()

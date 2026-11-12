@@ -150,6 +150,12 @@ def settings_for(
         "KERNARIUM_HOST_FORWARD": host_forward(host_port),
         "KERNARIUM_ANDROID_ADB_AUTH": "0",
     }
+    if engine == "jit":
+        # A device's engine is Andarium's JIT setting: the JIT where a debugger
+        # prepared its memory and the gadgets otherwise, so the runtime's own
+        # selection stays "auto".
+        settings["KERNARIUM_EXECUTION_ENGINE"] = "auto"
+        settings["ANDARIUM_JIT"] = "1"
     if erase:
         settings["ANDARIUM_ERASE"] = "1"
     if disk_size_gib is not None:

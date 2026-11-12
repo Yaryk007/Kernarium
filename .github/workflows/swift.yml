@@ -20,7 +20,7 @@
 # no .build input and runs no script phase (Andarium/README.md). The full
 # `Andarium` and `Kernarium` targets embed XCFrameworks that this repository
 # builds from source and a system image staged from an accepted Android
-# release; see docs/ci.md for what each one still needs.
+# release; see Andarium/README.md for their artifact contracts.
 #
 # check-integration is deliberately absent. It needs a guest rootfs image
 # (UML_INTEGRATION_ROOTFS) that this workflow does not build, and it boots a
@@ -63,8 +63,8 @@ jobs:
       # commit keeps its own author.
       - name: Configure Git identity
         run: |
-          git config user.name  "Kernarium CI"
-          git config user.email "kernarium-ci@kernarium.dev"
+          git config --global user.name  "Kernarium CI"
+          git config --global user.email "kernarium-ci@kernarium.dev"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -75,7 +75,7 @@ jobs:
       # the autotools to build GLib and friends, which come later.
       - name: Install host tools
         run: |
-          brew install ninja meson pkg-config rsync autoconf automake gettext \
+          brew install make ninja meson pkg-config rsync autoconf automake gettext \
             libtool gperf groff
 
       - name: Record the Apple SDK in use
@@ -103,8 +103,8 @@ jobs:
 
       - name: Configure Git identity
         run: |
-          git config user.name  "Kernarium CI"
-          git config user.email "kernarium-ci@kernarium.dev"
+          git config --global user.name  "Kernarium CI"
+          git config --global user.email "kernarium-ci@kernarium.dev"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -113,7 +113,7 @@ jobs:
 
       - name: Install host tools
         run: |
-          brew install ninja meson pkg-config rsync autoconf automake gettext \
+          brew install make ninja meson pkg-config rsync autoconf automake gettext \
             libtool gperf groff
 
       - name: Configure
@@ -123,7 +123,7 @@ jobs:
         run: cmake --build --preset tooling-test-binaries --parallel
 
       - name: Run tooling tests
-        run: ctest --preset tooling
+        run: ctest --preset tooling --parallel 2
 
       - name: Test log
         if: always()
@@ -180,6 +180,7 @@ jobs:
         run: |
           xcodebuild -project Andarium/Andarium.xcodeproj \
             -scheme AndariumPreview \
+            -configuration Debug \
             -destination 'generic/platform=iOS Simulator' \
             -derivedDataPath .build/andarium-preview-dd \
             build
@@ -227,8 +228,8 @@ jobs:
 
       - name: Configure Git identity
         run: |
-          git config user.name  "Kernarium CI"
-          git config user.email "kernarium-ci@kernarium.dev"
+          git config --global user.name  "Kernarium CI"
+          git config --global user.email "kernarium-ci@kernarium.dev"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -239,7 +240,7 @@ jobs:
       # when it exists; these are the PATH fallbacks for when it does not.
       - name: Install host tools
         run: |
-          brew install ninja meson mako pyyaml pkg-config rsync autoconf \
+          brew install make ninja meson mako pyyaml pkg-config rsync autoconf \
             automake gettext libtool gperf groff cmake
 
       - name: Metal toolchain
@@ -253,27 +254,16 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: |
+            external/sources
+            .build/dependency-cache
             .build/dependencies/macos-arm64-27
             .build/dependencies/apple-gpu-vulkan-experiment/macos-arm64
-          key: prefixes-${{ hashFiles('dependencies/manifest.tsv', 'dependencies/patches/**/series.tsv', 'dependencies/platforms/**', 'dependencies/build.sh', 'dependencies/build-apple-gpu.sh') }}
-          restore-keys: prefixes-
+          key: prefixes-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('dependencies/**', 'tools/rootfs/**', 'scripts/patch_series.py') }}
 
       - name: Verify restored prefixes
         id: verify
-        if: steps.prefixes.outputs.cache-hit != ''
-        # A restore-key hit is a prefix built from other inputs: it must not be
-        # used, or the test jobs would build against the wrong libraries.
-        env:
-          RESTORED_KEY: ${{ steps.prefixes.outputs.cache-matched-key }}
-          WANTED_KEY: ${{ steps.prefixes.outputs.cache-primary-key }}
+        if: steps.prefixes.outputs.cache-hit == 'true'
         run: |
-          if [ "$RESTORED_KEY" != "$WANTED_KEY" ]; then
-            echo "restored $RESTORED_KEY, want $WANTED_KEY: rebuilding"
-            rm -rf .build/dependencies/macos-arm64-27 \
-                   .build/dependencies/apple-gpu-vulkan-experiment/macos-arm64
-            echo "usable=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
           # The receipts, the manifest rows and the patched source trees the
           # prefix records have to match this checkout, and the prefix itself
           # has to hold no build-host path.
@@ -283,7 +273,7 @@ jobs:
             --manifest dependencies/manifest.tsv \
             --deployment-target 27.0
           dependencies/build-apple-gpu.sh \
-            --product apple-gpu-vulkan-experiment --platform macos --verify-only
+            --platform macos --verify-only
           echo "usable=true" >> "$GITHUB_OUTPUT"
 
       # prepare.sh is the only dependency step allowed to touch the network.
@@ -297,12 +287,10 @@ jobs:
         if: steps.verify.outputs.usable != 'true'
         run: dependencies/build.sh --jobs "$(sysctl -n hw.ncpu)"
 
-      # The product is named first: --platform alone leaves it to a default.
       - name: Build Apple GPU dependencies
         if: steps.verify.outputs.usable != 'true'
         run: >-
           dependencies/build-apple-gpu.sh
-          --product apple-gpu-vulkan-experiment
           --platform macos
           --jobs "$(sysctl -n hw.ncpu)"
 
@@ -312,9 +300,11 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: |
+            external/sources
+            .build/dependency-cache
             .build/dependencies/macos-arm64-27
             .build/dependencies/apple-gpu-vulkan-experiment/macos-arm64
-          key: prefixes-${{ hashFiles('dependencies/manifest.tsv', 'dependencies/patches/**/series.tsv', 'dependencies/platforms/**', 'dependencies/build.sh', 'dependencies/build-apple-gpu.sh') }}
+          key: prefixes-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('dependencies/**', 'tools/rootfs/**', 'scripts/patch_series.py') }}
 
   unit:
     name: Unit tests
@@ -326,8 +316,8 @@ jobs:
 
       - name: Configure Git identity
         run: |
-          git config user.name  "Kernarium CI"
-          git config user.email "kernarium-ci@kernarium.dev"
+          git config --global user.name  "Kernarium CI"
+          git config --global user.email "kernarium-ci@kernarium.dev"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -336,16 +326,18 @@ jobs:
 
       - name: Install host tools
         run: |
-          brew install ninja meson pkg-config rsync autoconf automake gettext \
+          brew install make ninja meson pkg-config rsync autoconf automake gettext \
             libtool gperf groff
 
       - name: Restore prefixes
         uses: actions/cache/restore@v4
         with:
           path: |
+            external/sources
+            .build/dependency-cache
             .build/dependencies/macos-arm64-27
             .build/dependencies/apple-gpu-vulkan-experiment/macos-arm64
-          key: prefixes-${{ hashFiles('dependencies/manifest.tsv', 'dependencies/patches/**/series.tsv', 'dependencies/platforms/**', 'dependencies/build.sh', 'dependencies/build-apple-gpu.sh') }}
+          key: prefixes-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('dependencies/**', 'tools/rootfs/**', 'scripts/patch_series.py') }}
           fail-on-cache-miss: true
 
       - name: Configure
@@ -376,8 +368,8 @@ jobs:
 
       - name: Configure Git identity
         run: |
-          git config user.name  "Kernarium CI"
-          git config user.email "kernarium-ci@kernarium.dev"
+          git config --global user.name  "Kernarium CI"
+          git config --global user.email "kernarium-ci@kernarium.dev"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -386,7 +378,7 @@ jobs:
 
       - name: Install host tools
         run: |
-          brew install ninja meson pkg-config rsync autoconf automake gettext \
+          brew install make ninja meson pkg-config rsync autoconf automake gettext \
             libtool gperf groff
 
       - name: Metal toolchain
@@ -396,9 +388,11 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: |
+            external/sources
+            .build/dependency-cache
             .build/dependencies/macos-arm64-27
             .build/dependencies/apple-gpu-vulkan-experiment/macos-arm64
-          key: prefixes-${{ hashFiles('dependencies/manifest.tsv', 'dependencies/patches/**/series.tsv', 'dependencies/platforms/**', 'dependencies/build.sh', 'dependencies/build-apple-gpu.sh') }}
+          key: prefixes-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('dependencies/**', 'tools/rootfs/**', 'scripts/patch_series.py') }}
           fail-on-cache-miss: true
 
       - name: Configure
@@ -424,8 +418,7 @@ jobs:
     needs: dependencies
     # Off by default. Turn it on with the repository variable
     # KERNARIUM_APP_BUILDS=true once the runner can hand the project what the
-    # target embeds; docs/ci.md#the-full-applications lists the six inputs and
-    # the two ways to get them.
+    # target embeds; Andarium/README.md describes the accepted artifacts.
     if: vars.KERNARIUM_APP_BUILDS == 'true'
     # A packaged device build needs a signing identity, and only a self-hosted
     # Mac can hold one this workflow may use. Point this label at that machine;
@@ -441,7 +434,7 @@ jobs:
           cmake --preset kernarium-ios-device-android \
             -DPython3_EXECUTABLE="$(command -v python3)"
           cmake --build --preset kernarium-ios-device-android --parallel
-          Kernarium/scripts/package-ios-frameworks.sh --runtimes android
+          Kernarium/scripts/package-ios-frameworks.sh --sdk device --runtimes android
 
       # The staged image is a copy of an accepted Android release. A release
       # build costs hours and tens of gigabytes, so the machine this job runs on

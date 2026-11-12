@@ -1,0 +1,230 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 18:10:30 +0900
+Subject: [PATCH] venus: end the context on a command the device does not
+ expose
+
+A device's proc table keeps NULL for every entry point of a version or
+extension the device did not enable, and the command handlers call an
+entry point without testing it. A guest that sends such a command, a
+Vulkan 1.2 command to a Vulkan 1.1 device for one, made the renderer
+call through NULL and end the host process.
+
+The protocol's generated dispatch only tests that the renderer has a
+handler for the command, so nothing at decode refuses it, and a handler
+cannot tell a command it must refuse from one it may run. Fill every
+NULL entry of the global, instance, physical device and device proc
+tables with one function that marks the context being dispatched lost
+and returns an error. The sync and ring dispatch loops name that
+context to it, per thread. An entry the device exposes is called as
+before, so a command pays nothing for the check.
+
+Two handlers answer a missing entry point themselves, because a guest
+sends the command on hosts that lack it: the Apple host has no DRM
+format modifiers, and the host image copy refuses a memcpy copy when
+the driver has no vkGetImageSubresourceLayout2. They now test
+vkr_proc_is_missing() where they tested for NULL, so the answer and the
+live context stay as they were.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/venus/vkr_context.c         | 47 +++++++++++++++++++++++++++++++++
+ src/venus/vkr_context.h         | 24 +++++++++++++++++
+ src/venus/vkr_device.c          |  1 +
+ src/venus/vkr_host_copy.c       |  2 +-
+ src/venus/vkr_image.c           |  2 +-
+ src/venus/vkr_instance.c        |  1 +
+ src/venus/vkr_physical_device.c |  1 +
+ src/venus/vkr_ring.c            |  2 ++
+ 8 files changed, 78 insertions(+), 2 deletions(-)
+
+diff --git a/src/venus/vkr_context.c b/src/venus/vkr_context.c
+index 623486be6fe5b6ce9408afa532781cb0a9a07203..c7e3b8d467009fb62fb9ec99ffb2f33f53a440a5 100644
+--- a/src/venus/vkr_context.c
++++ b/src/venus/vkr_context.c
+@@ -128,12 +128,56 @@ vkr_context_init_dispatch(struct vkr_context *ctx)
+    vkr_context_init_acceleration_structure_dispatch(ctx);
+ }
+ 
++static _Thread_local struct vkr_context *vkr_dispatching_context;
++
++void
++vkr_context_set_dispatching(struct vkr_context *ctx)
++{
++   vkr_dispatching_context = ctx;
++}
++
++/* Stands for each entry point a proc table lacks. It is called through the
++ * entry's own function pointer type and ignores the arguments the caller
++ * passed, which the C calling convention of the hosts (arm64 and x86-64) lets
++ * the caller clean up. An error is the one result no command reads as data. */
++static VkResult
++vkr_missing_proc(void)
++{
++   vkr_log("a command calls an entry point the device does not expose");
++   if (vkr_dispatching_context)
++      vkr_context_set_fatal(vkr_dispatching_context);
++   return VK_ERROR_FEATURE_NOT_PRESENT;
++}
++
++bool
++vkr_proc_is_missing(PFN_vkVoidFunction proc)
++{
++   return proc == (PFN_vkVoidFunction)vkr_missing_proc;
++}
++
++void
++vkr_proc_table_fill_missing(void *table, size_t size)
++{
++   assert(size % sizeof(PFN_vkVoidFunction) == 0);
++
++   uint8_t *bytes = table;
++   for (size_t offset = 0; offset < size; offset += sizeof(PFN_vkVoidFunction)) {
++      PFN_vkVoidFunction proc;
++      memcpy(&proc, bytes + offset, sizeof(proc));
++      if (!proc) {
++         proc = (PFN_vkVoidFunction)vkr_missing_proc;
++         memcpy(bytes + offset, &proc, sizeof(proc));
++      }
++   }
++}
++
+ static inline void
+ vkr_context_init_proc_table(struct vkr_context *ctx)
+ {
+    /* Get vkGetInstanceProcAddr from libvulkan */
+    ctx->get_proc_addr = ctx->vulkan_library.GetInstanceProcAddr;
+    vn_util_init_global_proc_table(ctx->get_proc_addr, &ctx->proc_table);
++   VKR_PROC_TABLE_FILL_MISSING(&ctx->proc_table);
+ }
+ 
+ bool
+@@ -172,15 +216,18 @@ vkr_context_submit_cmd(struct vkr_context *ctx, const void *buffer, size_t size)
+ 
+    vkr_cs_decoder_set_buffer_stream(&ctx->decoder, buffer, size);
+ 
++   vkr_context_set_dispatching(ctx);
+    while (vkr_cs_decoder_has_command(&ctx->decoder)) {
+       vn_dispatch_command(&ctx->dispatch);
+       if (vkr_context_get_fatal(ctx)) {
+          vkr_log("submit_cmd: vn_dispatch_command failed");
+ 
++         vkr_context_set_dispatching(NULL);
+          vkr_cs_decoder_reset(&ctx->decoder);
+          return false;
+       }
+    }
++   vkr_context_set_dispatching(NULL);
+ 
+    vkr_cs_decoder_reset(&ctx->decoder);
+    return true;
+diff --git a/src/venus/vkr_context.h b/src/venus/vkr_context.h
+index c19ca2daf9bf7fa7b0373141683a8a8e39fcf6a3..3974ea49eb80c49884576576967e18ba822281fb 100644
+--- a/src/venus/vkr_context.h
++++ b/src/venus/vkr_context.h
+@@ -197,6 +197,30 @@ vkr_context_get_fatal(struct vkr_context *ctx)
+    return ctx->cs_fatal_error;
+ }
+ 
++/* Names the context whose commands the calling thread dispatches, or NULL
++ * when it dispatches none. */
++void
++vkr_context_set_dispatching(struct vkr_context *ctx);
++
++/* The driver leaves the entry points of a version or extension the device
++ * does not enable NULL in a proc table, and the handlers call an entry point
++ * without testing it. Point each NULL entry at a function that ends the
++ * dispatching context, so that a command the device does not expose cannot
++ * reach a NULL call. Every entry of the table must be a function pointer. */
++void
++vkr_proc_table_fill_missing(void *table, size_t size);
++
++#define VKR_PROC_TABLE_FILL_MISSING(table)                                               \
++   vkr_proc_table_fill_missing((table), sizeof(*(table)))
++
++/* Whether a proc table entry stands for an entry point the driver does not
++ * expose. A handler that answers a missing entry point itself, instead of
++ * ending the context, tests for it with this. */
++bool
++vkr_proc_is_missing(PFN_vkVoidFunction proc);
++
++#define VKR_PROC_IS_MISSING(proc) vkr_proc_is_missing((PFN_vkVoidFunction)(proc))
++
+ static inline bool
+ vkr_context_validate_object_id_locked(struct vkr_context *ctx, vkr_object_id id)
+ {
+diff --git a/src/venus/vkr_device.c b/src/venus/vkr_device.c
+index 9343e4d77c5433eff6aeca41c135622bed6ac74f..3e538229d5aa79f25ef2b0aa8fae18cf26c6441c 100644
+--- a/src/venus/vkr_device.c
++++ b/src/venus/vkr_device.c
+@@ -75,6 +75,7 @@ vkr_device_init_proc_table(struct vkr_device *dev,
+ 
+    vn_util_init_device_proc_table(dev->base.handle.device, vk->GetDeviceProcAddr,
+                                   api_version, &ext_table, &dev->proc_table);
++   VKR_PROC_TABLE_FILL_MISSING(&dev->proc_table);
+ }
+ 
+ /* Look up the entry points of the extensions the renderer enabled for its own
+diff --git a/src/venus/vkr_host_copy.c b/src/venus/vkr_host_copy.c
+index c0d08075939ae191816a9c5a3922d74ad7b4e408..791565b50a8717600347897c9add5f88c280338a 100644
+--- a/src/venus/vkr_host_copy.c
++++ b/src/venus/vkr_host_copy.c
+@@ -589,7 +589,7 @@ vkr_host_copy_footprint(const struct vkr_host_copy_target *target,
+    }
+ 
+    if (target->flags & VK_HOST_IMAGE_COPY_MEMCPY_BIT) {
+-      if (!target->vk->GetImageSubresourceLayout2)
++      if (VKR_PROC_IS_MISSING(target->vk->GetImageSubresourceLayout2))
+          return false;
+ 
+       size_t memcpy_reach = 0;
+diff --git a/src/venus/vkr_image.c b/src/venus/vkr_image.c
+index a4bc30c7655fd9517802d337285984f52021cf7e..56efcc3189cd41867b88e4be2cd5e7de4b54ded6 100644
+--- a/src/venus/vkr_image.c
++++ b/src/venus/vkr_image.c
+@@ -339,7 +339,7 @@ vkr_dispatch_vkGetImageDrmFormatModifierPropertiesEXT(
+ 
+    /* An Apple host has no DRM format modifiers, so the entry point is not
+     * loaded and calling through the table would fault. */
+-   if (!vk->GetImageDrmFormatModifierPropertiesEXT) {
++   if (VKR_PROC_IS_MISSING(vk->GetImageDrmFormatModifierPropertiesEXT)) {
+       args->ret = VK_ERROR_EXTENSION_NOT_PRESENT;
+       return;
+    }
+diff --git a/src/venus/vkr_instance.c b/src/venus/vkr_instance.c
+index 3536deaa1815b1ff5d82a601a2da6ffa5dd85134..c6c7ff10ce16eb6c6ca183e0c6262d93a4d34126 100644
+--- a/src/venus/vkr_instance.c
++++ b/src/venus/vkr_instance.c
+@@ -107,6 +107,7 @@ vkr_instance_init_proc_table(struct vkr_instance *instance, struct vkr_context *
+    instance->get_proc_addr = ctx->get_proc_addr;
+    vn_util_init_instance_proc_table(instance->base.handle.instance, ctx->get_proc_addr,
+                                     &instance->proc_table);
++   VKR_PROC_TABLE_FILL_MISSING(&instance->proc_table);
+ }
+ 
+ static void
+diff --git a/src/venus/vkr_physical_device.c b/src/venus/vkr_physical_device.c
+index 6e955e3075f42379d30538ed712cd7b3d1934fcc..b99d4c58e6b21f1b0393735379bcbbec79e25cc0 100644
+--- a/src/venus/vkr_physical_device.c
++++ b/src/venus/vkr_physical_device.c
+@@ -513,6 +513,7 @@ vkr_physical_device_init_proc_table(struct vkr_physical_device *physical_dev,
+ {
+    vn_util_init_physical_device_proc_table(
+       instance->base.handle.instance, instance->get_proc_addr, &physical_dev->proc_table);
++   VKR_PROC_TABLE_FILL_MISSING(&physical_dev->proc_table);
+ }
+ 
+ static void
+diff --git a/src/venus/vkr_ring.c b/src/venus/vkr_ring.c
+index 1911c07c931aa7e7ce5e690ee2edf631ed0bb3c8..932535eb66086ba7b13e5b3ef6e3f9dc39703780 100644
+--- a/src/venus/vkr_ring.c
++++ b/src/venus/vkr_ring.c
+@@ -291,6 +291,8 @@ vkr_ring_thread(void *arg)
+ 
+    snprintf(thread_name, ARRAY_SIZE(thread_name), "vkr-ring-%d", ctx->ctx_id);
+    u_thread_setname(thread_name);
++   /* The thread dispatches this ring's commands for as long as it lives. */
++   vkr_context_set_dispatching(ctx);
+    if (ring->prio_valid && setpriority(PRIO_PROCESS, 0, ring->prio)) {
+ #ifdef DEBUG
+       /* Currently venus doesn't forward the CAP_SYS_NICE request upon forking, so

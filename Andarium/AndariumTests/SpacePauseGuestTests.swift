@@ -21,7 +21,7 @@ import UIKit
 @MainActor
 struct SpacePauseGuestTests {
     /// The device's free space as the test states it.
-    private final class FreeSpace: @unchecked Sendable {
+    private nonisolated final class FreeSpace: @unchecked Sendable {
         private let lock = NSLock()
         private var bytes: UInt64
         init(_ bytes: UInt64) { self.bytes = bytes }

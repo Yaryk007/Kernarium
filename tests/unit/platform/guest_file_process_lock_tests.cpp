@@ -21,7 +21,10 @@
 #include <fcntl.h>
 #include <filesystem>
 #include <poll.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/xattr.h>
+#include <thread>
 #include <unistd.h>
 
 namespace {
@@ -220,6 +223,49 @@ void theRestoreStillChecksTheDisks()
 	(void)uml::platform::forget_guest_files();
 }
 
+/* The attribute Foundation writes for a file excluded from backups. iOS's
+ * Foundation writes it again each time the exclusion is set, so every save of
+ * Andarium's guest settings moves the data disk's change time, and a save can
+ * fall between a quiesce's release and the resume. */
+constexpr char backupExclusion[] = "com.apple.metadata:com_apple_backup_excludeItem";
+constexpr char backupExclusionValue[] = "com.apple.backupd";
+
+/* A disk whose metadata alone changed while the guest was away resumes: the
+ * guest reads nothing that changed. */
+void aMetadataChangeWhileAwayResumes()
+{
+	(void)uml::platform::forget_guest_files();
+	const int disk = openScratch("excluded.img", O_RDWR);
+	const LockProbe probe {scratchPath("excluded.img")};
+	require(::pwrite(disk, "content", 7, 0) == 7);
+	require(lockDisk(disk, F_WRLCK) == 0);
+	require(uml::platform::release_guest_file_locks() == 0);
+	struct stat released {};
+	require(::fstat(disk, &released) == 0);
+	/* The change time has nanoseconds; a moment apart, the write moves it. */
+	std::this_thread::sleep_for(std::chrono::milliseconds {2});
+	require(::fsetxattr(disk, backupExclusion, backupExclusionValue,
+		sizeof backupExclusionValue - 1, 0, 0) == 0,
+		"set the backup exclusion");
+	struct stat excluded {};
+	require(::fstat(disk, &excluded) == 0);
+	require(excluded.st_ctimespec.tv_sec != released.st_ctimespec.tv_sec ||
+		excluded.st_ctimespec.tv_nsec != released.st_ctimespec.tv_nsec,
+		"the attribute must move the change time, or this checks nothing");
+	require(excluded.st_size == released.st_size &&
+		excluded.st_mtimespec.tv_sec == released.st_mtimespec.tv_sec &&
+		excluded.st_mtimespec.tv_nsec == released.st_mtimespec.tv_nsec,
+		"the attribute must leave the content's size and time alone");
+	require(uml::platform::restore_guest_file_locks(),
+		"a disk whose metadata alone changed while the guest was away resumes");
+	require(!probe.locked(), "a restored guest's disk must carry no host lock");
+	require(lockDisk(disk, F_WRLCK) == 0,
+		"a resumed guest locks its disks again");
+	require(uml::platform::release_guest_file_locks(true) == 0);
+	(void)::close(disk);
+	(void)uml::platform::forget_guest_files();
+}
+
 /* Only the non-blocking whole-file lock is a lock request, under either
  * policy. */
 void onlyTheNonBlockingWholeFileLockIsAccepted()
@@ -250,6 +296,7 @@ int main()
 	aGuestDiskLockLocksNoHostFile();
 	suspensionKeepsTheBookkeepingAndNoHostLock();
 	theRestoreStillChecksTheDisks();
+	aMetadataChangeWhileAwayResumes();
 	onlyTheNonBlockingWholeFileLockIsAccepted();
 	std::puts("guest file process lock tests passed");
 	return 0;

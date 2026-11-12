@@ -121,10 +121,10 @@ index 3342eb1f97a45c301ae43d1540f72cf0957f3bdb..340e3e3f3341eb845b4554d1479be36e
  int darwin_reserve_embedded_thread(void);
  void darwin_release_embedded_thread(void);
 diff --git a/arch/um/os-Darwin/signal.c b/arch/um/os-Darwin/signal.c
-index 28ab8dbe589f95dfba5654a2fb08c756c190bf19..dfcf40a0ea376cd35d2467e4323235130a622724 100644
+index 445785ad9f7d919d26afa87b5cf8992dacfdba75..757777fb3aca3f35797b51a887eb284756787ca8 100644
 --- a/arch/um/os-Darwin/signal.c
 +++ b/arch/um/os-Darwin/signal.c
-@@ -219,16 +219,16 @@ static void hard_handler(int signal, siginfo_t *info, void *pointer)
+@@ -221,16 +221,16 @@ static void hard_handler(int signal, siginfo_t *info, void *pointer)
  			state->alarm_pending = 1;
  			return;
  		}
@@ -145,7 +145,7 @@ index 28ab8dbe589f95dfba5654a2fb08c756c190bf19..dfcf40a0ea376cd35d2467e432323513
  	}
  	errno = saved_errno;
  }
-@@ -236,17 +236,18 @@ static void hard_handler(int signal, siginfo_t *info, void *pointer)
+@@ -238,17 +238,18 @@ static void hard_handler(int signal, siginfo_t *info, void *pointer)
  void deliver_alarm(void)
  {
  	struct darwin_signal_state *state = local_signal_state();
@@ -166,7 +166,7 @@ index 28ab8dbe589f95dfba5654a2fb08c756c190bf19..dfcf40a0ea376cd35d2467e432323513
  }
  
  void timer_set_signal_handler(void)
-@@ -380,7 +381,16 @@ int um_set_signals(int enable)
+@@ -382,7 +383,16 @@ int um_set_signals(int enable)
  
  int um_set_signals_trace(int enable)
  {

@@ -112,8 +112,9 @@ uml_add_unit_test(
     NAME platform-host-environment
     COMMAND uml_host_environment_tests)
 
-# The host GPU's fixed budget: the clamp, the guest's half as the maximum, no
-# limit, and when the process is short of the floor.
+# The host GPU's fixed budget: what the limit leaves above the floor, the
+# guest's RAM where there is no limit, and when the process is short of the
+# floor.
 add_executable(uml_gpu_budget_tests gpu_budget_tests.cpp)
 target_link_libraries(uml_gpu_budget_tests PRIVATE UML::GpuBudget)
 uml_add_unit_test(

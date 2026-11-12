@@ -120,4 +120,38 @@ struct PreferenceKeeperTests {
             #expect(DisplayOptionsStore.load(from: defaults) == DisplayOptions(chosenRetina: false))
         }
     }
+
+    @Test func theJitChoiceIsWrittenWhenMade() async throws {
+        try await withDefaults { defaults in
+            let model = model()
+            #expect(model.jitToKeep == false)
+            let keeper = PreferenceKeeper(model: model, defaults: defaults)
+            keeper.start()
+
+            model.setJit(true)
+            try await written(by: keeper)
+            #expect(JitPreference(defaults: defaults).isOn)
+            model.setJit(false)
+            try await written(by: keeper)
+            #expect(!JitPreference(defaults: defaults).isOn)
+        }
+    }
+
+    @Test func aLaunchThatDecidedTheJitLeavesTheStoredChoice() async {
+        await withDefaults { defaults in
+            JitPreference(defaults: defaults).keep(true)
+            let model = model()
+            model.jitDecidedByLaunch = true
+            model.jitOn = false
+            #expect(model.jitToKeep == nil)
+            let keeper = PreferenceKeeper(model: model, defaults: defaults)
+            keeper.start()
+
+            model.setJit(true)
+            model.setJit(false)
+            await keeper.pending?.value
+            keeper.keep()
+            #expect(JitPreference(defaults: defaults).isOn)
+        }
+    }
 }

@@ -580,6 +580,8 @@ def run_timed_session(
         with (
             mock.patch.object(sys, "argv", arguments),
             mock.patch.object(module, "Guest", return_value=guest) as built,
+            # The fake guest has four CPUs even on a smaller CI runner.
+            mock.patch("os.cpu_count", return_value=4),
             mock.patch("time.monotonic", side_effect=clock),
             mock.patch("subprocess.check_output", side_effect=cpu_time),
             mock.patch("subprocess.Popen", side_effect=start_sampler),

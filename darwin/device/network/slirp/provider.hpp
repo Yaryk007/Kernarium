@@ -131,6 +131,13 @@ public:
 		return processed_transmits_for_testing_.load(
 			std::memory_order_acquire);
 	}
+	/* Passes the event loop has made: a loop that never waits on its
+	 * sockets goes through them without pause. */
+	[[nodiscard]] std::uint64_t event_loop_passes_for_testing() const noexcept
+	{
+		return event_loop_passes_for_testing_.load(
+			std::memory_order_relaxed);
+	}
 	/* Forwards installed while a worker already ran on the instance. */
 	[[nodiscard]] std::size_t
 	forwards_installed_while_running_for_testing() const noexcept
@@ -240,6 +247,7 @@ private:
 	std::atomic_bool transmit_pause_requested_for_testing_{};
 	bool transmit_pause_reached_for_testing_{};
 	std::atomic_uint64_t processed_transmits_for_testing_{};
+	std::atomic_uint64_t event_loop_passes_for_testing_{};
 	std::atomic_size_t forwards_installed_while_running_for_testing_{};
 	std::atomic_size_t internet_sockets_for_testing_{};
 	std::uint32_t dns_interface_for_testing_{};

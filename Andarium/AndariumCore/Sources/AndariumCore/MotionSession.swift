@@ -48,6 +48,8 @@ public final class MotionSession: @unchecked Sendable {
     private var streamEpoch: UInt64 = 0
     private var run: UInt64 = 0
     private var applied = MotionPlan.off
+    /// The guest's service has accepted a connection in this run.
+    private var answered = false
 
     public init(
         opener: any GuestStreamOpener, device: any MotionDevice,
@@ -106,13 +108,21 @@ public final class MotionSession: @unchecked Sendable {
         let current = run
         sampling.connectionChanged(false)
         applied = .off
+        answered = false
         let stream = MotionStream(
             opener: opener, retryDelay: retryDelay,
             connectionChanged: { [weak self] connected in
                 self?.queue.async { [weak self] in
                     guard let self, run == current else { return }
                     sampling.connectionChanged(connected)
-                    problem(connected ? nil : .guestUnavailable)
+                    // A service that answered is there: its connection ends
+                    // when the guest goes down or the service restarts.
+                    if connected {
+                        answered = true
+                        problem(nil)
+                    } else if !answered {
+                        problem(.guestUnavailable)
+                    }
                     reconcile()
                 }
             },

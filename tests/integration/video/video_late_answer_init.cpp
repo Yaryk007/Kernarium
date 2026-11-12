@@ -64,20 +64,45 @@ void out(const char *s)
 	sys(nr_write, console, ptr(s), static_cast<long>(length(s)));
 }
 
-void out_num(long value)
-{
-	char buffer[24];
-	int at = 23;
-	buffer[at] = 0;
-	unsigned long v = value < 0 ? -static_cast<unsigned long>(value) : value;
-	do {
-		buffer[--at] = static_cast<char>('0' + v % 10);
-		v /= 10;
-	} while (v);
-	if (value < 0)
-		buffer[--at] = '-';
-	out(buffer + at);
-}
+/* One whole line per write. The host's transport thread logs a command's
+ * line when it reads the command, and a kick asks for no acknowledgement, so
+ * the line of a command the guest has just sent can come after the syscall
+ * that sent it returned: a line written in parts would be split by it. */
+class Line final {
+public:
+	Line &text(const char *s)
+	{
+		while (*s && size_ < sizeof(buffer_) - 1)
+			buffer_[size_++] = *s++;
+		return *this;
+	}
+
+	Line &number(long value)
+	{
+		char digits[24];
+		int at = 23;
+		digits[at] = 0;
+		unsigned long v =
+			value < 0 ? -static_cast<unsigned long>(value) : value;
+		do {
+			digits[--at] = static_cast<char>('0' + v % 10);
+			v /= 10;
+		} while (v);
+		if (value < 0)
+			digits[--at] = '-';
+		return text(digits + at);
+	}
+
+	void write()
+	{
+		text("\n");
+		sys(nr_write, console, ptr(buffer_), static_cast<long>(size_));
+	}
+
+private:
+	char buffer_[160];
+	unsigned long size_ = 0;
+};
 
 void sleep_ms(long milliseconds)
 {
@@ -98,16 +123,14 @@ void sleep_ms(long milliseconds)
 long open_decoder(const char *step)
 {
 	const long fd = sys(nr_openat, at_fdcwd, ptr("/dev/video0"), o_rdwr);
-	out("VIDEO_INIT ");
-	out(step);
+	Line line;
+	line.text("VIDEO_INIT ").text(step);
 	if (fd >= 0) {
-		out(" ok\n");
+		line.text(" ok").write();
 		sys(nr_close, fd);
 		return 0;
 	}
-	out(" errno=");
-	out_num(-fd);
-	out("\n");
+	line.text(" errno=").number(-fd).write();
 	return -fd;
 }
 
@@ -149,11 +172,11 @@ void validate(const char *step)
 {
 	const bool validated = write_attribute(
 		"/sys/kernel/slab/virtio-video-virtio0-vbufs/validate", "1");
-	out("VIDEO_INIT ");
-	out(step);
-	out(validated ? " validated objects=" : " validate failed objects=");
-	out_num(cache_objects());
-	out("\n");
+	Line line;
+	line.text("VIDEO_INIT ").text(step)
+		.text(validated ? " validated objects="
+				: " validate failed objects=")
+		.number(cache_objects()).write();
 }
 
 } // namespace
@@ -189,9 +212,7 @@ extern "C" [[noreturn]] void _start()
 	 * interrupt does a moment after the kick, only the command the device
 	 * never answered is still allocated. */
 	sleep_ms(1000);
-	out("VIDEO_INIT held objects=");
-	out_num(cache_objects());
-	out("\n");
+	Line().text("VIDEO_INIT held objects=").number(cache_objects()).write();
 	out(write_attribute("/sys/bus/virtio/drivers/virtio-video/unbind",
 		"virtio0") ? "VIDEO_INIT unbound\n" : "VIDEO_INIT unbind failed\n");
 	out(sys(nr_faccessat, at_fdcwd,

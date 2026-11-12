@@ -84,13 +84,17 @@ inline std::string receiveRequest(int descriptor, sockaddr_un &client,
 	return std::string(request.data.data(), length);
 }
 
-/* Answers a request with `text` and the error flag `error`; false when the
- * client has gone, as one that stopped waiting has. */
+/* Answers a request with `text` and the error flag `error`, as the final
+ * reply unless `more` says that another follows (the console text a command
+ * such as sysrq sends before its final reply); false when the client has
+ * gone, as one that stopped waiting has. */
 [[nodiscard]] inline bool sendReply(int descriptor, const sockaddr_un &client,
-	socklen_t clientLength, std::uint32_t error, std::string_view text)
+	socklen_t clientLength, std::uint32_t error, std::string_view text,
+	std::uint32_t more = 0U)
 {
 	require(text.size() <= maximumConsoleData);
-	ConsoleReply reply {error, 0U, static_cast<std::uint32_t>(text.size()), {}};
+	ConsoleReply reply {error, more,
+		static_cast<std::uint32_t>(text.size()), {}};
 	std::memcpy(reply.data.data(), text.data(), text.size());
 	return ::sendto(descriptor, &reply, sizeof(reply), 0,
 		reinterpret_cast<const sockaddr *>(&client), clientLength) ==

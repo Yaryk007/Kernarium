@@ -21,16 +21,16 @@ one again allocates through the host, which refuses past its bound.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- src/gallium/drivers/zink/zink_batch.c   | 16 +++++++++++++---
+ src/gallium/drivers/zink/zink_batch.c   | 15 ++++++++++++---
  src/gallium/drivers/zink/zink_batch.h   |  3 ++-
  src/gallium/drivers/zink/zink_context.c |  2 +-
  src/gallium/drivers/zink/zink_screen.c  |  7 ++++++-
  src/gallium/drivers/zink/zink_types.h   |  2 ++
  src/gallium/include/pipe/p_screen.h     | 10 +++++++---
- 6 files changed, 31 insertions(+), 9 deletions(-)
+ 6 files changed, 30 insertions(+), 9 deletions(-)
 
 diff --git a/src/gallium/drivers/zink/zink_batch.c b/src/gallium/drivers/zink/zink_batch.c
-index 4285bae83e310511426833e8334af69899110d98..f10f60c8ff39e8dd361587afbd8a24463ea0f9d1 100644
+index b8748cca43826eac02ad0ba689db5542ea9f6c5d..c9639196ab4e1390b526ec496e8872bfc4eb86dd 100644
 --- a/src/gallium/drivers/zink/zink_batch.c
 +++ b/src/gallium/drivers/zink/zink_batch.c
 @@ -8,6 +8,7 @@
@@ -54,17 +54,16 @@ index 4285bae83e310511426833e8334af69899110d98..f10f60c8ff39e8dd361587afbd8a2446
        zink_batch_state_append(&screen->free_batch_states, &screen->last_free_batch_state, i);
     }
     screen->active_batch_states = NULL;
-@@ -479,14 +482,21 @@ reset_active_batch_states(struct zink_screen *screen)
-  * behind its command buffers at their largest size.  The screen keeps every
-  * state any context has needed and hands them to whichever context asks next,
-  * so the storage of contexts that are gone stays allocated for as long as the
-- * screen lives.  Give it back; the next batch to take a state allocates what
-- * it needs again.  Returns the number of states released. */
-+ * screen lives.  Give it back from every state that has been free for at
-+ * least min_idle_ns; a context that keeps submitting frees its states and
-+ * takes them again within a frame or two, and keeps theirs.  The next batch
-+ * to take a released state allocates what it needs again.  Returns the
-+ * number of states released. */
+@@ -483,15 +486,21 @@ reset_active_batch_states(struct zink_screen *screen)
+  * submission are not free yet: they wait for the next submission to reset
+  * them, which does not come while every context is quiet or gone, and they
+  * hold the storage of the batches that were just finished.  Reset them first.
+- * Give it back; the next batch to take a state allocates what it needs
+- * again.  Returns the number of states released. */
++ * Give it back from every state that has been free for at least min_idle_ns;
++ * a context that keeps submitting frees its states and takes them again within
++ * a frame or two, and keeps theirs.  The next batch to take a released state
++ * allocates what it needs again.  Returns the number of states released. */
  unsigned
 -zink_screen_release_batch_storage(struct zink_screen *screen)
 +zink_screen_release_batch_storage(struct zink_screen *screen,
@@ -72,6 +71,7 @@ index 4285bae83e310511426833e8334af69899110d98..f10f60c8ff39e8dd361587afbd8a2446
  {
     unsigned released = 0;
 +   const int64_t now_ns = os_time_get_nano();
+    reset_active_batch_states(screen);
     simple_mtx_lock(&screen->free_batch_states_lock);
     for (struct zink_batch_state *bs = screen->free_batch_states; bs; bs = bs->next) {
 +      if (min_idle_ns && now_ns - bs->free_since_ns < (int64_t)min_idle_ns)

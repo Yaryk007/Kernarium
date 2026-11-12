@@ -5,3 +5,5 @@ patch	audio-do-not-declare-the-absent-bluetooth-module.patch
 patch	audio-give-the-primary-output-a-5-ms-nominal-latency.patch
 patch	audio-write-the-primary-output-straight-to-its-device.patch
 patch	audio-report-the-primary-output-s-position-from-its-device.patch
+patch	audio-do-not-throttle-the-primary-input-s-reading-thread.patch
+patch	audio-wait-for-the-primary-input-s-frames-instead-of-making-them-up.patch

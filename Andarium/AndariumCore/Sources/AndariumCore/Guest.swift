@@ -19,7 +19,9 @@ public struct Guest: Equatable, Codable, Sendable {
     public var cores: Int
     public var memoryMiB: Int
     public var capacityGiB: Int
-    /// A larger capacity that applies when the guest next starts.
+    /// A larger capacity that applies when the guest next starts. It exists
+    /// only on Home: a start applies it as it is handed to the runtime
+    /// (`applyPendingGrowth`).
     public var pendingCapacityGiB: Int?
     public var microphone: Bool
     /// The person's choice to share the device's accelerometer and gyroscope
@@ -95,7 +97,9 @@ public struct Guest: Equatable, Codable, Sendable {
     public var canGrow: Bool { effectiveCapacityGiB < Limits.capacityRangeGiB.upperBound }
 
     /// Resize: storage only grows, and the growth waits for the next start.
-    /// Choosing the current capacity again cancels a growth not yet applied.
+    /// Choosing the current capacity again cancels a growth not yet applied;
+    /// once a start has been handed to the runtime the growth is applied and
+    /// there is nothing left to cancel.
     /// `maximum` is the largest the carried system accepts, when that is
     /// below the range's.
     public mutating func setCapacity(_ value: Int, maximum: Int = Limits.capacityRangeGiB.upperBound) {
@@ -103,12 +107,18 @@ public struct Guest: Equatable, Codable, Sendable {
         pendingCapacityGiB = value > capacityGiB ? value : nil
     }
 
-    /// A start has finished booting: a pending growth now applies.
-    public mutating func didBoot() {
-        if let pending = pendingCapacityGiB {
-            capacityGiB = pending
-            pendingCapacityGiB = nil
-        }
+    /// A start is handed to the runtime, which grows the data disk to the
+    /// capacity the start carries, whatever the boot kind and however the
+    /// start ends. The growth applies here, so the capacity the guest records
+    /// is never below its disk's. Returns the capacity it grew from, or nil
+    /// when nothing was pending.
+    @discardableResult
+    public mutating func applyPendingGrowth() -> Int? {
+        guard let pending = pendingCapacityGiB else { return nil }
+        let before = capacityGiB
+        capacityGiB = pending
+        pendingCapacityGiB = nil
+        return before
     }
 
     /// The same choices with nothing in it: what Android's own factory reset

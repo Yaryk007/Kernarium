@@ -19,11 +19,12 @@ namespace uml::runtime {
  * "running" into it before the kernel starts, and every way the session can
  * end overwrites that with the end: the run's own return, a guest kernel
  * panic or other kernel crash (darwin_uml_abort), an exit the kernel drives
- * (darwin_uml_exit), a hibernated guest whose RAM cannot be restored, and any
- * exit() of the process while the guest runs. A record still "running" at the
- * next launch therefore says that something outside the process ended it,
- * without letting it run another instruction: a SIGKILL from the system, such
- * as a memory-limit end, or from the person.
+ * (darwin_uml_exit), a hibernated guest whose RAM cannot be restored, a resume
+ * that finds a guest disk changed (failed), and any exit() of the process
+ * while the guest runs. A record still "running" at the next launch therefore
+ * says that something outside the process ended it, without letting it run
+ * another instruction: a SIGKILL from the system, such as a memory-limit end,
+ * or from the person.
  *
  * The kernel's console and diagnostic output goes through write(), which the
  * loader resolves to kernel_write(): the record keeps the last few KiB of it,

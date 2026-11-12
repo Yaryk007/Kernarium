@@ -91,7 +91,8 @@ void theArgumentsStateTheLimitAndTheCache()
 		(2867 - 1536 - 64 - 636 - 149) * mib);
 	require(launch.budget.bytes == 482 * mib);
 	require(plan.budget.available == 2867 * mib - 1536 * mib - 316 * mib);
-	require(plan.budget.bytes == 768 * mib);
+	require(plan.budget.bytes == 1015 * mib,
+		"the remainder, not bounded by the guest");
 	require(!plan.budget.short_of_floor);
 }
 
@@ -321,7 +322,7 @@ void theLaunchParametersAreSubtracted()
 	require(line.find("384 MiB") != std::string::npos, line.c_str());
 }
 
-void noLimitLeavesHalfTheGuest()
+void noLimitLeavesTheGuest()
 {
 	const LimitScope scope;
 	if (platform::process_memory_limit_bytes() != 0)
@@ -330,8 +331,18 @@ void noLimitLeavesHalfTheGuest()
 		std::vector<std::string>{"uml-darwin", "mem=2048M"},
 		{.application = 500 * mib, .headroom = 500 * mib});
 	require(plan.process_limit == 0);
-	require(plan.budget.bytes == 1024 * mib);
+	require(plan.budget.bytes == 2048 * mib, "the guest's RAM");
 	require(!plan.budget.short_of_floor);
+	/* A launch that states a limit is evaluated as the device is, small
+	 * guest or not. */
+	const auto stated = emulator::plan_gpu_budget(
+		std::vector<std::string>{"uml-darwin", "mem=512M",
+			"--memory-limit=2867M", "--gadget-cache-budget=128M",
+			"ncpus=1"},
+		no_terms);
+	require(stated.process_limit == 2867 * mib);
+	require(stated.budget.bytes == (2867 - 512 - 132) * mib,
+		"a small guest on a stated limit gets the remainder");
 }
 
 } // namespace
@@ -360,7 +371,7 @@ int main()
 			theLaunchParametersDefaultToTheLaunchSet},
 		{"the-launch-parameters-are-subtracted",
 			theLaunchParametersAreSubtracted},
-		{"no-limit-leaves-half-the-guest", noLimitLeavesHalfTheGuest},
+		{"no-limit-leaves-the-guest", noLimitLeavesTheGuest},
 	};
 	return uml::testing::runNamedTests(tests);
 }

@@ -15,6 +15,8 @@
 #include <mutex>
 #include <pthread.h>
 #include <signal.h>
+#include <sys/proc.h>
+#include <sys/sysctl.h>
 #include <unistd.h>
 
 namespace {
@@ -238,7 +240,8 @@ __attribute__((constructor)) void isolateGuestTimerFromApplicationThreads()
         api->read_guest_memory == nullptr ||
         api->cancel_touch == nullptr ||
         api->quiesce_resident == nullptr ||
-        api->read_graphics_memory == nullptr) {
+        api->read_graphics_memory == nullptr ||
+        api->prepare_jit == nullptr) {
         std::fputs("Kernarium: runtime API validation failed\n", stderr);
         return false;
     }
@@ -454,6 +457,28 @@ uml::runtime::guest_memory::LaunchMemorySet launchMemorySet(
         parameters.headroom_mib);
 }
 
+/* C of runtime/guest_memory_budget.hpp for this process: the window the
+ * runtime puts the kernel in (a macOS process, and an iOS application on a Mac,
+ * get the macOS window; a device and the Simulator get the signed iOS
+ * envelope, as native_kernel_placement chooses) and the RAM of the host. */
+uint32_t guestMemoryCeilingMiB()
+{
+    namespace budget = uml::runtime::guest_memory;
+    static const uint32_t ceiling = [] {
+        NSProcessInfo* info = NSProcessInfo.processInfo;
+#if TARGET_OS_OSX
+        const bool macosWindow = true;
+#else
+        const bool macosWindow = info.isiOSAppOnMac;
+#endif
+        return budget::guest_memory_ceiling_mib(
+            macosWindow ? budget::guest_memory_range_maximum_mib
+                        : budget::device_window_guest_memory_maximum_mib,
+            info.physicalMemory);
+    }();
+    return ceiling;
+}
+
 } // namespace
 
 extern "C" kernarium_launch_memory_set
@@ -488,7 +513,15 @@ extern "C" uint32_t kernarium_runtime_loader_maximum_guest_memory_mib_for_limit(
     kernarium_launch_memory_set parameters)
 {
     return uml::runtime::guest_memory::maximum_guest_memory_mib(
-        limitBytes, guestProcessorCount, launchMemorySet(parameters));
+        limitBytes,
+        guestProcessorCount,
+        launchMemorySet(parameters),
+        guestMemoryCeilingMiB());
+}
+
+extern "C" uint32_t kernarium_runtime_loader_guest_memory_ceiling_mib(void)
+{
+    return guestMemoryCeilingMiB();
 }
 
 extern "C" uint32_t kernarium_runtime_loader_maximum_guest_memory_mib(
@@ -521,13 +554,40 @@ extern "C" uint32_t kernarium_runtime_loader_default_guest_memory_mib(
 }
 
 extern "C" uint32_t
+kernarium_runtime_loader_default_guest_memory_holds_gpu_budget_for_limit(
+    uint64_t limitBytes,
+    uint32_t guestProcessorCount,
+    kernarium_launch_memory_set parameters)
+{
+    return uml::runtime::guest_memory::default_guest_memory(
+               limitBytes, guestProcessorCount, launchMemorySet(parameters))
+                   .holds_gpu_budget
+        ? 1
+        : 0;
+}
+
+extern "C" uint32_t
+kernarium_runtime_loader_default_guest_memory_holds_gpu_budget(
+    uint32_t guestProcessorCount,
+    kernarium_launch_memory_set parameters)
+{
+    return kernarium_runtime_loader_default_guest_memory_holds_gpu_budget_for_limit(
+        uml::platform::os_memory_limit_bytes(),
+        guestProcessorCount,
+        parameters);
+}
+
+extern "C" uint32_t
 kernarium_runtime_loader_conservative_guest_memory_mib_for_limit(
     uint64_t limitBytes,
     uint32_t guestProcessorCount,
     kernarium_launch_memory_set parameters)
 {
     return uml::runtime::guest_memory::conservative_guest_memory_mib(
-        limitBytes, guestProcessorCount, launchMemorySet(parameters));
+        limitBytes,
+        guestProcessorCount,
+        launchMemorySet(parameters),
+        guestMemoryCeilingMiB());
 }
 
 extern "C" uint32_t kernarium_runtime_loader_conservative_guest_memory_mib(
@@ -640,6 +700,29 @@ extern "C" int kernarium_runtime_loader_automation_hold_delay_ms(void)
     return api() != nullptr && automationHoldDelayMs != nullptr
         ? automationHoldDelayMs()
         : 0;
+}
+#endif
+
+#ifndef UML_APP_STORE_APPLICATION
+extern "C" int kernarium_runtime_loader_prepare_jit(
+    int enable,
+    uint32_t guestMemoryMiB,
+    uint32_t guestProcessorCount)
+{
+    const kernarium_runtime_api* runtime = api();
+    return runtime == nullptr
+        ? KERNARIUM_RUNTIME_JIT_UNSUPPORTED
+        : runtime->prepare_jit(enable, guestMemoryMiB, guestProcessorCount);
+}
+
+extern "C" int kernarium_runtime_loader_debugger_attached(void)
+{
+    struct kinfo_proc information {};
+    std::size_t length = sizeof(information);
+    int name[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()};
+    if (sysctl(name, 4, &information, &length, nullptr, 0) != 0)
+        return 0;
+    return (information.kp_proc.p_flag & P_TRACED) != 0 ? 1 : 0;
 }
 #endif
 

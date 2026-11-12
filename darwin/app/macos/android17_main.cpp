@@ -214,7 +214,7 @@ void print_usage()
 			"  --android-data-disk=/absolute/data.img (the instance's writable disk;\n"
 			"      created when absent)\n"
 			"  --android-data-gib=N (capacity of a new data disk, or growth of an\n"
-			"      existing one; a disk never shrinks)\n"
+			"      existing one; a larger disk is kept, never shrunk)\n"
 			"  --android-boot-mode=auto|normal|recovery\n"
 			"  --gpu-dpi=N (also the guest density; 213 without it)\n"
 			"  ncpus=N (also the guest's timeout multiplier: 3 from six vCPUs,\n"
@@ -270,7 +270,8 @@ std::vector<std::string> boot_command_line(
 	return forwarded;
 }
 
-void announce_data_disk(const uml::android::PreparedDataDisk &prepared)
+void announce_data_disk(const uml::android::PreparedDataDisk &prepared,
+			std::uint32_t requested_gib)
 {
 	switch (prepared.change) {
 	case uml::android::DataDiskChange::created:
@@ -282,6 +283,11 @@ void announce_data_disk(const uml::android::PreparedDataDisk &prepared)
 			     prepared.capacityGiB);
 		break;
 	case uml::android::DataDiskChange::none:
+		if (requested_gib != 0 && requested_gib < prepared.capacityGiB)
+			std::fprintf(stderr,
+				     "Android: the data disk is %u GiB, above the "
+				     "%u GiB requested, and is kept\n",
+				     prepared.capacityGiB, requested_gib);
 		break;
 	}
 }
@@ -320,10 +326,12 @@ int main(int argc, char *argv[], char *envp[])
 			 * disk. */
 			uml::android::rejectStorageArguments(
 				std::span{options.forwarded}.subspan(1));
-			announce_data_disk(uml::android::prepareDataDisk(
-				uml::android::readLayout(
-					release / uml::android::releaseLayout),
-				data_disk, options.data_gib));
+			announce_data_disk(
+				uml::android::prepareDataDisk(
+					uml::android::readLayout(
+						release / uml::android::releaseLayout),
+					data_disk, options.data_gib),
+				options.data_gib);
 			const uml::android::Storage storage{release, data_disk};
 			if (storage.consumeBootloaderCommand())
 				say_bootloader_consumed();

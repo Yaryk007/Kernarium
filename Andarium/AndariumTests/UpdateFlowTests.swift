@@ -9,6 +9,9 @@ import Testing
 final class StubDriver: RuntimeDriver {
     var plan: StartPlan?
     var begun: [(mode: StartMode, kind: BootKind)] = []
+    /// The guest each start handed over, and the guest saved by then.
+    private(set) var begunGuests: [Guest] = []
+    private(set) var savedWhenBegun: [Guest?] = []
     var restored = 0
     var restoreFails = false
 
@@ -28,6 +31,8 @@ final class StubDriver: RuntimeDriver {
     func measuredUsedBytes() -> UInt64 { diskUsedBytes }
     func begin(guest: Guest, mode: StartMode, kind: BootKind) {
         begun.append((mode, kind))
+        begunGuests.append(guest)
+        savedWhenBegun.append(savedGuest)
     }
     func restoreUpdate() throws {
         if restoreFails { throw InstanceError.refused("No update is pending.") }
@@ -56,6 +61,26 @@ final class StubDriver: RuntimeDriver {
         defer { memoryAsked += 1 }
         guard !memories.isEmpty else { return nil }
         return memories[min(memoryAsked, memories.count - 1)]
+    }
+    var debuggerAttached = false
+    func jitDebuggerAttached() -> Bool { debuggerAttached }
+    /// What the JIT preparation answers and what it was asked, in order. A
+    /// debugger that serves the request has left once the answer is ready or
+    /// disabled. A test can hold the preparation to have a start catch it.
+    var jitAnswer = JitAnswer.ready
+    private(set) var jitAsked: [(wanted: Bool, shape: JitShape)] = []
+    var holdsJit = false
+    private var heldJit: CheckedContinuation<Void, Never>?
+    func prepareJit(wanted: Bool, shape: JitShape) async -> JitAnswer {
+        jitAsked.append((wanted, shape))
+        if holdsJit { await withCheckedContinuation { heldJit = $0 } }
+        let answer = wanted ? jitAnswer : .disabled
+        if answer == .ready || answer == .disabled { debuggerAttached = false }
+        return answer
+    }
+    func releaseJit() {
+        heldJit?.resume()
+        heldJit = nil
     }
 
     /// What the refusal-count readings answer, in turn, the last one
@@ -136,7 +161,15 @@ final class StubDriver: RuntimeDriver {
     /// Computers connected through the listener, which a stop closes.
     var connectedComputers = 0
     private(set) var closedComputers = 0
-    func usbDebugging() async -> Bool? { debugging }
+    /// While set, reading the setting does not answer, as while adbd restarts.
+    var holdsUsbDebuggingReads = false
+    func usbDebugging() async -> Bool? {
+        while holdsUsbDebuggingReads, !Task.isCancelled { try? await Task.sleep(for: .milliseconds(10)) }
+        return debugging
+    }
+    /// What Android's storage reads as; a test sets it as a boot would.
+    var storage: Bool? = true
+    func storageReady() async -> Bool? { storage }
     func startAdbOverNetwork() throws {
         if let startError { throw startError }
         listening = true

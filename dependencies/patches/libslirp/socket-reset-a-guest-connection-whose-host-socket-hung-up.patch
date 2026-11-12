@@ -1,0 +1,109 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 03:07:06 +0900
+Subject: [PATCH] socket: reset a guest connection whose host socket hung up
+
+A host socket shut down in both directions without an error made
+soread() meet end of file, and XNU answers getpeername() with EINVAL
+there where only ENOTCONN was known, so the connection was closed
+rather than dropped. Once the guest wrote, the socket was polled for
+writing only, XNU reported a hang-up at once, and every pass of
+slirp_pollfds_poll called soread() again and re-armed the 2MSL timer:
+the event loop spun on one core for as long as the connection lived.
+
+Map EINVAL from getpeername() to ENOTCONN, so the guest gets a reset.
+Send a socket that can no longer receive and reports a hang-up or an
+error to the new sohangup(): a pending socket error drops the
+connection, otherwise the guest's side is closed once and the socket
+is not polled again.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/slirp.c  | 12 ++++++++++++
+ src/socket.c | 26 ++++++++++++++++++++++++++
+ src/socket.h |  5 +++++
+ 3 files changed, 43 insertions(+)
+
+diff --git a/src/slirp.c b/src/slirp.c
+index 9b7526afdf9cc2be956356c1a69a80f9d5966cb1..7f4e08da4811fbc26a9e3c141f67d7714145d41e 100644
+--- a/src/slirp.c
++++ b/src/slirp.c
+@@ -1068,6 +1068,18 @@ void slirp_pollfds_poll(Slirp *slirp, int select_error,
+                 continue;
+             }
+ 
++            /*
++             * A socket that can no longer receive is polled only to write the
++             * guest's data, so a hang-up or an error there belongs to the
++             * write side. soread() would only meet the end of file it already
++             * handled and leave the socket ready on every pass.
++             */
++            if ((so->so_state & SS_FCANTRCVMORE) &&
++                (revents & (SLIRP_POLL_HUP | SLIRP_POLL_ERR))) {
++                sohangup(so);
++                continue;
++            }
++
+ #ifndef __APPLE__
+             /*
+              * Check for URG data
+diff --git a/src/socket.c b/src/socket.c
+index 6b65be197eea31e8bcb4ce22b1c29327a11198de..b311ec102bbc7e4e9fc2d7ed2b98efce4741b780 100644
+--- a/src/socket.c
++++ b/src/socket.c
+@@ -208,6 +208,11 @@ int soread(struct socket *so)
+ 
+                 if (!shutdown_wr && getpeername(so->s, paddr, &alen) < 0) {
+                     err = errno;
++                    /* XNU answers EINVAL for a socket shut down in both
++                     * directions: the peer is as gone as with ENOTCONN. */
++                    if (err == EINVAL) {
++                        err = ENOTCONN;
++                    }
+                 } else {
+                     if (getsockopt(so->s, SOL_SOCKET, SO_ERROR, &err, &elen) < 0) {
+                         err = errno;
+@@ -978,6 +983,27 @@ void sofwdrain(struct socket *so)
+         sofcantsendmore(so);
+ }
+ 
++void sohangup(struct socket *so)
++{
++    int err = 0;
++    socklen_t elen = sizeof(err);
++
++    /*
++     * The guest's data waiting in so_rcv can no longer reach the peer. A
++     * pending error resets the guest's connection, as soread() would have;
++     * without one, stop polling the socket and close the guest's side once.
++     */
++    if (getsockopt(so->s, SOL_SOCKET, SO_ERROR, &err, &elen) < 0) {
++        err = errno;
++    }
++    if (err != 0) {
++        tcp_drop(sototcpcb(so), err);
++    } else {
++        sofcantsendmore(so);
++        tcp_sockclosed(sototcpcb(so));
++    }
++}
++
+ static bool sotranslate_out4(Slirp *s, struct socket *so, struct sockaddr_in *sin)
+ {
+     if (!s->disable_dns && so->so_faddr.s_addr == s->vnameserver_addr.s_addr) {
+diff --git a/src/socket.h b/src/socket.h
+index c7c683401eef71a0bedbabe31758cf3209a2b375..005fc6584f3ffbd284f4a5f5ce766b52d6417769 100644
+--- a/src/socket.h
++++ b/src/socket.h
+@@ -217,6 +217,11 @@ void soisfconnected(register struct socket *);
+  * Set CANTSENDMORE once all data has been write()n
+  */
+ void sofwdrain(struct socket *);
++/*
++ * The host socket hung up while it is polled only for writing: give up the
++ * connection to the guest
++ */
++void sohangup(struct socket *);
+ struct iovec; /* For win32 */
+ /* Prepare iov for storing into the sb */
+ size_t sopreprbuf(struct socket *so, struct iovec *iov, int *np);

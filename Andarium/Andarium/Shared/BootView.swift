@@ -78,12 +78,17 @@ struct BootView: View {
     /// The steps, with the first saying what the disk write is doing while
     /// one is under way.
     private func shownSteps(guest: Guest) -> [Step] {
-        var steps = Self.steps(kind, guest: guest, system: model.system)
+        var steps = Self.steps(kind, guest: guest, system: model.system, grewFromGiB: model.lifecycle.grewFromGiB)
         if model.preparingDisk {
             let detail = model.diskProgress.map { "Preparing \u{00B7} \(Int(($0 * 100).rounded()))%" }
                 ?? "Preparing"
             steps[0] = Step(title: steps[0].title, detail: detail, seconds: 0)
         }
+        #if !APP_STORE
+        if model.preparingJit {
+            steps[0] = Step(title: steps[0].title, detail: JitStatus.preparing, seconds: 0)
+        }
+        #endif
         return steps
     }
 
@@ -155,6 +160,23 @@ struct BootView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .modifier(BootPanel(dimmed: dimmed, radius: 22))
             }
+
+            #if !APP_STORE
+            if let sentence = model.jitLastStart?.fallbackSentence {
+                Label {
+                    Text(sentence)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                } icon: {
+                    Image(systemName: "bolt.slash.fill")
+                        .foregroundStyle(Color.accentColor)
+                }
+                .padding(16)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .modifier(BootPanel(dimmed: dimmed, radius: 22))
+            }
+            #endif
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 20)
@@ -226,14 +248,19 @@ struct BootView: View {
         }
     }
 
-    static func steps(_ kind: BootKind, guest: Guest, system info: SystemInfo) -> [Step] {
+    /// `grewFromGiB` is the capacity this start grew the storage from
+    /// (`Lifecycle.grewFromGiB`): the runtime grows the disk in every kind of
+    /// start but the first, which creates it, and the guest's capacity is
+    /// already the new one.
+    static func steps(_ kind: BootKind, guest: Guest, system info: SystemInfo, grewFromGiB: Int? = nil) -> [Step] {
         let system = Step(title: "System image", detail: "\(info.releaseRevision) · read-only", seconds: 0.7)
         let kernel = Step(title: "Linux kernel", detail: "\(info.kernel.replacingOccurrences(of: "Linux ", with: "")) · \(Formats.vcpus(guest.cores)) · \(Formats.size(mib: guest.memoryMiB)) RAM", seconds: 0.9)
         let used = "\(Formats.size(bytes: guest.usedBytes)) of \(Formats.size(gib: guest.capacityGiB))"
+        let growing = grewFromGiB.map { "Growing from \(Formats.size(gib: $0)) to \(Formats.size(gib: guest.capacityGiB))" }
         switch kind {
         case .recovery:
             return [system, kernel,
-                    Step(title: "Storage", detail: used, seconds: 0.6),
+                    Step(title: "Storage", detail: growing ?? used, seconds: growing == nil ? 0.6 : 1.2),
                     Step(title: "Recovery", detail: "Loading recovery", seconds: 1.4)]
         case .firstStart:
             return [system, kernel,
@@ -241,12 +268,11 @@ struct BootView: View {
                     Step(title: "Startup", detail: "Setting up for the first time", seconds: 4.0)]
         case .upgrade:
             return [system, kernel,
-                    Step(title: "Storage", detail: used, seconds: 0.7),
+                    Step(title: "Storage", detail: growing ?? used, seconds: growing == nil ? 0.7 : 1.2),
                     Step(title: "Startup", detail: "Updating apps for \(info.releaseRevision)", seconds: 3.6)]
         case .normal, .restart:
-            let storage = guest.pendingCapacityGiB.map { "Growing from \(Formats.size(gib: guest.capacityGiB)) to \(Formats.size(gib: $0))" } ?? used
             return [system, kernel,
-                    Step(title: "Storage", detail: storage, seconds: guest.pendingCapacityGiB == nil ? 0.6 : 1.2),
+                    Step(title: "Storage", detail: growing ?? used, seconds: growing == nil ? 0.6 : 1.2),
                     Step(title: "Startup", detail: "Starting services", seconds: 1.8)]
         }
     }

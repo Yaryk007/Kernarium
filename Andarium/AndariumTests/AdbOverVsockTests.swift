@@ -592,7 +592,7 @@ struct AdbOverVsockTests {
     /// AUTH challenge, since the computer's key is not the host's.
     @Test(.timeLimit(.minutes(20))) func theBridgeCarriesAComputersConnectionToAdbd() async throws {
         guard Self.enabled else { return }
-        let operations = try await readyOperations()
+        _ = try await readyOperations()
         let bridge = AdbNetworkBridge(port: 0, opener: VsockConnector())
         let port = try bridge.start()
         defer { bridge.stop() }
@@ -1055,10 +1055,10 @@ extension AdbOverVsockTests {
     fileprivate nonisolated static func receive(
         _ connection: AdbConnection, transport: any AdbTransport, seconds: Double
     ) throws -> AdbMessage? {
-        let box = ReceiveBox()
+        let box = ReceiveBox(connection)
         let done = DispatchSemaphore(value: 0)
         let thread = Thread {
-            box.set(Result { try connection.receive() })
+            box.receive()
             done.signal()
         }
         thread.start()
@@ -1071,10 +1071,18 @@ extension AdbOverVsockTests {
     }
 }
 
+/// Hands a connection to the reader thread, its only user until `receive`
+/// returns; a caller that gives up shuts the transport down and leaves the
+/// connection alone.
 private nonisolated final class ReceiveBox: @unchecked Sendable {
     private let lock = NSLock()
+    private let connection: AdbConnection
     private var result: Result<AdbMessage, Error>?
-    func set(_ result: Result<AdbMessage, Error>) { lock.withLock { self.result = result } }
+    init(_ connection: AdbConnection) { self.connection = connection }
+    func receive() {
+        let outcome = Result { try connection.receive() }
+        lock.withLock { result = outcome }
+    }
     func get() throws -> AdbMessage? {
         try lock.withLock { try result?.get() }
     }

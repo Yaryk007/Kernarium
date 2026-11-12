@@ -46,7 +46,9 @@ disk; `validateDataDisk` checks it.
   validation. The grow is refused while another process, or another open file
   description of this one, holds a lock on the disk, as a running guest does.
 - `prepareDataDisk` is the single entry point of both products: create when
-  absent, grow when asked for more, leave it otherwise, refuse less.
+  absent, grow when asked for more, leave it otherwise. A request below the
+  disk's capacity keeps the disk and reports its capacity, so a caller whose
+  record lags a disk that already grew still starts.
 
 ## Exactly two disks
 

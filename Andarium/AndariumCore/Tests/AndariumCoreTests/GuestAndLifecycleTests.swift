@@ -66,12 +66,19 @@ struct GuestTests {
         #expect(guest.pendingCapacityGiB == nil)
     }
 
-    @Test func aFinishedBootAppliesAPendingGrowth() {
+    @Test func aStartAppliesAPendingGrowthAndSaysWhatItGrewFrom() {
         var guest = Guest.fresh(on: ipad)
+        #expect(guest.applyPendingGrowth() == nil)
+        #expect(guest.capacityGiB == 8)
         guest.setCapacity(24)
-        guest.didBoot()
+        #expect(guest.applyPendingGrowth() == 8)
         #expect(guest.capacityGiB == 24)
         #expect(guest.pendingCapacityGiB == nil)
+        #expect(guest.effectiveCapacityGiB == 24)
+        // Nothing is left to apply, or to cancel.
+        #expect(guest.applyPendingGrowth() == nil)
+        guest.setCapacity(8)
+        #expect(guest.capacityGiB == 24 && guest.pendingCapacityGiB == nil)
     }
 
     @Test func erasedKeepsTheChoicesAndTheCapacityTheNextStartRunsWith() {
@@ -80,7 +87,7 @@ struct GuestTests {
         guest.includeInBackups = true
         guest.memoryMiB = 2048
         guest.setCapacity(24)
-        guest.didBoot()
+        guest.applyPendingGrowth()
         guest.usedBytes = 5_000_000_000
         guest.setCapacity(32)
 
@@ -143,13 +150,89 @@ struct LifecycleTests {
         #expect(life.phase == .running(.normal))
     }
 
-    @Test func aRecoveryBootChangesNothingInTheGuest() {
+    /// The runtime grows the data disk at every start, Recovery's included, so
+    /// the growth is the guest's from the moment the start is handed over.
+    @Test func aRecoveryStartAppliesAPendingGrowth() {
         var guest = Guest.fresh(on: ipad)
         guest.setCapacity(24)
         var life = Lifecycle(guest: guest)
         #expect(life.start(.recovery, host: ipad) == .allowed(.recovery))
+        #expect(life.guest?.capacityGiB == 24)
+        #expect(life.guest?.pendingCapacityGiB == nil)
         life.finishBoot(.recovery)
         #expect(life.phase == .running(.recovery))
+        #expect(life.guest?.capacityGiB == 24)
+        #expect(life.guest?.pendingCapacityGiB == nil)
+    }
+
+    /// A start that is stopped, crashes or is killed before it finishes
+    /// booting has still had its disk grown; choosing the old size afterwards
+    /// must not leave a pending growth to cancel.
+    @Test func aStartThatNeverFinishesBootingStillAppliesAPendingGrowth() {
+        var guest = Guest.fresh(on: ipad)
+        guest.setCapacity(24)
+        var life = Lifecycle(guest: guest)
+        #expect(life.start(.normal, host: ipad) == .allowed(.normal))
+        life.fail()
+        #expect(life.guest?.capacityGiB == 24)
+        #expect(life.guest?.pendingCapacityGiB == nil)
+
+        var ended = Lifecycle(guest: guest)
+        _ = ended.start(.normal, host: ipad)
+        ended.powerOff()
+        #expect(ended.guest?.capacityGiB == 24)
+        #expect(ended.guest?.pendingCapacityGiB == nil)
+        // The Resize sheet's old size is below the disk now: nothing to cancel,
+        // and the next start asks for the disk's own size.
+        ended.guest?.setCapacity(8)
+        #expect(ended.guest?.pendingCapacityGiB == nil)
+        #expect(ended.guest?.capacityGiB == 24)
+        #expect(ended.guest?.effectiveCapacityGiB == 24)
+    }
+
+    @Test func aNormalBootAppliesAPendingGrowthAsBefore() {
+        var guest = Guest.fresh(on: ipad)
+        guest.setCapacity(24)
+        var life = Lifecycle(guest: guest)
+        #expect(life.start(.normal, host: ipad) == .allowed(.normal))
+        life.finishBoot(.normal)
+        #expect(life.phase == .running(.normal))
+        #expect(life.guest?.capacityGiB == 24)
+        #expect(life.guest?.pendingCapacityGiB == nil)
+    }
+
+    /// The boot screen says what the start grew the storage from while it
+    /// boots, in whatever kind of boot the growth came with.
+    @Test func theBootSaysWhatTheStartGrewTheStorageFromUntilItEnds() {
+        var guest = Guest.fresh(on: ipad)
+        guest.setCapacity(24)
+        var life = Lifecycle(guest: guest)
+        #expect(life.start(.recovery, host: ipad) == .allowed(.recovery))
+        #expect(life.grewFromGiB == 8)
+        life.finishBoot(.recovery)
+        #expect(life.grewFromGiB == nil)
+
+        for end in [{ (life: inout Lifecycle) in life.powerOff() }, { $0.fail() }, { $0.restart() }] {
+            var grown = Lifecycle(guest: guest)
+            _ = grown.start(.normal, host: ipad)
+            #expect(grown.grewFromGiB == 8)
+            end(&grown)
+            #expect(grown.grewFromGiB == nil)
+        }
+
+        // A start that grows nothing says nothing, and the next one is its own.
+        var plain = Lifecycle(guest: Guest.fresh(on: ipad))
+        _ = plain.start(.normal, host: ipad)
+        #expect(plain.grewFromGiB == nil)
+    }
+
+    /// A start the host refuses never reaches the runtime: the growth waits.
+    @Test func aRefusedStartLeavesAPendingGrowthPending() {
+        var guest = Guest.fresh(on: ipad)
+        guest.setCapacity(24)
+        var life = Lifecycle(guest: guest)
+        #expect(life.start(.normal, host: fullIpad) != .allowed(.normal))
+        #expect(life.guest?.capacityGiB == 8)
         #expect(life.guest?.pendingCapacityGiB == 24)
     }
 

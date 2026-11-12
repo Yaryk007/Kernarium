@@ -86,7 +86,8 @@ it; Kernarium passes none.
 - Background running, picture in picture and the console are Kernarium's, and
   stay in `Kernarium/Kernarium/`.
 - An application that defines `UML_APP_STORE_APPLICATION` (Andarium's AppStore
-  configuration) gets a loader without `set_frame_sink`, `send_console_input`
-  and the two `automation_*` entries and their lookups; the other entries and
-  the runtime API's validation are the same.
+  configuration) gets a loader without `set_frame_sink`, `send_console_input`,
+  `prepare_jit`, `debugger_attached` and the two `automation_*` entries and
+  their lookups; the other entries and the runtime API's validation are the
+  same.
 - A change here is a change to both applications: build and test both.

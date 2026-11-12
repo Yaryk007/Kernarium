@@ -163,6 +163,7 @@ for framework in $frameworks; do
 		@rpath/KosmicKrisp.framework/KosmicKrisp|\
 		/usr/lib/libc++.1.dylib|/usr/lib/libSystem.B.dylib|\
 		/usr/lib/libobjc.A.dylib|/usr/lib/libz.1.dylib|\
+		/usr/lib/libcompression.dylib|\
 		/usr/lib/libexpat.1.dylib|\
 		/System/Library/Frameworks/AppKit.framework/*|\
 		/System/Library/Frameworks/CoreFoundation.framework/*|\

@@ -1,0 +1,443 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 04:22:02 +0900
+Subject: [PATCH] venus: let go of a large command and reply once the host has
+ consumed them
+
+A ring submission holds the shmems of its command and its reply until the
+ring retires it, and the ring retires submissions only when the next one is
+made. A thread that makes one large call and then no more, such as the
+thread that saves an application's pipeline cache, therefore left its ring
+holding the reply shmem of that call, up to hundreds of MiB mapped in the
+host-visible aperture, until the thread exited. The upload buffer of a
+large command was held the same way: the ring keeps it for the next upload,
+and it is as large as the command.
+
+After a call that waits for its reply, retire the ring's submissions up to
+it when its reply or its command is larger than a pool serves. Release the
+upload buffer of such a command as soon as it is submitted; the submission
+holds it until the host has consumed it.
+
+The test builds a ring on a renderer that only counts shmems and plays the
+host, and checks that no large shmem outlives its call.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/virtio/vulkan/meson.build                 |  14 +
+ .../vulkan/tests/vn_ring_release_test.c       | 280 ++++++++++++++++++
+ src/virtio/vulkan/vn_cs.c                     |  17 ++
+ src/virtio/vulkan/vn_cs.h                     |   7 +
+ src/virtio/vulkan/vn_ring.c                   |  30 ++
+ 5 files changed, 348 insertions(+)
+ create mode 100644 src/virtio/vulkan/tests/vn_ring_release_test.c
+
+diff --git a/src/virtio/vulkan/meson.build b/src/virtio/vulkan/meson.build
+index 903a20edee5ab1c7846a9a01991b8ca96eb076cc..f43617f56da7fe489b803996aeb52f8cf46da989 100644
+--- a/src/virtio/vulkan/meson.build
++++ b/src/virtio/vulkan/meson.build
+@@ -210,4 +210,18 @@ if with_tests
+                include_directories : inc_include),
+     suite : ['venus'],
+   )
++  test(
++    'vn_ring_release',
++    executable('vn_ring_release_test',
++               ['tests/vn_ring_release_test.c', 'vn_ring.c', 'vn_cs.c',
++                'vn_renderer_internal.c', 'vn_renderer_util.c'],
++               include_directories : vn_incs,
++               dependencies : [dep_thread, idep_mesautil, idep_vulkan_util,
++                               idep_vulkan_runtime_headers,
++                               declare_dependency(
++                                 sources : [vn_entrypoints[0], vn_drirc[1],
++                                            sha1_h])],
++               c_args : vn_c_args),
++    suite : ['venus'],
++  )
+ endif
+diff --git a/src/virtio/vulkan/tests/vn_ring_release_test.c b/src/virtio/vulkan/tests/vn_ring_release_test.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..3ff8ff05035ceccd5e16ef2c11d111c1c0460828
+--- /dev/null
++++ b/src/virtio/vulkan/tests/vn_ring_release_test.c
+@@ -0,0 +1,280 @@
++/*
++ * Copyright 2026
++ * SPDX-License-Identifier: MIT
++ */
++
++/* A reply or a command of hundreds of MiB gets a shmem of its own.  The shmem
++ * must go once the command is done: a ring that its thread does not submit to
++ * again, as the ring of a thread that saves a pipeline cache once is, would
++ * otherwise hold it until the ring is destroyed.  This builds a ring on a
++ * renderer that only counts shmems and plays the host by letting every wait
++ * find the whole ring consumed.
++ */
++
++#include "vn_common.h"
++#include "vn_cs.h"
++#include "vn_instance.h"
++#include "vn_renderer.h"
++#include "vn_renderer_util.h"
++#include "vn_ring.h"
++
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define CHECK(expr)                                                          \
++   do {                                                                      \
++      if (!(expr)) {                                                         \
++         fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #expr);          \
++         return 1;                                                           \
++      }                                                                      \
++   } while (0)
++
++#define MIB ((size_t)1 << 20)
++
++/* what the driver code under test takes from the rest of the driver */
++struct vn_env vn_env;
++
++void
++vn_log(UNUSED struct vn_instance *instance, const char *format, ...)
++{
++   va_list args;
++   va_start(args, format);
++   vfprintf(stderr, format, args);
++   va_end(args);
++   fputc('\n', stderr);
++}
++
++struct fake_shmem {
++   struct vn_renderer_shmem base;
++   size_t size;
++};
++
++static struct {
++   unsigned live;
++   size_t live_bytes;
++   /* live shmems that a pool does not serve: 16 MiB and up */
++   unsigned live_large;
++   uint32_t next_res_id;
++   struct vn_renderer_shmem *ring_shmem;
++   size_t ring_shmem_size;
++   struct vn_ring_layout layout;
++} fake;
++
++static struct vn_renderer_shmem *
++fake_shmem_create(UNUSED struct vn_renderer *renderer, size_t size)
++{
++   struct fake_shmem *shmem = calloc(1, sizeof(*shmem));
++   void *ptr = calloc(1, size);
++   if (!shmem || !ptr) {
++      free(shmem);
++      free(ptr);
++      return NULL;
++   }
++   shmem->size = size;
++   shmem->base.refcount = VN_REFCOUNT_INIT(1);
++   shmem->base.res_id = ++fake.next_res_id;
++   shmem->base.mmap_size = size;
++   shmem->base.mmap_ptr = ptr;
++   fake.live++;
++   fake.live_bytes += size;
++   if (size >= 16 * MIB)
++      fake.live_large++;
++   if (!fake.ring_shmem && size == fake.ring_shmem_size)
++      fake.ring_shmem = &shmem->base;
++   return &shmem->base;
++}
++
++static void
++fake_shmem_destroy(UNUSED struct vn_renderer *renderer,
++                   struct vn_renderer_shmem *base)
++{
++   struct fake_shmem *shmem = (struct fake_shmem *)base;
++   if (fake.ring_shmem == base)
++      fake.ring_shmem = NULL;
++   fake.live--;
++   fake.live_bytes -= shmem->size;
++   if (shmem->size >= 16 * MIB)
++      fake.live_large--;
++   free(base->mmap_ptr);
++   free(shmem);
++}
++
++static VkResult
++fake_submit(UNUSED struct vn_renderer *renderer,
++            UNUSED const struct vn_renderer_submit_batch *batch)
++{
++   return VK_SUCCESS;
++}
++
++static VkResult
++fake_wait(UNUSED struct vn_renderer *renderer,
++          UNUSED const struct vn_renderer_wait *wait)
++{
++   return VK_SUCCESS;
++}
++
++static VkResult
++fake_sync_create(UNUSED struct vn_renderer *renderer,
++                 UNUSED uint64_t initial_val,
++                 struct vn_renderer_sync **out_sync)
++{
++   *out_sync = (struct vn_renderer_sync *)calloc(1, sizeof(void *));
++   return *out_sync ? VK_SUCCESS : VK_ERROR_OUT_OF_HOST_MEMORY;
++}
++
++static void
++fake_sync_destroy(UNUSED struct vn_renderer *renderer,
++                  struct vn_renderer_sync *sync)
++{
++   free(sync);
++}
++
++/* The host: whatever the driver waits for, it has consumed the whole ring. */
++struct vn_relax_state
++vn_relax_init(struct vn_instance *instance,
++              UNUSED enum vn_relax_reason reason)
++{
++   return (struct vn_relax_state){ .instance = instance };
++}
++
++void
++vn_relax(UNUSED struct vn_relax_state *state)
++{
++   if (!fake.ring_shmem)
++      return;
++   char *shared = fake.ring_shmem->mmap_ptr;
++   volatile atomic_uint *head =
++      (volatile atomic_uint *)(shared + fake.layout.head_offset);
++   const volatile atomic_uint *tail =
++      (const volatile atomic_uint *)(shared + fake.layout.tail_offset);
++   atomic_store_explicit(head, atomic_load_explicit(tail, memory_order_acquire),
++                         memory_order_release);
++}
++
++void
++vn_relax_fini(UNUSED struct vn_relax_state *state)
++{
++}
++
++static void *VKAPI_CALL
++test_allocation(UNUSED void *user_data,
++                size_t size,
++                UNUSED size_t alignment,
++                UNUSED VkSystemAllocationScope scope)
++{
++   return calloc(1, size);
++}
++
++static void *VKAPI_CALL
++test_reallocation(UNUSED void *user_data,
++                  void *original,
++                  size_t size,
++                  UNUSED size_t alignment,
++                  UNUSED VkSystemAllocationScope scope)
++{
++   return realloc(original, size);
++}
++
++static void VKAPI_CALL
++test_free(UNUSED void *user_data, void *memory)
++{
++   free(memory);
++}
++
++/* One command that waits for a reply: `command_size` bytes of zeros and a
++ * reply of `reply_size`.  Returns the live large shmems once the caller is
++ * done with the reply and the ring is not submitted to again.
++ */
++static int
++run_command(struct vn_ring *ring,
++            size_t command_size,
++            size_t reply_size,
++            unsigned *out_live_large)
++{
++   void *command = calloc(1, command_size);
++   CHECK(command);
++
++   struct vn_ring_submit_command submit;
++   struct vn_cs_encoder *enc = vn_ring_submit_command_init(
++      ring, &submit, command, command_size, reply_size);
++   vn_cs_encoder_write(enc, command_size, command, command_size);
++
++   vn_ring_submit_command(ring, &submit);
++   CHECK(submit.ring_seqno_valid);
++   CHECK(vn_ring_get_command_reply(ring, &submit));
++   free(command);
++
++   /* while the caller still holds the reply */
++   if (vn_renderer_shmem_pool_is_dedicated(reply_size))
++      CHECK(fake.live_large >= 1);
++
++   vn_ring_free_command_reply(ring, &submit);
++   *out_live_large = fake.live_large;
++   return 0;
++}
++
++int
++main(void)
++{
++   struct vn_renderer renderer = {
++      .ops = { .submit = fake_submit, .wait = fake_wait },
++      .shmem_ops = { .create = fake_shmem_create,
++                     .destroy = fake_shmem_destroy },
++      .sync_ops = { .create = fake_sync_create,
++                    .destroy = fake_sync_destroy },
++   };
++
++   struct vn_instance *instance = calloc(1, sizeof(*instance));
++   CHECK(instance);
++   instance->base.vk.alloc = (VkAllocationCallbacks){
++      .pfnAllocation = test_allocation,
++      .pfnReallocation = test_reallocation,
++      .pfnFree = test_free,
++   };
++   instance->renderer = &renderer;
++   vn_renderer_shmem_pool_init(&renderer, &instance->cs_shmem_pool, MIB);
++   vn_renderer_shmem_pool_init(&renderer, &instance->reply_shmem_pool, MIB);
++
++   vn_ring_get_layout(64 * 1024, 0, &fake.layout);
++   fake.ring_shmem_size = fake.layout.shmem_size;
++   struct vn_ring *ring = vn_ring_create(instance, &fake.layout, 3, false);
++   CHECK(ring);
++   CHECK(fake.ring_shmem);
++
++   unsigned live_large = ~0u;
++
++   /* A small command and reply stay in the pools. */
++   CHECK(!run_command(ring, 64, 64, &live_large));
++   CHECK(live_large == 0);
++
++   /* A large reply: the shmem of its own is gone with the caller's reference,
++    * with no further submission to the ring to retire the ring's. */
++   CHECK(!run_command(ring, 64, 24 * MIB, &live_large));
++   CHECK(live_large == 0);
++
++   /* A large command: its upload is gone once the host has consumed it. */
++   CHECK(!run_command(ring, 24 * MIB, 64, &live_large));
++   CHECK(live_large == 0);
++
++   /* Both at once, as the data of a pipeline cache that is sent back is. */
++   CHECK(!run_command(ring, 24 * MIB, 24 * MIB, &live_large));
++   CHECK(live_large == 0);
++
++   /* Nothing was left behind for the next command to trip over. */
++   CHECK(!run_command(ring, 64, 64, &live_large));
++   CHECK(live_large == 0);
++   CHECK(!run_command(ring, 20 * MIB, 20 * MIB, &live_large));
++   CHECK(live_large == 0);
++
++   vn_ring_destroy(ring);
++   vn_renderer_shmem_pool_fini(&renderer, &instance->reply_shmem_pool);
++   vn_renderer_shmem_pool_fini(&renderer, &instance->cs_shmem_pool);
++   CHECK(fake.live == 0);
++   CHECK(fake.live_bytes == 0);
++   free(instance);
++
++   printf("vn_ring_release passed\n");
++   return 0;
++}
+diff --git a/src/virtio/vulkan/vn_cs.c b/src/virtio/vulkan/vn_cs.c
+index 16d55962de2c715170dc9f6928e4effe913dd863..7b0e87e1891958fd7413e79cb96ccf2fafe9f128 100644
+--- a/src/virtio/vulkan/vn_cs.c
++++ b/src/virtio/vulkan/vn_cs.c
+@@ -181,6 +181,23 @@ vn_cs_encoder_reset(struct vn_cs_encoder *enc)
+       vn_cs_encoder_gc_buffers(enc);
+ }
+ 
++void
++vn_cs_encoder_release(struct vn_cs_encoder *enc)
++{
++   if (unlikely(enc->storage_type == VN_CS_ENCODER_STORAGE_POINTER))
++      return;
++
++   for (uint32_t i = 0; i < enc->buffer_count; i++)
++      vn_renderer_shmem_unref(enc->instance->renderer, enc->buffers[i].shmem);
++
++   enc->buffer_count = 0;
++   enc->total_committed_size = 0;
++   enc->current_buffer_size = 0;
++
++   enc->cur = NULL;
++   enc->end = NULL;
++}
++
+ static uint32_t
+ next_array_size(uint32_t cur_size, uint32_t min_size)
+ {
+diff --git a/src/virtio/vulkan/vn_cs.h b/src/virtio/vulkan/vn_cs.h
+index a78523b1080764c661039ba1d2b4b2fbe628defb..b58ecc3a764e4d7c261aeab8853d1c7c855dbd2a 100644
+--- a/src/virtio/vulkan/vn_cs.h
++++ b/src/virtio/vulkan/vn_cs.h
+@@ -120,6 +120,13 @@ vn_cs_encoder_fini(struct vn_cs_encoder *enc);
+ void
+ vn_cs_encoder_reset(struct vn_cs_encoder *enc);
+ 
++/**
++ * Drop the references to every buffer and start over.  A ring submission
++ * that still needs a buffer holds a reference of its own.
++ */
++void
++vn_cs_encoder_release(struct vn_cs_encoder *enc);
++
+ static inline void
+ vn_cs_encoder_set_fatal(const struct vn_cs_encoder *enc)
+ {
+diff --git a/src/virtio/vulkan/vn_ring.c b/src/virtio/vulkan/vn_ring.c
+index 733bc2885aa20799aa58aa15aa410d89e498b5b2..f841055e0510f8fb09e95967b837734ba0ced715 100644
+--- a/src/virtio/vulkan/vn_ring.c
++++ b/src/virtio/vulkan/vn_ring.c
+@@ -661,6 +661,14 @@ vn_ring_submit_locked(struct vn_ring *ring,
+ 
+    vn_ring_submission_cleanup(&submit);
+ 
++   /* A large command is uploaded to a buffer of its own size.  The submission
++    * holds the buffer until the host has consumed the command; the upload
++    * must not keep it for the next command as well.
++    */
++   if (cs == &ring->upload &&
++       vn_renderer_shmem_pool_is_dedicated(ring->upload.current_buffer_size))
++      vn_cs_encoder_release(&ring->upload);
++
+    if (ring_seqno)
+       *ring_seqno = seqno;
+ 
+@@ -713,6 +721,19 @@ vn_ring_set_reply_shmem_locked(struct vn_ring *ring,
+    vn_ring_submit_locked(ring, &local_enc, NULL, NULL);
+ }
+ 
++/* A ring submission holds the shmems of its command and reply until the ring
++ * retires it, and the ring only retires submissions when the next one is made.
++ * After a wait, the host is done with everything up to the seqno, so let go of
++ * what it held.
++ */
++static void
++vn_ring_retire_consumed(struct vn_ring *ring, uint32_t seqno)
++{
++   mtx_lock(&ring->mutex);
++   vn_ring_retire_submits(ring, seqno);
++   mtx_unlock(&ring->mutex);
++}
++
+ void
+ vn_ring_submit_command(struct vn_ring *ring,
+                        struct vn_ring_submit_command *submit)
+@@ -750,6 +771,15 @@ vn_ring_submit_command(struct vn_ring *ring,
+          submit->reply =
+             VN_CS_DECODER_INITIALIZER(reply_ptr, submit->reply_size);
+          vn_ring_wait_seqno(ring, submit->ring_seqno);
++
++         /* A ring that this thread does not submit to again would hold a
++          * large reply, or the upload of a large command, until it is
++          * destroyed.
++          */
++         if (vn_renderer_shmem_pool_is_dedicated(submit->reply_size) ||
++             vn_renderer_shmem_pool_is_dedicated(
++                vn_cs_encoder_get_len(&submit->command)))
++            vn_ring_retire_consumed(ring, submit->ring_seqno);
+       } else {
+          vn_renderer_shmem_unref(ring->instance->renderer,
+                                  submit->reply_shmem);

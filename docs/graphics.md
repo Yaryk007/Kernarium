@@ -225,7 +225,12 @@ only a resource's attached backing reaches guest RAM, a control-queue reply is
 never written past the descriptors the guest supplied (a command whose reply
 does not fit does not run), a Venus reply stream ends at the window the guest
 declared, and the driver bounds a transform feedback store by the buffer range
-bound for it.
+bound for it. Nor can a guest make the host read freed memory: a render pass
+begun on a framebuffer whose attachment view, or the view's image, the guest
+has destroyed marks the context lost before the command reaches the driver
+(`gpu-venus-render-pass-lifetime`). Nor can it make the host call a driver
+entry point that is not there: a command the device's version and enabled
+extensions do not expose marks the context lost (same test).
 
 ### Host-visible memory is bounded by the blob aperture
 
@@ -239,6 +244,13 @@ The aperture, not host memory, bounds host-visible memory: the host-visible
 memory type gets its own heap sized to it. A mapping near the aperture's size
 can fail at `vkMapMemory` with `VK_ERROR_OUT_OF_DEVICE_MEMORY` until the guest's
 released nodes retire.
+
+The aperture also holds every Venus shared-memory region of the guest: the ring
+and the command and reply pools. A reply larger than 16 MiB, such as the data of
+`vkGetPipelineCacheData` for a large cache, gets a region of its own that is
+unmapped when the reply is consumed; the Android guest's Venus port carries
+that rule, and a guest without it keeps the oversized pool region mapped, so the
+heap the application is shown is larger than the room it has left.
 
 ### Device memory budget
 
@@ -267,13 +279,21 @@ Metal makes it, so allocations that each fit alone never together take the
 process past B. The ledger counts a heap only once its pages are resident, so
 the driver makes each heap resident before its reservation ends, and a burst of
 creations with no work between them is refused at the ceiling
-(`gpu-host-gl-allocation-burst`). A reservation that does not fit first frees
-the buffers the host GL driver caches, and the command storage it has left
+(`gpu-host-gl-allocation-burst`). A heap is in the driver's resident tally
+while its pages arrive, so the pool is over by at most the heap's size while a
+heap is made resident, not twice that. A reservation that does not fit first
+frees the buffers the host GL driver caches, and the command storage it has left
 unused for a while, and is decided again. Memory the host frees leaves Metal's
 counter at once but the ledger only later, within milliseconds or at its next
-sweep. The pool sees the release in Metal's counter, and when the request would
-fit once the ledger had caught up with it, waits for the ledger (re-reading it
-every millisecond, for 300 ms at most) rather than refuse. A request that
+sweep. A freed heap that was made resident stays in the ledger until the process
+next asks Metal to make an allocation resident. The reclaim makes that request
+for a small buffer of its own and, when memory was freed since its last run,
+waits up to 10 ms for the ledger to fall, so a refusal with nothing to give back
+fails at once; the release after a guest context is destroyed makes the request
+without waiting (`retireFreedGpuMemory`, `freed_memory_watch.hpp`). The pool
+sees the release in Metal's counter, and when the request would fit once the
+ledger had caught up with it, waits for the ledger (re-reading it every
+millisecond, for 300 ms at most) rather than refuse. A request that
 follows no release, or would not fit even then, is refused at once, and a wait
 that reached its bound is not repeated until Metal's counter falls again.
 
@@ -318,7 +338,9 @@ that reached its bound is not repeated until Metal's counter falls again.
   refusal reaches the guest as a failed context at the next command naming the
   allocation, and only that guest process aborts. The Android guest allocates
   synchronously, so there the application gets `VK_ERROR_OUT_OF_DEVICE_MEMORY`
-  and keeps its device. A refused Venus allocation is not retried.
+  and keeps its device. While a guest reclaimer is armed, a refused Venus
+  allocation may first wait for it to end a cached holder and be tried again
+  (see the memory report below); an OpenGL refusal never waits on the host.
 - A device's first geometry heap is made at its floor size even when the pool
   refuses it, so a full pool can leave the process one floor per device past
   the ceiling.
@@ -330,7 +352,9 @@ live memory is below B.
 The device counts each OpenGL resource creation or blob it answers with out of
 memory, and each Venus allocation the pool refuses, on the display
 (`Display::memoryRefusals`), so a refusal the host reclaimed and retried past
-is not counted and a restarted guest does not reset the count. The applications
+is not counted and a restarted guest does not reset the count; neither is a
+Venus allocation that waited for the guest's reclaimer and was then made. The
+applications
 read it as `gpu_memory_refusals` of the runtime's statistics, and the macOS
 launchers print it as `gpu-refusals` with `--stats`. The renderer reports a
 Venus refusal through the pool's `refused` callback, which the device
@@ -348,7 +372,12 @@ the renderer's per-context report (the pool's `account` callback). The guest
 kernel names a context's creating process in the context's debug name
 (`<name>|pid=<tgid>|comm=<comm>`, the
 [kernel contract](../kernel/common/README.md#devices)); a kernel that does not
-leaves the holders unnamed and nothing acts on them. `read_graphics_memory`
+leaves the holders unnamed and nothing acts on them. A holder is quiet while
+none of its contexts has run a command; freeing memory is not activity: a
+command whose effect on the context's memory is to release it (a resource goes,
+a Venus allocation is freed, a resource shrinks) does not reset the holder's
+idle time unless it also allocated, so a cached application that trims itself
+stays eligible, and one that draws or allocates does not. `read_graphics_memory`
 (runtime API 28) lists the quiet holders by process, and the macOS launchers
 print them with `--stats`. Andarium ends the cached background app that holds
 the most when the budget is nearly full (`GraphicsReclaim`).
@@ -379,14 +408,29 @@ when a refusal was counted; the guest then asks again.
   still refused first, which the refusal edge reports.
 - Nothing is periodic and nothing wakes an idle device: the ledger's change
   observer arms a coalescing 250 ms timer on the transport thread, a refusal
-  moves that timer to the next millisecond, and the evaluator arms one
-  deadline for its own next change.
+  moves that timer to the next millisecond, an idle trim of the contexts arms it
+  too (the ledger does not see what that gives back), and the evaluator arms
+  one deadline for its own next change.
 - A query that sets `GUEST_RECLAIMS` records that a reclaimer in the guest is
   armed. The flag belongs to the connection, is cleared by a query without it
   and by a new connection, and reaches the applications as `guest_reclaims` of
   `read_graphics_memory` (runtime API 29) and the launchers' `--stats` line as
   `guest-reclaim=on`. While it is set `GraphicsReclaim` stands down and does not
   end an app.
+- While the reclaimer is armed, a Venus allocation the pool refused waits up to
+  1.5 s on the render-server thread that runs it, so only that context's
+  commands wait, and is tried again once room shows or a quiet holder has gone
+  (`device/gpu/reclaim_wait.*`, through the pool's `wait` and `waited`
+  callbacks). It waits only when the reclaimer could make the room in time: the
+  largest holder that meets the reclaimer's armed terms, other than the
+  requesting process, holds at least what the pool lacks, fewer than three
+  holders have gone in the reclaimer's episode, none went in the last 1.5 s,
+  and no wait in the last 10 s saw nothing go; otherwise the allocation is
+  refused at once. The guest is told of a wait as of a refusal, at once, so
+  its reclaimer acts; `Display::memoryRefusals` counts only the allocations
+  refused in the end. OpenGL allocations run on the transport thread, which
+  also carries the guest's memory query and the dying holder's context
+  destruction, so they never wait.
 
 ### Android guest requirements
 
@@ -491,10 +535,19 @@ host side little headroom, so guest RAM cannot be raised to make room for a
 workload. The per-device geometry heap starts small and grows within the pool, a
 grown heap is freed once nothing holds it, Zink's buffer cache is bounded, a
 destroyed context's command storage is released with it
-(`gpu-host-gl-batch-storage`) and an idle Virgl context is trimmed. virglrenderer's shared-memory segments are
-unlinked container files outside the footprint on iOS and POSIX shared memory
-inside it on macOS. A baked device campaign leaves out the groups its guest
-memory cannot hold ([`testing.md`](testing.md)).
+(`gpu-host-gl-batch-storage`) and an idle Virgl context is trimmed. What the
+host driver caches for a context that is gone or idle goes back without a
+request while other contexts run: Zink frees a slab once every entry has been
+free for a second; KosmicKrisp gives up a command allocator it has not been
+handed for a second; and the renderer releases the host driver's caches about
+two seconds after a guest context is destroyed (`gpu-host-gl-idle-release`).
+KosmicKrisp keeps the MSL text of a pipeline compressed with libcompression's
+LZFSE, since only a pipeline cache write and a render pass that binds fewer
+attachments read it again; a pipeline cache carries the compressed text, and
+its format number is part of the cache UUID. virglrenderer's shared-memory
+segments are unlinked container files outside the footprint on iOS and POSIX
+shared memory inside it on macOS. A baked device campaign leaves out the groups
+its guest memory cannot hold ([`testing.md`](testing.md)).
 
 ## Metal shader cache
 

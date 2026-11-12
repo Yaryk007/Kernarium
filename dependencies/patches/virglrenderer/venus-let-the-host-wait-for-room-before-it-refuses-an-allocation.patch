@@ -1,0 +1,234 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 18:58:10 +0900
+Subject: [PATCH] venus: let the host wait for room before it refuses an
+ allocation
+
+A Venus guest's vkAllocateMemory that the host's pool could not hold
+was answered with VK_ERROR_OUT_OF_DEVICE_MEMORY at once, and most
+applications end on that answer. A host whose guest can free memory on
+demand, by ending an application it keeps cached, can make the room in
+about a second, but by then the answer has been given.
+
+The pool now has an optional `wait` callback. Before a refused
+allocation is answered, the renderer calls it on the thread that runs
+the command, with the context, the size and the number of attempts so
+far, and tries the allocation again while it returns true. The driver
+path translates the command's arguments once and passes the driver the
+same ones on every attempt; a host-visible allocation, which the
+renderer reserves itself, reserves again. The call holds no lock of the
+renderer or the driver, so only the waiting context's commands wait.
+An optional `waited` callback then tells the host whether an allocation
+it waited for was made, so it can count what the wait saved.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/venus/vkr_device_memory.c | 60 ++++++++++++++++++++++++++++++++---
+ src/venus/vkr_renderer.c      | 18 +++++++++++
+ src/venus/vkr_renderer.h      | 19 +++++++++++
+ src/virglrenderer.c           |  2 ++
+ src/virglrenderer.h           | 12 +++++++
+ 5 files changed, 106 insertions(+), 5 deletions(-)
+
+diff --git a/src/venus/vkr_device_memory.c b/src/venus/vkr_device_memory.c
+index ae27ca53cb96673ead3843bcc20fe3c88972557c..26e9a58f1c7dc0ef2699305e8d4ead7be96d9922 100644
+--- a/src/venus/vkr_device_memory.c
++++ b/src/venus/vkr_device_memory.c
+@@ -238,6 +238,47 @@ vkr_gbm_get_fd_info_from_allocation_info(UNUSED struct vkr_physical_device *phys
+ 
+ #endif /* ENABLE_GBM_ALLOCATION */
+ 
++/* vkr_device_memory_create_and_add, but an allocation whose heap the driver
++ * could not charge to the host's pool is asked for again for as long as the
++ * host waits for room. The arguments are translated once, and every attempt
++ * passes the driver the same ones.
++ */
++static struct vkr_device_memory *
++vkr_device_memory_create_and_add_waiting(struct vkr_context *ctx,
++                                         struct vkr_device *dev,
++                                         struct vn_command_vkAllocateMemory *args)
++{
++   struct vkr_device_memory *mem = vkr_context_alloc_object(
++      ctx, sizeof(*mem), VK_OBJECT_TYPE_DEVICE_MEMORY, args->pMemory);
++   if (!mem) {
++      args->ret = VK_ERROR_OUT_OF_HOST_MEMORY;
++      return NULL;
++   }
++
++   struct vn_device_proc_table *vk = &dev->proc_table;
++
++   /* handles in args are replaced */
++   vn_replace_vkAllocateMemory_args_handle(args);
++   uint32_t attempt = 0;
++   for (;; attempt++) {
++      args->ret = vk->AllocateMemory(args->device, args->pAllocateInfo, NULL,
++                                     &mem->base.handle.device_memory);
++      if (args->ret != VK_ERROR_OUT_OF_DEVICE_MEMORY ||
++          !vkr_renderer_device_memory_wait(
++             ctx->ctx_id, args->pAllocateInfo->allocationSize, attempt))
++         break;
++   }
++   if (attempt)
++      vkr_renderer_device_memory_waited(ctx->ctx_id, args->ret == VK_SUCCESS);
++   if (args->ret != VK_SUCCESS) {
++      free(mem);
++      return NULL;
++   }
++
++   vkr_device_add_object(ctx, dev, &mem->base);
++   return mem;
++}
++
+ static void
+ vkr_device_memory_allocate(struct vn_dispatch_context *dispatch,
+                            struct vn_command_vkAllocateMemory *args,
+@@ -423,10 +464,17 @@ vkr_device_memory_allocate(struct vn_dispatch_context *dispatch,
+        * counts them once the driver has made a Metal buffer over them.
+        */
+       const VkDeviceSize charge = align(alloc_info->allocationSize, getpagesize());
+-      if (!vkr_renderer_device_memory_reserve(charge)) {
+-         args->ret = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+-         return;
++      uint32_t attempt = 0;
++      for (; !vkr_renderer_device_memory_reserve(charge); attempt++) {
++         if (!vkr_renderer_device_memory_wait(ctx->ctx_id, charge, attempt)) {
++            if (attempt)
++               vkr_renderer_device_memory_waited(ctx->ctx_id, false);
++            args->ret = VK_ERROR_OUT_OF_DEVICE_MEMORY;
++            return;
++         }
+       }
++      if (attempt)
++         vkr_renderer_device_memory_waited(ctx->ctx_id, true);
+       *reserved = charge;
+ 
+       host_shm = virgl_host_shm_alloc(
+@@ -545,7 +593,8 @@ vkr_device_memory_allocate(struct vn_dispatch_context *dispatch,
+          valid_fd_types |= 1 << VIRGL_RESOURCE_FD_DMABUF;
+    }
+ 
+-   struct vkr_device_memory *mem = vkr_device_memory_create_and_add(ctx, args);
++   struct vkr_device_memory *mem =
++      vkr_device_memory_create_and_add_waiting(ctx, dev, args);
+    if (!mem) {
+       virgl_resource_native_release(imported_native_resource_id);
+       if (local_import_info.fd >= 0)
+@@ -605,7 +654,8 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
+    if (reserved)
+       vkr_renderer_device_memory_release(reserved);
+ 
+-   /* The pool has freed what it could by now: this refusal reaches the guest.
++   /* The pool has freed what it could by now, and the host has waited for
++    * room as long as it chose: this refusal reaches the guest.
+     */
+    if (args->ret == VK_ERROR_OUT_OF_DEVICE_MEMORY)
+       vkr_renderer_device_memory_refused();
+diff --git a/src/venus/vkr_renderer.c b/src/venus/vkr_renderer.c
+index 3ec1c9aed167e09239121bb7d7057e55ef9b66ae..12e0787f0f726f9123c958ff1fba10ac7aa383b9 100644
+--- a/src/venus/vkr_renderer.c
++++ b/src/venus/vkr_renderer.c
+@@ -104,6 +104,24 @@ vkr_renderer_device_memory_refused(void)
+       pool->refused(pool->data);
+ }
+ 
++bool
++vkr_renderer_device_memory_wait(uint32_t ctx_id, uint64_t size, uint32_t attempt)
++{
++   const struct vkr_renderer_device_memory_pool *pool =
++      &vkr_state.device_memory_pool;
++   return pool->limit && pool->wait &&
++          pool->wait(pool->data, ctx_id, size, attempt);
++}
++
++void
++vkr_renderer_device_memory_waited(uint32_t ctx_id, bool admitted)
++{
++   const struct vkr_renderer_device_memory_pool *pool =
++      &vkr_state.device_memory_pool;
++   if (pool->limit && pool->waited)
++      pool->waited(pool->data, ctx_id, admitted);
++}
++
+ void
+ vkr_renderer_device_memory_account(uint32_t ctx_id, int64_t delta)
+ {
+diff --git a/src/venus/vkr_renderer.h b/src/venus/vkr_renderer.h
+index 580ec15ee195e4cd67de10e97029cf148295194f..7d7300fa2a38796a5f9888d5eca3272274ddcc47 100644
+--- a/src/venus/vkr_renderer.h
++++ b/src/venus/vkr_renderer.h
+@@ -34,6 +34,10 @@ struct vkr_renderer_device_memory_pool {
+    void (*refused)(void *data);
+    /* optional */
+    void (*account)(void *data, uint32_t ctx_id, int64_t delta);
++   /* optional */
++   bool (*wait)(void *data, uint32_t ctx_id, uint64_t size, uint32_t attempt);
++   /* optional */
++   void (*waited)(void *data, uint32_t ctx_id, bool admitted);
+ };
+ 
+ /* A guest's vkAllocateMemory has been answered with
+@@ -42,6 +46,21 @@ struct vkr_renderer_device_memory_pool {
+ void
+ vkr_renderer_device_memory_refused(void);
+ 
++/* The pool refused `size` bytes of a context's vkAllocateMemory, which has
++ * been tried again `attempt` times since its first refusal. Returns whether to
++ * try it again, once the host has waited for room as long as it chose; false
++ * when the host waits for none. Call it with no lock of a context, a device or
++ * the driver held.
++ */
++bool
++vkr_renderer_device_memory_wait(uint32_t ctx_id, uint64_t size, uint32_t attempt);
++
++/* An allocation vkr_renderer_device_memory_wait() had returned true for was
++ * made, or refused in the end. Called once for each such allocation.
++ */
++void
++vkr_renderer_device_memory_waited(uint32_t ctx_id, bool admitted);
++
+ /* The device memory a context's guest holds changed by `delta` bytes. */
+ void
+ vkr_renderer_device_memory_account(uint32_t ctx_id, int64_t delta);
+diff --git a/src/virglrenderer.c b/src/virglrenderer.c
+index 7275c9767adb8ad34b8725e858fede04cbad3e5c..4e612c56f7b4bad89c13a43a1dc54fbc91f6beb5 100644
+--- a/src/virglrenderer.c
++++ b/src/virglrenderer.c
+@@ -1769,6 +1769,8 @@ virgl_renderer_set_device_memory_pool(
+       .release = pool->release,
+       .refused = pool->refused,
+       .account = pool->account,
++      .wait = pool->wait,
++      .waited = pool->waited,
+    };
+    vkr_renderer_set_device_memory_pool(&vkr_pool);
+ #else
+diff --git a/src/virglrenderer.h b/src/virglrenderer.h
+index 3ad1aa3a124dd81f25f7ddee93407cdf1a6d86d3..03e816a10736826fcc00756be2d95d32ca56224f 100644
+--- a/src/virglrenderer.h
++++ b/src/virglrenderer.h
+@@ -615,6 +615,16 @@ virgl_renderer_set_host_visible_aperture_size(uint64_t size);
+  * freed what it could and decided again, so the host can count the refusals
+  * its guest was answered with.
+  *
++ * `wait`, if set, is called before such an answer, on the thread that runs
++ * the guest's vkAllocateMemory, with no lock of the renderer or the driver
++ * held: `ctx_id` is the guest's context, `size` the bytes the pool could not
++ * hold, and `attempt` how many times the allocation has been tried again
++ * since the first refusal. The host may block the call while it waits for
++ * room, and returns true to have the allocation tried again or false to have
++ * it refused. Only that context's commands wait meanwhile. `waited`, if set,
++ * is then called once on the same thread for each allocation `wait` returned
++ * true for, with whether the allocation was made in the end.
++ *
+  * `account`, if set, is called with a context's ID and a signed byte count
+  * whenever the device memory that context's guest holds changes: its size when
+  * a vkAllocateMemory succeeds, and minus that size when the memory is freed
+@@ -630,6 +640,8 @@ struct virgl_renderer_device_memory_pool {
+    void (*release)(void *data, uint64_t size);
+    void (*refused)(void *data);
+    void (*account)(void *data, uint32_t ctx_id, int64_t delta);
++   bool (*wait)(void *data, uint32_t ctx_id, uint64_t size, uint32_t attempt);
++   void (*waited)(void *data, uint32_t ctx_id, bool admitted);
+ };
+ 
+ /*

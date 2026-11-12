@@ -1,0 +1,212 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 22:25:46 +0000
+Subject: [PATCH] audio: wait for the primary input's frames instead of making
+ them up
+
+The primary input takes the frames its client asks for from a pipe that
+an I/O thread fills with the buffers the device captures. When the pipe
+was short it made silence up for the missing frames (a warning in the
+log each time), and its sleep pacing made some up to keep a schedule of
+its own. A recording thus held a gap of silence about that often, the
+captured frames behind it came as late as the gap was long, and the
+timestamps of the input could not be smooth.
+
+Wait for the frames a bounded time, at least 100 ms and at most 250 ms,
+and make silence up only when the device does not deliver within it.
+The I/O thread wakes the wait each time it has written to the pipe, and
+the wait ends when the thread is stopped. The device paces the input,
+so the pacing of its own goes, with its members. The position of the
+input stays its client's count and the time of the reply: when the
+client keeps up, a reply follows the arrival of the frames it hands
+over.
+---
+ .../aidl/default/alsa/StreamAlsaMonoPipe.cpp  | 48 ++++++++++++++++++-
+ .../include/core-impl/StreamAlsaMonoPipe.h    |  5 ++
+ .../default/include/core-impl/StreamPrimary.h |  4 --
+ audio/aidl/default/primary/StreamPrimary.cpp  | 38 ++-------------
+ 4 files changed, 54 insertions(+), 41 deletions(-)
+
+diff --git a/audio/aidl/default/alsa/StreamAlsaMonoPipe.cpp b/audio/aidl/default/alsa/StreamAlsaMonoPipe.cpp
+index aab177402c05c9ed0769e24ec84d8ba32078cd2e..c7ab82f0ec93dadc0285ba147b7f247d2f413383 100644
+--- a/audio/aidl/default/alsa/StreamAlsaMonoPipe.cpp
++++ b/audio/aidl/default/alsa/StreamAlsaMonoPipe.cpp
+@@ -17,6 +17,12 @@
+ #define LOG_TAG "AHAL_StreamAlsaMonoPipe"
+ #include <Log.h>
+ 
++#include <algorithm>
++#include <chrono>
++#include <condition_variable>
++#include <mutex>
++#include <thread>
++
+ #include <media/AidlConversionCppNdk.h>
+ 
+ #include "core-impl/StreamAlsaMonoPipe.h"
+@@ -122,8 +128,38 @@ StreamAlsaMonoPipe::~StreamAlsaMonoPipe() {
+     if (mIsInput) {
+         const size_t i = 0;  // For the input case, only support a single device.
+         LOG(VERBOSE) << __func__ << ": reading from sink " << i;
+-        ssize_t framesRead = mSources[i]->read(buffer, frameCount);
+-        LOG_IF(FATAL, framesRead < 0) << "Error reading from the pipe: " << framesRead;
++        // The I/O thread fills the pipe with the buffers that the device captures, and the client
++        // asks for its frames when it likes, so the pipe is often short of what it asks for. Wait
++        // for the frames, a bounded time, rather than making silence up for the missing ones: made
++        // up frames shift every captured frame behind them, and the timestamps of the recording
++        // with them. The I/O thread wakes the wait each time it has written to the pipe, and when
++        // it is stopped, which ends the wait as well.
++        constexpr int64_t kMinWaitNs = 100'000'000;
++        constexpr int64_t kMaxWaitNs = 250'000'000;
++        const int64_t frameDurationNs = static_cast<int64_t>(1'000'000'000) *
++                                        static_cast<int64_t>(frameCount) /
++                                        getContext().getSampleRate();
++        const auto deadline =
++                std::chrono::steady_clock::now() +
++                std::chrono::nanoseconds(std::clamp(4 * frameDurationNs, kMinWaitNs, kMaxWaitNs));
++        ssize_t framesRead = 0;
++        for (;;) {
++            const ssize_t chunk = mSources[i]->read(
++                    static_cast<char*>(buffer) + framesRead * mFrameSizeBytes,
++                    frameCount - framesRead);
++            LOG_IF(FATAL, chunk < 0) << "Error reading from the pipe: " << chunk;
++            framesRead += chunk;
++            if (framesRead >= static_cast<ssize_t>(frameCount) || !mIoThreadIsRunning ||
++                std::chrono::steady_clock::now() >= deadline) {
++                break;
++            }
++            if (chunk == 0) {
++                std::unique_lock lock(mInputMutex);
++                mInputCv.wait_until(lock, deadline, [&] {
++                    return !mIoThreadIsRunning || mSources[i]->availableToRead() > 0;
++                });
++            }
++        }
+         if (ssize_t framesMissing = static_cast<ssize_t>(frameCount) - framesRead;
+             framesMissing > 0) {
+             LOG(WARNING) << __func__ << ": incomplete data received, inserting " << framesMissing
+@@ -185,6 +221,9 @@ void StreamAlsaMonoPipe::inputIoThread(size_t idx) {
+                                            mBufferSizeFrames - bufferFramesWritten);
+                 if (framesWrittenOrError > 0) {
+                     bufferFramesWritten += framesWrittenOrError;
++                    // Wake the wait of the client's 'transfer' for frames.
++                    std::lock_guard lock(mInputMutex);
++                    mInputCv.notify_one();
+                 } else if (framesWrittenOrError == 0) {
+                     // The pipe is full, as the client is behind: try again soon.
+                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
+@@ -233,6 +272,11 @@ void StreamAlsaMonoPipe::outputIoThread(size_t idx) {
+ 
+ void StreamAlsaMonoPipe::teardownIo() {
+     mIoThreadIsRunning = false;
++    {
++        // Wake a 'transfer' that waits for frames: it ends its wait now that the thread is stopped.
++        std::lock_guard lock(mInputMutex);
++        mInputCv.notify_all();
++    }
+     if (mIsInput) {
+         LOG(DEBUG) << __func__ << ": shutting down pipes";
+         for (auto& sink : mSinks) {
+diff --git a/audio/aidl/default/include/core-impl/StreamAlsaMonoPipe.h b/audio/aidl/default/include/core-impl/StreamAlsaMonoPipe.h
+index aaa6b881b90a020dfb011477024221edb33f2885..527f3c5475ceef326fc2931e87aaacf147701161 100644
+--- a/audio/aidl/default/include/core-impl/StreamAlsaMonoPipe.h
++++ b/audio/aidl/default/include/core-impl/StreamAlsaMonoPipe.h
+@@ -17,6 +17,8 @@
+ #pragma once
+ 
+ #include <atomic>
++#include <condition_variable>
++#include <mutex>
+ #include <thread>
+ #include <vector>
+ 
+@@ -63,6 +65,9 @@ class StreamAlsaMonoPipe : public StreamAlsaBase {
+     std::vector<::android::sp<::android::MonoPipeReader>> mSources;
+     std::vector<std::thread> mIoThreads;
+     std::atomic<bool> mIoThreadIsRunning = false;  // used by all threads
++    // The input's I/O thread wakes 'transfer', which waits for the frames of the pipe.
++    std::mutex mInputMutex;
++    std::condition_variable mInputCv;
+ };
+ 
+ }  // namespace aidl::android::hardware::audio::core
+diff --git a/audio/aidl/default/include/core-impl/StreamPrimary.h b/audio/aidl/default/include/core-impl/StreamPrimary.h
+index e9c06b1d7ac659cfe39ef9b4e03a972be9b68468..91018af1ee8526fafdebf7a64f6a0eb7c5c3b463 100644
+--- a/audio/aidl/default/include/core-impl/StreamPrimary.h
++++ b/audio/aidl/default/include/core-impl/StreamPrimary.h
+@@ -52,12 +52,8 @@ class StreamPrimary : public StreamAlsaMonoPipe {
+     // The output writes to its device from 'transfer'.
+     bool outputUsesPipe() const override { return false; }
+ 
+-    const bool mIsAsynchronous;
+-    int64_t mStartTimeNs = 0;
+     // Whether the output's writer has asked for its real-time priority (see 'transfer').
+     bool mWriterPriorityRequested = false;
+-    long mFramesSinceStart = 0;
+-    bool mSkipNextTransfer = false;
+ 
+   private:
+     using AlsaDeviceId = std::pair<int, int>;
+diff --git a/audio/aidl/default/primary/StreamPrimary.cpp b/audio/aidl/default/primary/StreamPrimary.cpp
+index ea17a2d82c77a8a9a0855f9899dc7d2935568f35..20d69338517d7b26acc4602b7aad7d3965778607 100644
+--- a/audio/aidl/default/primary/StreamPrimary.cpp
++++ b/audio/aidl/default/primary/StreamPrimary.cpp
+@@ -43,7 +43,6 @@ namespace aidl::android::hardware::audio::core {
+ 
+ StreamPrimary::StreamPrimary(StreamContext* context, const Metadata& metadata)
+     : StreamAlsaMonoPipe(context, metadata, 3 /*readWriteRetries*/),
+-      mIsAsynchronous(!!getContext().getAsyncCallback()),
+       mStubDriver(getContext()) {
+     context->startStreamDataProcessor();
+ }
+@@ -88,9 +87,6 @@ StreamPrimary::StreamPrimary(StreamContext* context, const Metadata& metadata)
+         return mStubDriver.start();
+     }
+     RETURN_STATUS_IF_ERROR(StreamAlsaMonoPipe::start());
+-    mStartTimeNs = ::android::uptimeNanos();
+-    mFramesSinceStart = 0;
+-    mSkipNextTransfer = false;
+     return ::android::OK;
+ }
+ 
+@@ -118,37 +114,9 @@ StreamPrimary::StreamPrimary(StreamContext* context, const Metadata& metadata)
+         }
+         return StreamAlsaMonoPipe::transfer(buffer, frameCount, actualFrameCount, latencyMs);
+     }
+-    // This is a workaround for the emulator implementation which has a host-side buffer
+-    // and is not being able to achieve real-time behavior similar to ADSPs (b/302587331).
+-    if (!mSkipNextTransfer) {
+-        RETURN_STATUS_IF_ERROR(
+-                StreamAlsaMonoPipe::transfer(buffer, frameCount, actualFrameCount, latencyMs));
+-    } else {
+-        LOG(DEBUG) << __func__ << ": skipping transfer (" << frameCount << " frames)";
+-        *actualFrameCount = frameCount;
+-        if (mIsInput) memset(buffer, 0, frameCount * mFrameSizeBytes);
+-        mSkipNextTransfer = false;
+-    }
+-    if (!mIsAsynchronous) {
+-        const long bufferDurationUs =
+-                (*actualFrameCount) * MICROS_PER_SECOND / mContext.getSampleRate();
+-        const auto totalDurationUs =
+-                (::android::uptimeNanos() - mStartTimeNs) / NANOS_PER_MICROSECOND;
+-        mFramesSinceStart += *actualFrameCount;
+-        const long totalOffsetUs =
+-                mFramesSinceStart * MICROS_PER_SECOND / mContext.getSampleRate() - totalDurationUs;
+-        LOG(VERBOSE) << __func__ << ": totalOffsetUs " << totalOffsetUs;
+-        if (totalOffsetUs > 0) {
+-            const long sleepTimeUs = std::min(totalOffsetUs, bufferDurationUs);
+-            LOG(VERBOSE) << __func__ << ": sleeping for " << sleepTimeUs << " us";
+-            usleep(sleepTimeUs);
+-        } else {
+-            mSkipNextTransfer = true;
+-        }
+-    } else {
+-        LOG(VERBOSE) << __func__ << ": asynchronous transfer";
+-    }
+-    return ::android::OK;
++    // The input waits for the frames that its device captures (see 'StreamAlsaMonoPipe::transfer'),
++    // so the device paces it, and no frame is made up to keep a schedule.
++    return StreamAlsaMonoPipe::transfer(buffer, frameCount, actualFrameCount, latencyMs);
+ }
+ 
+ ::android::status_t StreamPrimary::refinePosition(StreamDescriptor::Position* position) {

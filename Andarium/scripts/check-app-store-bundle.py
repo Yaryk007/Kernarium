@@ -18,9 +18,15 @@ application that must:
     guest sampler, the footprint log, the virtual Jetsam, the activity logs,
     the census and histogram, the automation entries and the harness's
     leftovers (DEBUG_SYMBOLS and DEBUG_STRINGS name them; the stand-ins that
-    keep the runtime API's layout, runtimeSetFrameSink and
-    runtimeSendConsoleInput, are allowed), and contain no test bundle and no
-    XCTest or Testing framework;
+    keep the runtime API's layout, runtimeSetFrameSink,
+    runtimeSendConsoleInput and runtimePrepareJit, are allowed), and contain
+    no test bundle and no XCTest or Testing framework;
+  - carry no JIT: no arm64 JIT engine, no executable-memory owner, none of the
+    runtime's or the application's JIT entries or text, and no instruction
+    word of the debugger request (`brk #0xf00d`, JIT_DEBUGGER_REQUEST) in the
+    code of the application or of a framework (the JIT is for the other
+    configurations, which a debugger prepares; an App Store build has no
+    executable memory of its own);
   - carry no trace of the machine that built it: no path under a user's home
     directory (/Users/<name>/), on a mounted volume (/Volumes/<name>/) or in
     the per-user temporary directories (/var/folders/) in the host code of an
@@ -79,6 +85,13 @@ HOST_PATHS = (
 # Sections that hold the guest, not the host: the Linux kernel image a runtime
 # carries, and the boot files of a Linux runtime.
 GUEST_SECTIONS = {("__TEXT", "__uml_elf"), ("__TEXT", "__uml_boot_base"), ("__TEXT", "__uml_boot_init")}
+# Where the host's own instructions are. A word that is the debugger request
+# (below) in a section of data is no request.
+CODE_SECTIONS = {("__TEXT", "__text")}
+# `brk #0xf00d`: the instruction a process uses to ask the debugger it is
+# attached to for JIT memory (darwin/cpu/jit_memory/executable_memory.cpp).
+# Only the debugger-route build of the runtime contains it.
+JIT_DEBUGGER_REQUEST = bytes.fromhex("a0013ed4")
 
 MACHO_64 = 0xFEEDFACF
 FAT_MAGIC = 0xCAFEBABE
@@ -104,8 +117,10 @@ def thin_offset(data: bytes) -> int | None:
     return 0 if struct.unpack_from("<I", data, 0)[0] == MACHO_64 else None
 
 
-def guest_ranges(data: bytes, base: int) -> list[tuple[int, int]]:
-    """File ranges of the sections that hold the guest."""
+def section_ranges(
+    data: bytes, base: int, wanted: set[tuple[str, str]],
+) -> list[tuple[int, int]]:
+    """File ranges of the named (segment, section) pairs of one Mach-O slice."""
     found = []
     count = struct.unpack_from("<I", data, base + 16)[0]
     position = base + 32
@@ -118,11 +133,16 @@ def guest_ranges(data: bytes, base: int) -> list[tuple[int, int]]:
                 name = data[entry:entry + 16].rstrip(b"\0").decode()
                 segment = data[entry + 16:entry + 32].rstrip(b"\0").decode()
                 length, offset = struct.unpack_from("<QI", data, entry + 40)
-                if (segment, name) in GUEST_SECTIONS:
+                if (segment, name) in wanted:
                     found.append((base + offset, base + offset + length))
                 entry += 80
         position += size
     return found
+
+
+def guest_ranges(data: bytes, base: int) -> list[tuple[int, int]]:
+    """File ranges of the sections that hold the guest."""
+    return section_ranges(data, base, GUEST_SECTIONS)
 
 
 def host_code(path: Path) -> tuple[bytes, int] | None:
@@ -288,6 +308,17 @@ DEBUG_SYMBOLS = (
                       b"_rfbInitServer")),
     ("launch harness", (b"13ConsoleReport", b"15environmentName", b"13applyDeferred",
                         b"16printsStatistics", b"13launchApplied")),
+    # The arm64 JIT engine, the owner of executable memory and the debugger
+    # route of the runtime and of the loader. namespace uml::cpu::jit_memory
+    # and uml::cpu::arm64::jit, the engine's classes and entry names.
+    ("JIT", (b"10jit_memory", b"5arm643jit", b"11JitCompiler", b"11JitExecutor",
+             b"9JitEngine", b"16JitCacheGeometry", b"uml_arm64_jit_",
+             b"darwin_uml_jit_enter_guest", b"kernarium_runtime_loader_prepare_jit",
+             b"kernarium_runtime_loader_debugger_attached",
+             # The application's own: the preference, the policy, the
+             # debugger side and the Home section (Andarium/Shared/Jit.swift).
+             b"13JitPreference", b"8JitShape", b"9JitAnswer", b"9JitStatus",
+             b"11JitDebugger", b"10JitSection")),
 )
 DEBUG_STRINGS = (
     ("frame mirror", (b"uml-frame-tap",)),
@@ -298,6 +329,9 @@ DEBUG_STRINGS = (
     ("automation", (b"kernarium_runtime_automation_", b"automation boot with",
                     b"ADB authorization is off", b"removed the boot payload")),
     ("remote framebuffer", (b"RFB 003.00",)),
+    ("JIT", (b"--jit-cache-budget=", b"--execution-engine=jit",
+             b"running on gadgets, not the JIT", b"open Andarium from StikDebug",
+             b"Started without JIT")),
 )
 # What runs tests: a test bundle, and the frameworks and libraries that load it
 # (XCTest, XCUIAutomation and the rest, Swift Testing). They are in an
@@ -305,6 +339,17 @@ DEBUG_STRINGS = (
 TEST_SUPPORT = re.compile(
     r"^(?:.*\.xctest|XC[A-Za-z]*\.framework|libXC[A-Za-z]*\.dylib"
     r"|_?Testing(?:_[A-Za-z0-9]+)?\.framework|lib_?Testing[A-Za-z0-9_]*\.dylib)$")
+
+
+def debugger_requests(code: bytes, base: int) -> int:
+    """How many instruction words of the host's code are the debugger request."""
+    count = 0
+    for start, end in section_ranges(code, base, CODE_SECTIONS):
+        position = code.find(JIT_DEBUGGER_REQUEST, start, end)
+        while position != -1:
+            count += (position - start) % 4 == 0
+            position = code.find(JIT_DEBUGGER_REQUEST, position + 1, end)
+    return count
 
 
 def debug_support(path: Path) -> list[str]:
@@ -320,6 +365,8 @@ def debug_support(path: Path) -> list[str]:
                 fragment.decode() for fragment in fragments if fragment in code[0])
             if names:
                 found.append(f"{kind} ({', '.join(names)})")
+    if debugger_requests(*code):
+        found.append("JIT (an instruction asking a debugger for JIT memory)")
     return found
 
 

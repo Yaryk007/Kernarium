@@ -85,7 +85,12 @@ constexpr auto platform_default = ExecutionEngine::gadgets;
 {
 	switch (engine) {
 	case ExecutionEngine::jit:
+#ifdef UML_APP_STORE_RUNTIME
+		/* The App Store runtime has no JIT engine to enter. */
+		return nullptr;
+#else
 		return darwin_uml_jit_enter_guest;
+#endif
 	case ExecutionEngine::gadgets:
 	case ExecutionEngine::automatic:
 		return darwin_uml_static_enter_guest;
@@ -555,6 +560,37 @@ std::size_t gadget_cache_budget_for(std::size_t guest_memory_bytes,
 			::uml::platform::process_memory_limit_bytes()),
 		executors);
 }
+
+#ifndef UML_APP_STORE_RUNTIME
+std::size_t jit_cache_budget_for(std::size_t guest_memory_bytes,
+	unsigned executors) noexcept
+{
+	return gadget_cache_budget_for(guest_memory_bytes, 0, executors);
+}
+
+JitMemoryStatus prepare_jit_memory(std::size_t guest_memory_bytes,
+	unsigned executors, std::size_t per_executor_bytes) noexcept
+{
+	return ::uml::cpu::prepare_jit_memory(
+		jit_cache_budget_for(guest_memory_bytes, executors), executors,
+		per_executor_bytes);
+}
+
+bool jit_debugger_attached() noexcept
+{
+	return ::uml::cpu::jit_debugger_attached();
+}
+
+void release_jit_debugger() noexcept
+{
+	::uml::cpu::release_jit_debugger();
+}
+
+std::size_t prepared_jit_region_bytes() noexcept
+{
+	return ::uml::cpu::prepared_jit_region_bytes();
+}
+#endif
 
 std::size_t set_gadget_cache_budget(std::size_t guest_memory_bytes,
 	std::size_t bytes, unsigned executors) noexcept

@@ -128,7 +128,7 @@ public struct TwoDiskStorage: GuestStorage {
     public var dataDiskPath: String { locations.data.path }
 
     /// The data disk's size in GiB for the runtime, which creates a disk that
-    /// is absent and grows one that is smaller.
+    /// is absent, grows one that is smaller and keeps one that is larger.
     public func dataGiB(for guest: Guest) -> UInt32 {
         UInt32(clamping: guest.effectiveCapacityGiB)
     }

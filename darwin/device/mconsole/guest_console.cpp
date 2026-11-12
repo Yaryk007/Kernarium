@@ -57,9 +57,12 @@ enum class ExchangeResult {
 	rejected,
 };
 
-/* The guest kernel prints this once its filesystem writeback has begun. Its
- * absence means the request reached a console that refused to act on it. */
-constexpr std::string_view writebackAcknowledgement = "Emergency Sync";
+/* The final reply of a SysRq request names its key and whether the operation
+ * ran (arch/um/drivers/mconsole_kern.c with_console()). The text the
+ * operation prints is no answer: a console may print it after the final
+ * reply, from another vCPU, or not at all. */
+constexpr std::string_view writebackAcknowledgement = "sysrq s ok";
+constexpr std::string_view writebackDisabled = "sysrq s disabled";
 constexpr std::string_view suspendAcknowledgement = "suspended";
 /* A guest reports a suspend it gave up with "Suspend failed: <errno>". EBUSY
  * (16) is the one a moment later can cure: a wake source fired while the guest
@@ -384,15 +387,19 @@ void adoptConsolePath(const std::string &path)
 	unsigned int settleMs)
 {
 	std::string response;
-	if (exchange(location, "sysrq s", response) != ExchangeResult::accepted)
-		return false;
-	if (response.find(writebackAcknowledgement) == std::string::npos) {
+	const auto result = exchange(location, "sysrq s", response);
+	/* The final reply comes last, after any console text. */
+	if (result == ExchangeResult::rejected &&
+	    response.ends_with(writebackDisabled)) {
 		std::fputs(
 			"Guest console refused the filesystem writeback; "
 			"the guest has magic SysRq disabled\n",
 			stderr);
 		return false;
 	}
+	if (result != ExchangeResult::accepted ||
+	    !response.ends_with(writebackAcknowledgement))
+		return false;
 	/* The guest reports that the writeback started, not that it finished, so
 	 * give it a bounded chance to reach the block layer before the host flushes
 	 * what it received. */

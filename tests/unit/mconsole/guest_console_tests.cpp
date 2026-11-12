@@ -69,7 +69,7 @@ using Reply = std::pair<std::uint32_t, std::string>;
 const Reply busySuspend {1U, "Suspend failed: -16"};
 const Reply failedSuspend {1U, "Suspend failed: -5"};
 const Reply enteredSuspend {0U, "suspended"};
-const Reply writeback {0U, "SysRq : Emergency Sync"};
+const Reply writeback {0U, "sysrq s ok"};
 
 /* Answers each request with what `policy` gives for it and its index, the
  * first one only after `firstDelay`, and keeps listening for a while after the
@@ -433,8 +433,34 @@ void aWakeSendsOneWakeRequest()
 	(void)::close(server);
 }
 
-/* A sync is one emergency sync, which counts only if the guest started it. */
-void aWritebackIsOneEmergencySync()
+/* Answers one request with `parts`, all but the last as console text that
+ * is followed by more, and returns what the console heard. */
+template<typename Request>
+auto answeredInParts(int server, Request &&request,
+	const std::vector<Reply> &parts, std::string_view expected)
+{
+	std::vector<std::string> requests;
+	std::thread observer {[&] {
+		sockaddr_un client {};
+		socklen_t clientLength {};
+		if (!awaitRequest(server, 10000))
+			return;
+		requests.push_back(
+			receiveRequest(server, client, clientLength));
+		for (std::size_t index = 0U; index < parts.size(); ++index)
+			(void)sendReply(server, client, clientLength,
+				parts[index].first, parts[index].second,
+				index + 1U < parts.size() ? 1U : 0U);
+	}};
+	const auto result = request();
+	observer.join();
+	require(requests == std::vector<std::string> {std::string {expected}});
+	return result;
+}
+
+/* A sync is one SysRq sync, which counts only if the guest's final reply says
+ * that it ran. The text it printed meanwhile is no answer. */
+void aWritebackIsOneSysrqSync()
 {
 	using ::uml::device::request_guest_writeback;
 	const ::uml::device::GuestConsoleRun run {true};
@@ -442,12 +468,29 @@ void aWritebackIsOneEmergencySync()
 	require(!request_guest_writeback(0U));
 	const int server = bindServer(path);
 	const auto writeback = [] { return request_guest_writeback(0U); };
-	require(answered(server, writeback, "SysRq : Emergency Sync", 0U, 0,
-		"sysrq s"));
+	require(answered(server, writeback, "sysrq s ok", 0U, 0, "sysrq s"));
 	requireOwnerOnly(path);
-	/* A guest with magic SysRq disabled takes the request and does nothing. */
-	require(!answered(server, writeback, "SysRq : This sysrq operation is "
-		"disabled.", 0U, 0, "sysrq s"));
+	/* The console text comes first, in as many parts as it needs, and the
+	 * final reply last. */
+	require(answeredInParts(server, writeback,
+		{{0U, "SysRq : "}, {0U, "Emergency Sync\n"},
+			{0U, "sysrq s ok"}},
+		"sysrq s"));
+	/* A guest with magic SysRq disabled takes the request and does nothing;
+	 * so does one that is asked for an operation it lacks. */
+	require(!answered(server, writeback, "sysrq s disabled", 1U, 0,
+		"sysrq s"));
+	require(!answered(server, writeback, "sysrq s failed", 1U, 0,
+		"sysrq s"));
+	/* The printed text is not the final reply: a kernel that ends with
+	 * nothing, or whose text came but whose status did not, has not said
+	 * that the sync ran. */
+	require(!answered(server, writeback, "", 0U, 0, "sysrq s"));
+	require(!answered(server, writeback, "SysRq : Emergency Sync", 0U, 0,
+		"sysrq s"));
+	require(!answeredInParts(server, writeback,
+		{{0U, "SysRq : Emergency Sync\n"}, {1U, "sysrq s disabled"}},
+		"sysrq s"));
 	require(!awaitRequest(server, 200));
 	(void)::close(server);
 }
@@ -953,7 +996,7 @@ int main(int argc, char **argv)
 	} else if (selected == "wake") {
 		runPrivately(aWakeSendsOneWakeRequest);
 	} else if (selected == "writeback") {
-		runPrivately(aWritebackIsOneEmergencySync);
+		runPrivately(aWritebackIsOneSysrqSync);
 	} else if (selected == "suspend-failure") {
 		runPrivately([] {
 			aBusySuspendIsRetriedUntilTheDeadline();

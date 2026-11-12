@@ -117,4 +117,9 @@ patch	drm-virtio-name-the-creating-process-in-a-context-s-debug-name.patch
 patch	um-deliver-a-line-s-queued-output-before-console-text-and-at-exit.patch
 patch	drm-virtio-report-the-host-s-graphics-memory-pressure-and-holders.patch
 patch	ALSA-virtio-run-the-elapsed-period-work-on-a-real-time-worker.patch
-patch	uml-virtio_uml-kick-GPU-and-sound-devices-without-an-acknowledgement.patch
+patch	uml-virtio_uml-kick-every-device-but-the-console-without-a-reply.patch
+patch	um-walk-the-mconsole-s-console-clients-under-their-lock.patch
+patch	um-lock-the-mconsole-s-queue-of-process-context-requests.patch
+patch	um-fail-a-user-access-to-a-mapping-of-memory-outside-guest-RAM.patch
+patch	sysrq-report-whether-a-SysRq-operation-ran.patch
+patch	um-end-an-mconsole-console-command-with-a-status-reply.patch

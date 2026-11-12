@@ -55,3 +55,27 @@ if(UML_ANDROID_OOBE_RELEASE AND TARGET uml-darwin-android17)
         PROCESSORS 4
         RESOURCE_GROUPS cpus:4)
 endif()
+
+# microG's restricted signature spoofing (route p0007): with nothing installed
+# under the two microG names PackageManager reports neither, and test-key
+# decoys with those names report their own signer, never Google's certificate.
+# It boots Android with the macOS launcher, so it is opt-in: name the release
+# under test and the directory that tests/integration/android/microg/build-apks.sh
+# filled.
+set(UML_ANDROID_MICROG_RELEASE "" CACHE PATH
+    "Installed Android release directory that the android-microg-spoofing test boots")
+set(UML_ANDROID_MICROG_PROBE_DIR "" CACHE PATH
+    "Directory with the three APKs of the microG probe (microg/build-apks.sh)")
+if(UML_ANDROID_MICROG_RELEASE AND UML_ANDROID_MICROG_PROBE_DIR AND TARGET uml-darwin-android17)
+    uml_add_integration_test(
+        NAME android-microg-spoofing
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/run_android_microg_spoofing.py
+            --release ${UML_ANDROID_MICROG_RELEASE}
+            --emulator $<TARGET_FILE:uml-darwin-android17>
+            --probe-dir ${UML_ANDROID_MICROG_PROBE_DIR}
+        LABELS guest;boot;android
+        TIMEOUT 3600
+        PROCESSORS 4
+        RESOURCE_GROUPS cpus:4)
+endif()

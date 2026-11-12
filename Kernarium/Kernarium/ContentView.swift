@@ -508,7 +508,7 @@ struct GPUBudgetWarning: Equatable {
         limitMiB = mebibytes(plan.process_limit_bytes)
         guestMemoryMiB = mebibytes(plan.guest_memory_bytes)
         availableMiB = mebibytes(plan.available_bytes)
-        // The runtime clamps to the floor unless half the guest is less.
+        // The runtime gives the GPU the floor when the limit leaves less.
         floorMiB = mebibytes(plan.budget_bytes)
     }
 

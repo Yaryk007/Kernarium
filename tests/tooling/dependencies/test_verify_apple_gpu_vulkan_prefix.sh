@@ -336,7 +336,7 @@ expect_failure "duplicate Vulkan provider" verify "$CASE_PREFIX"
 
 # Each framework has its own dependency allowlist. The GL pair may use
 # libexpat, Foundation, and its two Mesa edges; KosmicKrisp may use only Metal,
-# QuartzCore, and the base system libraries.
+# QuartzCore, and the base system libraries, which include libcompression.
 GALLIUM="$BASE_PREFIX/Frameworks/MesaGallium.framework/MesaGallium"
 KOSMICKRISP="$BASE_PREFIX/Frameworks/KosmicKrisp.framework/KosmicKrisp"
 CASE_PREFIX="$TEST_ROOT/gl-allowlist"
@@ -345,6 +345,12 @@ make_framework "$CASE_PREFIX" MesaEGL "$TEST_ROOT/mesa-egl.c" "$GALLIUM" \
 	-lexpat -framework Foundation
 verify "$CASE_PREFIX" >/dev/null ||
 	fail "a GL framework using its allowed dependencies was rejected"
+
+CASE_PREFIX="$TEST_ROOT/kosmickrisp-compression"
+copy_fixture "$CASE_PREFIX"
+make_framework "$CASE_PREFIX" KosmicKrisp "$TEST_ROOT/kosmickrisp.c" -lcompression
+verify "$CASE_PREFIX" >/dev/null ||
+	fail "KosmicKrisp using libcompression was rejected"
 
 expect_framework_rejection \
 	"KosmicKrisp.framework dependency: /usr/lib/libexpat.1.dylib" \

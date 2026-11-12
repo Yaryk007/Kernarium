@@ -125,3 +125,12 @@ uml_add_tooling_test(
         ${PROJECT_SOURCE_DIR}/tests/tooling/android/test_oobe_runner.py
     LABELS android
     TIMEOUT 30)
+
+# The microG spoofing probe's sources agree with each other and with the
+# certificate LineageOS compares with, and its runner reads `am instrument`.
+uml_add_tooling_test(
+    NAME android17-microg-probe
+    COMMAND ${Python3_EXECUTABLE} -B
+        ${PROJECT_SOURCE_DIR}/tests/tooling/android/test_microg_probe.py
+    LABELS android
+    TIMEOUT 60)

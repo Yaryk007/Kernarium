@@ -60,14 +60,21 @@ bool locksSuspended{};
 	return a.st_dev == b.st_dev && a.st_ino == b.st_ino;
 }
 
+/* Whether a released disk is as the guest left it: the same file, with its
+ * size, link count and modification time, and on macOS its change time. The
+ * iOS family leaves the change time out, because the application's own
+ * metadata writes move it while the guest is away and the guest reads none of
+ * them. */
 [[nodiscard]] bool unchanged(const struct stat &a, const struct stat &b) noexcept
 {
-	return sameFile(a, b) && a.st_size == b.st_size &&
-		a.st_nlink == b.st_nlink &&
-		a.st_mtimespec.tv_sec == b.st_mtimespec.tv_sec &&
-		a.st_mtimespec.tv_nsec == b.st_mtimespec.tv_nsec &&
-		a.st_ctimespec.tv_sec == b.st_ctimespec.tv_sec &&
-		a.st_ctimespec.tv_nsec == b.st_ctimespec.tv_nsec;
+	if (!sameFile(a, b) || a.st_size != b.st_size ||
+	    a.st_nlink != b.st_nlink ||
+	    a.st_mtimespec.tv_sec != b.st_mtimespec.tv_sec ||
+	    a.st_mtimespec.tv_nsec != b.st_mtimespec.tv_nsec)
+		return false;
+	return !hostDiskLocks ||
+		(a.st_ctimespec.tv_sec == b.st_ctimespec.tv_sec &&
+		 a.st_ctimespec.tv_nsec == b.st_ctimespec.tv_nsec);
 }
 
 [[nodiscard]] int lockHostFile(int descriptor, struct flock lock) noexcept

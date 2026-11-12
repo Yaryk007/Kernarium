@@ -39,6 +39,12 @@ struct JitCacheGeometry final {
 		default;
 	[[nodiscard]] bool valid() const noexcept;
 	[[nodiscard]] std::size_t total_bytes() const noexcept;
+	/* The executable memory one executor of this geometry keeps: its code,
+	 * tracked-store and single-instruction arenas, each in whole 16 KiB
+	 * granules. A region that must hold every executor's arenas is this
+	 * times the executor count; total_bytes() already charges the same
+	 * mappings to the budget. */
+	[[nodiscard]] std::size_t executable_bytes() const noexcept;
 };
 
 inline constexpr unsigned maximum_jit_cache_executors = 64;
@@ -72,6 +78,14 @@ inline constexpr std::size_t minimum_shared_translation_cache_bytes =
  * explicit publication claims the documented fallback pair.
  */
 [[nodiscard]] bool set_jit_cache_budget(std::size_t total_bytes,
+	unsigned executors,
+	std::size_t per_executor_bytes =
+		default_jit_cache_budget_per_executor) noexcept;
+
+/* Whether a whole-process pair can still be published: none has been, or the
+ * published one is this one. The test set_jit_cache_budget applies, without
+ * publishing. */
+[[nodiscard]] bool jit_cache_budget_publishable(std::size_t total_bytes,
 	unsigned executors,
 	std::size_t per_executor_bytes =
 		default_jit_cache_budget_per_executor) noexcept;
@@ -173,10 +187,5 @@ using JitCacheRunSessionReservedHook = void (*)(void *) noexcept;
 [[nodiscard]] bool acquire_jit_cache_run_session_after_reservation_for_test(
 	JitCacheRunSessionReservedHook hook, void *context) noexcept;
 #endif
-
-/* Parses a byte count with an optional K/M/G suffix, as used by
- * `--jit-cache-budget=`. Returns zero if unparsable.
- */
-[[nodiscard]] std::size_t parse_byte_quantity(const char *text) noexcept;
 
 } // namespace uml::cpu::arm64

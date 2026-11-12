@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 03:04:37 +0000
+Subject: [PATCH] pm: let microG present Google's certificate on user builds
+
+LineageOS answers a package-info query for com.google.android.gms and
+com.android.vending with Google's certificate in both signatures and
+signingInfo, but only for a package that is signed by microG's release
+key alone and carries that certificate as its fake-signature meta-data
+(ComputerEngine.isMicrogSigned). The method also required
+isDebuggable(), a compile-time property of the build, so the spoof was
+off on every user build.
+
+The check is removed, as lineageos4microg's user-build patch does.
+What is left decides as before: the two package names, the exact
+signer and the exact meta-data value. No permission or API is added,
+and a package with another signer is never spoofed, whatever its name.
+The native isDebuggable() stays: the WebView update service calls it.
+---
+ services/core/java/com/android/server/pm/ComputerEngine.java | 4 +---
+ 1 file changed, 1 insertion(+), 3 deletions(-)
+
+diff --git a/services/core/java/com/android/server/pm/ComputerEngine.java b/services/core/java/com/android/server/pm/ComputerEngine.java
+index 4e499dcc6f0a5c7b9b063ee1e3b2f6f610a70b75..ef242abde3f88af378d4a9752b84d9bdb7a0e8cd 100644
+--- a/services/core/java/com/android/server/pm/ComputerEngine.java
++++ b/services/core/java/com/android/server/pm/ComputerEngine.java
+@@ -1492,9 +1492,7 @@ public class ComputerEngine implements Computer {
+     public static native boolean isDebuggable();
+ 
+     public static boolean isMicrogSigned(AndroidPackage p) {
+-        if (!isDebuggable()) {
+-            return false;
+-        }
++        // Not limited to debuggable builds: the package name and the exact signer decide.
+ 
+         // Allowlist the following apps:
+         // * com.android.vending - microG Companion

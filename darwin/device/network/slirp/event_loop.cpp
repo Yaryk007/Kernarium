@@ -215,6 +215,10 @@ void SlirpProvider::event_loop(std::stop_token stop_token) noexcept
 	state.descriptors.reserve(64);
 	while (!stop_token.stop_requested()) {
 		std::uint32_t timeout = 1000;
+#if UML_SLIRP_TESTING
+		event_loop_passes_for_testing_.fetch_add(
+			1, std::memory_order_relaxed);
+#endif
 		process_transmit_queue();
 		state.descriptors.clear();
 		state.descriptors.push_back({wake_pipe_[0].get(), POLLIN, 0});

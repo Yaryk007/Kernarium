@@ -415,6 +415,31 @@ std::uint64_t allocatedBytes(const fs::path &path)
 	return static_cast<std::uint64_t>(details.st_blocks) * 512U;
 }
 
+/* What a disk is as a file: the same inode and modification time prove that
+ * nothing wrote it or replaced it, the blocks that nothing was allocated. */
+struct FileIdentity {
+	ino_t inode;
+	off_t size;
+	timespec modified;
+	blkcnt_t blocks;
+
+	bool operator==(const FileIdentity &other) const
+	{
+		return inode == other.inode && size == other.size &&
+		       modified.tv_sec == other.modified.tv_sec &&
+		       modified.tv_nsec == other.modified.tv_nsec &&
+		       blocks == other.blocks;
+	}
+};
+
+FileIdentity identityOf(const fs::path &path)
+{
+	struct stat details {};
+	require(stat(path.c_str(), &details) == 0);
+	return {details.st_ino, details.st_size, details.st_mtimespec,
+		details.st_blocks};
+}
+
 /* A child that holds the disk open and locked as a running guest does, until
  * the object is destroyed. */
 class LockHolder final {
@@ -598,10 +623,35 @@ void testDataDiskGrow(const Fixture &fixture, const fs::path &directory)
 		readRange(fresh, 7U * gibibyte - mebibyte, mebibyte));
 	fs::remove(fresh);
 
-	/* It never shrinks. */
-	requireThrows([&] { (void)android::prepareDataDisk(layout, path, 6); });
+	/* A request below the disk keeps the disk: the caller asked for a size
+	 * the disk already exceeds, as an application does after the disk grew
+	 * for a start that never recorded it. Nothing is written, replaced or
+	 * left beside it. */
+	{
+		const auto before = identityOf(path);
+		const auto head = readRange(path, 0, 2 * mebibyte);
+		const auto tail = readRange(path, 7U * gibibyte - mebibyte, mebibyte);
+		for (const std::uint32_t smaller : {6U, 1U}) {
+			prepared = android::prepareDataDisk(layout, path, smaller);
+			require(prepared.change == android::DataDiskChange::none &&
+				prepared.capacityGiB == 7);
+		}
+		require(identityOf(path) == before);
+		require(android::validateDataDisk(layout, path) == 7);
+		require(readRange(path, 0, 2 * mebibyte) == head);
+		require(readRange(path, 7U * gibibyte - mebibyte, mebibyte) == tail);
+		require(readRange(path, userdata + 12345U, marker.size()) == marker);
+		require(readRange(path, metadata + 77U, marker.size()) == marker);
+		require(miscCommand(layout, path) == "boot-recovery");
+		require(entryCount(directory) == 1);
+	}
+
+	/* growDataDisk keeps its own precondition: it grows or it throws. */
 	requireThrows([&] { android::growDataDisk(layout, path, 7); });
+	requireThrows([&] { android::growDataDisk(layout, path, 6); });
 	requireThrows([&] { android::growDataDisk(layout, path, 129); });
+	/* A request beyond the template's range still fails, and the disk stays. */
+	requireThrows([&] { (void)android::prepareDataDisk(layout, path, 129); });
 	require(android::validateDataDisk(layout, path) == 7);
 	require(entryCount(directory) == 1);
 

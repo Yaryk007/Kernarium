@@ -71,7 +71,7 @@ LOCATIONS = (
         "code that goes into the Android image (overlay, sepolicy, sensors) "
         "is Apache-2.0", every_file=True),
     location(
-        r"^tests/integration/android/(motion|storage|webgl)/", {"Apache-2.0"},
+        r"^tests/integration/android/(microg|motion|storage|webgl)/", {"Apache-2.0"},
         "the Android test and probe apps are built in the Android tree and "
         "are Apache-2.0", every_file=True),
     location(

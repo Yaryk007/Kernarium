@@ -41,6 +41,7 @@ final class AndariumProcess {
         // This is the process's launch: a test that builds a model does not
         // sweep the folder a running test stages its files in.
         BugReportStaging.sweep()
+        GuestFileStaging.sweep()
         model = entry.makeModel()
     }
 }

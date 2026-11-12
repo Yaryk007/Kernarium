@@ -213,7 +213,8 @@ class Console:
 
     ``devicectl device process launch --console`` stays attached for as long
     as the application runs and writes what it prints to ``log``; leaving the
-    block interrupts it.
+    block interrupts it. ``start_stopped`` launches it stopped, for a debugger
+    to attach to before it runs (tests/integration/support/ios_jit_debugger.py).
     """
 
     def __init__(
@@ -222,11 +223,15 @@ class Console:
         application: Application,
         settings: Mapping[str, str],
         log: pathlib.Path,
+        *,
+        start_stopped: bool = False,
     ) -> None:
         self.log = log
         self._command = device_command(
             "device", "process", "launch", "--device", device,
-            "--console", "--terminate-existing", application.bundle_id,
+            "--console", "--terminate-existing",
+            *(["--start-stopped"] if start_stopped else []),
+            application.bundle_id,
         )
         self._environment = device_launch_environment(application, settings)
         self._output: IO[bytes] | None = None

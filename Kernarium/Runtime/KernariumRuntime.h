@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define KERNARIUM_RUNTIME_API_VERSION 29U
+#define KERNARIUM_RUNTIME_API_VERSION 30U
 
 #if defined(__OBJC__)
 @class MTKView;
@@ -61,14 +61,14 @@ enum {
  * android_data_gib GiB when that is larger; it never shrinks one. The guest
  * has exactly these two disks. The kernel is carried by the runtime.
  *
- * The host GPU's budget is B = clamp(L - A - G - E - S, 384 MiB, G / 2),
- * evaluated once at launch (see the architecture document): L is the
- * application's memory limit, G the guest's memory, and E the gadget cache
- * plus the other memory the guest side of the process uses. The request states
- * the three launch parameters: A, the application's own expected ceiling;
- * E_rest, the guest side's memory beyond the gadget cache; and S, the headroom
- * left unused. Zero, which is what the application states until their values
- * are chosen, adds nothing to the sum.
+ * The host GPU's budget is B = max(L - A - G - E - S, 384 MiB), evaluated
+ * once at launch (see the architecture document): L is the application's
+ * memory limit, G the guest's memory, and E the gadget cache plus the other
+ * memory the guest side of the process uses. Without a limit B is G. The
+ * request states the three launch parameters: A, the application's own
+ * expected ceiling; E_rest, the guest side's memory beyond the gadget cache;
+ * and S, the headroom left unused. Zero, which is what the application states
+ * until their values are chosen, adds nothing to the sum.
  *
  * An Android guest authorizes one adb host key for this boot without asking
  * its user: android_adb_public_key is the key as adb writes it, base64 of the
@@ -95,7 +95,14 @@ enum {
  * boot on, then the end, a guest kernel panic with its message included. The
  * caller reads it at its next launch, before it boots again. Null keeps no
  * record; the runtime reads it only from a request whose struct_size covers
- * it. */
+ * it.
+ *
+ * use_jit asks for the JIT engine in place of the gadget engine for this boot
+ * (runtime API 30), on a runtime that has one and has been through
+ * prepare_jit for this request's guest memory and vCPU count with a result of
+ * KERNARIUM_RUNTIME_JIT_READY. A boot that asks for it when that is not so
+ * runs on gadgets, with a line on stderr: an engine never fails a boot. The
+ * runtime reads it only from a request whose struct_size covers it. */
 typedef struct kernarium_runtime_boot {
     uint32_t struct_size;
     uint32_t width;
@@ -116,6 +123,8 @@ typedef struct kernarium_runtime_boot {
     const char* android_adb_public_key;
     const char* android_time_zone;
     const char* session_record_path;
+    uint32_t use_jit;
+    uint32_t reserved;
 } kernarium_runtime_boot;
 
 /* What a launch's host GPU budget comes to, as the runtime evaluates it for
@@ -174,6 +183,47 @@ typedef int (*kernarium_runtime_plan_gpu_budget_function)(
     uint32_t gpu_budget_engine_mib,
     uint32_t gpu_budget_headroom_mib,
     kernarium_runtime_gpu_budget* plan);
+
+/* What prepare_jit leaves, as its return value. */
+enum {
+    /* The JIT's executable memory is prepared for this guest memory and vCPU
+     * count, and the debugger, if one made it, has detached. A boot that sets
+     * use_jit runs on the JIT. */
+    KERNARIUM_RUNTIME_JIT_READY = 0,
+    /* This runtime has no JIT: an App Store runtime, or a build for the
+     * Simulator or a host that cannot make executable memory. */
+    KERNARIUM_RUNTIME_JIT_UNSUPPORTED = 1,
+    /* No debugger is attached to the process, or the one that was left
+     * before it served the request, so none prepared the memory. A boot
+     * runs on gadgets. */
+    KERNARIUM_RUNTIME_JIT_NO_DEBUGGER = 2,
+    /* The memory could not be prepared: the debugger did not answer, or the
+     * pages did not run code. A boot runs on gadgets, and the process does
+     * not try again. */
+    KERNARIUM_RUNTIME_JIT_FAILED = 3,
+    /* An earlier start of this process prepared the memory for another guest
+     * memory or vCPU count, and the debugger has left. A boot runs on
+     * gadgets until the application is opened from the debugger again. */
+    KERNARIUM_RUNTIME_JIT_OTHER_SETTINGS = 4,
+    /* `enable` was zero: the runtime asked an attached debugger to detach
+     * and prepared nothing. */
+    KERNARIUM_RUNTIME_JIT_DISABLED = 5,
+};
+/* Prepares the JIT for a guest of `guest_memory_mib` and `guest_processor_count`
+ * vCPUs when `enable` is nonzero (runtime API 30), and returns a
+ * KERNARIUM_RUNTIME_JIT_ value. On an iOS device the JIT's executable memory
+ * comes from a region a debugger the user attached to the process blesses once
+ * per process; the debugger then detaches. A zero `enable` only tells an
+ * attached debugger to detach, so a process that will not use the JIT does
+ * not stay under it. Call it before run, with the memory and vCPUs the run
+ * will state, and away from the main thread: it blocks for the seconds the
+ * debugger takes. It may be called long before the run, such as when the
+ * application opens: the prepared memory then stays wired until the process
+ * ends, and a run that does not use it carries it beside its own cache. */
+typedef int (*kernarium_runtime_prepare_jit_function)(
+    int enable,
+    uint32_t guest_memory_mib,
+    uint32_t guest_processor_count);
 
 typedef void (*kernarium_runtime_request_stop_function)(void);
 /* Flushes the guest's writable host files. Safe to call from any thread while
@@ -516,6 +566,7 @@ typedef struct kernarium_runtime_api {
     kernarium_runtime_cancel_touch_function cancel_touch;
     kernarium_runtime_quiesce_resident_function quiesce_resident;
     kernarium_runtime_read_graphics_memory_function read_graphics_memory;
+    kernarium_runtime_prepare_jit_function prepare_jit;
 } kernarium_runtime_api;
 
 #if defined(__GNUC__)

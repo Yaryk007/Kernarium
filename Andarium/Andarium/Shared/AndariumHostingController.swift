@@ -19,11 +19,12 @@ final class AndariumHostingController<Content: View>: UIHostingController<Conten
     /// The run's deferred edges; nil leaves SwiftUI's preference in charge.
     private var deferredEdges: ScreenEdges?
     private var updateScheduled = false
+    private var phaseWatcher: PhaseWatcher?
 
     init(rootView: Content, model: AppModel) {
         self.model = model
         super.init(rootView: rootView)
-        observePhase()
+        phaseWatcher = PhaseWatcher(model: model, target: self)
     }
 
     @available(*, unavailable)
@@ -65,17 +66,6 @@ final class AndariumHostingController<Content: View>: UIHostingController<Conten
         scheduleUpdate()
     }
 
-    private func observePhase() {
-        withObservationTracking {
-            _ = model.phase
-        } onChange: { [weak self] in
-            Task { @MainActor [weak self] in
-                self?.observePhase()
-                self?.scheduleUpdate()
-            }
-        }
-    }
-
     private func scheduleUpdate() {
         guard !updateScheduled else { return }
         updateScheduled = true
@@ -102,6 +92,33 @@ final class AndariumHostingController<Content: View>: UIHostingController<Conten
             // One call per turn, whatever the number of layouts and geometry
             // updates that scheduled it.
             model.driver?.sceneGeometryDidChange()
+        }
+    }
+}
+
+/// Tells the scene's root when the model's phase changes. Observation
+/// reports a change on whichever thread made it, so the hop back to the main
+/// actor must not carry the root's generic type: this class is not generic
+/// and reaches the root through the protocol, on the main actor only.
+@MainActor
+private final class PhaseWatcher {
+    private let model: AppModel
+    private weak var target: (any SceneGeometryObserver)?
+
+    init(model: AppModel, target: any SceneGeometryObserver) {
+        self.model = model
+        self.target = target
+        observe()
+    }
+
+    private func observe() {
+        withObservationTracking {
+            _ = model.phase
+        } onChange: { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.observe()
+                self?.target?.sceneGeometryDidChange()
+            }
         }
     }
 }

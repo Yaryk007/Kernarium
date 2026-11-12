@@ -157,7 +157,9 @@ private:
 		} else if (command == "suspend") {
 			text = "suspended";
 		}
-		if (command == "trim once")
+		if (command == "sysrq s")
+			text = "sysrq s ok";
+		else if (command == "trim once")
 			text = "trimmed 0 KiB in 0 ms, compacted in 40 ms, "
 			       "released 0 KiB in 1 ms";
 		else if (command.starts_with("trim "))

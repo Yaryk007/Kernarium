@@ -72,9 +72,12 @@ int set_guest_file_lock(int descriptor, int command,
 [[nodiscard]] unsigned release_guest_file_locks(bool retiring = false) noexcept;
 
 /* Reacquire every released disk lock and verify that no disk changed while
- * unlocked. On failure release the locks this attempt reacquired, and only
- * those, and keep the guest quiesced. The caller must not run the guest after
- * a failure. */
+ * unlocked: each descriptor still names its disk, with the size, link count
+ * and modification time it had, and on macOS the change time too (the iOS
+ * family leaves it out, because the application's own metadata writes move
+ * it). On failure release the locks this attempt reacquired, and only those,
+ * and keep the guest quiesced. The caller must not run the guest after a
+ * failure. */
 [[nodiscard]] bool restore_guest_file_locks() noexcept;
 
 /*

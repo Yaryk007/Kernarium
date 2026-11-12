@@ -3,9 +3,11 @@
 
 #include "context_memory_ledger.hpp"
 #include "protocol.hpp"
+#include "reclaim_wait.hpp"
 #include "../input/vnc/vnc_input.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -204,6 +206,20 @@ public:
     {
         return memoryRefusals_.load(std::memory_order_relaxed);
     }
+    /* A refused allocation waits for the guest's reclaimer (ReclaimWait).
+     * The guest is told of it as of a refusal, at once, so its reclaimer
+     * acts; the application's count, memoryRefusals(), holds only the
+     * refusals the guest was answered with. */
+    void recordMemoryWait() noexcept
+    {
+        memoryWaits_.fetch_add(1, std::memory_order_relaxed);
+        graphicsLedger_.notify();
+    }
+    [[nodiscard]] std::uint64_t memoryWaits() const noexcept
+    {
+        return memoryWaits_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] ReclaimWait& reclaimWait() noexcept { return reclaimWait_; }
     /* What the guest's contexts hold of the host GPU's memory, by process.
      * The device keeps it for as long as its guest runs, and clears it when
      * that guest is gone; it lives here because the display outlives the
@@ -230,6 +246,24 @@ public:
     {
         return guestReclaims_.load(std::memory_order_relaxed);
     }
+    /* The least a process holds, and how long it has been quiet, for the
+     * guest's reclaimer to end it: the terms of the guest's last query. */
+    void setGuestReclaimTerms(
+        std::uint64_t minimumBytes, std::uint32_t minimumIdleMs) noexcept
+    {
+        reclaimMinimumBytes_.store(minimumBytes, std::memory_order_relaxed);
+        reclaimMinimumIdleMs_.store(minimumIdleMs, std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint64_t guestReclaimMinimumBytes() const noexcept
+    {
+        return reclaimMinimumBytes_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::chrono::milliseconds guestReclaimMinimumIdle()
+        const noexcept
+    {
+        return std::chrono::milliseconds {
+            reclaimMinimumIdleMs_.load(std::memory_order_relaxed)};
+    }
 
 protected:
     Display() = default;
@@ -237,8 +271,12 @@ protected:
 private:
     std::atomic_bool guestScanoutActive_ {};
     std::atomic_bool guestReclaims_ {};
+    std::atomic<std::uint64_t> reclaimMinimumBytes_ {};
+    std::atomic<std::uint32_t> reclaimMinimumIdleMs_ {};
     std::atomic<std::uint64_t> memoryRefusals_ {};
+    std::atomic<std::uint64_t> memoryWaits_ {};
     ContextMemoryLedger graphicsLedger_;
+    ReclaimWait reclaimWait_;
 };
 
 [[nodiscard]] std::unique_ptr<Display> makeDisplay(

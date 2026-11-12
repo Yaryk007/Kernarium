@@ -82,18 +82,6 @@ set(UML_DEPENDENCY_PREFIX
     "${PROJECT_SOURCE_DIR}/.build/dependencies/macos-arm64-27"
     CACHE PATH "Private prefix containing source-built host dependencies")
 option(UML_BUILD_GPU "Build the host GPU/display provider" ${UML_TARGET_MACOS})
-# A development-signed iOS process can publish JIT memory only after a debugger
-# has attached and, on iOS 26 and later, prepared the region through the
-# StikDebug universal-script protocol. Stock and App Store runtimes keep this
-# off. The option changes executable-memory policy; signing must separately
-# provide get-task-allow.
-option(UML_ENABLE_IOS_STIKDEBUG_JIT
-    "Enable experimental StikDebug JIT publication on iOS devices" OFF)
-if(UML_ENABLE_IOS_STIKDEBUG_JIT AND
-   NOT UML_APPLE_PLATFORM STREQUAL "ios")
-    message(FATAL_ERROR
-        "UML_ENABLE_IOS_STIKDEBUG_JIT requires an iOS device build")
-endif()
 option(UML_BUILD_AUDIO "Build the host Virtio Sound playback provider"
     ${UML_BUILD_GPU})
 option(UML_BUILD_KERNARIUM_RUNTIME
@@ -109,10 +97,6 @@ option(UML_KERNARIUM_AUTOMATION_HARNESS
 option(UML_APP_STORE_RUNTIME
     "Build the App Store Kernarium runtime: it reads no environment variable that tunes, observes or drives a run, and carries no debugging or automation support"
     OFF)
-if(UML_ENABLE_IOS_STIKDEBUG_JIT AND UML_APP_STORE_RUNTIME)
-    message(FATAL_ERROR
-        "UML_ENABLE_IOS_STIKDEBUG_JIT cannot be used in an App Store runtime")
-endif()
 option(UML_BUILD_NETWORK_PROVIDER
     "Build the optional SLiRP network provider"
     ${UML_BUILD_KERNEL_RUNNER})
@@ -125,6 +109,22 @@ if(UML_APP_STORE_RUNTIME)
     # Every component of the runtime reads its diagnostics and A/B switches
     # through this definition, so one tree agrees.
     add_compile_definitions(UML_APP_STORE_RUNTIME)
+endif()
+
+# JIT. Every product but the App Store runtime builds the arm64 JIT engine. An
+# iOS device reaches JIT memory only through a region a debugger prepares
+# (darwin/cpu/jit_memory), which the App Store runtime refuses: it carries no
+# JIT code, no executable-memory owner and no debugger protocol.
+if(UML_APP_STORE_RUNTIME)
+    set(UML_ARM64_JIT_ENGINE OFF)
+    set(UML_IOS_DEBUGGER_JIT OFF)
+else()
+    set(UML_ARM64_JIT_ENGINE ON)
+    if(UML_APPLE_PLATFORM STREQUAL "ios")
+        set(UML_IOS_DEBUGGER_JIT ON)
+    else()
+        set(UML_IOS_DEBUGGER_JIT OFF)
+    endif()
 endif()
 
 # darwin/platform compiles Objective-C++ in every configuration. Without the

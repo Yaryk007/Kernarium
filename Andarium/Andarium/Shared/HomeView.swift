@@ -7,6 +7,9 @@ import SwiftUI
 /// its options and Start. Without a guest it offers to set one up.
 struct HomeView: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// The notes zoom out of the ribbon and back into it.
+    @Namespace private var whatsNewZoom
     let hints: ScreenHints
 
     var body: some View {
@@ -53,12 +56,21 @@ struct HomeView: View {
             }
         }
         .sheet(item: $model.sheet) { kind in
-            switch kind {
-            case .create: NewGuestSheet()
-            case .resize: ResizeSheet()
-            case .system: SystemSheet()
-            case .info: InfoSheet(page: hints.infoPage)
+            // On a Mac, SwiftUI reads a sheet's presentation preferences
+            // before the sheet inherits this view's environment, so every
+            // sheet is handed the model it reads.
+            Group {
+                switch kind {
+                case .create: NewGuestSheet()
+                case .resize: ResizeSheet()
+                case .system: SystemSheet()
+                case .info: InfoSheet(page: hints.infoPage)
+                case .whatsNew:
+                    WhatsNewSheet(releases: model.whatsNew.pending)
+                        .modifier(ZoomFrom(id: Self.ribbonID, namespace: whatsNewZoom, enabled: !reduceMotion))
+                }
             }
+            .environment(model)
         }
         .microphoneAccessAlert()
         .alert("Erase guest?", isPresented: $model.confirmingErase) {
@@ -81,6 +93,7 @@ struct HomeView: View {
         VStack(spacing: 22) {
             notices
             SystemSection()
+            developmentSections
             guestSections
             RecoveryErasePanel()
                 .id("erase")
@@ -96,6 +109,7 @@ struct HomeView: View {
         VStack(spacing: 28) {
             notices
             SystemSection()
+            developmentSections
             guestSections
             RecoveryErasePanel()
                 .id("erase")
@@ -112,6 +126,7 @@ struct HomeView: View {
             VStack(spacing: 22) {
                 notices
                 SystemSection()
+                developmentSections
             }
             .frame(maxWidth: 520)
             VStack(spacing: 22) {
@@ -125,6 +140,15 @@ struct HomeView: View {
         .padding(.top, 8)
         .padding(.bottom, 20)
         .frame(maxWidth: .infinity)
+    }
+
+    /// JIT, right below Guest system, in the builds that have it. An App Store
+    /// build has none and nothing takes its place.
+    @ViewBuilder
+    private var developmentSections: some View {
+        #if !APP_STORE
+        JitSection()
+        #endif
     }
 
     /// Display, Capabilities and Backup: what the guest shows and may use.
@@ -201,27 +225,47 @@ struct HomeView: View {
 
     // MARK: Start
 
-    /// The main action always starts Android normally.
+    private static let ribbonID = "whats-new-ribbon"
+
+    /// The main action always starts Android normally. After an update with
+    /// notes, the ribbon rides above it: Start keeps its place at the foot of
+    /// the screen, and the bar grows upwards.
     private func startBar(wide: Bool) -> some View {
-        StartButton()
-            .frame(maxWidth: wide ? 520 : .infinity)
-            .padding(.horizontal, 16)
-            .padding(.top, 14)
-            .padding(.bottom, 6)
-            .frame(maxWidth: .infinity)
-            .background {
-                // Content fades out under the button instead of showing through.
-                LinearGradient(
-                    stops: [
-                        .init(color: Color(.systemGroupedBackground).opacity(0), location: 0),
-                        .init(color: Color(.systemGroupedBackground).opacity(0.92), location: 0.45),
-                        .init(color: Color(.systemGroupedBackground), location: 1),
-                    ],
-                    startPoint: .top, endPoint: .bottom
+        VStack(spacing: 10) {
+            if model.whatsNew.showsRibbon {
+                WhatsNewRibbon(
+                    entries: model.whatsNew.pendingEntries,
+                    open: { model.sheet = .whatsNew },
+                    close: { withAnimation(.snappy) { model.whatsNew.putAway() } }
                 )
-                .ignoresSafeArea(edges: .bottom)
-                .allowsHitTesting(false)
+                .matchedTransitionSource(id: Self.ribbonID, in: whatsNewZoom)
+                .transition(
+                    reduceMotion ? .opacity : .move(edge: .bottom).combined(with: .opacity)
+                )
             }
+            StartButton()
+        }
+        .frame(maxWidth: wide ? 520 : .infinity)
+        .padding(.horizontal, 16)
+        .padding(.top, 14)
+        .padding(.bottom, 6)
+        .frame(maxWidth: .infinity)
+        .background {
+            // Content fades out under the button instead of showing through,
+            // and is gone by the ribbon's top, whose words read on glass.
+            let ribbon = model.whatsNew.showsRibbon
+            LinearGradient(
+                stops: [
+                    .init(color: Color(.systemGroupedBackground).opacity(0), location: 0),
+                    .init(color: Color(.systemGroupedBackground).opacity(0.92), location: ribbon ? 0.12 : 0.45),
+                    .init(color: Color(.systemGroupedBackground), location: ribbon ? 0.22 : 1),
+                    .init(color: Color(.systemGroupedBackground), location: 1),
+                ],
+                startPoint: .top, endPoint: .bottom
+            )
+            .ignoresSafeArea(edges: .bottom)
+            .allowsHitTesting(false)
+        }
     }
 }
 
@@ -482,6 +526,22 @@ struct RecoveryErasePanel: View {
                 .buttonStyle(.plain)
             }
             .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 26))
+        }
+    }
+}
+
+/// A zoom from the view marked with `id`, or the system's own presentation
+/// where Reduce Motion is on.
+struct ZoomFrom: ViewModifier {
+    let id: String
+    let namespace: Namespace.ID
+    let enabled: Bool
+
+    func body(content: Content) -> some View {
+        if enabled {
+            content.navigationTransition(.zoom(sourceID: id, in: namespace))
+        } else {
+            content
         }
     }
 }

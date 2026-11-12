@@ -378,7 +378,7 @@ function(_verify_framework _name)
         list(FIND _arg_DEPENDENCIES "${_dependency}" _allowed)
         if(_dependency STREQUAL "@rpath/${_name}.framework/${_name}" OR
            NOT _allowed EQUAL -1 OR
-           _dependency MATCHES "^/usr/lib/(libc\\+\\+\\.1|libSystem\\.B|libobjc\\.A|libz\\.1)\\.dylib$" OR
+           _dependency MATCHES "^/usr/lib/(libc\\+\\+\\.1|libSystem\\.B|libobjc\\.A|libz\\.1|libcompression)\\.dylib$" OR
            _dependency MATCHES "^/System/Library/Frameworks/(${_arg_SYSTEM})\\.framework/")
             continue()
         endif()

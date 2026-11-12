@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 add_library(uml_virtio_input STATIC
+    held_input.cpp
     in_process_service.cpp
     touchscreen.cpp
     virtio_input_device.cpp)

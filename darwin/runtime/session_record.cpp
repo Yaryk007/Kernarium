@@ -11,6 +11,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <mach/mach.h>
+#include <mach/mach_time.h>
 #include <os/lock.h>
 #include <pthread.h>
 #include <signal.h>
@@ -361,18 +362,25 @@ void write_memory_slot(int descriptor) noexcept
 	os_unfair_lock_unlock(&history_lock);
 }
 
+/* Waits one checkpoint interval inside libsystem_kernel alone: the thread
+ * fence defers a thread inside libsystem_c (nanosleep, usleep) on every pass,
+ * and so never holds this uml-* thread. */
+void wait_for_next_checkpoint() noexcept
+{
+	mach_timebase_info_data_t base{};
+	(void)mach_timebase_info(&base);
+	const std::uint64_t deadline = mach_absolute_time() +
+		static_cast<std::uint64_t>(memory_checkpoint_interval_ms) *
+		1000000ULL * base.denom / base.numer;
+	while (mach_wait_until(deadline) == KERN_ABORTED) {
+	}
+}
+
 void *checkpoint_memory(void *) noexcept
 {
 	(void)pthread_setname_np("uml-session-record");
 	for (;;) {
-		timespec interval{
-			.tv_sec = static_cast<time_t>(memory_checkpoint_interval_ms /
-				1000),
-			.tv_nsec = static_cast<long>(
-				(memory_checkpoint_interval_ms % 1000) * 1000000),
-		};
-		while (nanosleep(&interval, &interval) != 0 && errno == EINTR) {
-		}
+		wait_for_next_checkpoint();
 		if (session_open.load(std::memory_order_acquire))
 			checkpoint_session_memory();
 	}
