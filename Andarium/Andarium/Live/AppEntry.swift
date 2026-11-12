@@ -124,6 +124,7 @@ struct AppEntry {
         model.retina = launch.retina ?? options.retina(memoryLimitBytes: MemoryLimit.bytes())
         model.retinaChosen = options.chosenRetina != nil
         model.nativeResolution = options.nativeResolution
+        model.displayCutout = options.displayCutout
         // A value a launch states is that run's, and what the person chose
         // stays stored.
         model.retinaStatedByLaunch = launch.retina != nil

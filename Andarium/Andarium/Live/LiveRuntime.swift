@@ -49,6 +49,8 @@ final class LiveRuntime: RuntimeDriver {
     /// Android reached `sys.boot_completed` in the boot under way, which a
     /// clean end records. Recovery never does.
     private var reachedBootCompleted = false
+    /// The notch setting on its way to the guest.
+    private var cutoutTask: Task<Void, Never>?
     private let pause: PauseController
     /// Counts the time the guest runs, for the limits of adb operations: it
     /// stops while the application holds the guest paused.
@@ -457,6 +459,7 @@ final class LiveRuntime: RuntimeDriver {
             reachedBootCompleted = true
             updateGuestRotation()
             updateSpaceWatch()
+            applyDisplayCutout()
             // An update counts as applied once its start has booted, whatever
             // happens to the application after that.
             do { try storage.bootCompleted() } catch { print("Andarium: the guest's record was not updated: \(error.localizedDescription)") }
@@ -574,6 +577,37 @@ final class LiveRuntime: RuntimeDriver {
         if motionMount.update(policy: policy, interface: interfaceMotionAxes) { motion.restart() }
         rotation.update(policy: policy, ready: normalRun && reachedBootCompleted && active && !holdsGuestStill)
         updateMotionSensors()
+    }
+
+    func setDisplayCutout(_ on: Bool) {
+        // A boot under way takes it as it completes.
+        guard reachedBootCompleted else { return }
+        applyDisplayCutout()
+    }
+
+    /// Sends Android the notch setting as the model holds it. The shell may
+    /// not answer for a moment after the boot completes, so it asks a few
+    /// times; a later change supersedes an earlier one still trying.
+    private func applyDisplayCutout() {
+        guard let model else { return }
+        let on = model.displayCutout
+        let operations = self.operations
+        cutoutTask?.cancel()
+        cutoutTask = Task {
+            let command = DisplayCutoutEmulation.command(on: on)
+            for _ in 0..<6 {
+                if Task.isCancelled { return }
+                if let result = try? await operations.shell(command, limit: .seconds(20)) {
+                    if DisplayCutoutEmulation.succeeded(result) {
+                        print("Andarium: display cutout \(on ? "on" : "off")")
+                        return
+                    }
+                    print("Andarium: display cutout: \(String(decoding: result.stderr + result.stdout, as: UTF8.self))")
+                }
+                try? await Task.sleep(for: .seconds(5))
+            }
+            print("Andarium: the guest did not take the display cutout setting")
+        }
     }
 
     func setMotionSensors(_ on: Bool) {

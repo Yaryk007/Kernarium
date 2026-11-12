@@ -240,7 +240,8 @@ extension SystemRow where Below == EmptyView {
 
 /// Retina mode: the guest draws at the screen's own pixel density instead of
 /// at points. Native resolution: the guest fills the whole screen at its
-/// pixels, with no black bars.
+/// pixels, with no black bars. Notch (experimental): Android is told its
+/// display has a cutout, so apps keep clear of the Dynamic Island.
 struct DisplaySection: View {
     @Environment(AppModel.self) private var model
 
@@ -264,6 +265,19 @@ struct DisplaySection: View {
                     set: { model.chooseNativeResolution($0) }
                 ))
                 .labelsHidden()
+            }
+            RowDivider()
+            OptionRow(title: "Notch", symbol: "iphone.gen3",
+                      detail: "Experimental: apps make room for the Dynamic Island") {
+                Toggle("Notch", isOn: Binding(
+                    get: { model.displayCutout },
+                    set: { model.chooseDisplayCutout($0) }
+                ))
+                .labelsHidden()
+            }
+        } footer: {
+            if model.displayCutout && !model.nativeResolution {
+                SectionNote("The notch matters with native resolution, which draws under the Dynamic Island.")
             }
         }
         .id("display")

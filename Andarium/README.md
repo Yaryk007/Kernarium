@@ -278,7 +278,10 @@ requires reopening Andarium.
 - **Native resolution.** Native resolution lays the guest's display over the
   whole screen, under the Dynamic Island and the home indicator, and implies
   Retina mode; the display follows the larger view at once, the pixel density
-  at the next start.
+  at the next start. The experimental notch switches Android's tall display
+  cutout emulation through the shell after each `sys.boot_completed` and on
+  every change, with a shell overlay that keeps the cutout unpainted
+  (`DisplayCutoutEmulation`), so apps keep clear of the island.
 - **JIT.** A development build on a device has a JIT row on Home, off until
   the person turns it on and kept for the install (`JitPreference`). Below it,
   the experimental Fast JIT row tiers the run (`FastJitPreference`, read by the
