@@ -41,6 +41,11 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Configure Git identity for dependency patch replay
+        run: |
+          git config --global user.name "Kernarium CI"
+          git config --global user.email "kernarium-ci@kernarium.dev"
+
       - name: Install build tools
         run: |
           brew install make cmake ninja meson pkg-config rsync autoconf automake gettext libtool gperf groff
