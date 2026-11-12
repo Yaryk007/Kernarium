@@ -1067,6 +1067,12 @@ namespace {
  * property lookup or an init script finishes inside, and which a service or
  * an application passes in its first moments. */
 constexpr std::uint64_t jitTierInstructions = 200'000'000;
+
+/* The gadget cache of a tiered JIT run, which runs only the guest's cold code
+ * there: the floor of the gadget cache's budget formula. The JIT's prepared
+ * memory takes the cache term of the run's memory plan, so this is all the
+ * tiering adds to it. */
+constexpr std::uint64_t tieredGadgetCacheBytes = 128ULL << 20;
 #endif
 
 /* What a launch asked for, as the guest needs it at every boot. */
@@ -1359,6 +1365,9 @@ private:
              * ones keep it to themselves. */
             arguments.emplace_back(
                 "--arm64-jit-tier=" + std::to_string(jitTierInstructions));
+            arguments.emplace_back(
+                "--gadget-cache-budget=" +
+                std::to_string(tieredGadgetCacheBytes));
         }
 #endif
 #if KERNARIUM_RUNTIME_ANDROID_GUEST
@@ -1512,20 +1521,27 @@ constexpr std::uint64_t mebibyte = 1024ULL * 1024ULL;
  * `guestProcessorCount` vCPUs with the launch parameters `boot` states, which
  * is what both the application's warning and the run use.
  *
- * The executable memory a debugger prepared for this process is wired from the
- * moment it is prepared, which may be long before the start, and it stays so.
- * Every run carries it beside the gadget cache: a run on gadgets does not use
- * it, and a JIT run is tiered, so its address spaces fill the gadget cache
- * before they reach the JIT. The plan counts it as engine memory so the GPU
- * does not take what it holds. */
+ * `usesPreparedJitMemory` says whether the guest runs on the executable memory
+ * a debugger prepared for this process. That memory is wired from the moment
+ * it is prepared, which may be long before the start, and it stays so. A JIT
+ * run's cache term is that memory, so the plan holds it already; the run is
+ * tiered, and its small gadget cache (tieredGadgetCacheBytes) counts as engine
+ * memory. A run that does not use it (the JIT is off, or the guest changed
+ * after the memory was prepared) carries it beside its own cache, and the plan
+ * counts it as engine memory so the GPU does not take what it holds. The
+ * application's estimate before a start takes the memory as used. */
 uml::emulator::GpuBudgetPlan planGpuBudget(
     const kernarium_runtime_boot* boot,
     std::uint32_t guestMemoryMiB,
-    std::uint32_t guestProcessorCount)
+    std::uint32_t guestProcessorCount,
+    bool usesPreparedJitMemory)
 {
-    std::uint64_t preparedJitMemory = 0;
+    std::uint64_t extraEngineMemory = 0;
 #ifndef UML_APP_STORE_RUNTIME
-    preparedJitMemory = uml::runtime::prepared_jit_region_bytes();
+    extraEngineMemory = usesPreparedJitMemory ?
+        tieredGadgetCacheBytes : uml::runtime::prepared_jit_region_bytes();
+#else
+    (void)usesPreparedJitMemory;
 #endif
     auto plan = uml::emulator::plan_gpu_budget(
         static_cast<std::uint64_t>(guestMemoryMiB) * mebibyte,
@@ -1537,7 +1553,7 @@ uml::emulator::GpuBudgetPlan planGpuBudget(
         {
             .application = boot->gpu_budget_application_mib * mebibyte,
             .engine_rest =
-                boot->gpu_budget_engine_mib * mebibyte + preparedJitMemory,
+                boot->gpu_budget_engine_mib * mebibyte + extraEngineMemory,
             .headroom = boot->gpu_budget_headroom_mib * mebibyte,
         });
 #if UML_GPU_SOFTWARE_RENDERER
@@ -1569,7 +1585,7 @@ int runtimePlanGpuBudget(
     parameters.gpu_budget_engine_mib = engineMiB;
     parameters.gpu_budget_headroom_mib = headroomMiB;
     const auto planned = planGpuBudget(
-        &parameters, guestMemoryMiB, guestProcessorCount);
+        &parameters, guestMemoryMiB, guestProcessorCount, true);
     const std::uint32_t size = plan->struct_size;
     *plan = {};
     plan->struct_size = size;
@@ -1829,7 +1845,8 @@ int runtimeRun(
              * leaves less than the floor (runtimePlanGpuBudget); the guest boots
              * with the floor. */
             const auto gpuBudget = planGpuBudget(
-                boot, guestMemoryMiB, guestProcessorCount);
+                boot, guestMemoryMiB, guestProcessorCount,
+                request.jitCacheBudget != 0);
             const std::uint64_t deviceMemoryLimit = gpuBudget.budget.bytes;
             if (gpuBudget.budget.short_of_floor) {
                 std::fprintf(

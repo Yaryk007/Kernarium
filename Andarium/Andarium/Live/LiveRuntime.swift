@@ -291,7 +291,15 @@ final class LiveRuntime: RuntimeDriver {
             Task { @MainActor in self.reached(milestones, bootCompleted: bootCompleted) }
         }
         console = sink
+        #if !APP_STORE
+        RunLog.shared.begin()
+        kernarium_runtime_loader_set_console_output_handler { data in
+            RunLog.shared.console(data)
+            sink.feed(data)
+        }
+        #else
         kernarium_runtime_loader_set_console_output_handler { data in sink.feed(data) }
+        #endif
         // A Microphone setting the person turned on earlier follows the
         // guest while iOS still allows it; otherwise the guest hears nothing.
         model?.microphone?.guestStarting()

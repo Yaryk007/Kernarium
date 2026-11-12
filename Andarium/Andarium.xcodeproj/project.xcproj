@@ -134,6 +134,8 @@
         "GENERATE_INFOPLIST_FILE": "YES",
         "INFOPLIST_FILE": "Config/Info.plist",
         "INFOPLIST_KEY_CFBundleDisplayName": "Andarium",
+        "INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace[config=Release]": "YES",
+        "INFOPLIST_KEY_UIFileSharingEnabled[config=Release]": "YES",
         "INFOPLIST_KEY_NSLocalNetworkUsageDescription": "Apps running in Andarium use this to connect to devices on your local network, such as printers, media servers and computers, and ADB over network uses it to let a computer on your network connect to Andarium. Internet access doesn't need it.",
         "INFOPLIST_KEY_NSMicrophoneUsageDescription": "Andarium records from the microphone only when you turn on Microphone, so that apps in the guest can use it.",
         "INFOPLIST_KEY_UIApplicationSceneManifest_Generation": "NO",
