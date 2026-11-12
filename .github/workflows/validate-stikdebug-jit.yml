@@ -53,8 +53,5 @@ jobs:
             -c darwin/cpu/arm64/jit/jit_arena.cpp \
             -o .build/jit-source-check/jit_arena.o
 
-      - name: Test the region and preparation on the host
-        run: |
-          cmake --preset macos-unit --fresh
-          ctest --test-dir .build/presets/macos-unit \
-            -R '^arm64-jit-(debugger-region|debugger-request|memory-preparation)$' --output-on-failure
+      # The region/request/preparation behavioral tests are part of the unit
+      # suite in swift.yml, after its verified macOS dependency prefix is built.
