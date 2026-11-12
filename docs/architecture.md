@@ -208,10 +208,10 @@ its first run. Only the development configurations compile it
 no entry, Andarium's JIT row and the loader's preparation entries are compiled
 out of its application, and `check-app-store-bundle.py` refuses the symbols,
 text and the `brk` instruction. A start that cannot have the JIT runs on
-gadgets and says why; it never fails. The runtime tiers a JIT run: each address space
-starts on gadgets and moves to the JIT once it has retired a threshold of
-instructions ([tiered execution](../darwin/cpu/arm64/jit/README.md#tiered-execution)). Andarium asks for the preparation through
-runtime API 30 (`prepare_jit`, `use_jit`) as it opens, because StikDebug spins
+gadgets and says why; it never fails. The runtime tiers a JIT run: each
+address space starts on gadgets and moves to the JIT once it has retired a
+threshold of instructions ([arm64 JIT](../darwin/cpu/arm64/jit/README.md)).
+Andarium asks for the preparation through runtime API 30 (`prepare_jit`, `use_jit`) as it opens, because StikDebug spins
 until it is served and is ended by the system within a minute; the region then
 sits wired until the process ends, and a run that does not use it (the JIT is
 off, or the guest changed after it was prepared) carries it beside its own
