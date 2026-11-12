@@ -17,7 +17,7 @@ struct GuestLayer: View {
             ZStack {
                 Color.black.ignoresSafeArea()
                 GuestDisplayView(
-                    keyboardVisible: .constant(false), retinaMode: model.retina,
+                    keyboardVisible: .constant(false), retinaMode: model.drawsAtNativeScale,
                     // A touch beside the side keys reaches the guest, and
                     // puts the keys away.
                     touchDidBegin: { model.session.closeSideKeys() }
@@ -29,6 +29,9 @@ struct GuestLayer: View {
                 // guest's status bar; the system knows where they are. A
                 // scene that covers the screen has none.
                 .containerCornerOffset(SceneCoverage.cornerOffsetEdges(coversScreen: coversScreen), sizeToFit: true)
+                // Native resolution: the whole screen, under the Dynamic
+                // Island and the home indicator, so no bars are left black.
+                .ignoresSafeArea(.container, edges: model.nativeResolution ? .all : [])
             }
             .background {
                 SceneCoverageReader { coversScreen = $0 }

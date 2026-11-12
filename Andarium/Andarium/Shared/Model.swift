@@ -135,9 +135,28 @@ final class AppModel {
         retina = on
         retinaChosen = true
     }
+    /// Native resolution (`DisplayOptions.nativeResolution`). It applies at
+    /// once: the guest's display follows the view.
+    var nativeResolution = false
+    /// Whether the guest draws at the screen's pixel density: Retina mode,
+    /// or native resolution, which implies it.
+    var drawsAtNativeScale: Bool { retina || nativeResolution }
+    /// The experimental notch (`DisplayOptions.displayCutout`).
+    var displayCutout = false
+    func chooseNativeResolution(_ on: Bool) {
+        nativeResolution = on
+    }
+    /// A running guest takes the change at once; a later boot takes it as it
+    /// completes.
+    func chooseDisplayCutout(_ on: Bool) {
+        displayCutout = on
+        driver?.setDisplayCutout(on)
+    }
     /// What is kept of the display options across launches.
     var displayOptions: DisplayOptions {
-        DisplayOptions(chosenRetina: retinaChosen ? retina : nil)
+        DisplayOptions(
+            chosenRetina: retinaChosen ? retina : nil,
+            nativeResolution: nativeResolution, displayCutout: displayCutout)
     }
     /// The launch stated Retina mode (automation): the value belongs to that
     /// run and is not kept.

@@ -239,18 +239,45 @@ extension SystemRow where Below == EmptyView {
 // MARK: Display
 
 /// Retina mode: the guest draws at the screen's own pixel density instead of
-/// at points. It applies when the guest next starts.
+/// at points. Native resolution: the guest fills the whole screen at its
+/// pixels, with no black bars. Notch (experimental): Android is told its
+/// display has a cutout, so apps keep clear of the Dynamic Island.
 struct DisplaySection: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
         HomeSection(title: "Display") {
-            OptionRow(title: "Retina mode", symbol: "rectangle.inset.filled") {
+            OptionRow(title: "Retina mode", symbol: "rectangle.inset.filled",
+                      detail: model.nativeResolution ? "On with native resolution" : nil,
+                      dimmed: model.nativeResolution) {
                 Toggle("Retina mode", isOn: Binding(
-                    get: { model.retina },
+                    get: { model.drawsAtNativeScale },
                     set: { model.chooseRetina($0) }
                 ))
                 .labelsHidden()
+                .disabled(model.nativeResolution)
+            }
+            RowDivider()
+            OptionRow(title: "Native resolution", symbol: "arrow.up.left.and.arrow.down.right",
+                      detail: "Fills the whole screen") {
+                Toggle("Native resolution", isOn: Binding(
+                    get: { model.nativeResolution },
+                    set: { model.chooseNativeResolution($0) }
+                ))
+                .labelsHidden()
+            }
+            RowDivider()
+            OptionRow(title: "Notch", symbol: "iphone.gen3",
+                      detail: "Experimental: apps make room for the Dynamic Island") {
+                Toggle("Notch", isOn: Binding(
+                    get: { model.displayCutout },
+                    set: { model.chooseDisplayCutout($0) }
+                ))
+                .labelsHidden()
+            }
+        } footer: {
+            if model.displayCutout && !model.nativeResolution {
+                SectionNote("The notch matters with native resolution, which draws under the Dynamic Island.")
             }
         }
         .id("display")
