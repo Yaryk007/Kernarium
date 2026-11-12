@@ -141,22 +141,14 @@ final class AppModel {
     /// Whether the guest draws at the screen's pixel density: Retina mode,
     /// or native resolution, which implies it.
     var drawsAtNativeScale: Bool { retina || nativeResolution }
-    /// The experimental notch (`DisplayOptions.displayCutout`).
-    var displayCutout = false
     func chooseNativeResolution(_ on: Bool) {
         nativeResolution = on
-    }
-    /// A running guest takes the change at once; a later boot takes it as it
-    /// completes.
-    func chooseDisplayCutout(_ on: Bool) {
-        displayCutout = on
-        driver?.setDisplayCutout(on)
     }
     /// What is kept of the display options across launches.
     var displayOptions: DisplayOptions {
         DisplayOptions(
             chosenRetina: retinaChosen ? retina : nil,
-            nativeResolution: nativeResolution, displayCutout: displayCutout)
+            nativeResolution: nativeResolution)
     }
     /// The launch stated Retina mode (automation): the value belongs to that
     /// run and is not kept.
@@ -305,6 +297,14 @@ final class AppModel {
     /// The person turns the JIT on or off. It changes nothing until a start.
     func setJit(_ on: Bool) {
         jitOn = on
+    }
+    /// Fast JIT (experimental), kept for the install (`FastJitPreference`).
+    var fastJit = false
+    func setFastJit(_ on: Bool) {
+        fastJit = on
+        #if !APP_STORE
+        FastJitPreference().keep(on)
+        #endif
     }
     /// Reads whether a debugger is attached now. The preview plays one.
     func refreshJit() {

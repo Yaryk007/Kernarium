@@ -53,6 +53,36 @@ struct JitPreference {
     }
 }
 
+/// Fast JIT (experimental): the JIT runs tiered, each guest process starting
+/// on the gadget engine and moving to the JIT once it has run long enough to
+/// repay the compile. Off runs everything on the JIT, as the JIT always has.
+/// The runtime reads it from the environment at each start.
+struct FastJitPreference {
+    static let key = "andarium.jit.fast"
+    /// The runtime's variable, and the instructions a process retires on the
+    /// gadget engine first.
+    static let variable = "KERNARIUM_ARM64_JIT_TIER"
+    static let tierInstructions = "200000000"
+
+    private let defaults: UserDefaults
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+    }
+
+    var isOn: Bool { defaults.bool(forKey: Self.key) }
+
+    func keep(_ on: Bool) {
+        defaults.set(on, forKey: Self.key)
+        Self.apply(on)
+    }
+
+    /// Hands the choice to the runtime of this process.
+    static func apply(_ on: Bool) {
+        setenv(variable, on ? tierInstructions : "0", 1)
+    }
+}
+
 /// The guest memory and vCPU count the JIT's executable memory is prepared
 /// for. The runtime prepares it once per process, for the guest at the time
 /// (when Andarium opens, or at the first start if it did not), so a guest

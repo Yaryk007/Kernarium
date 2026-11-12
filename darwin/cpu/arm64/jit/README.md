@@ -44,7 +44,8 @@ gives it to the JIT once the gadgets have retired N instructions in it, with
 the draining handover of the x86-64 JIT's
 [tiered execution](../../x86_64/jit/README.md#tiered-execution)
 ([`jit_tier.hpp`](../../../runtime/jit_tier.hpp)). Zero, the default, runs the
-JIT from the first instruction; the Kernarium runtime tiers every JIT run.
+JIT from the first instruction; the Kernarium runtime tiers a JIT run when
+`KERNARIUM_ARM64_JIT_TIER` names a count (Andarium's experimental Fast JIT).
 Short-lived processes then never reach the arena, which the long-lived ones
 keep. Both engines present the profile they both implement while a tier is
 set, so a process sees the same identification registers and HWCAPs on each.

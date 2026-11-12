@@ -1063,10 +1063,22 @@ namespace {
 
 #ifndef UML_APP_STORE_RUNTIME
 /* The instructions a guest address space retires on gadgets before the JIT
- * takes it over: under a second of gadget time, which a shell command, a
- * property lookup or an init script finishes inside, and which a service or
- * an application passes in its first moments. */
-constexpr std::uint64_t jitTierInstructions = 200'000'000;
+ * takes it over, from KERNARIUM_ARM64_JIT_TIER (Andarium's Fast JIT); zero,
+ * the default, runs everything on the JIT from the first instruction. */
+std::uint64_t selectedJitTier()
+{
+    const char* requested = std::getenv("KERNARIUM_ARM64_JIT_TIER");
+    if (requested == nullptr || *requested == '\0')
+        return 0;
+    char* end = nullptr;
+    const unsigned long long value = std::strtoull(requested, &end, 10);
+    if (end == nullptr || *end != '\0') {
+        std::fputs(
+            "Kernarium: ignoring malformed KERNARIUM_ARM64_JIT_TIER\n", stderr);
+        return 0;
+    }
+    return value;
+}
 
 /* The gadget cache of a tiered JIT run, which runs only the guest's cold code
  * there: the floor of the gadget cache's budget formula. The JIT's prepared
@@ -1359,15 +1371,18 @@ private:
             arguments.emplace_back(
                 "--jit-cache-budget=" +
                 std::to_string(request_.jitCacheBudget));
-            /* Tiered: a guest process runs on gadgets until it has retired
-             * this many instructions, so the many short-lived processes of an
-             * Android guest never reach the JIT's cache and the long-lived
-             * ones keep it to themselves. */
-            arguments.emplace_back(
-                "--arm64-jit-tier=" + std::to_string(jitTierInstructions));
-            arguments.emplace_back(
-                "--gadget-cache-budget=" +
-                std::to_string(tieredGadgetCacheBytes));
+            /* Tiered when asked: a guest process runs on gadgets until it
+             * has retired this many instructions, so the many short-lived
+             * processes of an Android guest never reach the JIT's cache. */
+            if (const auto tier = selectedJitTier(); tier != 0) {
+                std::printf("Kernarium: tiered JIT after %llu instructions\n",
+                    static_cast<unsigned long long>(tier));
+                arguments.emplace_back(
+                    "--arm64-jit-tier=" + std::to_string(tier));
+                arguments.emplace_back(
+                    "--gadget-cache-budget=" +
+                    std::to_string(tieredGadgetCacheBytes));
+            }
         }
 #endif
 #if KERNARIUM_RUNTIME_ANDROID_GUEST
@@ -1524,10 +1539,10 @@ constexpr std::uint64_t mebibyte = 1024ULL * 1024ULL;
  * `usesPreparedJitMemory` says whether the guest runs on the executable memory
  * a debugger prepared for this process. That memory is wired from the moment
  * it is prepared, which may be long before the start, and it stays so. A JIT
- * run's cache term is that memory, so the plan holds it already; the run is
- * tiered, and its small gadget cache (tieredGadgetCacheBytes) counts as engine
- * memory. A run that does not use it (the JIT is off, or the guest changed
- * after the memory was prepared) carries it beside its own cache, and the plan
+ * run's cache term is that memory, so the plan holds it already; a tiered
+ * run's small gadget cache (tieredGadgetCacheBytes) counts as engine memory.
+ * A run that does not use it (the JIT is off, or the guest changed after the
+ * memory was prepared) carries it beside its own cache, and the plan
  * counts it as engine memory so the GPU does not take what it holds. The
  * application's estimate before a start takes the memory as used. */
 uml::emulator::GpuBudgetPlan planGpuBudget(
@@ -1538,8 +1553,10 @@ uml::emulator::GpuBudgetPlan planGpuBudget(
 {
     std::uint64_t extraEngineMemory = 0;
 #ifndef UML_APP_STORE_RUNTIME
-    extraEngineMemory = usesPreparedJitMemory ?
-        tieredGadgetCacheBytes : uml::runtime::prepared_jit_region_bytes();
+    if (!usesPreparedJitMemory)
+        extraEngineMemory = uml::runtime::prepared_jit_region_bytes();
+    else if (selectedJitTier() != 0)
+        extraEngineMemory = tieredGadgetCacheBytes;
 #else
     (void)usesPreparedJitMemory;
 #endif

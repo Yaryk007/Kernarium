@@ -107,10 +107,6 @@ protocol RuntimeDriver: AnyObject {
     func shutDownAfterSpacePause() async throws
     /// Enables or stops sharing motion with the guest.
     func setMotionSensors(_ on: Bool)
-    /// Tells a running Android whether its display has a cutout at the top
-    /// (the experimental notch); a boot that has not completed takes it when
-    /// it does.
-    func setDisplayCutout(_ on: Bool)
     /// The scene's geometry changed, which may include its interface
     /// orientation.
     func sceneGeometryDidChange()

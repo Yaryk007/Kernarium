@@ -43,8 +43,6 @@ final class StubDriver: RuntimeDriver {
     var motionSensors = false
     var savedGuest: Guest?
     func setMotionSensors(_ on: Bool) { motionSensors = on }
-    private(set) var displayCutout: Bool?
-    func setDisplayCutout(_ on: Bool) { displayCutout = on }
     private(set) var geometryChanges = 0
     func sceneGeometryDidChange() { geometryChanges += 1 }
 

@@ -123,14 +123,10 @@ public struct DisplayOptions: Codable, Equatable, Sendable {
     /// Native resolution: the guest fills the whole screen, under the
     /// Dynamic Island and the home indicator, at the screen's own pixels.
     public var nativeResolution: Bool
-    /// The experimental notch: Android is told its display has a cutout at
-    /// the top, so apps keep their content clear of the Dynamic Island.
-    public var displayCutout: Bool
 
-    public init(chosenRetina: Bool? = nil, nativeResolution: Bool = false, displayCutout: Bool = false) {
+    public init(chosenRetina: Bool? = nil, nativeResolution: Bool = false) {
         self.chosenRetina = chosenRetina
         self.nativeResolution = nativeResolution
-        self.displayCutout = displayCutout
     }
 
     /// Retina mode is on by default above this much memory the system lets
@@ -153,7 +149,7 @@ public struct DisplayOptions: Codable, Equatable, Sendable {
     // person set it. A form from before the default has no `chosen`: its
     // `true` was a choice, and its `false` may only have been the old default,
     // so it counts as no choice.
-    private enum CodingKeys: String, CodingKey { case retina, chosen, native, cutout }
+    private enum CodingKeys: String, CodingKey { case retina, chosen, native }
 
     public init(from decoder: any Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
@@ -164,7 +160,6 @@ public struct DisplayOptions: Codable, Equatable, Sendable {
         case nil: chosenRetina = retina ? true : nil
         }
         nativeResolution = try values.decodeIfPresent(Bool.self, forKey: .native) ?? false
-        displayCutout = try values.decodeIfPresent(Bool.self, forKey: .cutout) ?? false
     }
 
     public func encode(to encoder: any Encoder) throws {
@@ -172,7 +167,6 @@ public struct DisplayOptions: Codable, Equatable, Sendable {
         try values.encode(chosenRetina ?? false, forKey: .retina)
         try values.encode(chosenRetina != nil, forKey: .chosen)
         try values.encode(nativeResolution, forKey: .native)
-        try values.encode(displayCutout, forKey: .cutout)
     }
 }
 
