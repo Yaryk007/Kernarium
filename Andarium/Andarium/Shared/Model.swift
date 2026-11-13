@@ -305,14 +305,6 @@ final class AppModel {
     func setJit(_ on: Bool) {
         jitOn = on
     }
-    /// Fast JIT (experimental), kept for the install (`FastJitPreference`).
-    var fastJit = false
-    func setFastJit(_ on: Bool) {
-        fastJit = on
-        #if !APP_STORE
-        FastJitPreference().keep(on)
-        #endif
-    }
     /// Reads whether a debugger is attached now. The preview plays one.
     func refreshJit() {
         jitDebuggerAttached = driver?.jitDebuggerAttached() ?? previewJitDebugger

@@ -143,8 +143,10 @@ struct AppEntry {
             hasOtherSettings: !launch.isEmpty)
         model.jitOn = jit.isOn
         model.jitDecidedByLaunch = !jit.keepsChanges
-        model.fastJit = FastJitPreference().isOn
-        FastJitPreference.apply(model.fastJit)
+        // Tiered arm64 execution can strand Android during early ART service
+        // startup. Andarium's JIT therefore starts every process directly on
+        // the JIT engine, including after an older build kept Fast JIT on.
+        setenv("KERNARIUM_ARM64_JIT_TIER", "0", 1)
         #endif
 
         #if APP_STORE

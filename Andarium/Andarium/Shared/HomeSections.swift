@@ -397,17 +397,6 @@ struct JitSection: View {
                     ))
                     .labelsHidden()
                 }
-                RowDivider()
-                OptionRow(title: "Fast JIT", symbol: "hare.fill",
-                          detail: "Experimental: short-lived processes skip the JIT",
-                          dimmed: !model.jitOn) {
-                    Toggle("Fast JIT", isOn: Binding(
-                        get: { model.fastJit },
-                        set: { model.setFastJit($0) }
-                    ))
-                    .labelsHidden()
-                    .disabled(!model.jitOn)
-                }
             } footer: {
                 SectionNote(model.jitStatus.footer)
             }

@@ -280,12 +280,10 @@ requires reopening Andarium.
   Retina mode; the display follows the larger view at once, the pixel density
   at the next start. The experimental notch switches Android's tall display
   cutout emulation through the shell after each `sys.boot_completed` and on
-  every change, with a shell overlay that keeps the cutout unpainted
+  every change, with a system-image overlay that keeps the cutout unpainted
   (`DisplayCutoutEmulation`), so apps keep clear of the island.
 - **JIT.** A development build on a device has a JIT row on Home, off until
-  the person turns it on and kept for the install (`JitPreference`). Below it,
-  the experimental Fast JIT row tiers the run (`FastJitPreference`, read by the
-  runtime from `KERNARIUM_ARM64_JIT_TIER`). An iOS
+  the person turns it on and kept for the install (`JitPreference`). An iOS
   device gives the JIT its executable memory only through a debugger attached to
   the process ([`docs/architecture.md`](../docs/architecture.md#executable-code)):
   the person assigns StikDebug's universal script to Andarium once in StikDebug
