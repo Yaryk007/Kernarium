@@ -7,18 +7,18 @@ import Testing
 struct DisplayCutoutTests {
     @Test func onMakesRoomWithoutPaintingTheCutout() {
         let command = DisplayCutoutEmulation.command(on: true)
-        #expect(command.hasPrefix(
-            "cmd overlay enable-exclusive --user 0 --category com.android.internal.display.cutout.emulation.tall && "))
-        #expect(command.contains(
-            "cmd overlay fabricate --target android --name AndariumCutoutClear android:bool/config_fillMainBuiltInDisplayCutout 0x12 0"))
-        #expect(command.hasSuffix(
-            "cmd overlay set-priority --user 0 com.android.shell:AndariumCutoutClear highest"))
+        let clear = "cmd overlay enable --user 0 android.kernarium.overlay.cutoutclear"
+        let cutout = "cmd overlay enable-exclusive --user 0 --category com.android.internal.display.cutout.emulation.tall"
+        #expect(command.range(of: clear)!.lowerBound < command.range(of: cutout)!.lowerBound)
+        #expect(command.contains("cmd overlay set-priority --user 0 android.kernarium.overlay.cutoutclear highest"))
+        #expect(!command.contains("cmd overlay fabricate"))
+        #expect(command.contains("|| { cmd overlay disable --user 0 com.android.internal.display.cutout.emulation.tall"))
     }
 
     @Test func offTurnsBothOff() {
         let command = DisplayCutoutEmulation.command(on: false)
-        #expect(command.hasPrefix("cmd overlay disable --user 0 com.android.internal.display.cutout.emulation.tall && "))
-        #expect(command.contains("cmd overlay disable --user 0 com.android.shell:AndariumCutoutClear"))
+        #expect(command.hasPrefix("cmd overlay disable --user 0 com.android.internal.display.cutout.emulation.tall"))
+        #expect(command.contains("cmd overlay disable --user 0 android.kernarium.overlay.cutoutclear"))
     }
 
     @Test func onlyAZeroExitSucceeds() {

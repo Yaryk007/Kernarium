@@ -287,6 +287,8 @@ REQUIRED_ENTRIES = {
     "VENDOR/overlay/KernariumWifiOverlay.apk",
     # The overlay that releases PinnerService's home app pin.
     "VENDOR/overlay/KernariumPinnerOverlay.apk",
+    # The disabled-by-default overlay that keeps notch emulation transparent.
+    "VENDOR/overlay/KernariumCutoutClearOverlay.apk",
     *ABI_LIST_PROPERTY_FILES,
     *MESA_ELF_ENTRIES,
     *MESA_HAL_ENTRIES,

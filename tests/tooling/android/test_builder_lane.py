@@ -4693,6 +4693,31 @@ def verify_pinner_overlay(android_root: Path) -> None:
     if verifier.PINNER_OVERLAY != "VENDOR/overlay/KernariumPinnerOverlay.apk":
         fail("the verifier expects the pinner overlay somewhere other than the vendor overlay directory")
 
+    cutout_module = android_root / "overlay/rro/KernariumCutoutClearOverlay"
+    cutout_values = re.findall(
+        r'<bool name="([a-zA-Z_]+)">([^<]*)</bool>',
+        (cutout_module / "res/values/config.xml").read_text(),
+    )
+    if cutout_values != [("config_fillMainBuiltInDisplayCutout", "false")]:
+        fail(f"the cutout overlay sets {cutout_values}, not the cutout fill alone and to false")
+    cutout_manifest = (cutout_module / "AndroidManifest.xml").read_text()
+    for needle in (
+        'package="android.kernarium.overlay.cutoutclear"',
+        'android:targetPackage="android"',
+        'android:isStatic="false"',
+        'android:targetSdkVersion="28"',
+    ):
+        if needle not in cutout_manifest:
+            fail(f"the cutout overlay manifest lacks {needle}")
+    cutout_blueprint = (cutout_module / "Android.bp").read_text()
+    for needle in ('name: "KernariumCutoutClearOverlay"', "vendor: true,", 'sdk_version: "28",'):
+        if needle not in cutout_blueprint:
+            fail(f"the cutout overlay module lacks {needle}")
+    if len(re.findall(r"^PRODUCT_PACKAGES \+= KernariumCutoutClearOverlay$", product, re.M)) != 1:
+        fail("lineage_andarium.mk does not add KernariumCutoutClearOverlay to PRODUCT_PACKAGES exactly once")
+    if "VENDOR/overlay/KernariumCutoutClearOverlay.apk" not in verifier.REQUIRED_ENTRIES:
+        fail("the target-files verifier does not require the cutout overlay")
+
     for label, blob, expected in (
         ("SDK 28", synthetic_compiled_manifest(28), 28),
         ("SDK 37", synthetic_compiled_manifest(37), 37),
@@ -5855,6 +5880,7 @@ def verify_package_assertions(android_root: Path) -> None:
         "com.google.cf.wpa_supplicant",
         "KernariumWifiOverlay",
         "KernariumPinnerOverlay",
+        "KernariumCutoutClearOverlay",
         "SecureElement",
         "EasterEgg",
         "kernarium_net_setup",

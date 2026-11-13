@@ -266,6 +266,9 @@ outcomes are known and not defects of the image:
   `fstab.uml`), enabled at `sys.boot_completed`. PinnerService does not lock the
   home app's files, and `kernarium_reclaim_boot_apps.sh` kills only the cached
   processes of a reviewed list of boot-started apps after boot completes.
+- `KernariumCutoutClearOverlay` is disabled by default. Andarium enables it
+  together with Android's tall cutout emulation so the display shape reserves
+  the Dynamic Island without painting the emulated cutout black.
 - lmkd ends the cached app that holds the most host graphics memory while the
   kernel reports host GPU pressure in `/sys/class/drm/card0/gpu_memory_report`
   (route `p0027`; `ro.lmk.gpu_reclaim`, set by the product, turns it on). It does

@@ -465,6 +465,10 @@ PRODUCT_PACKAGES += KernariumWifiOverlay
 # sets the home pin size to zero and leaves the WebView pin as it was.
 PRODUCT_PACKAGES += KernariumPinnerOverlay
 
+# The optional notch emulation is enabled from Andarium. This mutable overlay
+# remains disabled until then and keeps the emulated cutout transparent.
+PRODUCT_PACKAGES += KernariumCutoutClearOverlay
+
 # Once boot completes, a script saves the virtual Wi-Fi network (VirtWifi, open)
 # the first time only. It does not turn Wi-Fi on, and a network the user forgets
 # stays forgotten. It runs from system_ext in a core domain of its own.
