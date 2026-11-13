@@ -56,11 +56,13 @@ xcodebuild -project Andarium/Andarium.xcodeproj -scheme AndariumPreview \
 
 ## Devices
 
-The guest is drawn with Metal 4, which the A14 and later chips have. No
-capability key names the chip, so `UIRequiredDeviceCapabilities` names `metal`
-and the application asks the GPU for the Metal 4 family at launch
-(`HostDevice.runsGuestGraphics`), refusing to start a guest without it; the
-Simulator draws on the CPU and always passes. iPhone and iPad are supported,
+The qualified device renderer uses Metal 4, which the A14 and later chips have.
+No capability key names the chip, so `UIRequiredDeviceCapabilities` names
+`metal` and the application checks the GPU family at launch
+(`HostDevice.runsGuestGraphics`). An A13 (Apple GPU family 6) may start through
+an experimental path with a visible warning that graphics may be slow,
+incorrect or fail; an older family is refused. The Simulator draws on the CPU
+and always passes. iPhone and iPad are supported,
 and so is an Apple silicon Mac in Designed for iPad mode: TestFlight and the
 App Store offer the application to Macs, and every configuration sets
 `SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD` to YES, which gives Xcode its Mac

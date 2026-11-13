@@ -169,6 +169,13 @@ struct HomeView: View {
                 text: DeviceRequirement.explanation(deviceName: model.host.name)
             )
         }
+        if model.host.experimentalGuestGraphics {
+            NoticeCard(
+                symbol: "exclamationmark.triangle.fill", color: .orange,
+                title: ExperimentalGraphicsWarning.title,
+                text: ExperimentalGraphicsWarning.explanation(deviceName: model.host.name)
+            )
+        }
         if model.lowSpace {
             NoticeCard(
                 symbol: "externaldrive.badge.exclamationmark", color: .orange,
@@ -363,6 +370,15 @@ struct WelcomeView: View {
                     symbol: "cpu", color: .orange,
                     title: DeviceRequirement.title,
                     text: DeviceRequirement.explanation(deviceName: model.host.name)
+                )
+                .frame(maxWidth: 400)
+                .padding(.top, 20)
+            }
+            if model.host.experimentalGuestGraphics {
+                NoticeCard(
+                    symbol: "exclamationmark.triangle.fill", color: .orange,
+                    title: ExperimentalGraphicsWarning.title,
+                    text: ExperimentalGraphicsWarning.explanation(deviceName: model.host.name)
                 )
                 .frame(maxWidth: 400)
                 .padding(.top, 20)

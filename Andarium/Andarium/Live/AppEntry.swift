@@ -310,21 +310,27 @@ struct AppEntry {
         // A guest has every processor, at most the count the memory budget is
         // measured for; the memory policy has a row for each of those counts.
         let limit = GuestProcessorLimit.vCPUs(physicalProcessorCount: info.activeProcessorCount)
+        let graphics = guestGraphicsSupport()
         return HostDevice(
             name: name, processorCount: limit,
             memory: memoryPolicy(processorCount: limit),
             freeStorageBytes: freeStorageBytes(),
-            runsGuestGraphics: drawsGuestGraphics()
+            runsGuestGraphics: graphics.runs,
+            experimentalGuestGraphics: graphics.experimental
         )
     }
 
-    /// The guest is drawn with Metal 4 (the A14 and later). The Simulator
-    /// draws it with the CPU and has no Metal 4 device, so it always can.
-    static func drawsGuestGraphics() -> Bool {
+    /// The qualified device path is Metal 4 (A14 and later). Apple GPU family
+    /// 6 (A13) may try it as an explicitly experimental path. The Simulator
+    /// draws with the CPU and always can.
+    static func guestGraphicsSupport() -> (runs: Bool, experimental: Bool) {
         #if targetEnvironment(simulator)
-        return true
+        return (true, false)
         #else
-        return MTLCreateSystemDefaultDevice()?.supportsFamily(.metal4) ?? false
+        guard let device = MTLCreateSystemDefaultDevice() else { return (false, false) }
+        if device.supportsFamily(.metal4) { return (true, false) }
+        if device.supportsFamily(.apple6) { return (true, true) }
+        return (false, false)
         #endif
     }
 
