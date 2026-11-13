@@ -599,7 +599,9 @@ final class LiveRuntime: RuntimeDriver {
                 if Task.isCancelled { return }
                 if let result = try? await operations.shell(command, limit: .seconds(20)) {
                     if DisplayCutoutEmulation.succeeded(result) {
-                        print("Andarium: display cutout \(on ? "on" : "off")")
+                        let reply = String(decoding: result.stdout, as: UTF8.self)
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                        print("Andarium: display cutout \(on ? "on" : "off")\(reply.isEmpty ? "" : " (fill: \(reply))")")
                         return
                     }
                     print("Andarium: display cutout: \(String(decoding: result.stderr + result.stdout, as: UTF8.self))")

@@ -5,14 +5,19 @@ import Foundation
 import Testing
 
 struct DisplayCutoutTests {
-    @Test func onMakesRoomWithoutPaintingTheCutout() {
+    @Test func onMakesRoomWithoutPaintingTheCutout() throws {
         let command = DisplayCutoutEmulation.command(on: true)
-        #expect(command.hasPrefix(
-            "cmd overlay enable-exclusive --user 0 --category com.android.internal.display.cutout.emulation.tall && "))
-        #expect(command.contains(
+        let fabricate = try #require(command.range(of:
             "cmd overlay fabricate --target android --name AndariumCutoutClear android:bool/config_fillMainBuiltInDisplayCutout 0x12 0"))
-        #expect(command.hasSuffix(
+        let raise = try #require(command.range(of:
             "cmd overlay set-priority --user 0 com.android.shell:AndariumCutoutClear highest"))
+        let tall = try #require(command.range(of:
+            "cmd overlay enable-exclusive --user 0 --category com.android.internal.display.cutout.emulation.tall"))
+        // The fill is off before the cutout appears, so SystemUI never paints it.
+        #expect(fabricate.upperBound <= raise.lowerBound)
+        #expect(raise.upperBound <= tall.lowerBound)
+        #expect(command.hasPrefix("{ cmd overlay disable --user 0 com.android.internal.display.cutout.emulation.tall"))
+        #expect(command.contains("cmd overlay lookup android android:bool/config_fillMainBuiltInDisplayCutout"))
     }
 
     @Test func offTurnsBothOff() {

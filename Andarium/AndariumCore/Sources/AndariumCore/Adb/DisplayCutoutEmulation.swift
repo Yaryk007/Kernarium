@@ -18,18 +18,24 @@ public enum DisplayCutoutEmulation {
     public static let clearName = "AndariumCutoutClear"
     public static let clearOverlay = "com.android.shell:\(clearName)"
 
-    /// What to run in the guest's shell. On enables the tall cutout and turns
-    /// every other cutout emulation off, then makes, enables and raises above
-    /// it the overlay that keeps the cutout unpainted. Off turns both off, so
-    /// a cutout the person chose in Developer options stays.
+    /// What to run in the guest's shell. On first makes, enables and raises
+    /// the overlay that keeps the cutout unpainted, and only then switches the
+    /// tall cutout on (off first, so SystemUI sees the cutout change even when
+    /// a previous start left it on): SystemUI decides whether to paint the
+    /// cutout when the cutout changes, so the fill must already be off by
+    /// then, or the black notch stays until SystemUI restarts. It ends with a
+    /// lookup of the fill value, for the run's log. Off turns both off, so a
+    /// cutout the person chose in Developer options stays.
     public static func command(on: Bool) -> String {
         if on {
             return [
-                "cmd overlay enable-exclusive --user 0 --category \(overlay)",
+                "{ cmd overlay disable --user 0 \(overlay) >/dev/null 2>&1; true; }",
                 "cmd overlay fabricate --target android --name \(clearName) "
                     + "android:bool/config_fillMainBuiltInDisplayCutout 0x12 0",
                 "cmd overlay enable --user 0 \(clearOverlay)",
                 "cmd overlay set-priority --user 0 \(clearOverlay) highest",
+                "cmd overlay enable-exclusive --user 0 --category \(overlay)",
+                "{ cmd overlay lookup android android:bool/config_fillMainBuiltInDisplayCutout; true; }",
             ].joined(separator: " && ")
         }
         return "cmd overlay disable --user 0 \(overlay)"
