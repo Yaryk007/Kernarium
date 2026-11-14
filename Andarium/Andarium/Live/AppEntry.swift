@@ -64,7 +64,8 @@ struct AppEntry {
         let launch = overrides
         let bundle = Bundle.main
         let version = Self.appVersion(bundle)
-        let systemFolder = bundle.resourceURL?.appendingPathComponent(SystemFolder.name)
+        // The system the person chose on the home screen (SystemCatalog), else the carried one.
+        let systemFolder = SystemCatalog.activeFolder ?? bundle.resourceURL?.appendingPathComponent(SystemFolder.name)
         let host = Self.hostDevice()
 
         var problem: String?
@@ -85,7 +86,9 @@ struct AppEntry {
             problem = "This copy of Andarium does not carry a system."
         }
 
-        let locations = GuestLocations(directory: Self.guestDirectory(instance: launch.instance))
+        // An imported system keeps its own guest beside the carried system's.
+        let guestBase = Self.guestDirectory(instance: launch.instance)
+        let locations = GuestLocations(directory: launch.instance == nil ? SystemCatalog.guestDirectory(base: guestBase) : guestBase)
         let storage = TwoDiskStorage(
             locations: locations,
             release: carried?.identity ?? ReleaseIdentity(

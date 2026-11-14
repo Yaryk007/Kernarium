@@ -194,6 +194,11 @@ what a screen holds. A screen shows a control only when the capability behind
 it exists (`Capabilities`); a build whose runtime cannot do a thing leaves its
 control out.
 
+- **Systems.** A development build boots the carried release or one the person
+  imported into `Documents/Systems/<id>/` (`SystemCatalog`): a release directory
+  with the carried release's four files. Each import keeps its own guest in
+  `Library/Guests/<id>`, so systems never share a data disk; the choice applies
+  at the next launch.
 - **Memory.** A guest has at most the shared
   [vCPU limit](../docs/architecture.md#memory-and-executable-code) and the RAM
   the runtime loader answers for that count

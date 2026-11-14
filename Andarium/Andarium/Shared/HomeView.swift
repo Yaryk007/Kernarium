@@ -148,6 +148,7 @@ struct HomeView: View {
     private var developmentSections: some View {
         #if !APP_STORE
         JitSection()
+        SystemImageSection()
         #endif
     }
 
@@ -393,6 +394,11 @@ struct WelcomeView: View {
             .buttonStyle(.glassProminent)
             .disabled(!model.host.runsGuestGraphics)
             .padding(.top, 28)
+            #if !APP_STORE
+            SystemImageSection()
+                .frame(maxWidth: 440)
+                .padding(.top, 24)
+            #endif
             Spacer(minLength: 20)
             Label("\(Formats.size(bytes: model.host.freeStorageBytes)) free on this \(model.host.name)", systemImage: "internaldrive")
                 .font(.footnote)
