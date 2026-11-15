@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 import AndariumCore
+import CryptoKit
 import Foundation
 import SwiftUI
 import UniformTypeIdentifiers
@@ -128,14 +129,23 @@ nonisolated enum SystemCatalog {
         return object["release_id"] as? String
     }
 
-    /// Copies a release out of a folder the person picked. The folder may hold
+    /// Copies a release out of a folder or a single full-disk system.img.
+    /// The folder may hold
     /// the release as built (`guest/`, `boot/`) or its files side by side;
-    /// `system.img` and `partition-layout.json` are required, and a missing
-    /// manifest or kernel command line is taken from the carried system.
+    /// A folder needs system.img; missing metadata comes from the carried
+    /// system. A standalone system.img must match the carried disk geometry.
     static func importRelease(from source: URL) throws -> Entry {
         let manager = FileManager.default
         let scoped = source.startAccessingSecurityScopedResource()
         defer { if scoped { source.stopAccessingSecurityScopedResource() } }
+        var isDirectory: ObjCBool = false
+        guard manager.fileExists(atPath: source.path, isDirectory: &isDirectory) else {
+            throw ImportError.invalid("The selected item is unavailable.")
+        }
+        let singleDisk = !isDirectory.boolValue
+        if singleDisk, source.lastPathComponent.lowercased() != "system.img" {
+            throw ImportError.invalid("Choose a system.img full-disk image.")
+        }
 
         func find(_ name: String) -> URL? {
             let direct = [source.appendingPathComponent(name)] + ["guest", "boot", "andarium-system/guest", "andarium-system/boot", "andarium-system"]
@@ -148,14 +158,16 @@ nonisolated enum SystemCatalog {
             }
             return nil
         }
-        guard let disk = find("system.img") else { throw ImportError.missing("system.img") }
-        guard let layoutFile = find("partition-layout.json") else { throw ImportError.missing("partition-layout.json") }
-        let manifestFile = find(manifest) ?? bundledFolder?.appendingPathComponent(manifest)
-        let commandFile = find("kernel-command-line.txt") ?? bundledFolder?.appendingPathComponent(commandLine)
+        let disk = singleDisk ? source : find("system.img")
+        guard let disk else { throw ImportError.missing("system.img") }
+        let layoutFile = singleDisk ? bundledFolder?.appendingPathComponent(layout) : find("partition-layout.json")
+        guard let layoutFile else { throw ImportError.missing("partition-layout.json") }
+        let manifestFile = (singleDisk ? nil : find(manifest)) ?? bundledFolder?.appendingPathComponent(manifest)
+        let commandFile = (singleDisk ? nil : find("kernel-command-line.txt")) ?? bundledFolder?.appendingPathComponent(commandLine)
         guard let manifestFile else { throw ImportError.missing(manifest) }
         guard let commandFile else { throw ImportError.missing("kernel-command-line.txt") }
 
-        let id = uniqueID(for: source.lastPathComponent)
+        let id = uniqueID(for: singleDisk ? source.deletingLastPathComponent().lastPathComponent : source.lastPathComponent)
         let target = root.appendingPathComponent(id, isDirectory: true)
         try manager.createDirectory(at: target.appendingPathComponent("guest"), withIntermediateDirectories: true)
         try manager.createDirectory(at: target.appendingPathComponent("boot"), withIntermediateDirectories: true)
@@ -164,6 +176,7 @@ nonisolated enum SystemCatalog {
             try manager.copyItem(at: commandFile, to: target.appendingPathComponent(commandLine))
             try manager.copyItem(at: layoutFile, to: target.appendingPathComponent(layout))
             try manager.copyItem(at: disk, to: target.appendingPathComponent(systemDisk))
+            if singleDisk { try identifySingleDisk(in: target, id: id) }
             if let problem = check(target) { throw ImportError.invalid(problem) }
         } catch {
             try? manager.removeItem(at: target)
@@ -174,6 +187,69 @@ nonisolated enum SystemCatalog {
         var folder = target
         try? folder.setResourceValues(excluded)
         return Entry(id: id, name: displayName(target) ?? id, folder: target, sizeBytes: size(of: target.appendingPathComponent(systemDisk)))
+    }
+
+    /// A standalone image uses the carried disk geometry and boot contract.
+    /// Tie its release identity to the actual bytes so it cannot inherit the
+    /// bundled system's identity or be mistaken for a later import.
+    private static func identifySingleDisk(in folder: URL, id: String) throws {
+        let disk = folder.appendingPathComponent(systemDisk)
+        let layoutURL = folder.appendingPathComponent(layout)
+        let manifestURL = folder.appendingPathComponent(manifest)
+        guard var layoutObject = try JSONSerialization.jsonObject(with: Data(contentsOf: layoutURL)) as? [String: Any],
+              var system = layoutObject["system_disk"] as? [String: Any],
+              let declared = (system["size_bytes"] as? NSNumber)?.uint64Value,
+              declared == size(of: disk),
+              let entries = (system["partition_entry_count"] as? NSNumber)?.intValue,
+              entries > 0, entries <= 1024,
+              declared > UInt64(1024 + entries * 128),
+              let carriedDisk = bundledFolder?.appendingPathComponent(systemDisk),
+              size(of: carriedDisk) == declared else {
+            throw ImportError.invalid("This system.img does not match the built-in disk size and layout.")
+        }
+        let handle = try FileHandle(forReadingFrom: disk)
+        defer { try? handle.close() }
+        let carried = try FileHandle(forReadingFrom: carriedDisk)
+        defer { try? carried.close() }
+        // The host checks these exact GPT bytes before boot. Compare them now
+        // while both the imported and carried disks are available.
+        let entryBytes = entries * 128
+        for (offset, length) in [(UInt64(0), 1024 + entryBytes),
+                                 (declared - UInt64(512 + entryBytes), 512 + entryBytes)] {
+            try handle.seek(toOffset: offset)
+            try carried.seek(toOffset: offset)
+            let imageGPT = try handle.read(upToCount: length)
+            let carriedGPT = try carried.read(upToCount: length)
+            guard imageGPT?.count == length, imageGPT == carriedGPT else {
+                throw ImportError.invalid("system.img must use the built-in full-disk GPT layout.")
+            }
+        }
+        try handle.seek(toOffset: 0)
+        var digest = SHA256()
+        while let chunk = try handle.read(upToCount: 4 * 1024 * 1024), !chunk.isEmpty {
+            digest.update(data: chunk)
+        }
+        let hash = digest.finalize().map { String(format: "%02x", $0) }.joined()
+        system["sha256"] = hash
+        layoutObject["system_disk"] = system
+        try JSONSerialization.data(withJSONObject: layoutObject, options: [.sortedKeys])
+            .write(to: layoutURL, options: .atomic)
+
+        guard var manifestObject = try JSONSerialization.jsonObject(with: Data(contentsOf: manifestURL)) as? [String: Any],
+              var android = manifestObject["android"] as? [String: Any] else {
+            throw ImportError.invalid("The built-in release metadata cannot be read.")
+        }
+        manifestObject["release_id"] = "custom-\(id)"
+        manifestObject.removeValue(forKey: "acceptance")
+        manifestObject.removeValue(forKey: "inventory")
+        android["fingerprint"] = "andarium/custom/\(id):17/custom/user"
+        android["build_number"] = 1
+        android["security_patch"] = ""
+        android.removeValue(forKey: "build_id")
+        android.removeValue(forKey: "abi_list")
+        manifestObject["android"] = android
+        try JSONSerialization.data(withJSONObject: manifestObject, options: [.sortedKeys])
+            .write(to: manifestURL, options: .atomic)
     }
 
     /// Deletes an imported system and its guest.
@@ -233,7 +309,7 @@ struct SystemImageSection: View {
             }
             RowDivider()
             OptionRow(title: importing ? "Importing…" : "Import a system", symbol: "square.and.arrow.down.fill",
-                      detail: "A folder with system.img and partition-layout.json") {
+                      detail: "Choose system.img or an Andarium release folder") {
                 if importing { ProgressView() } else {
                     Button("Choose") { picking = true }.buttonStyle(.bordered)
                 }
@@ -244,7 +320,7 @@ struct SystemImageSection: View {
                         : "Close and reopen Andarium to start the chosen system.")
         }
         .id("systems")
-        .fileImporter(isPresented: $picking, allowedContentTypes: [.folder]) { result in
+        .fileImporter(isPresented: $picking, allowedContentTypes: [.folder, .item]) { result in
             guard case .success(let url) = result else { return }
             importing = true
             Task {

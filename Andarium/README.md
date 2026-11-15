@@ -195,8 +195,10 @@ it exists (`Capabilities`); a build whose runtime cannot do a thing leaves its
 control out.
 
 - **Systems.** A development build boots the carried release or one the person
-  imported into `Documents/Systems/<id>/` (`SystemCatalog`): a release directory
-  with the carried release's four files. Each import keeps its own guest in
+  imported into `Documents/Systems/<id>/` (`SystemCatalog`): an Andarium release
+  folder or a single full-disk `system.img` with the carried disk geometry.
+  A single image uses the carried layout and boot command line and gets an
+  identity tied to its bytes. Each import keeps its own guest in
   `Library/Guests/<id>`, so systems never share a data disk; the choice applies
   at the next launch.
 - **Memory.** A guest has at most the shared
