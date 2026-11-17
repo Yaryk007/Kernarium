@@ -195,12 +195,15 @@ it exists (`Capabilities`); a build whose runtime cannot do a thing leaves its
 control out.
 
 - **Systems.** A development build boots the carried release or one the person
-  imported into `Documents/Systems/<id>/` (`SystemCatalog`): an Andarium release
-  folder or a single full-disk `system.img` with the carried disk geometry.
-  A single image uses the carried layout and boot command line and gets an
-  identity tied to its bytes. Each import keeps its own guest in
-  `Library/Guests/<id>`, so systems never share a data disk; the choice applies
-  at the next launch.
+  imported into `Documents/Systems/<id>/` (`SystemCatalog`,
+  `SystemImageImport`): an Andarium release folder, a full GPT system disk of
+  any name, or an EROFS partition image (a GSI `system.img`, or `vendor.img`
+  and the like by file name) written into a copy of the carried disk, its
+  partition grown to fit. Sparse, xz and gzip images are unpacked first. An
+  image import takes the carried boot command line, a layout read from the
+  disk it writes, and an identity tied to that disk's bytes. Each import keeps
+  its own guest in `Library/Guests/<id>`, so systems never share a data disk;
+  the choice applies at the next launch.
 - **Memory.** A guest has at most the shared
   [vCPU limit](../docs/architecture.md#memory-and-executable-code) and the RAM
   the runtime loader answers for that count
