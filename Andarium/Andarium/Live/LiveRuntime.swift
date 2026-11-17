@@ -52,6 +52,13 @@ final class LiveRuntime: RuntimeDriver {
     /// The notch setting on its way to the guest.
     private var cutoutTask: Task<Void, Never>?
     private var awakeTask: Task<Void, Never>?
+    /// The iPhone's location, given to Android while Location is on.
+    private lazy var location = GuestLocation { [weak self] command in
+        guard let operations = self?.operations,
+              let result = try? await operations.shell(command, limit: .seconds(20)) else { return false }
+        return String(decoding: result.stdout, as: UTF8.self).contains("ok")
+    }
+    private var locationObserver: NSObjectProtocol?
     private let pause: PauseController
     /// Counts the time the guest runs, for the limits of adb operations: it
     /// stops while the application holds the guest paused.
@@ -462,6 +469,7 @@ final class LiveRuntime: RuntimeDriver {
             updateSpaceWatch()
             applyDisplayCutout()
             keepGuestAwake()
+            updateLocation()
             // An update counts as applied once its start has booted, whatever
             // happens to the application after that.
             do { try storage.bootCompleted() } catch { print("Andarium: the guest's record was not updated: \(error.localizedDescription)") }
@@ -492,6 +500,7 @@ final class LiveRuntime: RuntimeDriver {
 
     private func finished(result: Int32) {
         normalRun = false
+        location.update(enabled: false, guestReady: false)
         runActive = false
         shuttingDown = false
         spaceAlertOpen = false
@@ -642,6 +651,21 @@ final class LiveRuntime: RuntimeDriver {
             }
             print("Andarium: the guest did not take the stay-on setting")
         }
+    }
+
+    /// Location (Home › Capabilities) is shared while it is on, the guest
+    /// has booted and Andarium is in the foreground.
+    private func updateLocation() {
+        if locationObserver == nil {
+            locationObserver = NotificationCenter.default.addObserver(
+                forName: UserDefaults.didChangeNotification, object: nil, queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated { self?.updateLocation() }
+            }
+        }
+        location.update(
+            enabled: UserDefaults.standard.bool(forKey: LocationPreference.key),
+            guestReady: normalRun && reachedBootCompleted && active)
     }
 
     /// Presses Power when Android's display is off, so coming back to
@@ -964,6 +988,7 @@ final class LiveRuntime: RuntimeDriver {
                 $0.model?.applicationActive = false
                 $0.motion.stop()
                 $0.updateGuestRotation()
+                $0.updateLocation()
                 $0.pause.willResignActive()
             }),
             (UIApplication.didEnterBackgroundNotification, {
@@ -995,6 +1020,7 @@ final class LiveRuntime: RuntimeDriver {
         active = true
         updateGuestRotation()
         wakeGuestDisplay()
+        updateLocation()
         guard let model else { return }
         model.applicationActive = true
         let free = freeSpace()

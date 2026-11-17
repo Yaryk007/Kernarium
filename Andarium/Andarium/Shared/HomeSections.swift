@@ -297,6 +297,8 @@ struct CapabilitiesSection: View {
                 MicrophoneRow()
                 RowDivider()
                 GyroscopeRow()
+                RowDivider()
+                LocationRow()
             } footer: {
                 if let reason = model.motionSensorsProblem ?? Self.gyroscopeUnavailable(available: model.motionSensorsAvailable) {
                     SectionNote(reason)
@@ -333,6 +335,23 @@ struct MicrophoneRow: View {
             .labelsHidden()
         }
         .accessibilityHint(denied ? "Andarium is not allowed to use the microphone. Turning this on offers to open Settings." : "")
+    }
+}
+
+/// Whether Android gets the iPhone's location (`GuestLocation`). Off until
+/// the person turns it on; iOS asks for access the first time.
+enum LocationPreference {
+    static let key = "andarium.location"
+}
+
+struct LocationRow: View {
+    @AppStorage(LocationPreference.key) private var on = false
+
+    var body: some View {
+        OptionRow(title: "Location", symbol: "location.fill",
+                  detail: on ? "Android apps see this iPhone\u{2019}s location" : nil) {
+            Toggle("Location", isOn: $on).labelsHidden()
+        }
     }
 }
 
