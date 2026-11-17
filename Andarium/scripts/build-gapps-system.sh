@@ -17,8 +17,8 @@ set -euo pipefail
 release_tar=$(realpath "$1")
 gapps_zip=$(realpath "$2")
 output=$(realpath -m "$3")
-here=$(cd "$(dirname "$0")" && pwd)
-repo=$(cd "$here/../.." && pwd)
+here=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+repo=$(CDPATH= cd -- "$here/../.." && pwd)
 policy="$repo/android/lineage-24/support/image/disk-policy.json"
 ubd_disk="$repo/android/lineage-24/tools/ubd-disk.py"
 work=$(mktemp -d)
@@ -56,7 +56,7 @@ for partition in product system_ext; do
     root="$work/root-$partition"
     sudo fsck.erofs --extract="$root" --preserve --xattrs "$work/images/$partition.img"
     added="$work/added-$partition.txt"
-    (cd "$work/gapps/system/$partition" && find . -mindepth 1 | sort) > "$added"
+    (CDPATH= cd -- "$work/gapps/system/$partition" && find . -mindepth 1 | sort) > "$added"
     sudo cp -a --no-preserve=ownership "$work/gapps/system/$partition/." "$root/"
     # Android's own files are root's with these modes; product and system_ext
     # files are system_file to SELinux.
@@ -76,5 +76,5 @@ done
 python3 -I "$ubd_disk" assemble --policy "$policy" --images-dir "$work/images" --output-dir "$work/disk"
 python3 -I "$ubd_disk" verify --layout "$work/disk/partition-layout.json" --disk "$work/disk/system.img"
 xz -T1 -3 -c "$work/disk/system.img" > "$output/andarium-gapps-system.img.xz"
-(cd "$output" && sha256sum andarium-gapps-system.img.xz > andarium-gapps-system.img.xz.sha256)
+(CDPATH= cd -- "$output" && sha256sum andarium-gapps-system.img.xz > andarium-gapps-system.img.xz.sha256)
 ls -l "$output"
