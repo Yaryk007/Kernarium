@@ -89,6 +89,13 @@ using JitMemoryStatus = ::uml::cpu::JitMemoryStatus;
 	std::size_t guest_memory_bytes, unsigned executors,
 	std::size_t per_executor_bytes) noexcept;
 
+/* The same for a whole-process budget the caller derived itself
+ * (`total_bytes`), for a host that funds the JIT beyond the gadget cache's
+ * figure. The run must state the same total and private cap. */
+[[nodiscard]] JitMemoryStatus prepare_jit_memory_budget(
+	std::size_t total_bytes, unsigned executors,
+	std::size_t per_executor_bytes) noexcept;
+
 /* Whether a debugger is attached to the process, and tells it to detach, for a
  * process that will not use JIT. */
 [[nodiscard]] bool jit_debugger_attached() noexcept;

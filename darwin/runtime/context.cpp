@@ -606,6 +606,13 @@ JitMemoryStatus prepare_jit_memory(std::size_t guest_memory_bytes,
 		per_executor_bytes);
 }
 
+JitMemoryStatus prepare_jit_memory_budget(std::size_t total_bytes,
+	unsigned executors, std::size_t per_executor_bytes) noexcept
+{
+	return ::uml::cpu::prepare_jit_memory(
+		total_bytes, executors, per_executor_bytes);
+}
+
 bool jit_debugger_attached() noexcept
 {
 	return ::uml::cpu::jit_debugger_attached();

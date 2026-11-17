@@ -21,6 +21,7 @@
 #include "audio/in_process_service.hpp"
 #include "audio/microphone_switch.hpp"
 #include "platform/microphone_authorization.hpp"
+#include "platform/host_environment.hpp"
 #include "video/in_process_service.hpp"
 #include "video/virtio_video_device.hpp"
 #include "video/virtio_video_encoder_device.hpp"
@@ -1085,6 +1086,45 @@ std::uint64_t selectedJitTier()
  * memory takes the cache term of the run's memory plan, so this is all the
  * tiering adds to it. */
 constexpr std::uint64_t tieredGadgetCacheBytes = 128ULL << 20;
+
+/* The translation budget of a JIT run on a device: the total and one vCPU's
+ * private cache, the pair the executable memory is prepared for and the run
+ * states again (--jit-cache-budget, --jit-executor-cache-budget).
+ *
+ * The gadget cache's cap alone (jit_cache_budget_for: 240 MiB at six vCPUs)
+ * left the JIT six private caches of 40 MiB and no shared tier, since a
+ * private cache takes up to 256 MiB before the shared tier gets anything.
+ * Every vCPU then translated Android's framework code for itself and reset
+ * its arena again and again, and the JIT ran slower than the gadgets it was
+ * meant to beat. A device run therefore gets twice that cap, never more than
+ * a quarter of guest memory or an eighth of the process limit, and private
+ * caches take five eighths of it, so the rest is the shared tier every vCPU
+ * copies translations from instead of decoding them again. */
+struct DeviceJitBudget {
+    std::size_t total;
+    std::size_t perExecutor;
+};
+
+DeviceJitBudget deviceJitBudget(
+    std::uint32_t guestMemoryMiB, std::uint32_t guestProcessorCount)
+{
+    constexpr std::size_t mib = std::size_t{1} << 20;
+    const std::size_t memory = static_cast<std::size_t>(guestMemoryMiB) * mib;
+    const unsigned executors = std::max(guestProcessorCount, 1U);
+    const std::size_t base =
+        uml::runtime::jit_cache_budget_for(memory, executors);
+    std::size_t total = std::min(base * 2U, memory / 4U);
+    if (const auto limit = uml::platform::process_memory_limit_bytes();
+        limit != 0)
+        total = std::min<std::size_t>(total, limit / 8U);
+    total = std::max(total, base) & ~(mib - 1U);
+    std::size_t perExecutor = (total / 8U * 5U / executors) & ~(mib - 1U);
+    perExecutor = std::clamp<std::size_t>(perExecutor, 16U * mib,
+        uml::emulator::default_jit_executor_cache_budget);
+    if (perExecutor * executors >= total)
+        return {base, uml::emulator::default_jit_executor_cache_budget};
+    return {total, perExecutor};
+}
 #endif
 
 /* What a launch asked for, as the guest needs it at every boot. */
@@ -1104,6 +1144,8 @@ struct GuestRequest final {
      * the gadget engine. Only a request that asked for the JIT, on a runtime
      * that has one and found its executable memory ready, sets it. */
     std::size_t jitCacheBudget {};
+    /* One vCPU's private JIT cache, the cap the memory was prepared for. */
+    std::size_t jitExecutorCacheBudget {};
 #if KERNARIUM_RUNTIME_ANDROID_GUEST
     /* The guest's two disks: the release's system disk and the instance's
      * data disk. */
@@ -1371,6 +1413,10 @@ private:
             arguments.emplace_back(
                 "--jit-cache-budget=" +
                 std::to_string(request_.jitCacheBudget));
+            if (request_.jitExecutorCacheBudget != 0)
+                arguments.emplace_back(
+                    "--jit-executor-cache-budget=" +
+                    std::to_string(request_.jitExecutorCacheBudget));
             /* Tiered when asked: a guest process runs on gadgets until it
              * has retired this many instructions, so the many short-lived
              * processes of an Android guest never reach the JIT's cache. */
@@ -1555,8 +1601,18 @@ uml::emulator::GpuBudgetPlan planGpuBudget(
 #ifndef UML_APP_STORE_RUNTIME
     if (!usesPreparedJitMemory)
         extraEngineMemory = uml::runtime::prepared_jit_region_bytes();
-    else if (selectedJitTier() != 0)
-        extraEngineMemory = tieredGadgetCacheBytes;
+    else {
+        /* The plan's cache term is the gadget cache's cap; a device JIT
+         * run's budget (deviceJitBudget) holds more than that. */
+        const auto jit = deviceJitBudget(guestMemoryMiB, guestProcessorCount);
+        const auto base = uml::runtime::jit_cache_budget_for(
+            static_cast<std::size_t>(guestMemoryMiB) << 20,
+            std::max(guestProcessorCount, 1U));
+        if (jit.total > base)
+            extraEngineMemory = jit.total - base;
+        if (selectedJitTier() != 0)
+            extraEngineMemory += tieredGadgetCacheBytes;
+    }
 #else
     (void)usesPreparedJitMemory;
 #endif
@@ -1644,15 +1700,12 @@ constexpr std::size_t bootSizeBeforeJit =
 std::size_t readyJitCacheBudget(
     std::uint32_t guestMemoryMiB, std::uint32_t guestProcessorCount)
 {
-    const std::size_t memory =
-        static_cast<std::size_t>(guestMemoryMiB) * mebibyte;
     const char* reason = nullptr;
-    switch (uml::runtime::prepare_jit_memory(
-        memory, guestProcessorCount,
-        uml::emulator::default_jit_executor_cache_budget)) {
+    const auto budget = deviceJitBudget(guestMemoryMiB, guestProcessorCount);
+    switch (uml::runtime::prepare_jit_memory_budget(
+        budget.total, guestProcessorCount, budget.perExecutor)) {
     case uml::runtime::JitMemoryStatus::ready:
-        return uml::runtime::jit_cache_budget_for(
-            memory, guestProcessorCount);
+        return budget.total;
     case uml::runtime::JitMemoryStatus::unsupported:
         reason = "this runtime cannot make executable memory";
         break;
@@ -1773,6 +1826,14 @@ int runtimeRun(
             boot->use_jit != 0)
             request.jitCacheBudget =
                 readyJitCacheBudget(guestMemoryMiB, guestProcessorCount);
+        if (request.jitCacheBudget != 0) {
+            request.jitExecutorCacheBudget =
+                deviceJitBudget(guestMemoryMiB, guestProcessorCount).perExecutor;
+            std::printf("Kernarium: JIT translation budget %zu MiB, %zu MiB "
+                        "private per vCPU\n",
+                request.jitCacheBudget >> 20,
+                request.jitExecutorCacheBudget >> 20);
+        }
 #endif
 #if KERNARIUM_RUNTIME_ANDROID_GUEST
         if (boot->android_data_disk_path == nullptr ||
@@ -2464,10 +2525,9 @@ int runtimePrepareJit(
     }
     if (guestMemoryMiB == 0 || guestProcessorCount == 0)
         return KERNARIUM_RUNTIME_JIT_FAILED;
-    switch (uml::runtime::prepare_jit_memory(
-        static_cast<std::size_t>(guestMemoryMiB) * mebibyte,
-        guestProcessorCount,
-        uml::emulator::default_jit_executor_cache_budget)) {
+    const auto budget = deviceJitBudget(guestMemoryMiB, guestProcessorCount);
+    switch (uml::runtime::prepare_jit_memory_budget(
+        budget.total, guestProcessorCount, budget.perExecutor)) {
     case uml::runtime::JitMemoryStatus::ready:
         return KERNARIUM_RUNTIME_JIT_READY;
     case uml::runtime::JitMemoryStatus::unsupported:
