@@ -51,6 +51,7 @@ final class LiveRuntime: RuntimeDriver {
     private var reachedBootCompleted = false
     /// The notch setting on its way to the guest.
     private var cutoutTask: Task<Void, Never>?
+    private var awakeTask: Task<Void, Never>?
     private let pause: PauseController
     /// Counts the time the guest runs, for the limits of adb operations: it
     /// stops while the application holds the guest paused.
@@ -460,6 +461,7 @@ final class LiveRuntime: RuntimeDriver {
             updateGuestRotation()
             updateSpaceWatch()
             applyDisplayCutout()
+            keepGuestAwake()
             // An update counts as applied once its start has booted, whatever
             // happens to the application after that.
             do { try storage.bootCompleted() } catch { print("Andarium: the guest's record was not updated: \(error.localizedDescription)") }
@@ -604,12 +606,51 @@ final class LiveRuntime: RuntimeDriver {
                         print("Andarium: display cutout \(on ? "on" : "off")\(reply.isEmpty ? "" : " (fill: \(reply))")")
                         return
                     }
-                    print("Andarium: display cutout: \(String(decoding: result.stderr + result.stdout, as: UTF8.self))")
+                    let text = String(decoding: result.stderr + result.stdout, as: UTF8.self)
+                    print("Andarium: display cutout: \(text)")
+                    // A user build's shell may never fabricate overlays:
+                    // asking again only reconnects adb.
+                    if text.contains("must be root") {
+                        print("Andarium: this system does not let the shell set the display cutout")
+                        return
+                    }
                 }
                 try? await Task.sleep(for: .seconds(5))
             }
             print("Andarium: the guest did not take the display cutout setting")
         }
+    }
+
+    /// Keeps Android's display on while Andarium shows it. Android turns its
+    /// display off on its screen timeout (and stays on while "plugged in"
+    /// only on a charger, which an iPhone off its cable is not); with the
+    /// display off it suspends, and a touch cannot wake it. The iOS screen
+    /// already stays on while the guest runs, so the guest's should too.
+    private func keepGuestAwake() {
+        let operations = self.operations
+        awakeTask?.cancel()
+        awakeTask = Task {
+            let command = "svc power stayon true; settings put system screen_off_timeout 2147483647; echo ok"
+            for _ in 0..<6 {
+                if Task.isCancelled { return }
+                if let result = try? await operations.shell(command, limit: .seconds(20)),
+                   String(decoding: result.stdout, as: UTF8.self).contains("ok") {
+                    print("Andarium: the guest display stays on")
+                    return
+                }
+                try? await Task.sleep(for: .seconds(5))
+            }
+            print("Andarium: the guest did not take the stay-on setting")
+        }
+    }
+
+    /// Presses Power when Android's display is off, so coming back to
+    /// Andarium, or touching its dark screen, shows the guest again.
+    func wakeGuestDisplay() {
+        guard normalRun, reachedBootCompleted, !holdsGuestStill,
+              kernarium_runtime_loader_guest_display_active() == 0 else { return }
+        print("Andarium: waking the guest display")
+        press(.power)
     }
 
     func setMotionSensors(_ on: Bool) {
@@ -953,6 +994,7 @@ final class LiveRuntime: RuntimeDriver {
         #endif
         active = true
         updateGuestRotation()
+        wakeGuestDisplay()
         guard let model else { return }
         model.applicationActive = true
         let free = freeSpace()

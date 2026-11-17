@@ -20,7 +20,10 @@ struct GuestLayer: View {
                     keyboardVisible: .constant(false), retinaMode: model.drawsAtNativeScale,
                     // A touch beside the side keys reaches the guest, and
                     // puts the keys away.
-                    touchDidBegin: { model.session.closeSideKeys() }
+                    touchDidBegin: {
+                        model.session.closeSideKeys()
+                        (model.driver as? LiveRuntime)?.wakeGuestDisplay()
+                    }
                 ) { view, geometry in
                     (model.driver as? LiveRuntime)?.viewDidLayout(view, geometry)
                 }
