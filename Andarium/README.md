@@ -204,6 +204,8 @@ control out.
   disk it writes, and an identity tied to that disk's bytes. Each import keeps
   its own guest in `Library/Guests/<id>`, so systems never share a data disk;
   the choice applies at the next launch.
+  `scripts/build-gapps-system.sh` (CI: `build-andarium-gapps-system.yml`) makes
+  such a disk from a release and a MindTheGapps package.
 - **Memory.** A guest has at most the shared
   [vCPU limit](../docs/architecture.md#memory-and-executable-code) and the RAM
   the runtime loader answers for that count
