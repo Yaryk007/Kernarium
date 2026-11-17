@@ -43,7 +43,7 @@ struct HomeView: View {
                     }
                 }
             }
-            .background(Color(.systemGroupedBackground))
+            .background { HomeBackdrop() }
             .navigationTitle("Andarium")
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
@@ -91,6 +91,7 @@ struct HomeView: View {
 
     private var narrowLayout: some View {
         VStack(spacing: 22) {
+            HomeHero()
             notices
             SystemSection()
             developmentSections
@@ -107,6 +108,7 @@ struct HomeView: View {
     /// options and Recovery and erase beneath.
     private var tallLayout: some View {
         VStack(spacing: 28) {
+            HomeHero()
             notices
             SystemSection()
             developmentSections
@@ -124,6 +126,7 @@ struct HomeView: View {
     private var wideLayout: some View {
         HStack(alignment: .top, spacing: 24) {
             VStack(spacing: 22) {
+                HomeHero()
                 notices
                 SystemSection()
                 developmentSections

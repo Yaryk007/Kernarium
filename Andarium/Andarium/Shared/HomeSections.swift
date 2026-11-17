@@ -389,16 +389,37 @@ struct JitSection: View {
 
     var body: some View {
         if model.jitAvailable, model.guest != nil {
-            HomeSection(title: "JIT") {
-                OptionRow(title: "JIT", symbol: "bolt.fill") {
+            let status = model.jitStatus
+            HomeSection(title: "Engine") {
+                HStack(spacing: 14) {
+                    Image(systemName: model.jitOn ? "bolt.fill" : "bolt.slash.fill")
+                        .font(.system(size: 22, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .frame(width: 46, height: 46)
+                        .background((model.jitOn ? Color.orange : Color.gray).gradient,
+                                    in: .rect(cornerRadius: 13, style: .continuous))
+                        .symbolEffect(.bounce, value: model.jitOn)
+                        .accessibilityHidden(true)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("JIT").font(.headline)
+                        Text(model.jitOn ? "Native arm64 code, shared across vCPUs" : "Gadget engine")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                        Label(status.usable ? "Ready" : "Needs StikDebug",
+                              systemImage: status.usable ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(status.usable ? Color.green : Color.orange)
+                    }
+                    Spacer(minLength: 8)
                     Toggle("JIT", isOn: Binding(
                         get: { model.jitOn },
                         set: { model.setJit($0) }
                     ))
                     .labelsHidden()
                 }
+                .padding(16)
             } footer: {
-                SectionNote(model.jitStatus.footer)
+                SectionNote(status.footer)
             }
             .id("jit")
             .task { model.refreshJit() }
