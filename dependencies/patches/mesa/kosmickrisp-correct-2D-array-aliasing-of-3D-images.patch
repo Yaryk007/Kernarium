@@ -108,10 +108,10 @@ index ede8d596c2a869005e36da1e8ac38c4c5d8bc7f2..f8ecaffbcaea08539d27f83bf922572c
  mtl_render_pass_attachment_descriptor_set_load_action(
     mtl_render_pass_attachment_descriptor *descriptor,
 diff --git a/src/kosmickrisp/vulkan/kk_cmd_draw.c b/src/kosmickrisp/vulkan/kk_cmd_draw.c
-index 282d6e737573cba558ec11840f8fde1e871505c4..ade9af72b2a3a5b5b1b0a0cda03cee0ce6ca8016 100644
+index 1360a8a8b8cf670ce68b5d72c77d451e716197e8..9a850d4d51f045a505bc987850c78ba065bf333b 100644
 --- a/src/kosmickrisp/vulkan/kk_cmd_draw.c
 +++ b/src/kosmickrisp/vulkan/kk_cmd_draw.c
-@@ -130,8 +130,13 @@ kk_fill_common_attachment_description(
+@@ -131,8 +131,13 @@ kk_fill_common_attachment_description(
     if (!iview->planes[0].render_is_view) {
        mtl_render_pass_attachment_descriptor_set_level(descriptor,
                                                        iview->vk.base_mip_level);

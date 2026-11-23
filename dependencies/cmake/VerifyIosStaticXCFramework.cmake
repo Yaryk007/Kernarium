@@ -64,7 +64,7 @@ function(uml_verify_ios_static_xcframework)
             set(_mach_platform 7)
         endif()
         uml_verify_apple_binary(PATH "${_archive}"
-            PLATFORM ${_mach_platform} MINOS 27.0)
+            PLATFORM ${_mach_platform} MINOS 26.0)
 
         execute_process(
             COMMAND nm -g "${_archive}"

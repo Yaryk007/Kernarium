@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# The vibrator HAL (overlay/vibrator) sends its frames to the host application
+# over vsock, like the motion sub-HAL. The platform requires this explicit
+# domain classification for direct vsock access. The service accepts only host
+# CID 2 and never connects out.
+typeattribute hal_vibrator_default unconstrained_vsock_violators;
+allow hal_vibrator_default self:vsock_socket { create bind listen accept read write shutdown getattr getopt };
+
+# Debug dump output goes to dumpsys's pipes.
+allow hal_vibrator_default shell:fd use;
+allow hal_vibrator_default shell:fifo_file write;
+allow hal_vibrator_default dumpstate:fd use;
+allow hal_vibrator_default dumpstate:fifo_file write;

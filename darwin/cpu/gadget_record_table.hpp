@@ -55,14 +55,10 @@ namespace uml::cpu::gadget_cache {
  * A table given an Account (`meter`) charges it every change in bytes(), so
  * the account holds exactly what the table does.
  *
- * A record type may shape its chunks. `Record::chunk_prefix` bytes come before
- * a chunk's first record, which `Record::prepare_chunk(storage)` initializes
- * when the chunk is made; a released place zeroes only the record's first
- * `Record::cleared_bytes`; and `Record::Companion`, when the type names one, is
- * a value kept for each record apart from it, in an array behind the chunk's
- * records, reached by the record's number (`companion_at`). That lets a record
- * that generated code reads keep only what the code reads, and lets a record
- * hold words that belong to its neighbour.
+ * `Record::Companion`, when the type names one, is a value kept for each
+ * record apart from it, in an array behind the chunk's records, reached by the
+ * record's number (`companion_at`). That lets a record that generated code
+ * reads keep only what the code reads.
  */
 template <typename Record>
 struct RecordCompanion final {
@@ -84,21 +80,6 @@ class StableRecordTable final {
 		"records are released with their chunk, without a destructor");
 	static_assert(alignof(Record) <= __STDCPP_DEFAULT_NEW_ALIGNMENT__,
 		"chunks come from the ordinary array allocation");
-
-	static constexpr std::size_t prefix_bytes = [] {
-		if constexpr (requires { Record::chunk_prefix; })
-			return std::size_t{Record::chunk_prefix};
-		else
-			return std::size_t{0};
-	}();
-	static constexpr std::size_t cleared_bytes = [] {
-		if constexpr (requires { Record::cleared_bytes; })
-			return std::size_t{Record::cleared_bytes};
-		else
-			return sizeof(Record);
-	}();
-	static_assert(prefix_bytes % alignof(Record) == 0 &&
-		cleared_bytes <= sizeof(Record));
 
 public:
 	using Companion = typename RecordCompanion<Record>::type;
@@ -379,7 +360,7 @@ public:
 			std::size_t first = 0;
 			for (const auto &chunk : table->chunks_) {
 				const auto begin = reinterpret_cast<std::uintptr_t>(
-					chunk.storage + prefix_bytes);
+					chunk.storage);
 				const auto used = &chunk == &table->chunks_.back() ?
 					table->used_ : chunk.count;
 				marks.ranges_.push_back({begin,
@@ -516,12 +497,12 @@ private:
 	static constexpr std::size_t maximum_records =
 		(std::size_t{1} << number_bits) - 1U;
 
-	/* What a chunk of `count` records takes: its prefix, the records and
-	 * their companions. */
+	/* What a chunk of `count` records takes: the records and their
+	 * companions. */
 	[[nodiscard]] static constexpr std::size_t chunk_bytes(
 		std::size_t count) noexcept
 	{
-		return prefix_bytes + count * stride_bytes;
+		return count * stride_bytes;
 	}
 
 	/* A chunk's storage comes from the engine's leased heap. Its size is the
@@ -613,8 +594,7 @@ private:
 	[[nodiscard]] std::byte *place(std::size_t ordinal) const noexcept
 	{
 		const auto at = position_of(ordinal);
-		return chunks_[at.chunk].storage + prefix_bytes +
-			at.slot * sizeof(Record);
+		return chunks_[at.chunk].storage + at.slot * sizeof(Record);
 	}
 
 	/* Where its companion lives, behind the chunk's records. */
@@ -623,8 +603,8 @@ private:
 	{
 		const auto at = position_of(ordinal);
 		const auto &chunk = chunks_[at.chunk];
-		return chunk.storage + prefix_bytes +
-			chunk.count * sizeof(Record) + at.slot * companion_bytes;
+		return chunk.storage + chunk.count * sizeof(Record) +
+			at.slot * companion_bytes;
 	}
 
 	[[nodiscard]] bool vacant(std::size_t ordinal) const noexcept
@@ -694,10 +674,6 @@ private:
 				::uml::memory::HeapLease::heap().allocate(
 					chunk_bytes(count), alignof(Record))),
 				count);
-			if constexpr (requires(std::byte *storage) {
-					      Record::prepare_chunk(storage);
-				      })
-				Record::prepare_chunk(chunks_.back().storage);
 			record_bytes_ += chunk_bytes(count);
 			used_ = 0;
 		}
@@ -708,7 +684,7 @@ private:
 	void free_place(std::size_t ordinal) noexcept
 	{
 		assert(!vacant(ordinal));
-		std::memset(static_cast<void *>(place(ordinal)), 0, cleared_bytes);
+		std::memset(static_cast<void *>(place(ordinal)), 0, sizeof(Record));
 		if constexpr (companion_bytes != 0)
 			std::memset(static_cast<void *>(
 				companion_place(ordinal)), 0, companion_bytes);

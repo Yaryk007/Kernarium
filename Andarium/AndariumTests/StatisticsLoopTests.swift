@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 import AndariumCore
+import AndariumCoreTestSupport
 import Foundation
+import Observation
 import Testing
 @testable import Andarium
 
@@ -27,6 +29,46 @@ private final class SleepGate {
         held = nil
         continuation?.resume()
     }
+}
+
+/// Counts how often the readout the views draw from is replaced.
+@MainActor
+private final class Publications {
+    private(set) var count = 0
+    private let model: AppModel
+
+    init(_ model: AppModel) {
+        self.model = model
+        watch()
+    }
+
+    private func watch() {
+        withObservationTracking {
+            _ = model.session.readout
+        } onChange: { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.count += 1
+                self?.watch()
+            }
+        }
+    }
+}
+
+/// Everything the process writes to standard output while `body` runs.
+@MainActor
+private func capturingStandardOutput(_ body: () async -> Void) async -> String {
+    fflush(stdout)
+    let saved = dup(STDOUT_FILENO)
+    var ends: [Int32] = [0, 0]
+    guard saved >= 0, pipe(&ends) == 0 else { return "" }
+    dup2(ends[1], STDOUT_FILENO)
+    close(ends[1])
+    await body()
+    fflush(stdout)
+    dup2(saved, STDOUT_FILENO)
+    close(saved)
+    let reader = FileHandle(fileDescriptor: ends[0], closeOnDealloc: true)
+    return String(decoding: reader.readDataToEndOfFile(), as: UTF8.self)
 }
 
 /// The statistics loop against a scripted runtime, with the pause between
@@ -312,5 +354,155 @@ struct StatisticsLoopTests {
         #expect(readout.history.isEmpty)
         #expect(readout.memoryUsedBytes == nil, "the last guest's memory is not this one's")
         model.statistics(.pill, visible: false)
+    }
+
+    // MARK: What is published
+
+    /// `count` readings of a guest with two vCPUs: the first at 0, the second
+    /// 250 ms later and then a second apart, as the loop paces them. A vCPU
+    /// computes `busy` of every second and `frames` reach the screen. `change`
+    /// alters the reading at the given index, for a figure that moves once.
+    private func steadyReadings(
+        _ count: Int, busy: Double = 0.5, frames: UInt64 = 60, change: (index: Int, extraBusy: Double)? = nil
+    ) -> [StatsSample?] {
+        var extra = 0.0
+        return (0..<count).map { index in
+            let milliseconds = index == 0 ? 0 : UInt64(250 + (index - 1) * 1000)
+            let seconds = Double(milliseconds) / 1000
+            if let change, change.index == index { extra += change.extraBusy }
+            return .some(
+                reading(
+                    milliseconds, busy: UInt64((seconds * busy + extra) * 1000),
+                    frames: UInt64(seconds * Double(frames))))
+        }
+    }
+
+    private func memory(usedBytes: UInt64) -> GuestMemorySample {
+        GuestMemorySample(totalBytes: 2048 * Limits.bytesPerMiB, availableBytes: 2048 * Limits.bytesPerMiB - usedBytes)
+    }
+
+    /// Lets the loop through to its `count`th wait, one reading at a time:
+    /// the readings so far are made and published.
+    private func readings(upTo count: Int, gate: SleepGate) async -> Bool {
+        guard await until({ gate.isWaiting }) else { return false }
+        while gate.waits.count < count {
+            let before = gate.waits.count
+            gate.release()
+            guard await until({ gate.waits.count == before + 1 && gate.isWaiting }) else { return false }
+        }
+        return true
+    }
+
+    @Test func aSteadyGuestPublishesNothingOnceTheSparklineIsFull() async {
+        let gate = SleepGate()
+        let driver = StubDriver(plan: .normal)
+        driver.samples = steadyReadings(20)
+        driver.memories = [.some(memory(usedMiB: 818))]
+        let model = runningModel(driver, gate: gate)
+        let publications = Publications(model)
+        model.statistics(.pill, visible: true)
+        // The first reading has nothing to draw but is published, the second
+        // brings the figures and each of the next nine one more bar.
+        #expect(await readings(upTo: StatsMeter.historyLength + 1, gate: gate))
+        await settle()
+        #expect(publications.count == StatsMeter.historyLength + 1)
+        #expect(model.session.readout.history == Array(repeating: 25, count: StatsMeter.historyLength))
+        // Five more seconds, and the views are left alone.
+        #expect(await readings(upTo: StatsMeter.historyLength + 6, gate: gate))
+        await settle()
+        #expect(publications.count == StatsMeter.historyLength + 1, "nothing it draws changed")
+        #expect(driver.statisticsAsked == StatsMeter.historyLength + 6, "the readings go on at the same rate")
+        #expect(driver.memoryAsked == (StatsMeter.historyLength + 6) / StatsSampling.memoryEvery)
+        model.statistics(.pill, visible: false)
+    }
+
+    @Test func aFigureThatMovesIsPublishedInTheTurnItIsRead() async {
+        let gate = SleepGate()
+        let driver = StubDriver(plan: .normal)
+        let settled = StatsMeter.historyLength + 3
+        // A burst in the reading after the sparkline settled: the vCPUs
+        // computed a second longer than their share in the last second.
+        driver.samples = steadyReadings(settled + 3, change: (settled, 0.5))
+        driver.memories = [.some(memory(usedMiB: 818))]
+        let model = runningModel(driver, gate: gate)
+        let publications = Publications(model)
+        model.statistics(.pill, visible: true)
+        #expect(await readings(upTo: settled, gate: gate))
+        await settle()
+        let before = publications.count
+        // The loop is back at its wait: the reading is made and drawn.
+        #expect(await readings(upTo: settled + 1, gate: gate))
+        #expect(model.session.readout.cpu == 50, "published in the second it was read")
+        await settle()
+        #expect(publications.count == before + 1)
+        model.statistics(.pill, visible: false)
+    }
+
+    @Test func aMemoryThatDrawsTheSameIsNotPublishedAndOneThatDrawsMoreIs() async {
+        let gate = SleepGate()
+        let driver = StubDriver(plan: .normal)
+        driver.samples = steadyReadings(20)
+        let used = 818 * Limits.bytesPerMiB
+        // The memory comes with every second reading: the sixth is 100 KiB
+        // more, in the same figure and the same bar, the seventh a MiB more.
+        driver.memories = Array(repeating: .some(memory(usedBytes: used)), count: 5)
+            + [.some(memory(usedBytes: used + (100 << 10))), .some(memory(usedBytes: used + Limits.bytesPerMiB))]
+        let model = runningModel(driver, gate: gate)
+        let publications = Publications(model)
+        model.statistics(.pill, visible: true)
+        // The sparkline settles at the eleventh reading.
+        #expect(await readings(upTo: 12, gate: gate))
+        await settle()
+        let settled = publications.count
+        #expect(settled == StatsMeter.historyLength + 1)
+        #expect(driver.memoryAsked == 6)
+        #expect(model.session.readout.memoryUsedBytes == used, "the sixth memory draws what the fifth did")
+        #expect(await readings(upTo: 13, gate: gate))
+        await settle()
+        #expect(publications.count == settled)
+        #expect(await readings(upTo: 14, gate: gate))
+        await settle()
+        #expect(driver.memoryAsked == 7)
+        #expect(model.session.readout.memoryUsedBytes == used + Limits.bytesPerMiB)
+        #expect(publications.count == settled + 1)
+        model.statistics(.pill, visible: false)
+    }
+
+    @Test func aNewSessionShowsTheNextReadingEvenWhenItDrawsWhatWasShown() async {
+        let gate = SleepGate()
+        let driver = StubDriver(plan: .normal)
+        driver.samples = steadyReadings(20)
+        driver.memories = [.some(memory(usedMiB: 818))]
+        let model = runningModel(driver, gate: gate)
+        model.statistics(.pill, visible: true)
+        #expect(await readings(upTo: StatsMeter.historyLength + 2, gate: gate))
+        #expect(model.session.readout.cpu == 25)
+        // A restart in place gives the guest a session that shows dashes.
+        model.session = SessionState()
+        #expect(model.session.readout.cpu == nil)
+        #expect(await readings(upTo: StatsMeter.historyLength + 3, gate: gate))
+        #expect(model.session.readout.cpu == 25, "what the last session drew is not what this one shows")
+        model.statistics(.pill, visible: false)
+    }
+
+    @Test func theConsoleReportStillPrintsEveryReadingWhateverTheViewsShow() async {
+        let gate = SleepGate()
+        let driver = StubDriver(plan: .normal)
+        driver.samples = steadyReadings(20)
+        driver.memories = [.some(memory(usedMiB: 818))]
+        let model = runningModel(driver, gate: gate)
+        model.printsStatistics = true
+        let publications = Publications(model)
+        let readingsMade = StatsMeter.historyLength + 6
+        let output = await capturingStandardOutput {
+            model.statistics(.pill, visible: true)
+            let made = await readings(upTo: readingsMade, gate: gate)
+            #expect(made)
+            await settle()
+        }
+        model.statistics(.pill, visible: false)
+        let lines = output.split(separator: "\n").filter { $0.hasPrefix("Andarium stats: ") }
+        #expect(lines.count == readingsMade, "the harness reads one a second")
+        #expect(publications.count == StatsMeter.historyLength + 1, "the views were given far fewer")
     }
 }

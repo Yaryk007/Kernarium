@@ -82,18 +82,6 @@ set(UML_DEPENDENCY_PREFIX
     "${PROJECT_SOURCE_DIR}/.build/dependencies/macos-arm64-27"
     CACHE PATH "Private prefix containing source-built host dependencies")
 option(UML_BUILD_GPU "Build the host GPU/display provider" ${UML_TARGET_MACOS})
-# A development-signed iOS process can publish JIT memory only after a debugger
-# has attached and, on iOS 26 and later, prepared the region through the
-# StikDebug universal-script protocol. Stock and App Store runtimes keep this
-# off. The option changes executable-memory policy; signing must separately
-# provide get-task-allow.
-option(UML_ENABLE_IOS_STIKDEBUG_JIT
-    "Enable experimental StikDebug JIT publication on iOS devices" OFF)
-if(UML_ENABLE_IOS_STIKDEBUG_JIT AND
-   NOT UML_APPLE_PLATFORM STREQUAL "ios")
-    message(FATAL_ERROR
-        "UML_ENABLE_IOS_STIKDEBUG_JIT requires an iOS device build")
-endif()
 option(UML_BUILD_AUDIO "Build the host Virtio Sound playback provider"
     ${UML_BUILD_GPU})
 option(UML_BUILD_KERNARIUM_RUNTIME
@@ -106,25 +94,16 @@ endif()
 option(UML_KERNARIUM_AUTOMATION_HARNESS
     "Build the automation-only Kernarium runtime: Linux boots host payloads, Android lets a launch turn ADB authorization off"
     OFF)
-option(UML_APP_STORE_RUNTIME
-    "Build the App Store Kernarium runtime: it reads no environment variable that tunes, observes or drives a run, and carries no debugging or automation support"
-    OFF)
-if(UML_ENABLE_IOS_STIKDEBUG_JIT AND UML_APP_STORE_RUNTIME)
-    message(FATAL_ERROR
-        "UML_ENABLE_IOS_STIKDEBUG_JIT cannot be used in an App Store runtime")
-endif()
 option(UML_BUILD_NETWORK_PROVIDER
     "Build the optional SLiRP network provider"
     ${UML_BUILD_KERNEL_RUNNER})
-if(UML_APP_STORE_RUNTIME)
-    if(UML_KERNARIUM_AUTOMATION_HARNESS OR NOT UML_BUILD_KERNARIUM_RUNTIME)
-        message(FATAL_ERROR
-            "UML_APP_STORE_RUNTIME builds the Kernarium runtime and conflicts "
-            "with UML_KERNARIUM_AUTOMATION_HARNESS")
-    endif()
-    # Every component of the runtime reads its diagnostics and A/B switches
-    # through this definition, so one tree agrees.
-    add_compile_definitions(UML_APP_STORE_RUNTIME)
+
+# JIT. An iOS device reaches JIT memory only through a region a debugger
+# prepares (darwin/cpu/jit_memory).
+if(UML_APPLE_PLATFORM STREQUAL "ios")
+    set(UML_IOS_DEBUGGER_JIT ON)
+else()
+    set(UML_IOS_DEBUGGER_JIT OFF)
 endif()
 
 # darwin/platform compiles Objective-C++ in every configuration. Without the
@@ -288,6 +267,14 @@ add_subdirectory(darwin)
 
 if(UML_BUILD_KERNARIUM_RUNTIME)
     add_subdirectory(Kernarium/Runtime)
+endif()
+
+get_property(_uml_aot_fw_dir GLOBAL PROPERTY
+    UML_AOT_FRAMEWORK_DIR)
+if(_uml_aot_fw_dir)
+    cmake_path(GET _uml_aot_fw_dir PARENT_PATH
+        _uml_aot_fw_parent)
+    list(APPEND CMAKE_BUILD_RPATH "${_uml_aot_fw_parent}")
 endif()
 
 if(UML_BUILD_UNIT_TESTS OR UML_BUILD_INTEGRATION_TESTS OR

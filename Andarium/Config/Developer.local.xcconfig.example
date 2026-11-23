@@ -1,0 +1,15 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+//
+// Copy to Developer.local.xcconfig, which Git ignores, and name the developer's
+// profile on X. Store a handle, never a whole address: `//` starts a comment in
+// an xcconfig, and the code builds the address. A Release build made with this
+// file has Follow developer on X, an Info row that opens the developer's
+// profile on X; every other build carries none of it and no handle.
+//
+// The row also needs the logo in the ignored Local directory beside this one,
+// where a build made with the handle and without the file fails:
+//
+//   Local/x-logo.svg   X's logo, a single-colour vector (one path, any fill)
+//                      drawn as a template image
+
+DEVELOPER_X_HANDLE = example_handle

@@ -14,6 +14,7 @@ __import__("sys").dont_write_bytecode = True
 import argparse
 import hashlib
 import importlib.util
+import json
 import pathlib
 import sys
 
@@ -175,7 +176,7 @@ def main() -> int:
 
     # The reviewable text form must reproduce the binary form exactly.
     pack = pack_path.read_bytes()
-    corpus, tokens = builder.decode_pack(pack)
+    corpus, tokens = builder.decoded_pack(pack)
 
     # The pack carries the LSE2 alignment rewrite of the current script.
     step = corpus.meta.get("lse2_alignment")
@@ -206,6 +207,12 @@ def main() -> int:
         builder.dump_corpus(subset, tokens))
     if builder.encode_pack(reloaded, reloaded_tokens) != encoded:
         raise SystemExit("corpus text dump does not re-pack to the same bytes")
+    # The tests that read the records take them from dump_records: the rows of the text dump, with the
+    # same values in the same key order.
+    rows = [row for row in map(json.loads, builder.dump_corpus(subset, tokens)) if "record" in row]
+    if [json.dumps(row) for row in rows] != \
+            [json.dumps(row) for row in builder.dump_records(subset)]:
+        raise SystemExit("dump_records does not give the records of the text dump")
     decoded, _decoded_tokens = builder.decode_pack(encoded)
     if [record.name for record in decoded.records] != \
             [record.name for record in records]:

@@ -145,12 +145,8 @@ inline constexpr const char *guest_sme_policy_variable = "DARWIN_UML_GUEST_SME";
  * bridge see one answer for the whole process. */
 [[nodiscard]] inline GuestSmePolicy guest_sme_policy() noexcept
 {
-#ifdef UML_APP_STORE_RUNTIME
-	static const GuestSmePolicy policy = parse_guest_sme_policy(nullptr);
-#else
 	static const GuestSmePolicy policy =
 		parse_guest_sme_policy(std::getenv(guest_sme_policy_variable));
-#endif
 	return policy;
 }
 

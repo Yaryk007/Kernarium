@@ -84,15 +84,19 @@ class FakeDevice:
         if command[:2] == ["xcrun", "devicectl"]:
             arguments = command[2:]
             if arguments[:3] == ["device", "info", "files"]:
-                report = pathlib.Path(
-                    arguments[arguments.index("--json-output") + 1]
-                )
-                report.write_text(json.dumps({"result": {"files": [
+                target = arguments[arguments.index("--json-output") + 1]
+                # The diagnostic reports the runners count first: none held.
+                held = {} if "systemCrashLogs" in arguments else self.documents
+                text = json.dumps({"result": {"files": [
                     {"relativePath": name,
                      "metadata": {"size": len(contents)},
                      "resources": {"isDirectory": False}}
-                    for name, contents in self.documents.items()
-                ]}}))
+                    for name, contents in held.items()
+                ]}})
+                if target == "-":
+                    return subprocess.CompletedProcess(
+                        command, 0, stdout=text.encode(), stderr=b"")
+                pathlib.Path(target).write_text(text)
             elif arguments[:3] == ["device", "copy", "to"]:
                 source = pathlib.Path(
                     arguments[arguments.index("--source") + 1]

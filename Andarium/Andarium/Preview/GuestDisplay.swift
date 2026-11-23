@@ -21,9 +21,9 @@ struct GuestHomeScreen: View {
                 VStack(spacing: 0) {
                     AndroidStatusBar(time: "9:41")
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Friday, Oct 30")
+                        Text(verbatim: "Friday, Oct 30")
                             .font(.system(size: wide ? 22 : 20, weight: .regular))
-                        Text("Partly cloudy · 18°")
+                        Text(verbatim: "Partly cloudy · 18°")
                             .font(.system(size: 14))
                             .opacity(0.85)
                     }
@@ -37,7 +37,7 @@ struct GuestHomeScreen: View {
                         iconRow(["Phone", "Messaging", "Browser", "Camera"], labels: false)
                         HStack(spacing: 10) {
                             Image(systemName: "magnifyingglass")
-                            Text("Search")
+                            Text(verbatim: "Search")
                             Spacer()
                             Image(systemName: "mic")
                         }
@@ -183,7 +183,7 @@ struct GuestSearchScreen: View {
                 HStack(spacing: 12) {
                     Image(systemName: "magnifyingglass")
                     HStack(spacing: 1) {
-                        Text("cl")
+                        Text(verbatim: "cl")
                         Rectangle()
                             .fill(Color(hex: 0x006A6A))
                             .frame(width: 2, height: 22)
@@ -200,7 +200,7 @@ struct GuestSearchScreen: View {
                 .padding(.top, 10)
                 .frame(maxWidth: 600)
 
-                Text("Apps")
+                Text(verbatim: "Apps")
                     .font(.system(size: 14, weight: .medium))
                     .foregroundStyle(Color(hex: 0x3F4948))
                     .frame(maxWidth: 600, alignment: .leading)
@@ -272,12 +272,12 @@ struct AndroidKeyboard: View {
                     special(Image(systemName: "delete.left"), width: unit * 1.5)
                 }
                 HStack(spacing: gap) {
-                    special(Text("?123").font(.system(size: 14, weight: .medium)), width: unit * 1.5)
+                    special(Text(verbatim: "?123").font(.system(size: 14, weight: .medium)), width: unit * 1.5)
                     letter(",", width: unit, fill: function)
                     RoundedRectangle(cornerRadius: 7)
                         .fill(key)
                         .frame(width: unit * 5 + gap * 4, height: 46)
-                        .overlay(Text("English").font(.system(size: 13)).foregroundStyle(ink.opacity(0.6)))
+                        .overlay(Text(verbatim: "English").font(.system(size: 13)).foregroundStyle(ink.opacity(0.6)))
                     letter(".", width: unit, fill: function)
                     Image(systemName: "magnifyingglass")
                         .font(.system(size: 17, weight: .semibold))
@@ -293,7 +293,7 @@ struct AndroidKeyboard: View {
         .frame(height: 270)
         .background(base)
         .accessibilityElement()
-        .accessibilityLabel("Keyboard")
+        .accessibilityLabel(Text(verbatim: "Keyboard"))
     }
 
     private var divider: some View {
@@ -393,8 +393,8 @@ struct GuestVolumePanel: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .trailing)
         .allowsHitTesting(false)
         .accessibilityElement()
-        .accessibilityLabel("Volume")
-        .accessibilityValue("\(level) of \(maximum)")
+        .accessibilityLabel(Text(verbatim: "Volume"))
+        .accessibilityValue(Text(verbatim: "\(level) of \(maximum)"))
     }
 }
 
@@ -412,15 +412,15 @@ struct GuestSetupScreen: View {
                         .font(.system(size: 34, weight: .regular))
                         .foregroundStyle(Color(hex: 0x9ED1D6))
                         .padding(.top, 48)
-                    Text("Welcome")
+                    Text(verbatim: "Welcome")
                         .font(.system(size: 36, weight: .regular))
                         .foregroundStyle(.white)
-                    Text("Let\u{2019}s set up your device.")
+                    Text(verbatim: "Let\u{2019}s set up your device.")
                         .font(.system(size: 16))
                         .foregroundStyle(Color(hex: 0xC4C9CB))
                     HStack {
                         Image(systemName: "globe")
-                        Text("English (United States)")
+                        Text(verbatim: "English (United States)")
                         Spacer()
                         Image(systemName: "chevron.down")
                     }
@@ -432,7 +432,7 @@ struct GuestSetupScreen: View {
                     .padding(.top, 24)
                     HStack {
                         Image(systemName: "figure.stand")
-                        Text("Accessibility")
+                        Text(verbatim: "Accessibility")
                         Spacer()
                     }
                     .font(.system(size: 16))
@@ -447,7 +447,7 @@ struct GuestSetupScreen: View {
                 HStack {
                     Spacer()
                     Button(action: onNext) {
-                        Text("Next")
+                        Text(verbatim: "Next")
                             .font(.system(size: 15, weight: .medium))
                             .foregroundStyle(Color(hex: 0x00363B))
                             .padding(.horizontal, 26)
@@ -524,10 +524,10 @@ struct GuestRecoveryScreen: View {
             Color.black
             VStack(alignment: .leading, spacing: 0) {
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("Recovery")
+                    Text(verbatim: "Recovery")
                         .font(.system(size: 30, weight: .medium))
                         .foregroundStyle(.white)
-                    Text("Version 24.0 (\(PreviewData.release))")
+                    Text(verbatim: "Version 24.0 (\(PreviewData.release))")
                         .font(.system(size: 13, design: .monospaced))
                         .foregroundStyle(Color(hex: 0x9AA3A6))
                     Text(state.subtitle)

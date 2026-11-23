@@ -221,7 +221,9 @@ SHUTDOWN_GRACE_SECONDS = 180
 # progress.  Counting it cost one shard 4.4 hours of a guest slot: the CTS
 # process was spinning in the guest kernel, which starved the in-guest
 # watchdog as well, leaving this bound the only thing able to end the session.
-KERNEL_CONSOLE_TIMESTAMP = re.compile(r"\[\s*\d+\.\d+\]\s*")
+# With CONFIG_PRINTK_CALLER a line is "[ time][    C1] text" (T for a task,
+# C for a CPU in interrupt context), so the optional caller field goes too.
+KERNEL_CONSOLE_TIMESTAMP = re.compile(r"\[\s*\d+\.\d+\](?:\[\s*[TC]\d+\])?\s*")
 KERNEL_STALL_DIAGNOSTICS = (
     re.compile(r"rcu:"),
     re.compile(r"Task dump for CPU\b"),

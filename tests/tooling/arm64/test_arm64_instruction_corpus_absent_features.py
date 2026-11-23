@@ -37,7 +37,6 @@ __import__("sys").dont_write_bytecode = True
 import collections
 import functools
 import importlib.util
-import json
 import pathlib
 import re
 import sys
@@ -173,11 +172,9 @@ def check(rewrite, records: list[dict], step: dict) -> str:
 def main() -> int:
     rewrite = load_rewrite()
     builder = rewrite.corpus
-    corpus, tokens = builder.decode_pack(
+    corpus, _tokens = builder.decode_pack(
         pathlib.Path(sys.argv[1]).read_bytes())
-    records = [item for item in map(json.loads,
-                                    builder.dump_corpus(corpus, tokens))
-               if "cases" in item]
+    records = list(builder.dump_records(corpus))
     print(check(rewrite, records, corpus.meta["absent_features"]))
     return 0
 

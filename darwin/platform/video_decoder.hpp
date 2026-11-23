@@ -11,7 +11,7 @@ namespace uml::platform {
 enum class VideoCodec { h264, hevc, jpeg, vp9 };
 enum class VideoProfile {
     h264Baseline, h264ConstrainedBaseline, h264Main, h264High, h264ConstrainedHigh,
-    h264High10, hevcMain, hevcMain10, jpegBaseline, vp9Profile0,
+    h264High10, hevcMain, hevcMain10, jpegBaseline, vp9Profile0, vp9Profile2,
 };
 
 // maximumLevel is the highest level the hardware decodes, as the stream states
@@ -25,6 +25,11 @@ struct VideoDecodeCapability {
     std::uint32_t maximumLevel;
     std::uint32_t bitDepth;
 };
+
+// The smallest side of a VP9 picture the host decodes. The capability list
+// states 64 for every codec, but the VP9 hardware is the one that refuses a
+// session below it, and only after a decoder has taken the new size on.
+inline constexpr std::uint32_t kVp9DecodeMinimumSide = 64;
 
 struct VideoFormat {
     std::uint32_t width {};

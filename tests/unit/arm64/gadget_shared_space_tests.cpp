@@ -9,7 +9,9 @@
 #include "allocation_failure.hpp"
 #include "require.hpp"
 
+#include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <new>
 #include <vector>
 
@@ -153,6 +155,192 @@ void a_body_that_cannot_be_queued_is_never_freed()
 	require(body.frees == 0 && limbo.size() == 0);
 }
 
+/* What the registry asks of an engine's address space, without an engine. */
+struct FakeKey final {
+	unsigned long generation{};
+	std::uint8_t mode{};
+	unsigned options{};
+	const void *owner{};
+};
+
+class FakeSpace final {
+public:
+	FakeSpace(FakeKey key, std::uint64_t) : key_{key} {}
+
+	[[nodiscard]] const FakeKey &key() const noexcept { return key_; }
+	void attach(const cache::ExecutorAnnouncement *) noexcept { ++executors_; }
+	[[nodiscard]] bool detach(const cache::ExecutorAnnouncement *) noexcept
+	{
+		return --executors_ == 0;
+	}
+	[[nodiscard]] bool close() noexcept { return !closed_.exchange(true); }
+	[[nodiscard]] bool closed() const noexcept { return closed_.load(); }
+	[[nodiscard]] bool shedding() const noexcept { return shedding_; }
+	void shed() noexcept { shedding_ = true; }
+	void request_renewal() noexcept { ++renewals_asked; }
+	static void note_closed() noexcept {}
+
+	unsigned renewals_asked{};
+
+private:
+	FakeKey key_;
+	unsigned executors_{};
+	std::atomic<bool> closed_{};
+	bool shedding_{};
+};
+
+/* A shared address space closed for renewal is counted once in the cache
+ * ledger, the figure the session record shows beside the reliefs; one the
+ * budget asked to shed is a shed account instead. */
+void a_renewal_is_counted_when_the_space_is_closed_for_it()
+{
+	using Registry = cache::SpaceRegistry<FakeSpace, FakeKey>;
+	auto &registry = Registry::instance();
+	cache::ExecutorAnnouncement executor;
+	const auto before = cache::ledger().renewals.load();
+	auto *renewed = registry.attach({1, 0, 0, nullptr}, 0, &executor);
+	registry.close(renewed);
+	require(cache::ledger().renewals.load() == before + 1 &&
+		renewed->renewals_asked == 1, "a renewal was not counted");
+	registry.close(renewed);
+	require(cache::ledger().renewals.load() == before + 1,
+		"a space closed twice was counted twice");
+	registry.detach(renewed, &executor);
+
+	auto *shed = registry.attach({2, 0, 0, nullptr}, 0, &executor);
+	shed->shed();
+	registry.close(shed);
+	require(cache::ledger().renewals.load() == before + 1 &&
+		shed->renewals_asked == 1, "a shed space was counted as renewed");
+	registry.detach(shed, &executor);
+}
+
+/* A space the budget sheds while an executor attaches to it, at a point a
+ * test chooses: relieve_at() sets the account's flag and then asks the
+ * executors attached, which is what shed_now() does, under no lock of the
+ * registry. */
+class RacingSpace final {
+public:
+	/* Where the next attach() is raced: the budget acts just before this
+	 * executor is among those attached, or just after. */
+	enum class When { never, before_the_push, after_the_push };
+	static inline When race = When::never;
+
+	RacingSpace(FakeKey key, std::uint64_t) : key_{key} {}
+
+	[[nodiscard]] const FakeKey &key() const noexcept { return key_; }
+	void attach(const cache::ExecutorAnnouncement *announcement)
+	{
+		if (race == When::before_the_push)
+			shed_now();
+		attached_.attach(announcement);
+		if (race == When::after_the_push)
+			shed_now();
+	}
+	[[nodiscard]] bool detach(const cache::ExecutorAnnouncement *announcement)
+	{
+		return attached_.detach(announcement);
+	}
+	[[nodiscard]] bool close() noexcept { return !closed_.exchange(true); }
+	[[nodiscard]] bool closed() const noexcept { return closed_.load(); }
+	[[nodiscard]] bool shedding() const noexcept { return shedding_.load(); }
+	void request_renewal() { attached_.request_renewal(); }
+	static void note_closed() noexcept {}
+
+private:
+	void shed_now()
+	{
+		race = When::never;
+		shedding_.store(true);
+		attached_.request_renewal();
+	}
+
+	FakeKey key_;
+	cache::AttachedExecutors attached_;
+	std::atomic<bool> closed_{};
+	std::atomic<bool> shedding_{};
+};
+
+/* An executor that attaches to a shared space as the budget sheds it is never
+ * left in it with nothing to ask it to let go: what attach() returns is a
+ * space that is not being shed, or the executor's announcement is set. The
+ * budget's ask reaches the executors attached when it is made, so one that
+ * attaches between the registry's check of the space and its own entry in the
+ * list is not among them. Raced before its entry, the old registry handed out
+ * the shed space and nobody asked the executor to let go of it; raced after,
+ * the ask reaches it, and the registry has no more to do than not to lose
+ * it. */
+void an_executor_attaching_as_the_budget_sheds_is_asked_to_let_go(
+	RacingSpace::When when, unsigned long generation)
+{
+	using Registry = cache::SpaceRegistry<RacingSpace, FakeKey>;
+	auto &registry = Registry::instance();
+	cache::ExecutorAnnouncement first;
+	cache::ExecutorAnnouncement second;
+	auto *held = registry.attach({generation, 0, 0, nullptr}, 0, &first);
+	RacingSpace::race = when;
+	auto *got = registry.attach({generation, 0, 0, nullptr}, 0, &second);
+	require(RacingSpace::race == RacingSpace::When::never,
+		"the attach was not raced");
+	require(held->shedding() && first.renew.load(),
+		"the first executor was not asked to let go");
+	require((!got->shedding() && !got->closed()) || second.renew.load(),
+		"an executor was left in a shed space with no ask to let go of it");
+	/* The shed space is closed for the others to let go of, and the
+	 * executor goes on in a space of its own. */
+	require(got != held && !got->shedding() && held->closed(),
+		"the shed space was handed out or left open");
+	registry.detach(held, &first);
+	registry.detach(got, &second);
+}
+
+/* The three ways a window sees an address space it holds. */
+void a_window_tells_idle_from_held_here_from_running_elsewhere()
+{
+	using cache::PlaceUse;
+	cache::ExecutorAnnouncement asking;
+	cache::ExecutorAnnouncement other;
+	cache::AttachedExecutors attached;
+	attached.attach(&asking);
+	cache::Account account{[](void *) noexcept {}, nullptr};
+	const auto now = cache::epoch();
+
+	/* A new account counts as entered, so with only this cache holding it
+	 * the space is held here, and with another it is running elsewhere. */
+	require(cache::place_use(attached, account, false, now) ==
+		PlaceUse::here, "a space held by one cache was not held here");
+	attached.attach(&other);
+	require(cache::place_use(attached, account, false, now) ==
+		PlaceUse::elsewhere, "a space two caches hold was not shared");
+
+	/* A closed space is let go of at the next entry whoever runs it. */
+	require(cache::place_use(attached, account, true, now) ==
+		PlaceUse::idle, "a closed space was kept by its use");
+
+	/* Nobody entered it for a whole window: idle however many hold it,
+	 * until some executor enters it. */
+	const auto later = now + cache::window_epochs;
+	require(cache::place_use(attached, account, false, later) ==
+		PlaceUse::idle, "a space nobody entered was not idle");
+	account.ran(later);
+	require(cache::place_use(attached, account, false, later) ==
+		PlaceUse::elsewhere, "a space entered again was not running");
+	require(attached.detach(&other) == false);
+	require(cache::place_use(attached, account, false, later) ==
+		PlaceUse::here, "a space left to one cache was not held here");
+	attached.attach(&other);
+
+	/* The budget asks it to shed: its holders let go of it at their next
+	 * entry, so no window keeps it, though it is entered all the time. */
+	cache::set_budget(1024);
+	account.charge(4096);
+	cache::relieve_at(later);
+	cache::set_budget(cache::fallback_budget);
+	require(account.shedding(), "the budget did not ask the space to shed");
+	require(cache::place_use(attached, account, false, later) ==
+		PlaceUse::idle, "a space asked to shed was kept by its use");
+}
+
 } // namespace
 
 int main()
@@ -160,5 +348,11 @@ int main()
 	a_failed_snapshot_frees_nothing_early();
 	a_failed_snapshot_keeps_the_next_bodies_waiting();
 	a_body_that_cannot_be_queued_is_never_freed();
+	a_renewal_is_counted_when_the_space_is_closed_for_it();
+	a_window_tells_idle_from_held_here_from_running_elsewhere();
+	an_executor_attaching_as_the_budget_sheds_is_asked_to_let_go(
+		RacingSpace::When::before_the_push, 31);
+	an_executor_attaching_as_the_budget_sheds_is_asked_to_let_go(
+		RacingSpace::When::after_the_push, 32);
 	return 0;
 }

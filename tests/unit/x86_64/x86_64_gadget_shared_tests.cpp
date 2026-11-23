@@ -34,9 +34,11 @@
 #include "cpu/x86_64/gadgets/program.hpp"
 #include "memory/guest_address_space.hpp"
 #include "require.hpp"
+#include "wait_until.hpp"
 #include "x86_64_code_change_history.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -46,6 +48,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <source_location>
 #include <span>
 #include <string_view>
 #include <thread>
@@ -56,6 +59,7 @@ namespace {
 using namespace uml::cpu::x86_64;
 using uml::cpu::EngineEvent;
 using uml::testing::require;
+using uml::testing::waitUntil;
 
 using uml::test::x86_64_code_change_history::Sequences;
 using uml::test::x86_64_code_change_history::read_code_changes;
@@ -215,11 +219,43 @@ void load_writer(Memory &memory)
 	memory.load(writer_block, {0x88, 0x1a, 0x0f, 0x05});
 }
 
-void prepare(gadgets::Executor &executor, Memory &memory, Sequences &sequences)
+void prepare(gadgets::Executor &executor, Memory &memory, Sequences &sequences,
+	std::uint64_t in = generation)
 {
-	executor.prepare(memory, generation, sequences.mapping_changes,
+	executor.prepare(memory, in, sequences.mapping_changes,
 		sequences.code_changes, &sequences, read_sequences,
 		read_code_changes);
+}
+
+/* Wait until no executor has entered any address space for a whole activity
+ * window (about 175 ms), after which a cache's window takes none for one that
+ * another executor is running. Never short: the clock only advances. */
+void let_activity_lapse()
+{
+	namespace gadget_cache = uml::cpu::gadget_cache;
+	const auto until =
+		gadget_cache::epoch() + gadget_cache::window_epochs + 1;
+	require(waitUntil([until] { return gadget_cache::epoch() >= until; },
+		std::chrono::seconds{10}, std::chrono::milliseconds{5}),
+		"the activity window did not lapse");
+}
+
+/* For a test that keeps an address space active from one executor while the
+ * window of another is trimmed: the epoch to read before each entry of the
+ * first, and the check after the other's next prepare that no whole activity
+ * window has passed since, as a host that held the test would let happen. */
+[[nodiscard]] std::uint64_t activity_stamp() noexcept
+{
+	return uml::cpu::gadget_cache::epoch();
+}
+
+void require_activity_held(std::uint64_t stamp,
+	std::source_location location = std::source_location::current())
+{
+	namespace gadget_cache = uml::cpu::gadget_cache;
+	require(gadget_cache::epoch() - stamp < gadget_cache::window_epochs,
+		"the host held the test past the activity window; rerun it alone",
+		location);
 }
 
 [[nodiscard]] gadgets::ProgramSelection select(gadgets::Executor &executor,
@@ -407,6 +443,136 @@ void test_an_unrelated_executor_letting_go_keeps_the_others()
 	require(back.cache_hit && first.cache_diagnostics().translations == 2,
 		"an executor that came back to the address space built its "
 		"blocks again");
+}
+
+/* An executor whose window is full does not retire an address space another
+ * executor is running, which would free, as the last holder, the code that
+ * executor is in. The second executor holds only the entry block and runs the
+ * next through the link the first armed, so the first's slots are what keep
+ * that block alive. The window retires the oldest address space nobody has
+ * entered for an activity window in its place. A new address space looks
+ * entered until its history is its own, so the first fills its window with
+ * the spaces to go before the activity lapses, and only the second's entries
+ * after that keep the shared one in use. */
+void test_a_window_keeps_the_address_space_another_executor_runs()
+{
+	/* The window keeps eight address spaces, as the arm64 cache does. */
+	constexpr std::uint64_t window = 8;
+	World world;
+	auto &first = world.add();
+	auto &second = world.add();
+	(void)select(first, world.memory, entry_block);
+	(void)select(first, world.memory, target_block);
+	const auto x = select(second, world.memory, entry_block);
+	require(chained(run(second, world.memory, *x.program)),
+		"the chain was not armed");
+	require(second.cache_diagnostics().translations == 0,
+		"the second executor built what the address space held");
+
+	/* The first executor's window is full: this space and the ones to go. */
+	for (std::uint64_t other = 1; other < window; ++other)
+		prepare(first, world.memory, world.sequences,
+			generation + other);
+	require(first.resident_generations() == window,
+		"the first executor's window did not fill");
+	let_activity_lapse();
+
+	/* A new space is admitted on each turn, and the window goes past this
+	 * one, to the oldest left that nobody entered, every time. */
+	auto stamp = activity_stamp();
+	prepare(second, world.memory, world.sequences);
+	for (std::uint64_t other = 1; other < window; ++other) {
+		prepare(first, world.memory, world.sequences,
+			generation + window + other);
+		require_activity_held(stamp);
+		/* The second executor enters the address space each turn. */
+		stamp = activity_stamp();
+		prepare(second, world.memory, world.sequences);
+	}
+	require(first.resident_generations() == window,
+		"the first executor's window did not stay full");
+	require(chained(run(second, world.memory, *x.program)),
+		"an executor retired an address space another was running");
+	require(second.cache_diagnostics().translations == 0,
+		"the second executor built a block again");
+	/* The first executor still holds its blocks. */
+	prepare(first, world.memory, world.sequences);
+	const auto kept = select(first, world.memory, target_block);
+	require(kept.cache_hit && first.cache_diagnostics().translations == 2,
+		"the first executor lost the address space it shared");
+
+	/* Once the second executor has stopped entering it, the first's window
+	 * retires it in its turn, and the block only the first held goes. */
+	let_activity_lapse();
+	for (std::uint64_t other = 1; other <= window + 1; ++other)
+		prepare(first, world.memory, world.sequences,
+			generation + 2 * window + other);
+	require(stopped_at_the_jump(run(second, world.memory, *x.program)),
+		"an address space nobody was running stayed in the window");
+}
+
+/* A window that spares an address space another executor is running takes in
+ * its place one nobody wants, not one that only this cache holds and entered
+ * lately: that one would be translated again at once. The first executor's
+ * window holds the shared space (the second runs it) and the private spaces
+ * the first entered since; with none idle, it takes the place it names the
+ * fewest slots of, the oldest of equals, which here is the spared one, and
+ * the private spaces are kept. */
+void test_a_window_does_not_take_a_busy_private_space_for_the_one_it_spares()
+{
+	constexpr std::uint64_t window = 8;
+	World world;
+	auto &first = world.add();
+	auto &second = world.add();
+	(void)select(first, world.memory, entry_block);
+	(void)select(second, world.memory, entry_block);
+	for (std::uint64_t other = 1; other < window; ++other) {
+		prepare(first, world.memory, world.sequences,
+			generation + other);
+		(void)select(first, world.memory, entry_block);
+	}
+
+	/* The first executor then enters each private space again, which
+	 * leaves the shared one the oldest place; the second enters the shared
+	 * one, which is then running elsewhere. */
+	let_activity_lapse();
+	const auto stamp = activity_stamp();
+	for (std::uint64_t other = 1; other < window; ++other)
+		prepare(first, world.memory, world.sequences,
+			generation + other);
+	prepare(second, world.memory, world.sequences);
+	/* One address space more than the window holds. */
+	prepare(first, world.memory, world.sequences, generation + window);
+	require_activity_held(stamp);
+	require(first.resident_generations() == window,
+		"the first executor's window did not stay full");
+
+	/* The oldest private space was kept, with the block it holds. */
+	const auto translations = first.cache_diagnostics().translations;
+	prepare(first, world.memory, world.sequences, generation + 1);
+	require(select(first, world.memory, entry_block).cache_hit &&
+		first.cache_diagnostics().translations == translations,
+		"a private space the first entered lately was taken for the "
+		"one that is running elsewhere");
+}
+
+/* An address space only one executor holds is retired in its turn, however
+ * lately that executor ran it. */
+void test_a_window_retires_a_space_no_other_executor_holds()
+{
+	constexpr std::uint64_t window = 8;
+	World world;
+	auto &only = world.add();
+	(void)select(only, world.memory, entry_block);
+	for (std::uint64_t other = 1; other <= window; ++other)
+		prepare(only, world.memory, world.sequences,
+			generation + other);
+	require(only.resident_generations() == window,
+		"the window did not retire the oldest address space");
+	prepare(only, world.memory, world.sequences);
+	const auto again = select(only, world.memory, entry_block);
+	require(!again.cache_hit && only.cache_diagnostics().translations == 2,
+		"an address space nobody else held stayed in the window");
 }
 
 void test_executors_built_for_different_exceptions_share_nothing()
@@ -769,8 +935,8 @@ void test_a_space_under_the_floor_is_left_alone()
 		"an executor let go of a space nobody closed");
 }
 
-/* The process's byte budget, past which the largest space is asked to shed,
- * reaches every executor that holds it. */
+/* The process's byte budget, past which a space is asked to shed, reaches
+ * every executor that holds it. */
 void test_the_budget_reaches_every_executor_of_a_space()
 {
 	constexpr std::size_t blocks = 3000;
@@ -802,6 +968,70 @@ void test_the_budget_reaches_every_executor_of_a_space()
 	b.leave_gone_generations(0, &alive);
 	require(b.resident_generations() == 0,
 		"an executor kept a space the budget asked to shed");
+	world.executors.clear();
+	require(budget::ledger_state().total == base.total,
+		"executors that went kept their charges");
+}
+
+/* A window that keeps an address space another executor is running does not
+ * keep it from the budget, and when the budget demands the space, relief wins:
+ * it asks any open account to shed, and every executor holding one lets go of
+ * it at its next entry, whatever its window would do. The window spares a
+ * space only while it is neither closed nor being shed, and once the budget
+ * has asked, no window takes it back. The second executor enters the address
+ * space on every turn of the first's through the window, so the window goes
+ * past it; the budget then falls under what is held and a store of the first's
+ * passes it. The first lets go of the space at its next entry, the second at
+ * its own, and the last of them frees it. */
+void test_the_budget_sheds_the_address_space_a_window_keeps()
+{
+	constexpr std::uint64_t window = 8;
+	const auto base = budget::ledger_state();
+	World world;
+	auto &first = world.add();
+	auto &second = world.add();
+	(void)select(first, world.memory, entry_block);
+	(void)select(first, world.memory, target_block);
+	const auto x = select(second, world.memory, entry_block);
+	require(chained(run(second, world.memory, *x.program)),
+		"the chain was not armed");
+	for (std::uint64_t other = 1; other < window; ++other)
+		prepare(first, world.memory, world.sequences,
+			generation + other);
+	let_activity_lapse();
+	auto stamp = activity_stamp();
+	prepare(second, world.memory, world.sequences);
+	for (std::uint64_t other = 1; other < window; ++other) {
+		prepare(first, world.memory, world.sequences,
+			generation + window + other);
+		require_activity_held(stamp);
+		stamp = activity_stamp();
+		prepare(second, world.memory, world.sequences);
+	}
+	require(chained(run(second, world.memory, *x.program)),
+		"an executor retired an address space another was running");
+
+	const auto held = budget::ledger_state();
+	require(held.total > base.total && held.shedding == base.shedding,
+		"the address space holds nothing to shed");
+	budget::set_budget((held.total - base.total) / 2);
+	/* A store of the first's, in another address space, past the budget. */
+	prepare(first, world.memory, world.sequences,
+		generation + 2 * window);
+	(void)select(first, world.memory, entry_block);
+	const auto asked = budget::ledger_state();
+	budget::set_budget(budget::fallback_budget);
+	require(asked.reliefs > held.reliefs,
+		"a store past the budget did not relieve it");
+	require(asked.shedding > held.shedding,
+		"the budget did not ask the running address space to shed");
+	/* The first lets go; the second still holds it. */
+	first.leave_gone_generations(0, &alive);
+	require(budget::ledger_state().shedding > held.shedding,
+		"the space was freed with an executor still holding it");
+	second.leave_gone_generations(0, &alive);
+	require(budget::ledger_state().shedding == held.shedding,
+		"the last executor to let go did not free the space");
 	world.executors.clear();
 	require(budget::ledger_state().total == base.total,
 		"executors that went kept their charges");
@@ -870,6 +1100,9 @@ int main(int argc, char **argv)
 		test_a_second_executor_adopts();
 		test_a_code_change_reaches_every_executors_links();
 		test_an_unrelated_executor_letting_go_keeps_the_others();
+		test_a_window_keeps_the_address_space_another_executor_runs();
+		test_a_window_does_not_take_a_busy_private_space_for_the_one_it_spares();
+		test_a_window_retires_a_space_no_other_executor_holds();
 		test_executors_built_for_different_exceptions_share_nothing();
 		test_executors_keep_their_own_when_asked();
 		test_a_shared_space_is_never_swept();
@@ -887,6 +1120,7 @@ int main(int argc, char **argv)
 			Departure::retired);
 		test_a_space_under_the_floor_is_left_alone();
 		test_the_budget_reaches_every_executor_of_a_space();
+		test_the_budget_sheds_the_address_space_a_window_keeps();
 		test_executors_on_threads_keep_running_while_spaces_are_replaced();
 	} else {
 		std::fprintf(stderr, "x86 gadget shared: unknown mode %s\n", argv[1]);

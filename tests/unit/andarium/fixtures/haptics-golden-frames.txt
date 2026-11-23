@@ -1,0 +1,121 @@
+# Golden frames of the haptics wire (vsock 5557), the contract between the
+# guest's vibrator HAL (android/lineage-24/overlay/vibrator) and the host
+# (Andarium/AndariumCore HapticsProtocol.swift).
+#
+# One frame per line: `name: <hex bytes>`. A line that starts with `#` is a
+# comment, and the comment above a frame says what it means. Every number is
+# little endian; a float32 is IEEE 754.
+#
+# Frame ids: the primitive and effect codes are android.hardware.vibrator's
+# CompositePrimitive and Effect numbers (CLICK 1, THUD 2 ... for a primitive;
+# CLICK 0, DOUBLE_CLICK 1 ... TEXTURE_TICK 21 for an effect), and an effect's
+# strength is EffectStrength (LIGHT 0, MEDIUM 1, STRONG 2).
+#
+# The guest's encoder produces every `play-`, `intensity-` and `stop` frame
+# from the call described above it, and its decoder reads every `ack-` frame.
+# The host's decoder reads every `play-`, `intensity-` and `stop` frame as
+# described, encodes every `ack-` frame, and refuses every `reject-` frame
+# (the guest's encoder never produces one).
+
+# --- Guest to host
+
+# PLAY target 0, sequence 7: one primitive CLICK (code 1) at scale 1.0, start 0 ms, duration 12 ms. 36 bytes.
+play-primitive-click: 41 48 56 31 01 00 1c 00 00 00 01 00 07 00 00 00 01 01 00 00 00 00 00 00 0c 00 00 00 00 00 80 3f 00 00 00 00
+
+# PLAY target 0, sequence 1: one tone, start 0 ms, duration 500 ms, intensity 1.0, sharpness 0.5.
+play-tone: 41 48 56 31 01 00 1c 00 00 00 01 00 01 00 00 00 00 00 00 00 00 00 00 00 f4 01 00 00 00 00 80 3f 00 00 00 3f
+
+# PLAY target 0, sequence 2: one effect DOUBLE_CLICK (code 1) of medium strength (1), start 0 ms, duration 112 ms, intensity 1.0.
+play-effect-double-click: 41 48 56 31 01 00 1c 00 00 00 01 00 02 00 00 00 02 01 01 00 00 00 00 00 70 00 00 00 00 00 80 3f 00 00 00 00
+
+# PLAY target 0, sequence 3: one effect TEXTURE_TICK (code 21) of light strength (0), start 0 ms, duration 8 ms, intensity 1.0.
+play-effect-texture-tick: 41 48 56 31 01 00 1c 00 00 00 01 00 03 00 00 00 02 15 00 00 00 00 00 00 08 00 00 00 00 00 80 3f 00 00 00 00
+
+# PLAY target 0, sequence 4: primitive CLICK (code 1) at scale 0.5, start 0 ms, duration 12 ms; then, after a 50 ms delay, primitive THUD (code 2) at scale 1.0, start 62 ms, duration 60 ms.
+play-composition: 41 48 56 31 01 00 30 00 00 00 02 00 04 00 00 00 01 01 00 00 00 00 00 00 0c 00 00 00 00 00 00 3f 00 00 00 00 01 02 00 00 3e 00 00 00 3c 00 00 00 00 00 80 3f 00 00 00 00
+
+# PLAY target 1, sequence 5: one tone, start 0 ms, duration 100 ms, intensity 0.25, sharpness 0.8.
+play-second-target: 41 48 56 31 01 00 1c 00 01 00 01 00 05 00 00 00 00 00 00 00 00 00 00 00 64 00 00 00 00 00 80 3e cd cc 4c 3f
+
+# INTENSITY target 0, sequence 6, intensity 0.5. 20 bytes.
+intensity-half: 41 48 56 31 02 00 0c 00 00 00 00 00 06 00 00 00 00 00 00 3f
+
+# STOP target 0, sequence 8. 16 bytes.
+stop: 41 48 56 31 03 00 08 00 00 00 00 00 08 00 00 00
+
+# --- Host to guest
+
+# ACK sequence 7, 300 microseconds, result 0 (played). 17 bytes.
+ack-played: 41 48 56 31 10 00 09 00 07 00 00 00 2c 01 00 00 00
+
+# ACK sequence 9, 0 microseconds, result 1 (not in front).
+ack-not-in-front: 41 48 56 31 10 00 09 00 09 00 00 00 00 00 00 00 01
+
+# ACK sequence 10, 1500 microseconds, result 2 (engine failed).
+ack-engine-failed: 41 48 56 31 10 00 09 00 0a 00 00 00 dc 05 00 00 02
+
+# --- Frames the host refuses (the connection closes)
+
+# The magic is AHV2.
+reject-bad-magic: 41 48 56 32 01 00 1c 00 00 00 01 00 07 00 00 00 01 01 00 00 00 00 00 00 0c 00 00 00 00 00 80 3f 00 00 00 00
+
+# Type 99.
+reject-unknown-type: 41 48 56 31 63 00 1c 00 00 00 01 00 07 00 00 00 01 01 00 00 00 00 00 00 0c 00 00 00 00 00 80 3f 00 00 00 00
+
+# An ACK is a host-to-guest frame; the guest does not send it.
+reject-ack-from-guest: 41 48 56 31 10 00 09 00 07 00 00 00 2c 01 00 00 00
+
+# A PLAY header that declares a payload of 4097 bytes.
+reject-length-over-4096: 41 48 56 31 01 00 01 10
+
+# A PLAY whose payload is not 8 plus a whole number of 20-byte events (27 bytes).
+reject-length-not-whole-events: 41 48 56 31 01 00 1b 00 00 00 01 00 07 00 00 00 01 01 00 00 00 00 00 00 0c 00 00 00 00 00 80 3f 00 00 00
+
+# A PLAY with count 0 and no event.
+reject-play-without-events: 41 48 56 31 01 00 08 00 00 00 00 00 07 00 00 00
+
+# A PLAY whose count says 2 and whose payload holds 1 event.
+reject-play-count-mismatch: 41 48 56 31 01 00 1c 00 00 00 02 00 07 00 00 00 01 01 00 00 00 00 00 00 0c 00 00 00 00 00 80 3f 00 00 00 00
+
+
+# A PLAY with a flag set.
+reject-play-flags: 41 48 56 31 01 00 1c 00 00 01 01 00 07 00 00 00 01 01 00 00 00 00 00 00 0c 00 00 00 00 00 80 3f 00 00 00 00
+
+# An event of kind 3.
+reject-event-kind: 41 48 56 31 01 00 1c 00 00 00 01 00 07 00 00 00 03 01 00 00 00 00 00 00 0c 00 00 00 00 00 80 3f 00 00 00 00
+
+# An event whose reserved byte is 1.
+reject-event-reserved: 41 48 56 31 01 00 1c 00 00 00 01 00 07 00 00 00 01 01 00 01 00 00 00 00 0c 00 00 00 00 00 80 3f 00 00 00 00
+
+# A tone with code 1.
+reject-tone-with-code: 41 48 56 31 01 00 1c 00 00 00 01 00 01 00 00 00 00 01 00 00 00 00 00 00 f4 01 00 00 00 00 80 3f 00 00 00 3f
+
+# An effect of strength 3.
+reject-effect-strength: 41 48 56 31 01 00 1c 00 00 00 01 00 02 00 00 00 02 01 03 00 00 00 00 00 70 00 00 00 00 00 80 3f 00 00 00 00
+
+# A primitive whose scale is NaN.
+reject-nan-intensity: 41 48 56 31 01 00 1c 00 00 00 01 00 07 00 00 00 01 01 00 00 00 00 00 00 0c 00 00 00 00 00 c0 7f 00 00 00 00
+
+# A tone whose sharpness is +Infinity.
+reject-infinite-sharpness: 41 48 56 31 01 00 1c 00 00 00 01 00 01 00 00 00 00 00 00 00 00 00 00 00 f4 01 00 00 00 00 80 3f 00 00 80 7f
+
+# A tone of intensity 0.
+reject-tone-without-intensity: 41 48 56 31 01 00 1c 00 00 00 01 00 01 00 00 00 00 00 00 00 00 00 00 00 f4 01 00 00 00 00 00 00 00 00 00 3f
+
+# A primitive of scale 1.5.
+reject-primitive-scale-above-1: 41 48 56 31 01 00 1c 00 00 00 01 00 07 00 00 00 01 01 00 00 00 00 00 00 0c 00 00 00 00 00 c0 3f 00 00 00 00
+
+# An INTENSITY of 0.
+reject-intensity-zero: 41 48 56 31 02 00 0c 00 00 00 00 00 06 00 00 00 00 00 00 00
+
+# An INTENSITY of NaN.
+reject-intensity-nan: 41 48 56 31 02 00 0c 00 00 00 00 00 06 00 00 00 00 00 c0 7f
+
+# An INTENSITY with a 16-byte payload.
+reject-intensity-length: 41 48 56 31 02 00 10 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# A STOP whose reserved bytes are not 0.
+reject-stop-reserved: 41 48 56 31 03 00 08 00 00 01 00 00 08 00 00 00
+
+# A STOP with a 12-byte payload.
+reject-stop-length: 41 48 56 31 03 00 0c 00 00 00 00 00 00 00 00 00 00 00 00 00

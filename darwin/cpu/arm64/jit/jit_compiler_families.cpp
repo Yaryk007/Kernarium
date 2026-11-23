@@ -52,6 +52,12 @@ bool JitCompilerFamilies::gpr_slots_unbound() const noexcept {
          });
 }
 
+bool JitCompilerFamilies::no_gprs_bound() const noexcept {
+  return std::ranges::all_of(gpr_slots_, [](const auto &slot) {
+    return slot.guest == unbound_guest;
+  });
+}
+
 void JitCompilerFamilies::emit(std::uint32_t instruction) {
   static_cast<Arm64Emitter *>(family_emitter_)->emit(instruction);
 }

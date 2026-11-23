@@ -1,0 +1,15 @@
+// SPDX-License-Identifier: Apache-2.0
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+// The application that the text-message checks of an image install: it records the SMS_RECEIVED broadcasts it
+// holds RECEIVE_SMS for, and makes the calls that an application's domain must not be able to (a vsock socket,
+// a virtual machine).
+android_app {
+    name: "AndariumSmsProbe",
+    manifest: "app/AndroidManifest.xml",
+    srcs: ["app/src/**/*.java"],
+    sdk_version: "current",
+    optimize: { enabled: false },
+}

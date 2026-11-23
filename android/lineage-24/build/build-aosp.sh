@@ -10,6 +10,7 @@ ANDROID_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 METADATA="$ANDROID_ROOT/metadata/lineage.env"
 VERIFIER="$ANDROID_ROOT/tools/verify-aosp-patches.py"
 MESA_VENUS_VERIFIER="$ANDROID_ROOT/tools/verify-mesa-venus-source.py"
+ACCESSIBILITY_VERIFIER="$ANDROID_ROOT/tools/verify-accessibility-source.py"
 TARGET_FILES_VERIFIER="$ANDROID_ROOT/tools/verify-target-files.py"
 FIRST_BOOT_TOOL="$ANDROID_ROOT/tools/precompile-first-boot-apps.py"
 OUTER_ROOT=$(CDPATH= cd -- "$ANDROID_ROOT/../.." && pwd)
@@ -24,6 +25,8 @@ BUILD_NUMBER_VALUE=
 
 # shellcheck disable=SC1090
 source "$SCRIPT_DIR/common.sh"
+# shellcheck disable=SC1090
+source "$SCRIPT_DIR/build-number-properties.sh"
 
 usage()
 {
@@ -35,7 +38,9 @@ Usage: android/lineage-24/build/build-aosp.sh \
 
 Run locally on the x86_64 Linux builder after applying the routed AOSP patch
 series. The kernel is a published Android kernel artifact of the tracked
-mainline source, whose vmlinux is the runtime image without DWARF. The output
+mainline source, whose vmlinux is the runtime image without DWARF. TalkBack
+and eSpeak NG are built from the pinned sources that prepare-sources.sh
+materializes in the workspace. The output
 directory must be an ignored directory inside the AOSP Repo
 workspace; the pinned Android 17 Soong tree rejects generated host-tool paths
 from an external absolute OUT_DIR. Reusing the same output path lets the
@@ -46,7 +51,9 @@ missing output path is initialized automatically.
 ro.build.version.incremental and the number of its fingerprint. A release
 carries its own number: it is how a data partition tells a newer system from
 an older one, so numbers rise from release to release. A build without one
-keeps AOSP's eng.<user> and cannot be published.
+keeps AOSP's eng.<user> and cannot be published. Before the build, the output
+directory's build.prop and prop.default files that name another number are
+removed, and a build that leaves one is refused.
 EOF
 }
 
@@ -146,6 +153,7 @@ fi
 [[ -f "$METADATA" ]] || fail "AOSP metadata is missing"
 [[ -x "$VERIFIER" ]] || fail "AOSP patch verifier is missing"
 [[ -x "$MESA_VENUS_VERIFIER" ]] || fail "Mesa Venus source verifier is missing"
+[[ -x "$ACCESSIBILITY_VERIFIER" ]] || fail "accessibility source verifier is missing"
 [[ -x "$TARGET_FILES_VERIFIER" ]] || fail "target-files verifier is missing"
 [[ -f "$FIRST_BOOT_TOOL" ]] || fail "first-boot precompile tool is missing"
 [[ -f "$KERNEL_ARTIFACT_VERIFIER" ]] || fail "kernel artifact verifier is missing"
@@ -153,6 +161,8 @@ fi
 source "$METADATA"
 
 "$MESA_VENUS_VERIFIER" --android-root "$ANDROID_ROOT" \
+	--aosp-source "$AOSP_SOURCE"
+"$ACCESSIBILITY_VERIFIER" --android-root "$ANDROID_ROOT" \
 	--aosp-source "$AOSP_SOURCE"
 "$VERIFIER" --android-root "$ANDROID_ROOT" \
 	--aosp-source "$AOSP_SOURCE" --expect final
@@ -383,6 +393,14 @@ PRODUCT_PACKAGES=" $(get_build_var PRODUCT_PACKAGES) "
 	fail "the Android motion sensor service is absent"
 [[ "$PRODUCT_PACKAGES" == *" android.hardware.sensors@2.1-impl.andarium "* ]] ||
 	fail "the Andarium motion sensor backend is absent"
+[[ "$PRODUCT_PACKAGES" == *" android.hardware.vibrator-service.andarium "* ]] ||
+	fail "the Andarium vibrator service is absent"
+[[ "$PRODUCT_PACKAGES" == *" android.hardware.gnss-service.andarium "* ]] ||
+	fail "the Andarium GNSS service is absent"
+[[ "$PRODUCT_PACKAGES" == *" android.hardware.thermal-service.andarium "* ]] ||
+	fail "the Andarium thermal service is absent"
+[[ "$(get_build_var ODM_MANIFEST_SKUS)" == haptics ]] ||
+	fail "ODM_MANIFEST_SKUS must be exactly haptics: the vibrator HAL exists only in that SKU's manifest"
 for package in \
 	android.hardware.health-service.example \
 	android.hardware.health-service.example_recovery \
@@ -416,11 +434,9 @@ for package in \
 		fail "required UML product package is absent: $package"
 done
 # The curated LineageOS application set leaves out the updater and the apps
-# for hardware this machine lacks. LineageOS's switches (no camera, no AudioFX,
-# no charger, no fastbootd) keep most out of the package set; the rest are
-# excluded by name.
+# for hardware this machine lacks. LineageOS's switches (no AudioFX, no charger,
+# no fastbootd) keep most out of the package set; the rest are excluded by name.
 for package in \
-	Aperture \
 	AudioFX \
 	Canvas \
 	F-Droid \
@@ -451,12 +467,22 @@ fi
 	fail "the suspend blocker that holds the guest awake for an adb host is absent"
 [[ "$PRODUCT_PACKAGES" == *" kernarium_net_setup "* ]] ||
 	fail "the network setup tool that configures eth0 and the virtual Wi-Fi is absent"
+[[ "$PRODUCT_PACKAGES" == *" kernarium_gamepad "* ]] ||
+	fail "the gamepad relay that turns the host's game controllers into HID devices is absent"
 [[ "$PRODUCT_PACKAGES" == *" kernarium_wifi_network_script "* ]] ||
 	fail "the script that saves the virtual Wi-Fi network is absent"
 [[ "$PRODUCT_PACKAGES" == *" kernarium_reclaim_boot_apps_script "* ]] ||
 	fail "the script that reclaims the cached boot-started apps is absent"
 [[ "$PRODUCT_PACKAGES" == *" kernarium_time_zone_script "* ]] ||
 	fail "the script that applies the host's time zone is absent"
+[[ "$PRODUCT_PACKAGES" == *" kernarium_keyboard_default_script "* ]] ||
+	fail "the script that moves an older guest to the on-screen keyboard default is absent"
+[[ "$PRODUCT_PACKAGES" == *" kernarium_oldapp "* ]] ||
+	fail "the shell command that lists and switches Old app compatibility is absent"
+[[ "$PRODUCT_PACKAGES" == *" kernarium_apps "* ]] ||
+	fail "the shell command that lists the launcher applications with their icons and starts one is absent"
+[[ "$PRODUCT_PACKAGES" == *" KernariumIcons "* ]] ||
+	fail "the application that draws the launcher applications' icons for that command is absent"
 [[ "$PRODUCT_PACKAGES" == *" com.android.hardware.wifi "* ]] ||
 	fail "the Wi-Fi HAL that the virtual Wi-Fi needs is absent"
 [[ "$PRODUCT_PACKAGES" == *" com.google.cf.wpa_supplicant "* ]] ||
@@ -465,12 +491,28 @@ fi
 	fail "the Wi-Fi overlay that turns MAC randomization off is absent"
 [[ "$PRODUCT_PACKAGES" == *" KernariumPinnerOverlay "* ]] ||
 	fail "the overlay that releases the home app's memory pin is absent"
+[[ "$PRODUCT_PACKAGES" == *" KernariumSms "* ]] ||
+	fail "the service that delivers the host's text messages is absent"
+[[ "$PRODUCT_PACKAGES" == *" kernarium_sms_listener "* ]] ||
+	fail "the holder of the text message service's vsock port is absent"
+[[ "$PRODUCT_PACKAGES" == *" kernarium_sms_wake_script "* ]] ||
+	fail "the script that starts the text message service is absent"
+[[ "$PRODUCT_PACKAGES" == *" messaging "* ]] ||
+	fail "the SMS application that shows the host's text messages is absent"
+[[ "$PRODUCT_PACKAGES" == *" TelephonyProvider "* ]] ||
+	fail "the provider that stores text messages is absent"
 [[ "$PRODUCT_PACKAGES" == *" SecureElement "* ]] ||
 	fail "the OMAPI service that SEService clients bind on demand is absent"
+for package in \
+	Aperture \
+	android.hardware.camera.provider@2.7-service-google-lazy \
+	emu_camera_v4l2.json \
+	libgooglecamerahwl_impl; do
+	[[ "$PRODUCT_PACKAGES" == *" $package "* ]] ||
+		fail "the camera application or the lazy camera provider and its HAL are absent: $package"
+done
 [[ "$PRODUCT_PACKAGES" == *" EasterEgg "* ]] ||
 	fail "the easter egg that the platform logo screen opens is absent"
-[[ "$PRODUCT_PACKAGES" == *" com.android.hardware.thermal "* ]] ||
-	fail "the example thermal HAL that the thermal manager needs is absent"
 [[ "$PRODUCT_PACKAGES" == *" com.android.hardware.cas "* ]] ||
 	fail "the default CAS HAL that MediaCas needs is absent"
 [[ "$PRODUCT_PACKAGES" == *" libclearkeycasplugin "* ]] ||
@@ -481,29 +523,34 @@ for package in \
 	BluetoothMidiService \
 	Calendar \
 	Camera2 \
+	CameraExtensionsProxy \
 	Contacts \
 	CuttlefishService \
 	DeskClock \
+	DeviceAsWebcam \
 	DeviceDiagnostics \
 	Dialer \
 	DynamicSystemInstallationService \
+	EyesFreeVidService \
 	Gallery2 \
 	QuickSearchBox \
 	TeleService \
 	Telecom \
-	TelephonyProvider \
 	com.android.compos \
 	com.android.hardware.authsecret \
 	com.android.hardware.graphics.composer.ranchu \
 	android.hardware.health-service.cuttlefish_recovery \
 	com.android.hardware.contexthub \
+	com.android.hardware.gnss \
 	com.android.hardware.input.processor \
 	com.android.hardware.net.nlinterceptor \
 	com.android.hardware.rebootescrow \
 	com.android.hardware.security.authgraph \
 	com.android.hardware.security.secretkeeper \
 	com.android.hardware.tetheroffload \
+	com.android.hardware.thermal \
 	com.android.hardware.usb \
+	com.android.hardware.vibrator \
 	com.android.vndk.v31 \
 	com.android.vndk.v32 \
 	com.android.vndk.v33 \
@@ -514,11 +561,15 @@ for package in \
 	com.google.cf.identity \
 	com.google.cf.ir \
 	com.google.cf.wifi \
+	com.google.emulated.camera.provider.hal \
+	com.google.emulated.camera.provider.hal.v4l2 \
+	emu_camera_back.json \
+	emu_camera_depth.json \
+	emu_camera_front.json \
 	CuttlefishTetheringOverlay \
 	CuttlefishWifiOverlay \
 	gsi_tool \
 	gsid \
-	messaging \
 	pmg_daemon \
 	snapshotctl \
 	snapuserd \
@@ -539,6 +590,13 @@ done
 [[ -z "$(get_build_var PRODUCT_EXTRA_VNDK_VERSIONS)" ]] ||
 	fail "PRODUCT_EXTRA_VNDK_VERSIONS must be empty for the fixed vendor image"
 PRODUCT_VENDOR_PROPERTIES=" $(get_build_var PRODUCT_VENDOR_PROPERTIES) "
+[[ "$PRODUCT_VENDOR_PROPERTIES" == *" ro.vendor.camera.config=v4l2 "* ]] ||
+	fail "the camera HAL is not told to take its cameras from the camera device: ro.vendor.camera.config=v4l2"
+# An inherited vendor property cannot be removed from PRODUCT_VENDOR_PROPERTIES: the
+# denylist drops it when the build writes the vendor property file, and the verifier
+# requires its absence there.
+[[ " $(get_build_var PRODUCT_VENDOR_PROPERTY_BLACKLIST) " == *" ro.camerax.extensions.enabled "* ]] ||
+	fail "the inherited CameraX extensions switch is not denylisted: the image has no vendor extensions"
 [[ "$PRODUCT_VENDOR_PROPERTIES" != *" ro.rebootescrow.device="* ]] ||
 	fail "the unsupported reboot-escrow backing property remains present"
 for property in \
@@ -557,6 +615,8 @@ for property in \
 done
 [[ "$PRODUCT_PRODUCT_PROPERTIES" == *" ro.lmk.gpu_reclaim=true "* ]] ||
 	fail "required lmkd property is absent: ro.lmk.gpu_reclaim=true"
+[[ "$PRODUCT_PRODUCT_PROPERTIES" == *" ro.camera.enableLazyHal=true "* ]] ||
+	fail "cameraserver is not told that the camera provider is lazy: ro.camera.enableLazyHal=true"
 [[ "$(get_build_var LOCAL_USE_VENDOR_AUDIO_CONFIGURATION)" == true ]] ||
 	fail "the UML product must own its minimal primary audio policy"
 for package in \
@@ -609,6 +669,13 @@ if ! cmp -s -- "$KERNEL_ELF" "$PRODUCT_OUT/kernel"; then
 	install -m 0755 -- "$KERNEL_ELF" "$PRODUCT_OUT/kernel"
 fi
 
+# The build reads the build number without depending on it: a property file
+# whose other inputs did not change would keep an earlier release's number.
+PRODUCT_OUT_ABSOLUTE=$AOSP_SOURCE/$PRODUCT_OUT
+if [[ -n "$BUILD_NUMBER_VALUE" ]]; then
+	remove_stale_build_properties "$OUT_DIR_ABSOLUTE" "$PRODUCT_OUT_ABSOLUTE" "$BUILD_NUMBER_VALUE"
+fi
+
 # publish-release.py consumes the packaged VINTF checker from this output, and
 # signs with sign_target_files_apks and the tools it runs, so a fresh output
 # builds those host tools.
@@ -635,6 +702,9 @@ else
 	mv -- "$FIRST_BOOT_OAT.new" "$FIRST_BOOT_OAT"
 	export LINEAGE24_FIRST_BOOT_OAT_MK=$FIRST_BOOT_OAT/first-boot-oat.mk
 	m -j"$JOBS" target-files-package
+fi
+if [[ -n "$BUILD_NUMBER_VALUE" ]]; then
+	verify_build_number_properties "$OUT_DIR_ABSOLUTE" "$PRODUCT_OUT_ABSOLUTE" "$BUILD_NUMBER_VALUE"
 fi
 DEXPREOPT_CONFIG="$OUT_DIR_ABSOLUTE/soong/dexpreopt-${LINEAGE24_PRODUCT}.config"
 verify_dexpreopt_config "$DEXPREOPT_CONFIG"

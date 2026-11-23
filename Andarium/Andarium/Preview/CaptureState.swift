@@ -32,7 +32,7 @@ enum CaptureState {
         case .inactive: "inactive"
         default: "background"
         }
-        let record: [String: Any] = [
+        var record: [String: Any] = [
             "pid": Int(ProcessInfo.processInfo.processIdentifier), "screen": screen, "state": state,
         ]
         guard let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first,

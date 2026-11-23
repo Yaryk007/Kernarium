@@ -349,8 +349,9 @@ CLREX = {"A": [0xF57FF01F], "T": [0xF3BF, 0x8F2F]}
 # program spills once before the pair as well, which an engine whose TLB the
 # spill's page would miss (the gadgets') has filled by then, so that the
 # spill between the pair costs no host exclusive monitor. They are a suite of
-# their own: the lanes that interrupt the guest throughout measure the bare
-# window of the pair, and a longer one only adds losses to them.
+# their own so that the plain pairs stay the bare window of the pair; the
+# lanes that interrupt the guest throughout run both, because a reservation
+# lost after a spill must be retried against data that holds the spill.
 SPILLS = {"A": {"spill": [0xE58D8008], "spill_pair": [0xE1CD80F8]},
           "T": {"spill": [0xF8CD, 0x8008], "spill_pair": [0xE9CD, 0x8902]}}
 

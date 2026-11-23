@@ -1,0 +1,88 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 05:15:56 +0900
+Subject: [PATCH] vulkan/runtime: refuse a pipeline create info that names no
+ pipeline
+
+vkGetPipelineKeyKHR, and vkCreatePipelineBinariesKHR where the driver has an
+internal cache to look a pipeline up in, take the pipeline from the first
+structure of the chain of a VkPipelineCreateInfoKHR, and read it as the
+create info of a graphics, compute or ray tracing pipeline by its type. The
+chain is the application's and the generated validation does not require it,
+so a create info with no chain reached a read of a null pointer, and one that
+begins with another structure ended in UNREACHABLE: in a release build the
+switch then fell into a case that reads the structure with the layout of a
+graphics pipeline's, taking its stage count and stage array from fields the
+application chose and reading past the end of the structure.
+
+Both commands now return VK_ERROR_VALIDATION_FAILED, a result each defines
+and the one the implementation gives when it detects invalid usage, for an
+empty chain and for a first structure that names no pipeline. The key of the
+device itself, a create info of NULL, is served as before.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/vulkan/runtime/vk_pipeline.c | 28 ++++++++++++++++++++++++++--
+ 1 file changed, 26 insertions(+), 2 deletions(-)
+
+diff --git a/src/vulkan/runtime/vk_pipeline.c b/src/vulkan/runtime/vk_pipeline.c
+index 2fd9d8426c8a7660f1284a97da65993a675a3f33..0a3eac7238e78bf15c711b979c98d6f5ba2774ce 100644
+--- a/src/vulkan/runtime/vk_pipeline.c
++++ b/src/vulkan/runtime/vk_pipeline.c
+@@ -4288,6 +4288,13 @@ vk_common_CreatePipelineBinariesKHR(
+       struct vk_pipeline_cache *cache = device->mem_cache;
+       const VkBaseInStructure *next = pCreateInfo->pPipelineCreateInfo->pNext;
+ 
++      /* The pipeline create info names its pipeline in the structure that
++       * begins its chain (see vk_common_GetPipelineKeyKHR). */
++      if (next == NULL) {
++         return vk_errorf(device, VK_ERROR_VALIDATION_FAILED,
++                          "a pipeline create info has an empty chain");
++      }
++
+       switch (next->sType) {
+       case VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO: {
+          struct vk_graphics_pipeline_state state_tmp;
+@@ -4405,7 +4412,9 @@ vk_common_CreatePipelineBinariesKHR(
+       }
+ 
+       default:
+-         UNREACHABLE("Unsupported pNext");
++         return vk_errorf(device, VK_ERROR_VALIDATION_FAILED,
++                          "a pipeline create info begins with structure type "
++                          "%d, not a pipeline's", next->sType);
+       }
+    } else if (pipeline != NULL) {
+       switch (pipeline->bind_point) {
+@@ -4569,7 +4578,20 @@ vk_common_GetPipelineKeyKHR(
+       return VK_SUCCESS;
+    }
+ 
++   /* A pipeline create info names its pipeline in the structure that begins
++    * its chain: the graphics, compute or ray tracing pipeline create info
++    * read below.  The chain is the application's, and the generated
++    * validation does not require it, so a create info with no chain, or with
++    * another structure first, names no pipeline to key.  Reading that
++    * structure as a pipeline's would take its fields from another type's
++    * layout, so it is refused instead.  VK_ERROR_VALIDATION_FAILED is the
++    * result a command gives when the implementation detects invalid usage,
++    * and this command defines it. */
+    const VkBaseInStructure *next = pPipelineCreateInfo->pNext;
++   if (next == NULL) {
++      return vk_errorf(device, VK_ERROR_VALIDATION_FAILED,
++                       "a pipeline create info has an empty chain");
++   }
+ 
+    struct mesa_blake3 blake3_ctx;
+    _mesa_blake3_init(&blake3_ctx);
+@@ -4626,7 +4648,9 @@ vk_common_GetPipelineKeyKHR(
+    }
+ 
+    default:
+-      UNREACHABLE("Unsupported pNext");
++      return vk_errorf(device, VK_ERROR_VALIDATION_FAILED,
++                       "a pipeline create info begins with structure type %d, "
++                       "not a pipeline's", next->sType);
+    }
+ 
+    pPipelineKey->keySize = sizeof(blake3_hash);

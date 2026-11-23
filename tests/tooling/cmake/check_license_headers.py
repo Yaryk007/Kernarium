@@ -71,7 +71,7 @@ LOCATIONS = (
         "code that goes into the Android image (overlay, sepolicy, sensors) "
         "is Apache-2.0", every_file=True),
     location(
-        r"^tests/integration/android/(motion|storage|webgl)/", {"Apache-2.0"},
+        r"^tests/integration/android/(gamepad|location|microg|motion|oldapp|sms|storage|webgl)/", {"Apache-2.0"},
         "the Android test and probe apps are built in the Android tree and "
         "are Apache-2.0", every_file=True),
     location(
@@ -82,6 +82,10 @@ LOCATIONS = (
         "the route table of the patches to AOSP and LineageOS projects; its "
         "SHA-256 is recorded in accepted-release.env and in each release "
         "manifest, so a changed byte re-opens the accepted release"),
+    location(
+        r"^tests/integration/android/keymouse/", {"Apache-2.0"},
+        "the keyboard and mouse probe app is built in the Android tree and is "
+        "Apache-2.0", every_file=True),
     location(
         r"^android/lineage-24/patches/", {"Apache-2.0"},
         "the series manifests of the patches to AOSP and LineageOS projects; "

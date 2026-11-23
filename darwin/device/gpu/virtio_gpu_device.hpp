@@ -210,6 +210,7 @@ private:
         const protocol::GpuControlHeader& request,
         std::span<const std::uint8_t> bytes,
         std::size_t capacity);
+    [[nodiscard]] std::uint64_t guestMemoryRefusals() const noexcept;
     [[nodiscard]] MemoryPressure::Reading memoryReading() const noexcept;
     /* The ledger's observer that calls memoryWake_, or none without one. */
     [[nodiscard]] std::function<void()> memoryObserver();

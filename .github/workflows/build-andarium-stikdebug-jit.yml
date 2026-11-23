@@ -1,16 +1,10 @@
 name: Build Andarium StikDebug JIT IPA
 
 on:
+  push:
+    branches: [merge-official-andarium]
   workflow_dispatch:
     inputs:
-      android_release_url:
-        description: HTTPS URL of the accepted Android release tar archive
-        required: true
-        type: string
-      android_release_sha256:
-        description: SHA-256 of the Android release archive
-        required: true
-        type: string
       kernel_artifact_url:
         description: HTTPS URL of the accepted Android kernel artifact tar archive
         required: true
@@ -52,22 +46,32 @@ jobs:
           restore-keys: |
             andarium-ios27-${{ runner.os }}-
 
-      - name: Fetch accepted Android release
+      - name: Fetch accepted Android kernel
         env:
-          RELEASE_URL: ${{ inputs.android_release_url }}
-          RELEASE_SHA256: ${{ inputs.android_release_sha256 }}
-          KERNEL_URL: ${{ inputs.kernel_artifact_url }}
-          KERNEL_SHA256: ${{ inputs.kernel_artifact_sha256 }}
+          KERNEL_URL: ${{ inputs.kernel_artifact_url || 'https://github.com/imxieyi/Kernarium/releases/download/andarium-1.1/android-6.18-arm64-4k-20261119-6.18.60-ca1.tar.gz' }}
+          KERNEL_SHA256: ${{ inputs.kernel_artifact_sha256 || '128d0948d6989e7d1cd03edc5f1c1218d0dd2fac99c7bb960897c64019e38196' }}
         run: |
-          mkdir -p .build/android/releases
           mkdir -p .build/kernel/artifacts
-          curl --fail --location --retry 3 "$RELEASE_URL" --output "$RUNNER_TEMP/andarium-release.tar"
-          printf '%s  %s\n' "$RELEASE_SHA256" "$RUNNER_TEMP/andarium-release.tar" | shasum -a 256 --check
-          tar -xf "$RUNNER_TEMP/andarium-release.tar" -C .build/android/releases
           curl --fail --location --retry 3 "$KERNEL_URL" --output "$RUNNER_TEMP/andarium-kernel.tar"
           printf '%s  %s\n' "$KERNEL_SHA256" "$RUNNER_TEMP/andarium-kernel.tar" | shasum -a 256 --check
           tar -xf "$RUNNER_TEMP/andarium-kernel.tar" -C .build/kernel/artifacts
-          Andarium/scripts/stage-system-image.py
+
+      - name: Prepare translated libraries for the official guest
+        run: |
+          release_base=https://github.com/imxieyi/Kernarium/releases/download/andarium-1.1
+          release_name=lineage24-mainline6.18-4k-20261121-los24-r29
+          mkdir -p "$RUNNER_TEMP/guest-release" "$RUNNER_TEMP/guest-aot"
+          curl --fail --location --retry 3 "$release_base/$release_name.tar.gz" --output "$RUNNER_TEMP/guest.tar.gz"
+          curl --fail --location --retry 3 "$release_base/$release_name-aot.tar.gz" --output "$RUNNER_TEMP/guest-aot.tar.gz"
+          printf '%s  %s\n' 0d9628d61c9aee094fb433b3a02138fe3071ca7eddc14b93834236188106a460 "$RUNNER_TEMP/guest.tar.gz" | shasum -a 256 --check
+          printf '%s  %s\n' bdba3b58c8c7b4ab72a357beb14b21281b9204411ec19d43de3f7bb9b6005175 "$RUNNER_TEMP/guest-aot.tar.gz" | shasum -a 256 --check
+          tar -xf "$RUNNER_TEMP/guest.tar.gz" -C "$RUNNER_TEMP/guest-release"
+          tar -xf "$RUNNER_TEMP/guest-aot.tar.gz" -C "$RUNNER_TEMP/guest-aot"
+          aot_manifest="$(find "$RUNNER_TEMP/guest-aot" -name artifact.json -type f)"
+          test -f "$aot_manifest"
+          android/lineage-24/tools/install-release.py \
+            --source "$RUNNER_TEMP/guest-release/$release_name" \
+            --aot-artifact "$(dirname "$aot_manifest")"
 
       - name: Prepare pinned dependency sources
         run: |
@@ -84,11 +88,11 @@ jobs:
           dependencies/build-ios-network.sh --platform ios
           dependencies/build-apple-gpu.sh --platform ios --jobs "$(sysctl -n hw.ncpu)"
 
-      - name: Build experimental Android JIT runtime
+      - name: Build the upstream Android runtime
         run: |
-          cmake --preset kernarium-ios-device-android-stikdebug-jit
-          cmake --build --preset kernarium-ios-device-android-stikdebug-jit
-          Kernarium/scripts/package-ios-frameworks.sh --sdk device --runtimes android --stikdebug-jit
+          cmake --preset kernarium-ios-device-android
+          cmake --build --preset kernarium-ios-device-android
+          Kernarium/scripts/package-ios-frameworks.sh --sdk device --runtimes android
 
       - name: Build Andarium without signing
         run: |
@@ -103,6 +107,7 @@ jobs:
 
       - name: Package unsigned IPA
         run: |
+          test ! -e "$DERIVED_DATA/Build/Products/Release-iphoneos/Andarium.app/andarium-system"
           mkdir -p "$RUNNER_TEMP/andarium-ipa/Payload"
           cp -R "$DERIVED_DATA/Build/Products/Release-iphoneos/Andarium.app" \
             "$RUNNER_TEMP/andarium-ipa/Payload/Andarium.app"
@@ -116,6 +121,6 @@ jobs:
           name: Andarium-StikDebug-JIT-unsigned
           path: |
             Andarium-StikDebug-JIT-unsigned.ipa
-            Andarium/Config/Andarium.StikDebug.entitlements
+            Andarium/Config/Andarium.entitlements
           if-no-files-found: error
           retention-days: 14

@@ -29,12 +29,15 @@ namespace uml::gpu {
  * The usage is the counter less imports, plus what the ledger holds beyond
  * the resident heaps, so the IOSurfaces and the command storage both count;
  * it is never less than either estimate alone. A heap enters `residentHeaps`
- * only once the ledger holds it and leaves before Metal drops it, so reading
- * `residentHeaps` last can count a heap twice for a moment but never leave it
- * out; a heap made between the readings is still reserved. Other memory that
- * both hold, the host's own Metal textures and buffers, counts twice. An
- * import larger than the counter (the two are read at different instants)
- * reads as nothing made.
+ * as its pages are made resident, while its reservation is held, and leaves
+ * before Metal drops it, so reading `residentHeaps` last can count a heap
+ * twice for a moment but never leave it out; a heap made between the readings
+ * is still reserved, and the reservation covers the pages the ledger has not
+ * counted yet. While a heap is made resident its reservation and Metal's
+ * count both hold it, so the usage is over by at most the heap's size. Other
+ * memory that both hold, the host's own Metal textures and buffers, counts
+ * twice. An import larger than the counter (the two are read at different
+ * instants) reads as nothing made.
  *
  * Read `imported` before `metalAllocated`: an import that lands between the
  * two readings is then counted a moment too long and never too short.
@@ -87,19 +90,24 @@ namespace uml::gpu {
  * Memory the host driver caches for reuse counts against the pool, and the
  * driver releases it only when a client of that driver is refused, never for
  * another consumer's refusal. So the pool takes one reclaim hook, which frees
- * what the host drivers cache and reports how many cached allocations it
- * freed, and calls it before it refuses: a reservation that does not fit
- * runs the hook and is decided once more.
+ * what the host drivers cache, has Metal return the graphics footprint of the
+ * heaps freed (waiting for it only when something was freed), and reports how
+ * many cached allocations it freed, and calls it before it refuses: a
+ * reservation that does not fit runs the hook and is decided once more.
  *
  * What `allocated` reports does not all follow a release at once. Metal's
  * counter drops the moment a heap is freed, and the graphics ledger beside it
- * follows later: within milliseconds, or only at the ledger's next sweep,
- * a quarter of a second at most. A request that fits once everything is freed
- * is therefore refused by the ledger's share for that while. A pool given a
- * `prompt` reading, the part of `allocated` that does follow at once, sees
- * the release: at every decision it compares the prompt reading with the one
- * before, and what it fell by is what the ledger still owes, less what
- * `allocated` has fallen by since and what the prompt reading has risen by.
+ * follows later: within milliseconds, or only at the ledger's next sweep, a
+ * quarter of a second at most. A heap made resident through a residency set, as
+ * KosmicKrisp makes each of its heaps, leaves the ledger only when the process
+ * next asks Metal to make an allocation resident, which the reclaim hook and
+ * the release after a context's destruction do. A request that fits once
+ * everything is freed is therefore refused by the ledger's share for that
+ * while. A pool given a `prompt` reading, the part of `allocated` that does
+ * follow at once, sees the release: at every decision it compares the prompt
+ * reading with the one before, and what it fell by is what the ledger still
+ * owes, less what `allocated` has fallen by since and what the prompt reading
+ * has risen by.
  * When a request is refused and would fit once the ledger had paid what it
  * owes, the pool waits for `allocated` to fall rather than refuse, until it
  * admits the request, the ledger has paid and it still does not fit, or the

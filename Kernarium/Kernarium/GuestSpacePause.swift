@@ -139,19 +139,13 @@ final class GuestSpacePause: ObservableObject {
         run.isActive && pause == nil && (controller()?.guestRuns ?? true)
     }
 
-    private func readFreeSpace() async -> UInt64 {
-        let source = freeSpace
-        return await Task.detached(priority: .utility) { source() }.value
-    }
-
     private func watchSpace() async {
         while !Task.isCancelled {
             guard wantsWatch else {
                 try? await Task.sleep(for: idleInterval)
                 continue
             }
-            let free = await readFreeSpace()
-            guard !Task.isCancelled, wantsWatch else { continue }
+            let free = freeSpace()
             if RunSpace.verdict(freeBytes: free) == .pause {
                 await pauseGuest(freeBytes: free)
                 continue
@@ -209,7 +203,7 @@ final class GuestSpacePause: ObservableObject {
     }
 
     private func resumeAfterReading() async {
-        let free = await readFreeSpace()
+        let free = freeSpace()
         guard pause?.working == .resuming else { return }
         let enough = RunSpace.allowsResume(freeBytes: free)
         // A guest is woken in the foreground only: an edge that came
@@ -245,9 +239,11 @@ final class GuestSpacePause: ObservableObject {
         }
     }
 
-    /// Shut down: the run ends the way leaving the guest does. The suspension
-    /// already wrote the guest's storage back, so nothing is asked of the
-    /// guest. The run ending takes the screen away.
+    /// Shut down: the run ends the way leaving the guest does, with the guest
+    /// asked to write its storage back first. A guest the suspension holds
+    /// reports what the suspension confirmed, which costs nothing; one that
+    /// did not hold still is asked. The screen says Shutting down meanwhile,
+    /// and the run ending takes it away.
     func shutDown() {
         guard var current = pause, current.stage != .pausing,
               current.working == nil else { return }
@@ -273,7 +269,7 @@ final class GuestSpacePause: ObservableObject {
     }
 
     private func checkAfterReading() async {
-        let free = await readFreeSpace()
+        let free = freeSpace()
         guard pause?.stage == .pausing else { return }
         guard !RunSpace.allowsResume(freeBytes: free) else {
             pause = nil

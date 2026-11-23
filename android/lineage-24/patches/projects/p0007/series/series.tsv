@@ -16,3 +16,8 @@ patch	adb-record-the-USB-debugging-setting-in-persist.sys.usb.config.patch
 patch	adb-restart-adbd-instead-of-stopping-it-when-debugging-is-turned-off.patch
 patch	storage-report-exact-virtual-filesystem-sizes.patch
 patch	adb-raise-the-USB-debugging-dialog-again-when-it-died-unanswered.patch
+patch	pm-let-microG-present-Google-s-certificate-on-user-builds.patch
+patch	display-use-the-default-configuration-s-refresh-rate-throttling-map.patch
+patch	SystemConfig-read-the-compass-feature-only-when-the-host-has-a-magne.patch
+patch	SensorPrivacy-no-reminder-for-a-camera-that-the-hardware-toggle-bloc.patch
+patch	ActivityThread-load-the-old-app-layer-for-apps-switched-on.patch

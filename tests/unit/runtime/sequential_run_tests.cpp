@@ -20,6 +20,9 @@
 #include "uml/emulator.h"
 #include "context.hpp"
 #include "cpu/arm64/jit/jit_test_api.hpp"
+#if UML_TEST_AOT
+#include "cpu/arm64/aot/aot_runtime.hpp"
+#endif
 #include "cpu/gadget_cache_budget.hpp"
 #include "device/sockets/socket_paths.hpp"
 #include "emulator_test_support.hpp"
@@ -32,6 +35,8 @@
 #include "memory/mmu/domain_registry_testing.hpp"
 #include "memory/shared_backing.hpp"
 #include "native_kernel_layout.hpp"
+#include "options.hpp"
+#include "platform/host_environment.hpp"
 #include "require.hpp"
 #include "testing.hpp"
 #include "uml_darwin_host.h"
@@ -846,6 +851,429 @@ void a_spent_end_stays_spent(Ending ending,
 	(void)close(world.control);
 }
 
+/* A start the process refuses publishes nothing the whole process keeps: the
+ * JIT cache budget, once published, is permanent, so a start refused for its
+ * AOT choice (here `on` with no release) must leave it unset for the valid
+ * start that follows with another budget. */
+void a_refused_start_leaves_no_cache_budget()
+{
+	auto emulator = make_emulator(kernel);
+	const char *refused[]{"uml-sequential-runs", "ncpus=1",
+		"--execution-engine=jit", "--jit-cache-budget=128M", "--aot=on"};
+	require(uml_emulator_run(emulator.get(), 5, refused, nullptr) ==
+		-UML_EMULATOR_UNSUPPORTED,
+		"a start for the component with no release was not refused");
+	require(kernel_entries == 0, "a refused start entered its kernel");
+	const char *valid[]{"uml-sequential-runs", "ncpus=1",
+		"--execution-engine=jit", "--jit-cache-budget=256M", "--aot=off"};
+	require(uml_emulator_run(emulator.get(), 5, valid, nullptr) ==
+		kernel_booted,
+		"a valid start was refused for the budget a refused start left");
+	require(kernel_entries == 1, "the valid start did not enter its kernel");
+}
+
+/* A start that arrives while another run owns the process waits for it, and
+ * neither it nor its refusal changes what that run is using: the memory limit
+ * the first run stated stays while the second handle's start (which states
+ * another and which the process refuses) waits. */
+struct LimitRace final {
+	std::mutex mutex;
+	std::condition_variable changed;
+	bool waiting{};
+	bool returned{};
+	int status{};
+	uml_emulator *second{};
+	std::thread starting;
+} limit_race;
+
+constexpr std::uint64_t first_memory_limit = 4ULL << 30U;
+
+void note_the_second_start_waiting(void *) noexcept
+{
+	const std::lock_guard lock{limit_race.mutex};
+	limit_race.waiting = true;
+	limit_race.changed.notify_all();
+}
+
+/* The first run's kernel: while it runs, the second handle starts, and the
+ * limit the process holds is read once that start waits or has returned. */
+int kernel_while_another_starts(int, char *const[], char *const[])
+{
+	++kernel_entries;
+	limit_race.starting = std::thread{[] {
+		const char *arguments[]{"uml-sequential-runs", "--memory-limit=2G",
+			"--aot=on"};
+		const int status = uml_emulator_run(
+			limit_race.second, 3, arguments, nullptr);
+		const std::lock_guard lock{limit_race.mutex};
+		limit_race.status = status;
+		limit_race.returned = true;
+		limit_race.changed.notify_all();
+	}};
+	std::unique_lock lock{limit_race.mutex};
+	require(limit_race.changed.wait_for(lock, std::chrono::seconds(30),
+		[] { return limit_race.waiting || limit_race.returned; }),
+		"the second start neither waited nor returned");
+	require(!limit_race.returned,
+		"the second start was decided while the first run owned the process");
+	require(uml::platform::configured_process_memory_limit_bytes() ==
+		first_memory_limit,
+		"a start that did not own the process changed the memory limit");
+	return kernel_left_memory;
+}
+
+void a_waiting_start_leaves_the_memory_limit_alone()
+{
+	uml::emulator::testing::set_address_space_admission_hooks(
+		nullptr, note_the_second_start_waiting, nullptr, nullptr);
+	auto first = make_emulator(kernel_while_another_starts);
+	auto second = make_emulator(kernel);
+	limit_race.second = second.get();
+	const char *arguments[]{"uml-sequential-runs", "--memory-limit=4G"};
+	require(uml_emulator_run(first.get(), 2, arguments, nullptr) ==
+		kernel_left_memory, "the first run did not return its kernel's result");
+	limit_race.starting.join();
+	require(limit_race.status == -UML_EMULATOR_UNSUPPORTED,
+		"the second start for the component with no release was not refused");
+	require(uml::platform::configured_process_memory_limit_bytes() ==
+		first_memory_limit,
+		"the refused start changed the memory limit after the first run");
+	uml::emulator::testing::set_address_space_admission_hooks(
+		nullptr, nullptr, nullptr, nullptr);
+}
+
+#if UML_TEST_AOT
+/* The ahead-of-time component is chosen once per session: a guest that ran
+ * without it (its launch stated no release) keeps it off until the session
+ * ends, and the release of the guest after its clean power-off ends it, so
+ * the next boot in the process can have the component for its own release. */
+void a_release_lets_the_next_session_choose_its_aot_afresh()
+{
+	const HandBackHooks hooks;
+	auto emulator = make_emulator(boot);
+	begin_restarts(emulator.get(), 0, Ending::power_off);
+	require(run(emulator.get()) == kernel_booted, "the guest did not boot");
+	const auto release = uml::cpu::arm64::aot::embedded_release();
+	require(release.has_value(), "the framework names no release");
+	require(!uml::runtime::select_aot(
+			uml::runtime::AotSelection::on, &*release),
+		"a session that ran without the component took it");
+	require(uml_emulator_release_guest(emulator.get()) == 0,
+		"a clean power-off could not release its guest");
+	require_hand_backs(1);
+	require(uml::runtime::select_aot(
+			uml::runtime::AotSelection::on, &*release),
+		"the released session held the next one off the component");
+	require(uml::cpu::arm64::aot::enabled(),
+		"the next session's choice was not taken");
+	(void)close(world.control);
+}
+
+std::string hex(const std::array<std::uint8_t, 32> &digest)
+{
+	static constexpr char digits[] = "0123456789abcdef";
+	std::string text;
+	for (const auto byte : digest) {
+		text += digits[byte >> 4U];
+		text += digits[byte & 15U];
+	}
+	return text;
+}
+
+/* The launch argument that states `release`, or a release of another ID with
+ * the same digests. */
+std::string release_argument(const uml::cpu::AotRelease &release,
+	std::string_view id = {})
+{
+	return uml::emulator::aot_release_argument(
+		id.empty() ? release.id : id, hex(release.manifest_sha256),
+		hex(release.system_sha256));
+}
+
+int run_stating(uml_emulator *emulator, const char *aot,
+	const std::string &release)
+{
+	const char *arguments[]{"uml-sequential-runs", aot, release.c_str()};
+	return uml_emulator_run(emulator, 3, arguments, nullptr);
+}
+
+/* The moment a session ends, held open: the guest is handed back and the
+ * session's own end (the AOT choice's reset) has not run. */
+struct SessionBoundary final {
+	std::mutex mutex;
+	std::condition_variable changed;
+	bool in_window{};
+	bool let_go{};
+	bool start_waiting{};
+	bool start_returned{};
+} boundary;
+
+constexpr auto boundary_bound = std::chrono::seconds(30);
+
+void hold_the_session_end(void *context,
+	const GuestHandBackReport &report) noexcept
+{
+	check_hand_back(context, report);
+	std::unique_lock lock{boundary.mutex};
+	boundary.in_window = true;
+	boundary.changed.notify_all();
+	require(boundary.changed.wait_for(lock, boundary_bound,
+		[] { return boundary.let_go; }),
+		"the held end of a session was never let go");
+}
+
+/* A start that reaches the process's admission and finds it taken. */
+void note_a_start_waiting(void *) noexcept
+{
+	const std::lock_guard lock{boundary.mutex};
+	boundary.start_waiting = true;
+	boundary.changed.notify_all();
+}
+
+struct SessionBoundaryHooks final {
+	SessionBoundaryHooks()
+	{
+		uml::emulator::testing::set_guest_hand_back_hook(
+			hold_the_session_end, nullptr);
+		uml::emulator::testing::set_address_space_admission_hooks(
+			nullptr, note_a_start_waiting, nullptr, nullptr);
+	}
+	~SessionBoundaryHooks()
+	{
+		uml::emulator::testing::set_guest_hand_back_hook(nullptr, nullptr);
+		uml::emulator::testing::set_address_space_admission_hooks(
+			nullptr, nullptr, nullptr, nullptr);
+	}
+	SessionBoundaryHooks(const SessionBoundaryHooks &) = delete;
+	SessionBoundaryHooks &operator=(const SessionBoundaryHooks &) = delete;
+};
+
+enum class NextStart { on_matching, off_matching, on_mismatched };
+
+/* A session ends (its guest released) while another handle starts: the
+ * second handle decides its AOT choice only after the first session has
+ * ended, and neither a start that has not yet been admitted nor the end of
+ * the session before it can undo the other. The start waits for the process
+ * with the release held in the middle of its end. */
+void a_start_waits_for_the_session_before_it_to_end(bool earlier_on,
+	NextStart next)
+{
+	const SessionBoundaryHooks hooks;
+	const auto release = uml::cpu::arm64::aot::embedded_release();
+	require(release.has_value(), "the framework names no release");
+	const std::string matching = release_argument(*release);
+	auto first = make_emulator(boot);
+	begin_restarts(first.get(), 0, Ending::power_off);
+	if (earlier_on) {
+		require(run_stating(first.get(), "--aot=on", matching) ==
+			kernel_booted, "the first session did not boot with the component");
+		require(uml::cpu::arm64::aot::enabled(),
+			"the first session did not take the component");
+	} else {
+		require(run(first.get()) == kernel_booted,
+			"the first session did not boot");
+		require(!uml::cpu::arm64::aot::enabled(),
+			"the first session took the component with no release");
+	}
+	auto second = make_emulator(boot);
+	const std::string mismatched = release_argument(*release, "another-release");
+	const char *const word = next == NextStart::off_matching ? "--aot=off" :
+		"--aot=on";
+	const std::string &stated = next == NextStart::on_mismatched ? mismatched :
+		matching;
+
+	int released = -1;
+	int started = 0;
+	std::thread ending{[&] {
+		released = uml_emulator_release_guest(first.get());
+	}};
+	{
+		std::unique_lock lock{boundary.mutex};
+		require(boundary.changed.wait_for(lock, boundary_bound,
+			[] { return boundary.in_window; }),
+			"the first session's guest was never handed back");
+	}
+	std::thread starting{[&] {
+		started = run_stating(second.get(), word, stated);
+		const std::lock_guard lock{boundary.mutex};
+		boundary.start_returned = true;
+		boundary.changed.notify_all();
+	}};
+	bool decided_early;
+	{
+		std::unique_lock lock{boundary.mutex};
+		require(boundary.changed.wait_for(lock, boundary_bound, [] {
+			return boundary.start_waiting || boundary.start_returned;
+		}), "the second start neither waited nor returned");
+		decided_early = boundary.start_returned;
+		boundary.let_go = true;
+		boundary.changed.notify_all();
+	}
+	ending.join();
+	starting.join();
+	require(!decided_early,
+		"a start was decided before the session ahead of it had ended");
+	require(released == 0, "the first session's guest was not released");
+	require_hand_backs(1);
+
+	const auto &again = *release;
+	switch (next) {
+	case NextStart::on_matching:
+		require(started == kernel_booted,
+			"the start after an off session was refused");
+		require(uml::cpu::arm64::aot::enabled(),
+			"the start's choice of the component was lost");
+		break;
+	case NextStart::off_matching:
+		require(started == kernel_booted,
+			"the start after an on session was refused");
+		/* Asked before enabled(), which decides an undecided session itself. */
+		require(!uml::runtime::select_aot(
+				uml::runtime::AotSelection::on, &again),
+			"the start's choice to run without the component was lost");
+		require(!uml::cpu::arm64::aot::enabled(),
+			"the start took the component the earlier session had");
+		break;
+	case NextStart::on_mismatched:
+		require(started == -UML_EMULATOR_UNSUPPORTED,
+			"a release the component was not made from was taken");
+		/* The refused start decided nothing: the process is still between
+		 * sessions. */
+		require(uml::runtime::select_aot(
+				uml::runtime::AotSelection::on, &again),
+			"a refused start held the next one off the component");
+		break;
+	}
+	(void)close(world.control);
+}
+
+/* A start that takes its AOT choice and then fails before its guest runs
+ * leaves the choice as it was: here the JIT cache budget is below the
+ * minimum, which fails the start after the choice and before any guest. */
+constexpr int refused_cache_arguments = 5;
+const char *const refused_cache[refused_cache_arguments]{
+	"uml-sequential-runs", "ncpus=1", "--execution-engine=jit",
+	"--jit-cache-budget=1K", "--aot=off"};
+
+void a_failed_start_leaves_the_aot_choice_alone()
+{
+	const auto release = uml::cpu::arm64::aot::embedded_release();
+	require(release.has_value(), "the framework names no release");
+	const std::string matching = release_argument(*release);
+	auto emulator = make_emulator(kernel);
+	require(uml_emulator_run(emulator.get(), refused_cache_arguments,
+		refused_cache, nullptr) == -UML_EMULATOR_RUNTIME_ERROR,
+		"a start with a budget below the minimum did not fail");
+	require(kernel_entries == 0, "a failed start entered its kernel");
+	/* Nothing ran, so the process has chosen nothing: the retry states the
+	 * release and takes the component. */
+	require(run_stating(emulator.get(), "--aot=on", matching) ==
+		kernel_booted,
+		"a start that failed before its guest held the next one off the component");
+	require(uml::cpu::arm64::aot::enabled(),
+		"the retry's choice of the component was not taken");
+}
+
+/* The same for a restart: the session's choice stays whichever way the
+ * start after it fails. */
+void a_failed_restart_keeps_the_choice_of_its_session()
+{
+	const HandBackHooks hooks;
+	const auto release = uml::cpu::arm64::aot::embedded_release();
+	require(release.has_value(), "the framework names no release");
+	const std::string matching = release_argument(*release);
+	auto emulator = make_emulator(boot);
+	begin_restarts(emulator.get(), 1, Ending::power_off);
+	require(run_stating(emulator.get(), "--aot=on", matching) ==
+		kernel_booted && run_end_kind(emulator.get()) ==
+			UML_EMULATOR_RUN_END_RESTART,
+		"the first boot did not take the component and restart");
+	require(uml_emulator_run(emulator.get(), refused_cache_arguments,
+		refused_cache, nullptr) == -UML_EMULATOR_RUNTIME_ERROR,
+		"a restart with a budget below the minimum did not fail");
+	require(run_stating(emulator.get(), "--aot=on", matching) ==
+		kernel_booted,
+		"a failed restart changed the session's choice");
+	require(uml::cpu::arm64::aot::enabled(),
+		"the restarted boot lost the component");
+	require(run_end_kind(emulator.get()) == UML_EMULATOR_RUN_END_POWER_OFF,
+		"the restarted boot did not power off");
+	(void)close(world.control);
+}
+
+#if UML_TEST_KERNEL_RUNNER
+/* The production path enters the kernel through the loader, which refuses an
+ * image it cannot run before the guest does: the start has taken its AOT
+ * choice by then and must put it back. A one-byte image is a kernel image to
+ * the handle and to nothing else. */
+void a_loader_refusal_leaves_the_aot_choice_alone()
+{
+	const auto release = uml::cpu::arm64::aot::embedded_release();
+	require(release.has_value(), "the framework names no release");
+	const std::string matching = release_argument(*release);
+	static const unsigned char one_byte[]{0};
+	auto refused = uml::testing::create_emulator({
+		.abi_version = UML_EMULATOR_ABI_VERSION,
+		.struct_size = sizeof(uml_emulator_config),
+		.rootfs_path = "/tmp/uml-test.img",
+		.kernel_image = one_byte,
+		.kernel_image_size = sizeof(one_byte),
+	});
+	const char *arguments[]{"uml-sequential-runs", "--aot=off"};
+	require(uml_emulator_run(refused.get(), 2, arguments, nullptr) == 126,
+		"the loader did not refuse the image");
+	require(kernel_entries == 0, "a refused image entered a kernel");
+	/* Nothing ran, so the process has chosen nothing: another handle with a
+	 * kernel states the release and takes the component. */
+	auto next = make_emulator(kernel);
+	require(run_stating(next.get(), "--aot=on", matching) == kernel_booted,
+		"a start the loader refused held the next one off the component");
+	require(uml::cpu::arm64::aot::enabled(),
+		"the next start's choice of the component was not taken");
+}
+#endif
+
+/* A guest that restarts is one session: its choice stays through the
+ * restart, which is not a session boundary. */
+void a_restart_keeps_the_choice_of_its_session(bool on)
+{
+	const HandBackHooks hooks;
+	const auto release = uml::cpu::arm64::aot::embedded_release();
+	require(release.has_value(), "the framework names no release");
+	const std::string matching = release_argument(*release);
+	auto emulator = make_emulator(boot);
+	begin_restarts(emulator.get(), 1, Ending::power_off);
+	if (on)
+		require(run_stating(emulator.get(), "--aot=on", matching) ==
+			kernel_booted, "the first boot did not take the component");
+	else
+		require(run(emulator.get()) == kernel_booted,
+			"the first boot did not run");
+	require(run_end_kind(emulator.get()) == UML_EMULATOR_RUN_END_RESTART,
+		"the first boot did not restart");
+	require(uml::cpu::arm64::aot::enabled() == on,
+		"a restart changed the session's choice");
+	if (on) {
+		require(run_stating(emulator.get(), "--aot=on", matching) ==
+			kernel_booted, "the restarted boot did not keep the component");
+		require(uml::cpu::arm64::aot::enabled(),
+			"the restarted boot lost the component");
+	} else {
+		/* A session that ran without it does not turn it on by restarting. */
+		require(run_stating(emulator.get(), "--aot=on", matching) ==
+			-UML_EMULATOR_UNSUPPORTED,
+			"a restart took the component a session had run without");
+		require(run(emulator.get()) == kernel_booted,
+			"the restarted boot did not run");
+		require(!uml::cpu::arm64::aot::enabled(),
+			"the restarted boot took the component");
+	}
+	require(run_end_kind(emulator.get()) == UML_EMULATOR_RUN_END_POWER_OFF,
+		"the restarted boot did not power off");
+	(void)close(world.control);
+}
+#endif
+
 void clean_power_off_releases_the_process(bool fresh_handle, Ending ending)
 {
 	const HandBackHooks hooks;
@@ -1172,6 +1600,35 @@ int main(int argc, char **argv)
 			clean_power_off_releases_the_process(true, Ending::power_off);
 		else if (mode == "release-halt")
 			clean_power_off_releases_the_process(true, Ending::halt);
+		else if (mode == "refused-start-no-cache-budget")
+			a_refused_start_leaves_no_cache_budget();
+		else if (mode == "waiting-start-memory-limit")
+			a_waiting_start_leaves_the_memory_limit_alone();
+#if UML_TEST_AOT
+		else if (mode == "release-reselects-aot")
+			a_release_lets_the_next_session_choose_its_aot_afresh();
+		else if (mode == "release-race-off-then-on")
+			a_start_waits_for_the_session_before_it_to_end(
+				false, NextStart::on_matching);
+		else if (mode == "release-race-on-then-off")
+			a_start_waits_for_the_session_before_it_to_end(
+				true, NextStart::off_matching);
+		else if (mode == "release-race-mismatched")
+			a_start_waits_for_the_session_before_it_to_end(
+				false, NextStart::on_mismatched);
+#if UML_TEST_KERNEL_RUNNER
+		else if (mode == "loader-refusal-keeps-aot-choice")
+			a_loader_refusal_leaves_the_aot_choice_alone();
+#endif
+		else if (mode == "failed-start-keeps-aot-choice")
+			a_failed_start_leaves_the_aot_choice_alone();
+		else if (mode == "failed-restart-keeps-aot-choice")
+			a_failed_restart_keeps_the_choice_of_its_session();
+		else if (mode == "restart-keeps-aot-on")
+			a_restart_keeps_the_choice_of_its_session(true);
+		else if (mode == "restart-keeps-aot-off")
+			a_restart_keeps_the_choice_of_its_session(false);
+#endif
 		else if (mode == "release-borrowed-view")
 			a_clean_release_waits_for_resources(false);
 		else if (mode == "release-running-thread")

@@ -24,6 +24,7 @@ REPOSITORY = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPOSITORY / "tests" / "integration" / "support"))
 import guest  # noqa: E402
 import ios_device  # noqa: E402
+import ios_device_reports  # noqa: E402
 import kernarium  # noqa: E402
 
 WORKLOAD = Path(__file__).resolve().parent / "guest" / "ubd-discard.sh"
@@ -60,6 +61,7 @@ def parse_arguments() -> argparse.Namespace:
                         default=kernarium.DEFAULT_INITRAMFS_TOOL)
     parser.add_argument("--maximum-batched-ms", type=float, default=500.0)
     parser.add_argument("--minimum-speedup", type=float, default=2.0)
+    ios_device_reports.add_arguments(parser)
     return parser.parse_args()
 
 
@@ -146,12 +148,13 @@ def main() -> int:
     if not app.is_dir():
         raise ValueError(f"Kernarium app is unavailable: {app}")
     kernarium.require_automation_app(app)
-    ios_device.install_app(arguments.device, app, 300)
 
     artifact = arguments.artifact_root.resolve() / time.strftime(
         "%Y%m%d-%H%M%S"
     )
     artifact.mkdir(parents=True, exist_ok=False)
+    ios_device_reports.preflight(arguments, [kernarium.APPLICATION])
+    ios_device.install_app(arguments.device, app, 300)
     results: dict[str, list[dict[str, int | str]]] = {}
     for mode in MODES:
         results[mode] = launch(arguments, mode, artifact)

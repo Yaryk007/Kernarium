@@ -241,6 +241,9 @@ public:
   [[nodiscard]] std::size_t allocated_shards() const noexcept;
 
   [[nodiscard]] static SharedTranslationCache &instance() noexcept;
+  /* Whether instance() has run: every access to the process tier goes through
+   * it, so a process whose executors never reach the tier shows false. */
+  [[nodiscard]] static bool instance_exists() noexcept;
 
 private:
   struct Entry final {

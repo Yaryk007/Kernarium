@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!--
+     The ODM manifest of the "haptics" SKU (ODM_MANIFEST_HAPTICS_FILES): the one
+     place that declares a vibrator. The host selects the SKU at boot on a
+     device with haptics.
+-->
+<manifest version="1.0" type="device">
+    <hal format="aidl">
+        <name>android.hardware.vibrator</name>
+        <version>4</version>
+        <fqname>IVibrator/default</fqname>
+    </hal>
+</manifest>

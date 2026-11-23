@@ -27,7 +27,14 @@ class VhostUserServer;
 /* Serves one vhost-user device, on a thread of its own, to the guest of this
  * process. The guest's virtio_uml transport takes one end of a socketpair by
  * its connection name; the service answers on the other end until stop().
- * Every in-process device service is one of these around its own device. */
+ * Every in-process device service is one of these around its own device.
+ *
+ * The thread blocks while it is idle: it wakes for a message from the guest,
+ * for the device's event descriptor (`VhostUserDevice::eventDescriptor()`),
+ * for the request gate and for stop(), and for nothing else but the 100 ms
+ * retry of a config change the device holds back (the complete list is at
+ * `VhostUserServer::setStopShutsDownConnection()`). A device that has work no
+ * guest message starts must therefore signal its event descriptor. */
 class InProcessVhostUserService final {
 public:
     using DeviceFactory =
@@ -67,7 +74,8 @@ public:
     /* The guest's end, named for a virtio_uml.device= argument. It can be
      * taken once; the guest owns that descriptor from then on. */
     [[nodiscard]] std::string takeConnectionName();
-    /* Stops serving and joins the thread; later calls do nothing. */
+    /* Stops serving and joins the thread; later calls do nothing. It wakes the
+     * thread by shutting the connection down, which the idle thread waits on. */
     void stop() noexcept;
 
 

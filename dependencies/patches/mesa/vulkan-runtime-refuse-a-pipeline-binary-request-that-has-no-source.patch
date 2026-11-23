@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 04:00:35 +0900
+Subject: [PATCH] vulkan/runtime: refuse a pipeline binary request that has no
+ source
+
+vkCreatePipelineBinariesKHR makes binaries from a pipeline, from keys and
+data to import, or, on an implementation with an internal cache, from a
+pipeline create info. When none applies, the function fell into the import
+branch, whose only guard was an assert that a release build compiles out, and
+dereferenced the import it does not have. A request names none when it has
+no source at all, and also when it has only a pipeline create info on an
+implementation without an internal cache, which has nothing to look the
+create info up in.
+
+Refuse such a request with VK_ERROR_VALIDATION_FAILED. The command defines
+that result, and it is the one a command gives when the implementation
+detects invalid usage.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/vulkan/runtime/vk_pipeline.c | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/src/vulkan/runtime/vk_pipeline.c b/src/vulkan/runtime/vk_pipeline.c
+index 8037fc4136149faab722f44727fc6d5dcc95175c..2fd9d8426c8a7660f1284a97da65993a675a3f33 100644
+--- a/src/vulkan/runtime/vk_pipeline.c
++++ b/src/vulkan/runtime/vk_pipeline.c
+@@ -4504,9 +4504,7 @@ vk_common_CreatePipelineBinariesKHR(
+       default:
+          UNREACHABLE("Unsupported pipeline");
+       }
+-   } else {
+-      assert(pCreateInfo->pKeysAndDataInfo != NULL);
+-
++   } else if (pCreateInfo->pKeysAndDataInfo != NULL) {
+       for (uint32_t i = 0; i < pCreateInfo->pKeysAndDataInfo->binaryCount; i++) {
+          vk_outarray_append_typed(VkPipelineBinaryKHR, &out, binary) {
+             VkResult result = vk_create_pipeline_binary(
+@@ -4523,6 +4521,14 @@ vk_common_CreatePipelineBinariesKHR(
+             }
+          }
+       }
++   } else {
++      /* A pipeline create info alone is a source only where an internal
++       * cache looks it up, so a request can reach here with no source at
++       * all.  VK_ERROR_VALIDATION_FAILED is the result a command gives when
++       * the implementation detects invalid usage, and this command defines
++       * it. */
++      return vk_errorf(device, VK_ERROR_VALIDATION_FAILED,
++                       "a pipeline binary request has no source for its binaries");
+    }
+ 
+    return success_or_first_fail != VK_SUCCESS ?

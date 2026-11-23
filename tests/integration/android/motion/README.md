@@ -7,6 +7,12 @@ iPad. The foreground application is necessary for sustained validation:
 Android can disable a plain shell UID's sensor subscription after that UID
 becomes idle, independently of host delivery.
 
+A host can build the APK without Soong, from an Android source tree's
+prebuilts: `build-apk.sh ANDROID_ROOT OUTPUT_DIR` signs it with the AOSP test
+key. Its `compass` mode (an image that lists `Host Magnetometer`) also reads the
+magnetic field and the rotation vector and writes `files/compass.json` every
+200 ms; `tests/integration/android/run_android_compass.py` drives it.
+
 Build this directory as an explicit Soong module in the Android workspace
 (`m AndariumMotionProbe`), with a temporary source copy at
 `test/andarium-motion`. It is not a product package and is never installed in

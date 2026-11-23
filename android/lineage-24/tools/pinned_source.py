@@ -351,8 +351,13 @@ def open_checkout(
     prefix: str,
     label: str,
     error: Error,
+    nested: tuple[str, ...] = (),
 ) -> Path:
-    """Return the clean materialized checkout whose origin is the pinned one."""
+    """Return the clean materialized checkout whose origin is the pinned one.
+
+    A directory of `nested` is another checkout's destination inside this one,
+    and is the only untracked path the checkout may show.
+    """
     if not aosp_source.is_dir() or not (aosp_source / ".repo").is_dir():
         raise error("AOSP source is not a Repo workspace")
     source = aosp_source / values[f"{prefix}_DESTINATION"]
@@ -361,7 +366,8 @@ def open_checkout(
     top = Path(run("git", "rev-parse", "--show-toplevel", cwd=source, error=error))
     if top.resolve() != source.resolve():
         raise error(f"{label} destination is not the Git checkout root")
-    if run("git", "status", "--porcelain", "--untracked-files=all", cwd=source, error=error):
+    status = run("git", "status", "--porcelain", "--untracked-files=all", cwd=source, error=error)
+    if set(status.splitlines()) - {f"?? {path}/" for path in nested}:
         raise error(f"materialized {label} checkout is dirty")
     if run("git", "remote", "get-url", "origin", cwd=source, error=error) != values[
         f"{prefix}_UPSTREAM_REPOSITORY"

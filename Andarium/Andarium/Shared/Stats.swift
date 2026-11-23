@@ -71,7 +71,7 @@ struct Readout {
     /// What a figure shows before the first reading.
     static let unknown = "\u{2013}"
     /// What VoiceOver says for it.
-    static let unknownSpoken = "no reading yet"
+    static let unknownSpoken = String(localized: "no reading yet")
 
     var cpuText: String { cpu.map { "\($0)%" } ?? Self.unknown }
     var fpsText: String { fps.map { "\($0) fps" } ?? Self.unknown }
@@ -81,7 +81,7 @@ struct Readout {
     /// "818 MiB of 2 GiB", with the guest's size. Every size goes through
     /// the one formatter.
     func memoryText(of memoryMiB: Int) -> String {
-        memoryUsedBytes.map { "\(Formats.size(bytes: $0)) of \(Formats.size(mib: memoryMiB))" } ?? Self.unknown
+        memoryUsedBytes.map { MeterWords.of(Formats.size(bytes: $0), Formats.size(mib: memoryMiB)) } ?? Self.unknown
     }
 
     /// The memory in use alone, beside a bar that draws its share.
@@ -101,7 +101,7 @@ struct Readout {
 
     /// "412 MiB of 534 MiB".
     var vramText: String {
-        vram.map { "\(Formats.size(bytes: $0.used)) of \(Formats.size(bytes: $0.budget))" } ?? Self.unknown
+        vram.map { MeterWords.of(Formats.size(bytes: $0.used), Formats.size(bytes: $0.budget)) } ?? Self.unknown
     }
     var vramUsedText: String { vram.map { Formats.size(bytes: $0.used) } ?? Self.unknown }
     var vramFraction: Double? { vram.map { Self.fraction($0.used, of: $0.budget) } }
@@ -109,14 +109,14 @@ struct Readout {
     /// What VoiceOver reads for the whole capsule: every figure in words,
     /// with the whole each share is of.
     func spoken(memoryMiB: Int, recovery: Bool) -> String {
-        func part(_ name: String, _ value: String?) -> String { "\(name) \(value ?? Self.unknownSpoken)" }
+        let none = Self.unknownSpoken
         var parts = [
-            part("CPU", cpu.map { "\($0)%" }),
-            part("memory", memoryUsedBytes.map { _ in memoryText(of: memoryMiB) }),
-            part("graphics memory", vram.map { _ in vramText }),
+            String(localized: "CPU \(cpu.map { "\($0)%" } ?? none)"),
+            String(localized: "memory \(memoryUsedBytes.map { MeterWords.spoken(Formats.size(bytes: $0), of: Formats.size(mib: memoryMiB)) } ?? none)"),
+            String(localized: "graphics memory \(vram.map { MeterWords.spoken(Formats.size(bytes: $0.used), of: Formats.size(bytes: $0.budget)) } ?? none)"),
         ]
-        if !recovery { parts.append(part("frame rate", fps.map { "\($0) fps" })) }
-        return parts.joined(separator: ", ")
+        if !recovery { parts.append(String(localized: "frame rate \(fps.map { "\($0) fps" } ?? none)")) }
+        return ListWords.join(parts)
     }
 
     private static func bytes(mib: Int) -> UInt64 { UInt64(max(mib, 0)) * Limits.bytesPerMiB }
@@ -138,21 +138,21 @@ enum StatsTint {
     }
 }
 
-/// Where the statistics capsule sits over a running session, and the graphics
-/// notice that makes room for it. Distances are in points from the top
+/// Where the statistics capsule sits over a running session, and the notices
+/// that make room for it. Distances are in points from the top
 /// safe-area edge.
 enum StatsPlacement {
     /// The capsule's distance below the top safe-area edge.
     static let top: CGFloat = 24
     /// The capsule's height.
     static let height: CGFloat = 40
-    /// The graphics notice's distance below the capsule.
+    /// A notice's distance below the capsule, and below another notice.
     static let noticeGap: CGFloat = 8
-    /// The graphics notice's distance below the top safe-area edge while the
+    /// The first notice's distance below the top safe-area edge while the
     /// capsule is hidden.
     static let noticeTopAlone: CGFloat = 36
 
-    /// The graphics notice's distance below the top safe-area edge.
+    /// The first notice's distance below the top safe-area edge.
     static func noticeTop(statsShowing: Bool) -> CGFloat {
         statsShowing ? top + height + noticeGap : noticeTopAlone
     }
@@ -189,6 +189,8 @@ struct StatsPill: View {
         .accessibilityLabel(readout.spoken(memoryMiB: memoryMiB, recovery: recovery))
     }
 
+    /// The titles are plain strings: the capsule says CPU, RAM, VRAM and FPS
+    /// in every language.
     private func metric(_ title: String, _ value: String) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             Text(title)
@@ -252,6 +254,8 @@ struct Sparkline: View {
             }
             .frame(maxHeight: .infinity, alignment: .bottom)
         }
+        // The figure beside it says the reading.
+        .accessibilityHidden(true)
     }
 }
 

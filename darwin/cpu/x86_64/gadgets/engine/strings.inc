@@ -43,8 +43,7 @@ Lx86_string_destination_64\@:
 
 .macro string_load width, load, host_register, address, destination
 	mov x7, x\address
-	page_cross_check (\width / 8), Lx86_string_load_cross\@
-	translate 0, UML_X86_64_TLB_READ_PAGE, (\width / 8)
+	translate 0, UML_X86_64_TLB_READ_PAGE, (\width / 8), cross=Lx86_string_load_cross\@
 	\load \host_register\()\destination, [x7]
 	b Lx86_string_load_done\@
 Lx86_string_load_cross\@:
@@ -59,8 +58,7 @@ Lx86_string_load_done\@:
 
 .macro string_store width, store, host_register
 	mov x7, x26
-	page_cross_check (\width / 8), Lx86_string_store_cross\@
-	translate 1, UML_X86_64_TLB_WRITE_PAGE, (\width / 8)
+	translate 1, UML_X86_64_TLB_WRITE_PAGE, (\width / 8), cross=Lx86_string_store_cross\@
 	\store \host_register\()27, [x7]
 	b Lx86_string_store_done\@
 Lx86_string_store_cross\@:

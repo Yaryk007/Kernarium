@@ -38,17 +38,21 @@ public:
 
 class JitMapping final {
 public:
+	/* `guest_code` is the argument of the map call: 1 for guest code, 3 when
+	 * the kernel also declares the page immutable. */
 	JitMapping(unsigned long generation, std::uint64_t base,
 		   const ::uml::testing::ScratchBacking &backing,
 		   std::size_t pages,
-		   int protection = PROT_READ | PROT_WRITE | PROT_EXEC)
+		   int protection = PROT_READ | PROT_WRITE | PROT_EXEC,
+		   int guest_code = 1)
 		: generation_{generation}
 		, protection_{protection}
+		, guest_code_{guest_code}
 	{
 		require(darwin_uml_static_vm_activate(generation) == 0);
 		require(darwin_uml_static_vm_map(
 			reinterpret_cast<void *>(base), backing.descriptor(), 0,
-			pages * DARWIN_UML_GUEST_PAGE_SIZE, protection, 1,
+			pages * DARWIN_UML_GUEST_PAGE_SIZE, protection, guest_code,
 			(protection & PROT_WRITE) != 0) == 0);
 	}
 
@@ -59,7 +63,7 @@ public:
 	{
 		require(darwin_uml_static_vm_map(
 			reinterpret_cast<void *>(address), backing.descriptor(), 0,
-			DARWIN_UML_GUEST_PAGE_SIZE, protection_, 1,
+			DARWIN_UML_GUEST_PAGE_SIZE, protection_, guest_code_,
 			(protection_ & PROT_WRITE) != 0) == 0);
 	}
 
@@ -74,6 +78,7 @@ public:
 private:
 	unsigned long generation_;
 	int protection_;
+	int guest_code_;
 };
 
 /* `pages` guest pages of `backing` at `address` in one generation, unmapped
@@ -90,6 +95,22 @@ public:
 		require(darwin_uml_static_vm_map_generation(generation_,
 			reinterpret_cast<void *>(address_), backing.descriptor(),
 			0, length_, protection, code ? 1 : 0, code ? 0 : 1) == 0);
+	}
+
+	/* The same with the map call's `guest_code` as the caller spells it (1
+	 * for guest code, 3 when the kernel also calls the page immutable) and
+	 * the mapping not guest-writable. */
+	GenerationMapping(unsigned long generation, std::uint64_t address,
+		const ::uml::testing::ScratchBacking &backing,
+		std::size_t pages, int protection, int guest_code,
+		bool guest_writable)
+		: generation_{generation}, address_{address},
+		  length_{pages * DARWIN_UML_GUEST_PAGE_SIZE}
+	{
+		require(darwin_uml_static_vm_map_generation(generation_,
+			reinterpret_cast<void *>(address_), backing.descriptor(),
+			0, length_, protection, guest_code,
+			guest_writable ? 1 : 0) == 0);
 	}
 
 	~GenerationMapping()

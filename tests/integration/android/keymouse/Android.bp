@@ -1,0 +1,15 @@
+// SPDX-License-Identifier: Apache-2.0
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+// Foreground client for the candidate image's hardware keyboard and mouse
+// checks: it logs the input devices, keys, pointer events and pointer capture
+// it sees.
+android_app {
+    name: "AndariumKeyMouseProbe",
+    manifest: "app/AndroidManifest.xml",
+    srcs: ["app/src/**/*.java"],
+    sdk_version: "current",
+    optimize: { enabled: false },
+}

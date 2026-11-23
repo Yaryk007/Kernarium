@@ -1,0 +1,4335 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 07:00:01 +0000
+Subject: [PATCH] take cameras, frames, stills and RAW from V4L2 camera nodes
+
+A device whose cameras are the V4L2 nodes of the host's camera device (ro.vendor.camera.config=v4l2)
+gets its camera list, its characteristics, its frames and its controls from those nodes. Each camera
+has a capture node and a metadata node. The capture node's description control and its ENUM_FMT,
+ENUM_FRAMESIZES and ENUM_FRAMEINTERVALS calls say what the camera is and which sizes and rates it
+runs; the HAL turns them into LIMITED static metadata on a template (emu_camera_v4l2.json, the
+emulated back camera without the features this device does not offer), with the capabilities the
+description earns: MANUAL_SENSOR and READ_SENSOR_SETTINGS for a single lens and RAW once calibrated.
+A camera that states RAW also states the lens shading map modes OFF and ON, as the device info
+requires of every RAW capable camera (the template's OFF alone made it reject a calibrated lens at
+boot, and the camera was gone from the list), the hot pixel map modes OFF and ON with the map among
+its result keys, and that its RAW data has no lens shading correction applied
+(android.sensor.info.lensShadingApplied FALSE: the host copies the platform's Bayer pixels and the
+HAL's shading map is all ones). A result for the hot pixel map mode ON carries an empty map, since
+the host hands over no list of defective pixels. A camera without RAW keeps the template's values.
+BURST_CAPTURE is never declared, because the host cannot meet its conditions, and the maximum latency
+is unknown.
+
+The sizes are the host's own plus the ones the camera API requires of every camera (1920x1080,
+1280x720, 640x480 and 320x240 as JPEG, those that fit the largest video size as YUV and PRIVATE, and
+1920x1440 with 1280x720 beside them for a camera that reaches that size). A size the host does not
+serve is cut from the smallest native NV12 mode that covers it, scaled with libyuv and, for a JPEG,
+encoded by the HAL's own compressor with the Exif data of the stock sensor. The Exif thumbnail of
+such a picture is cropped to its aspect ratio before it is scaled, never stretched.
+
+The frame source queues the framework's gralloc buffer as a dma-buf where the node can import it
+(its chroma may start where the node's image puts it, padding included) and copies from the node's
+own buffer where it cannot, with the reason logged once per stream. It writes the request's controls
+before the first frame, and a control is retired only when the node says it does not exist, never for
+a refused value. A request has one deadline; a wait that ends without its buffer takes the stream's
+buffers back, so the rest of the request fails at once and a late frame cannot land in memory the
+framework has reused. The exposure's values (exposure, gain, white balance, focus, 3A states, the
+neutral color point and the noise profile of a RAW) come from the metadata node's record, matched by
+sequence.
+
+Each video output of a request has its own host stream, so that one exposure fills a preview and a
+recording of one size (on one stream they took an exposure each, which halved the frame rate), and
+the stream of an output that stays configured but leaves the requests (a recording that stopped)
+closes after half a second and two requests that took no still, so that the platform's restart for
+the largest open size comes then; an output that leaves the configuration closes with the
+reconfiguration, which makes a new frame source. A request that takes a still counts for nothing:
+a still holds the pipeline for as long as the host takes to make the picture, and the requests of
+the preview wait behind it, behind one still or a queue of them, so that preview keeps its stream
+and the host its capture session; the absences that a video output earned before such a request
+start again from zero at it, so that a queue of mixed captures (two YUV, then two JPEG) does not
+close the preview that waits behind it; a stream that the request about to begin uses is never closed
+(camera_streams.hpp). With auto-exposure on, the camera runs at the top of the requested frame rate
+range, not at its midpoint. A JPEG made here from a frame that the device made black (blocked,
+interrupted, resuming) fails, as a native still does. The Exif exposure time and aperture are
+written only for a positive, finite value. The Exif focal length in 35 mm film follows from the
+camera's stated focal length and physical sensor size, which the host's description states as a
+pair (the field of view's own equivalent): the V4L2 frame source hands them to the Exif writer, a
+camera whose description states none gets no tag, and the template's default size does not pass for
+a stated one; the sensor characteristics take both from the static metadata for any other camera.
+
+Stills are encoded by the host with a gap for the Exif data: the HAL builds the Exif data and a
+thumbnail from the result and writes them into the gap in place, then the blob header at the end of
+the buffer. RAW16 is copied from the still node. Discovery opens only /dev/video10 and above, where
+the driver registers the camera's nodes; the codec nodes are below.
+
+The source reports a request whose outputs all failed (the host refused them, or the deadline
+passed) as failed as a whole, by the rules of camera_request.hpp, which also holds the request's
+deadline: 3 seconds, or 15 with a still (the host gives a started still 10 and the rest of its group
+2 more).
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ devices/EmulatedCamera/hwl/Android.bp         |    8 +
+ devices/EmulatedCamera/hwl/ConfigUtils.cpp    |    6 +
+ devices/EmulatedCamera/hwl/ConfigUtils.h      |    5 +
+ devices/EmulatedCamera/hwl/EmulatedSensor.cpp |   24 +
+ devices/EmulatedCamera/hwl/JpegCompressor.cpp |   22 +-
+ devices/EmulatedCamera/hwl/JpegCompressor.h   |   30 +-
+ .../hwl/SensorCharacteristics.h               |    8 +-
+ .../hwl/V4l2Characteristics.cpp               |  445 ++++++++
+ .../EmulatedCamera/hwl/V4l2Characteristics.h  |   37 +
+ .../EmulatedCamera/hwl/V4l2FrameSource.cpp    | 1011 +++++++++++++++++
+ devices/EmulatedCamera/hwl/V4l2FrameSource.h  |  180 +++
+ devices/EmulatedCamera/hwl/V4l2Stream.cpp     |  468 ++++++++
+ devices/EmulatedCamera/hwl/V4l2Stream.h       |  179 +++
+ devices/EmulatedCamera/hwl/V4l2Thumbnail.cpp  |  180 +++
+ devices/EmulatedCamera/hwl/V4l2Thumbnail.h    |   36 +
+ devices/EmulatedCamera/hwl/V4l2Utils.cpp      |  479 ++++++++
+ devices/EmulatedCamera/hwl/V4l2Utils.h        |  154 +++
+ devices/EmulatedCamera/hwl/configs/Android.bp |    6 +
+ .../hwl/configs/emu_camera_v4l2.json          |  592 ++++++++++
+ .../EmulatedCamera/hwl/utils/ExifUtils.cpp    |   44 +-
+ devices/EmulatedCamera/hwl/utils/HWLUtils.cpp |   26 +
+ 21 files changed, 3907 insertions(+), 33 deletions(-)
+ create mode 100644 devices/EmulatedCamera/hwl/V4l2Characteristics.cpp
+ create mode 100644 devices/EmulatedCamera/hwl/V4l2Characteristics.h
+ create mode 100644 devices/EmulatedCamera/hwl/V4l2FrameSource.cpp
+ create mode 100644 devices/EmulatedCamera/hwl/V4l2FrameSource.h
+ create mode 100644 devices/EmulatedCamera/hwl/V4l2Stream.cpp
+ create mode 100644 devices/EmulatedCamera/hwl/V4l2Stream.h
+ create mode 100644 devices/EmulatedCamera/hwl/V4l2Thumbnail.cpp
+ create mode 100644 devices/EmulatedCamera/hwl/V4l2Thumbnail.h
+ create mode 100644 devices/EmulatedCamera/hwl/V4l2Utils.cpp
+ create mode 100644 devices/EmulatedCamera/hwl/V4l2Utils.h
+ create mode 100644 devices/EmulatedCamera/hwl/configs/emu_camera_v4l2.json
+
+diff --git a/devices/EmulatedCamera/hwl/Android.bp b/devices/EmulatedCamera/hwl/Android.bp
+index 15127af8299f24d4c1ec2beadabfb99d1afbf8a3..b69372c79439d1268ab9928451331cd49870981c 100644
+--- a/devices/EmulatedCamera/hwl/Android.bp
++++ b/devices/EmulatedCamera/hwl/Android.bp
+@@ -40,6 +40,11 @@ cc_defaults {
+         "EmulatedRequestState.cpp",
+         "EmulatedTorchState.cpp",
+         "GrallocSensorBuffer.cpp",
++        "V4l2Characteristics.cpp",
++        "V4l2FrameSource.cpp",
++        "V4l2Stream.cpp",
++        "V4l2Thumbnail.cpp",
++        "V4l2Utils.cpp",
+         "VideoFrameSource.cpp",
+     ],
+     cflags: [
+@@ -81,6 +86,8 @@ cc_defaults {
+     ],
+     include_dirs: [
+         "system/media/private/camera/include",
++        // The camera device's wire and the rules the HAL applies to it.
++        "device/kernarium/andarium/camera/hal",
+     ],
+     header_libs: [
+         "libgooglecamerahal_headers",
+@@ -145,6 +152,7 @@ cc_library_static {
+         "hardware/google/camera/common/hal/common",
+         "hardware/google/camera/common/hal/hwl_interface",
+         "hardware/google/camera/common/hal/utils",
++        "device/kernarium/andarium/camera/hal",
+     ],
+ 
+     export_include_dirs: ["."],
+diff --git a/devices/EmulatedCamera/hwl/ConfigUtils.cpp b/devices/EmulatedCamera/hwl/ConfigUtils.cpp
+index 32ff153c42da34d6fa1b9c83a2b25d43943d0356..48441d9b1cd9851fa2e0c1477751fba834238e7b 100644
+--- a/devices/EmulatedCamera/hwl/ConfigUtils.cpp
++++ b/devices/EmulatedCamera/hwl/ConfigUtils.cpp
+@@ -30,6 +30,7 @@
+ 
+ #include "EmulatedSensor.h"
+ #include "SensorCharacteristics.h"
++#include "V4l2Characteristics.h"
+ #include "utils/HWLUtils.h"
+ #include "vendor_tag_defs.h"
+ 
+@@ -479,6 +480,11 @@ status_t GetCameraConfigurations(std::vector<CameraConfiguration>* configs) {
+   }
+ 
+   char prop[PROPERTY_VALUE_MAX];
++  // A device whose cameras are the V4L2 nodes of the camera device.
++  property_get("ro.vendor.camera.config", prop, nullptr);
++  if (strcmp(prop, "v4l2") == 0) {
++    return GetV4l2CameraConfigurations(config_dir, configs);
++  }
+ #ifdef USE_EMULATED_CAMERA2_HAL_AUTO
+   bool is_automotive = true;
+ #else
+diff --git a/devices/EmulatedCamera/hwl/ConfigUtils.h b/devices/EmulatedCamera/hwl/ConfigUtils.h
+index 751b8494c9212015282e821993dbd9a33ecd9e52..a0e21aa0a0c44de02230c3365c4b5a155cdd73f0 100644
+--- a/devices/EmulatedCamera/hwl/ConfigUtils.h
++++ b/devices/EmulatedCamera/hwl/ConfigUtils.h
+@@ -44,6 +44,11 @@ struct CameraConfiguration {
+ 
+ status_t GetCameraConfigurations(std::vector<CameraConfiguration>* configs);
+ 
++// Builds a camera's static metadata from the JSON of a characteristics file and
++// checks that the sensor it describes is one the HAL supports.
++status_t ParseCharacteristics(const Json::Value& value,
++                              CameraConfiguration* config);
++
+ }  // namespace android
+ 
+ #endif  // EMULATOR_CAMERA_HAL_HWL_CONFIG_UTILS_H
+diff --git a/devices/EmulatedCamera/hwl/EmulatedSensor.cpp b/devices/EmulatedCamera/hwl/EmulatedSensor.cpp
+index 2e4b787abd8180e8db0772dcb2811cd40055a16f..8ab54a26637656a9e9639734b7b8937a9decb426 100644
+--- a/devices/EmulatedCamera/hwl/EmulatedSensor.cpp
++++ b/devices/EmulatedCamera/hwl/EmulatedSensor.cpp
+@@ -39,6 +39,7 @@
+ #include "ColorBarFrameSource.h"
+ #include "EmulatedFrameSource.h"
+ #include "EmulatedSensor.h"
++#include "V4l2FrameSource.h"
+ #include "VideoFrameSource.h"
+ #include "utils/ExifUtils.h"
+ #include "utils/HWLUtils.h"
+@@ -48,6 +49,7 @@ namespace android {
+ using android::google_camera_hal::ErrorCode;
+ using framesource::ColorBarFrameSource;
+ using framesource::EmulatedFrameSource;
++using framesource::V4l2FrameSource;
+ using framesource::VideoFrameSource;
+ using google_camera_hal::ErrorMessage;
+ using google_camera_hal::HalCameraMetadata;
+@@ -594,6 +596,14 @@ status_t EmulatedSensor::StartUp(
+       return res;
+     }
+     frame_source_ = std::move(source);
++  } else if (source_config.type == "v4l2") {
++    auto source = V4l2FrameSource::Create(*chars_, logical_camera_id);
++    if (source == nullptr) {
++      ALOGE("%s: No camera device for camera id: %u", __FUNCTION__,
++            logical_camera_id);
++      return NO_INIT;
++    }
++    frame_source_ = std::move(source);
+   } else {
+     frame_source_ =
+         std::make_unique<EmulatedFrameSource>(*chars_, logical_camera_id);
+@@ -1129,6 +1139,20 @@ void EmulatedSensor::ReturnResults(
+                                      lens_shading_map.size());
+       }
+     }
++    if (device_chars->second.hot_pixel_map_supported) {
++      camera_metadata_ro_entry_t hot_pixel_map_mode;
++      if ((result->result_metadata->Get(ANDROID_STATISTICS_HOT_PIXEL_MAP_MODE,
++                                        &hot_pixel_map_mode) == OK) &&
++          (hot_pixel_map_mode.count == 1) &&
++          (hot_pixel_map_mode.data.u8[0] ==
++           ANDROID_STATISTICS_HOT_PIXEL_MAP_MODE_ON)) {
++        // The host's Bayer data comes with no list of defective pixels, so the
++        // map is empty: no hot pixel is known, which is a valid map.
++        const int32_t no_hot_pixels[2] = {0, 0};
++        result->result_metadata->Set(ANDROID_STATISTICS_HOT_PIXEL_MAP,
++                                     no_hot_pixels, 0);
++      }
++    }
+     if (logical_settings->second.report_video_stab) {
+       result->result_metadata->Set(ANDROID_CONTROL_VIDEO_STABILIZATION_MODE,
+                                    &logical_settings->second.video_stab, 1);
+diff --git a/devices/EmulatedCamera/hwl/JpegCompressor.cpp b/devices/EmulatedCamera/hwl/JpegCompressor.cpp
+index b47228fea019810cb2803cf74c1eb5a148aa3838..5c33e8d1e64d9b9275f938a95fe6b4786b0a49d1 100644
+--- a/devices/EmulatedCamera/hwl/JpegCompressor.cpp
++++ b/devices/EmulatedCamera/hwl/JpegCompressor.cpp
+@@ -159,7 +159,10 @@ static constexpr uint8_t kIccProfileSrgb[] = {
+     0x00, 0x03, 0x00, 0x00, 0x00, 0x02, 0x66, 0x69, 0x00, 0x00, 0xf2, 0xa7,
+     0x00, 0x00, 0x0d, 0x59, 0x00, 0x00, 0x13, 0xd0, 0x00, 0x00, 0x0a, 0x5b};
+ 
+-JpegCompressor::JpegCompressor() {
++JpegCompressor::JpegCompressor() : JpegCompressor(true) {
++}
++
++JpegCompressor::JpegCompressor(bool start_thread) {
+   ATRACE_CALL();
+   char value[PROPERTY_VALUE_MAX];
+   if (property_get("ro.product.manufacturer", value, "unknown") <= 0) {
+@@ -172,7 +175,15 @@ JpegCompressor::JpegCompressor() {
+   }
+   exif_model_ = std::string(value);
+ 
+-  jpeg_processing_thread_ = std::thread([this] { this->ThreadLoop(); });
++  if (start_thread) {
++    jpeg_processing_thread_ = std::thread([this] { this->ThreadLoop(); });
++  }
++}
++
++size_t JpegCompressor::EncodeYUV420(const YUV420Frame& frame) {
++  // An encoder without a thread: it only carries the libjpeg state of one encode.
++  JpegCompressor encoder(/*start_thread=*/false);
++  return encoder.CompressYUV420Frame(frame);
+ }
+ 
+ JpegCompressor::~JpegCompressor() {
+@@ -181,7 +192,9 @@ JpegCompressor::~JpegCompressor() {
+   // Abort the ongoing compression and flush any pending jobs
+   jpeg_done_ = true;
+   condition_.notify_one();
+-  jpeg_processing_thread_.join();
++  if (jpeg_processing_thread_.joinable()) {
++    jpeg_processing_thread_.join();
++  }
+   while (!pending_yuv_jobs_.empty()) {
+     auto job = std::move(pending_yuv_jobs_.front());
+     job->output->stream_buffer.status = BufferStatus::kError;
+@@ -467,6 +480,9 @@ size_t JpegCompressor::CompressYUV420Frame(YUV420Frame frame) {
+   if (CheckError("Error configuring color space")) {
+     return 0;
+   }
++  if (frame.quality > 0) {
++    jpeg_set_quality(cinfo.get(), std::min(frame.quality, 100), TRUE);
++  }
+ 
+   cinfo->raw_data_in = 1;
+   // YUV420 planar with chroma subsampling
+diff --git a/devices/EmulatedCamera/hwl/JpegCompressor.h b/devices/EmulatedCamera/hwl/JpegCompressor.h
+index e836ca6a27cbb96c662db51f6993a2866463416c..8d0eb5ecd5ab93acfbd31035563ff846c9518906 100644
+--- a/devices/EmulatedCamera/hwl/JpegCompressor.h
++++ b/devices/EmulatedCamera/hwl/JpegCompressor.h
+@@ -71,7 +71,27 @@ class JpegCompressor {
+ 
+   status_t QueueYUV420(std::unique_ptr<JpegYUV420Job> job);
+ 
++  // A planar YUV 4:2:0 frame to encode, and the Exif segment to place before it.
++  struct YUV420Frame {
++    uint8_t* output_buffer;
++    size_t output_buffer_size;
++    YCbCrPlanes yuv_planes;
++    size_t width;
++    size_t height;
++    const uint8_t* app1_buffer;
++    size_t app1_buffer_size;
++    int32_t color_space;
++    // The libjpeg quality (1 to 100); 0 leaves the library's default.
++    int quality = 0;
++  };
++
++  // Encodes a frame at once, on the calling thread (a source that scales its
++  // own frames uses it). Returns the size of the JPEG, or 0.
++  static size_t EncodeYUV420(const YUV420Frame& frame);
++
+  private:
++  explicit JpegCompressor(bool start_thread);
++
+   std::mutex mutex_;
+   std::condition_variable condition_;
+   std::atomic_bool jpeg_done_ = false;
+@@ -82,16 +102,6 @@ class JpegCompressor {
+   j_common_ptr jpeg_error_info_;
+   bool CheckError(const char* msg);
+   void CompressYUV420(std::unique_ptr<JpegYUV420Job> job);
+-  struct YUV420Frame {
+-    uint8_t* output_buffer;
+-    size_t output_buffer_size;
+-    YCbCrPlanes yuv_planes;
+-    size_t width;
+-    size_t height;
+-    const uint8_t* app1_buffer;
+-    size_t app1_buffer_size;
+-    int32_t color_space;
+-  };
+   size_t CompressYUV420Frame(YUV420Frame frame);
+   size_t JpegRCompressYUV420Frame(YUV420Frame p010_frame);
+   void ThreadLoop();
+diff --git a/devices/EmulatedCamera/hwl/SensorCharacteristics.h b/devices/EmulatedCamera/hwl/SensorCharacteristics.h
+index 355cee16c72667a672d317596d56e165bfb99a9a..85638d6bb5ef28e5db068a2520be2c42a954c95f 100644
+--- a/devices/EmulatedCamera/hwl/SensorCharacteristics.h
++++ b/devices/EmulatedCamera/hwl/SensorCharacteristics.h
+@@ -99,9 +99,15 @@ struct SensorCharacteristics {
+   uint32_t max_processed_streams = 0;
+   uint32_t max_stalling_streams = 0;
+   uint32_t max_input_streams = 0;
+-  uint32_t physical_size[2] = {0};
++  // The camera's physical sensor size and focal length, in millimetres: the
++  // stated pair that the field of view follows from (zero where none is
++  // stated). The Exif focal length in 35 mm film is computed from them.
++  float physical_size[2] = {0.f, 0.f};
++  float focal_length = 0.f;
+   bool is_flash_supported = false;
+   uint32_t lens_shading_map_size[2] = {0};
++  // The camera states the hot pixel map mode ON: a result of a request for the map carries one.
++  bool hot_pixel_map_supported = false;
+   uint32_t max_pipeline_depth = 0;
+   uint32_t orientation = 0;
+   bool is_front_facing = false;
+diff --git a/devices/EmulatedCamera/hwl/V4l2Characteristics.cpp b/devices/EmulatedCamera/hwl/V4l2Characteristics.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..f4237ca777f78b4078eb9de9c868072a84daafec
+--- /dev/null
++++ b/devices/EmulatedCamera/hwl/V4l2Characteristics.cpp
+@@ -0,0 +1,445 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#define LOG_TAG "V4l2Characteristics"
++#include "V4l2Characteristics.h"
++
++#include <android-base/file.h>
++#include <json/json.h>
++#include <log/log.h>
++#include <system/camera_metadata.h>
++
++#include <algorithm>
++#include <cmath>
++#include <map>
++#include <memory>
++#include <set>
++#include <span>
++#include <vector>
++
++#include "EmulatedSensor.h"
++#include "SensorCharacteristics.h"
++#include "V4l2Utils.h"
++#include "camera_ids.hpp"
++#include "camera_plan.hpp"
++#include "utils/HWLUtils.h"
++
++namespace android {
++
++namespace {
++
++namespace abi = andarium::camera::abi;
++namespace plan = andarium::camera;
++
++constexpr char kTemplateFile[] = "emu_camera_v4l2.json";
++
++template <typename T>
++status_t Put(HalCameraMetadata* metadata, uint32_t tag, const std::vector<T>& values) {
++  return metadata->Set(tag, values.data(), static_cast<uint32_t>(values.size()));
++}
++
++template <typename T>
++status_t PutOne(HalCameraMetadata* metadata, uint32_t tag, T value) {
++  return metadata->Set(tag, &value, 1);
++}
++
++// The int32 list `list_tag` (request, result or characteristics keys) without
++// `remove`, and with `add`.
++void EditKeyList(HalCameraMetadata* metadata, uint32_t list_tag,
++                 const std::set<int32_t>& remove, const std::set<int32_t>& add) {
++  camera_metadata_ro_entry_t entry;
++  if (metadata->Get(list_tag, &entry) != OK) {
++    return;
++  }
++  std::vector<int32_t> keys;
++  for (size_t i = 0; i < entry.count; ++i) {
++    if (remove.count(entry.data.i32[i]) == 0) {
++      keys.push_back(entry.data.i32[i]);
++    }
++  }
++  for (int32_t tag : add) {
++    if (std::find(keys.begin(), keys.end(), tag) == keys.end()) {
++      keys.push_back(tag);
++    }
++  }
++  Put(metadata, list_tag, keys);
++}
++
++void RemoveCharacteristic(HalCameraMetadata* metadata, uint32_t tag) {
++  metadata->Erase(tag);
++  EditKeyList(metadata, ANDROID_REQUEST_AVAILABLE_CHARACTERISTICS_KEYS,
++              {static_cast<int32_t>(tag)}, {});
++}
++
++void AddCharacteristic(HalCameraMetadata* metadata, uint32_t tag) {
++  EditKeyList(metadata, ANDROID_REQUEST_AVAILABLE_CHARACTERISTICS_KEYS, {},
++              {static_cast<int32_t>(tag)});
++}
++
++// Where camera_plan.hpp's state_raw_metadata writes: the camera's static metadata. The plan has no Android
++// headers and names the tags and values by number.
++class MetadataSink {
++ public:
++  explicit MetadataSink(HalCameraMetadata* metadata) : metadata_(metadata) {}
++
++  void put_bytes(int32_t tag, std::span<const uint8_t> values) {
++    Put(metadata_, static_cast<uint32_t>(tag), std::vector<uint8_t>(values.begin(), values.end()));
++  }
++  void list_characteristic(int32_t tag) { AddCharacteristic(metadata_, static_cast<uint32_t>(tag)); }
++  void list_result(int32_t tag) {
++    EditKeyList(metadata_, ANDROID_REQUEST_AVAILABLE_RESULT_KEYS, {}, {tag});
++  }
++
++ private:
++  HalCameraMetadata* metadata_;
++};
++
++static_assert(plan::tag::sensor_info_lens_shading_applied == ANDROID_SENSOR_INFO_LENS_SHADING_APPLIED);
++static_assert(plan::tag::statistics_hot_pixel_map == ANDROID_STATISTICS_HOT_PIXEL_MAP);
++static_assert(plan::tag::statistics_hot_pixel_map_mode == ANDROID_STATISTICS_HOT_PIXEL_MAP_MODE);
++static_assert(plan::tag::statistics_lens_shading_map == ANDROID_STATISTICS_LENS_SHADING_MAP);
++static_assert(plan::tag::statistics_lens_shading_map_mode == ANDROID_STATISTICS_LENS_SHADING_MAP_MODE);
++static_assert(plan::tag::statistics_info_available_hot_pixel_map_modes ==
++              ANDROID_STATISTICS_INFO_AVAILABLE_HOT_PIXEL_MAP_MODES);
++static_assert(plan::tag::statistics_info_available_lens_shading_map_modes ==
++              ANDROID_STATISTICS_INFO_AVAILABLE_LENS_SHADING_MAP_MODES);
++static_assert(plan::map_mode::off == static_cast<int>(ANDROID_STATISTICS_LENS_SHADING_MAP_MODE_OFF) &&
++              plan::map_mode::on == static_cast<int>(ANDROID_STATISTICS_LENS_SHADING_MAP_MODE_ON) &&
++              plan::map_mode::off == static_cast<int>(ANDROID_STATISTICS_HOT_PIXEL_MAP_MODE_OFF) &&
++              plan::map_mode::on == static_cast<int>(ANDROID_STATISTICS_HOT_PIXEL_MAP_MODE_ON));
++static_assert(plan::lens_shading_applied_false == static_cast<int>(ANDROID_SENSOR_INFO_LENS_SHADING_APPLIED_FALSE) &&
++              plan::lens_shading_applied_true == static_cast<int>(ANDROID_SENSOR_INFO_LENS_SHADING_APPLIED_TRUE));
++
++camera_metadata_rational_t Rational(int32_t q16) {
++  return {q16, 65536};
++}
++
++std::vector<camera_metadata_rational_t> Matrix(const int32_t (&q16)[9]) {
++  std::vector<camera_metadata_rational_t> matrix;
++  for (int32_t value : q16) {
++    matrix.push_back(Rational(value));
++  }
++  return matrix;
++}
++
++bool IsZero(const int32_t (&matrix)[9]) {
++  return std::all_of(std::begin(matrix), std::end(matrix),
++                     [](int32_t value) { return value == 0; });
++}
++
++uint8_t IlluminantOf(uint32_t value) {
++  return value == 0 ? ANDROID_SENSOR_REFERENCE_ILLUMINANT1_D65 : static_cast<uint8_t>(value);
++}
++
++// Makes the characteristics of the template the camera's own: what its
++// description and formats say, and the keys that depend on it. The template is
++// a single-lens back camera of the emulated HAL without the features that the
++// camera device does not offer.
++status_t Specialize(const v4l2cam::CameraNodes& nodes, HalCameraMetadata* m) {
++  const abi::Desc& desc = nodes.desc;
++  const plan::Formats& formats = nodes.formats;
++  if (formats.video.empty()) {
++    ALOGE("%s: camera %u offers no video size", __FUNCTION__, nodes.camera_index);
++    return BAD_VALUE;
++  }
++  const plan::Capabilities caps = plan::capabilities_of(desc, formats);
++  const plan::Size array = plan::array_size(desc, caps);
++  if (array.width == 0 || array.height == 0) {
++    ALOGE("%s: camera %u has no pixel array", __FUNCTION__, nodes.camera_index);
++    return BAD_VALUE;
++  }
++  const bool raw = caps.raw && desc.white_level > desc.black_level && desc.white_level > 0;
++  const bool has_flash = (desc.flags & (abi::feature::flash | abi::feature::torch)) != 0;
++  const bool has_af = (desc.flags & abi::feature::autofocus) != 0;
++  const bool manual_wb = caps.manual_sensor && (desc.flags & abi::feature::manual_white_balance) != 0;
++
++  // Identity and level.
++  PutOne<uint8_t>(m, ANDROID_LENS_FACING,
++                  desc.facing == abi::facing::front ? ANDROID_LENS_FACING_FRONT
++                                                    : ANDROID_LENS_FACING_BACK);
++  PutOne<int32_t>(m, ANDROID_SENSOR_ORIENTATION, static_cast<int32_t>(desc.sensor_orientation % 360));
++  PutOne<uint8_t>(m, ANDROID_INFO_SUPPORTED_HARDWARE_LEVEL, ANDROID_INFO_SUPPORTED_HARDWARE_LEVEL_LIMITED);
++  PutOne<uint8_t>(m, ANDROID_SENSOR_INFO_TIMESTAMP_SOURCE, ANDROID_SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME);
++  // The camera device applies a request some frames after it is submitted, so the HAL cannot say how many.
++  PutOne<int32_t>(m, ANDROID_SYNC_MAX_LATENCY, ANDROID_SYNC_MAX_LATENCY_UNKNOWN);
++
++  std::vector<uint8_t> capabilities = {ANDROID_REQUEST_AVAILABLE_CAPABILITIES_BACKWARD_COMPATIBLE};
++  if (caps.manual_sensor) {
++    capabilities.push_back(ANDROID_REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR);
++    capabilities.push_back(ANDROID_REQUEST_AVAILABLE_CAPABILITIES_READ_SENSOR_SETTINGS);
++  }
++  if (raw) {
++    capabilities.push_back(ANDROID_REQUEST_AVAILABLE_CAPABILITIES_RAW);
++  }
++  // BURST_CAPTURE is never declared: the camera API wants a full-size YUV stream at 20 frames
++  // per second, a 15 ms stall per request and per-frame control, which the host cannot give
++  // (camera_plan.hpp, Capabilities).
++  Put(m, ANDROID_REQUEST_AVAILABLE_CAPABILITIES, capabilities);
++  PutOne<uint8_t>(m, ANDROID_REQUEST_PIPELINE_MAX_DEPTH,
++                  static_cast<uint8_t>(plan::pipeline_depth(formats)));
++  Put<int32_t>(m, ANDROID_REQUEST_MAX_NUM_OUTPUT_STREAMS, {raw ? 1 : 0, 3, 1});
++
++  // Sensor and optics.
++  Put<int32_t>(m, ANDROID_SENSOR_INFO_PIXEL_ARRAY_SIZE,
++               {static_cast<int32_t>(array.width), static_cast<int32_t>(array.height)});
++  const std::vector<int32_t> active = {0, 0, static_cast<int32_t>(array.width),
++                                       static_cast<int32_t>(array.height)};
++  Put(m, ANDROID_SENSOR_INFO_ACTIVE_ARRAY_SIZE, active);
++  Put(m, ANDROID_SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE, active);
++  if (desc.sensor_width_um != 0 && desc.sensor_height_um != 0) {
++    Put<float>(m, ANDROID_SENSOR_INFO_PHYSICAL_SIZE,
++               {static_cast<float>(desc.sensor_width_um) / 1000.0f,
++                static_cast<float>(desc.sensor_height_um) / 1000.0f});
++  }
++
++  const nsecs_t exposure_min = std::max<int64_t>(static_cast<int64_t>(desc.exposure_min_ns),
++                                                 EmulatedSensor::kSupportedExposureTimeRange[0]);
++  const nsecs_t exposure_max = std::min<int64_t>(static_cast<int64_t>(desc.exposure_max_ns),
++                                                 EmulatedSensor::kSupportedExposureTimeRange[1]);
++  if (exposure_max > exposure_min) {
++    Put<int64_t>(m, ANDROID_SENSOR_INFO_EXPOSURE_TIME_RANGE, {exposure_min, exposure_max});
++    PutOne<int64_t>(m, ANDROID_SENSOR_INFO_MAX_FRAME_DURATION,
++                    std::min<int64_t>(std::max<int64_t>(plan::max_frame_duration_ns(desc), exposure_max),
++                                      EmulatedSensor::kSupportedFrameDurationRange[1]));
++  }
++  Put<int32_t>(m, ANDROID_SENSOR_INFO_SENSITIVITY_RANGE,
++               {plan::sensitivity_min(desc), plan::sensitivity_max(desc)});
++  PutOne<int32_t>(m, ANDROID_SENSOR_MAX_ANALOG_SENSITIVITY, plan::sensitivity_max(desc));
++
++  PutOne<float>(m, ANDROID_LENS_INFO_MINIMUM_FOCUS_DISTANCE, plan::minimum_focus_dioptres(desc));
++  PutOne<float>(m, ANDROID_LENS_INFO_HYPERFOCAL_DISTANCE,
++                std::min(0.2f, plan::minimum_focus_dioptres(desc)));
++  if (desc.focal_length_um != 0) {
++    PutOne<float>(m, ANDROID_LENS_INFO_AVAILABLE_FOCAL_LENGTHS, plan::focal_length_mm(desc));
++  }
++  if (desc.aperture_x100 != 0) {
++    PutOne<float>(m, ANDROID_LENS_INFO_AVAILABLE_APERTURES, plan::aperture(desc));
++  }
++  PutOne<uint8_t>(m, ANDROID_LENS_INFO_FOCUS_DISTANCE_CALIBRATION,
++                  ANDROID_LENS_INFO_FOCUS_DISTANCE_CALIBRATION_UNCALIBRATED);
++  PutOne<uint8_t>(m, ANDROID_FLASH_INFO_AVAILABLE, has_flash ? 1 : 0);
++
++  // Zoom: a range, or none when the lens does not zoom.
++  const float zoom_min = desc.zoom_min_q16 != 0 ? plan::from_q16(desc.zoom_min_q16) : 1.0f;
++  const float zoom_max = desc.zoom_max_q16 != 0 ? plan::from_q16(desc.zoom_max_q16) : 1.0f;
++  PutOne<float>(m, ANDROID_SCALER_AVAILABLE_MAX_DIGITAL_ZOOM, std::max(zoom_max, 1.0f));
++  if (zoom_max > zoom_min) {
++    Put<float>(m, ANDROID_CONTROL_ZOOM_RATIO_RANGE, {zoom_min, zoom_max});
++    PutOne<float>(m, ANDROID_SCALER_AVAILABLE_MAX_DIGITAL_ZOOM, zoom_max);
++  } else {
++    RemoveCharacteristic(m, ANDROID_CONTROL_ZOOM_RATIO_RANGE);
++    EditKeyList(m, ANDROID_REQUEST_AVAILABLE_REQUEST_KEYS, {ANDROID_CONTROL_ZOOM_RATIO}, {});
++    EditKeyList(m, ANDROID_REQUEST_AVAILABLE_RESULT_KEYS, {ANDROID_CONTROL_ZOOM_RATIO}, {});
++  }
++
++  // 3A.
++  std::vector<uint8_t> ae_modes;
++  if (caps.manual_sensor) {
++    ae_modes.push_back(ANDROID_CONTROL_AE_MODE_OFF);
++  }
++  ae_modes.push_back(ANDROID_CONTROL_AE_MODE_ON);
++  if (has_flash) {
++    ae_modes.push_back(ANDROID_CONTROL_AE_MODE_ON_AUTO_FLASH);
++    ae_modes.push_back(ANDROID_CONTROL_AE_MODE_ON_ALWAYS_FLASH);
++  }
++  Put(m, ANDROID_CONTROL_AE_AVAILABLE_MODES, ae_modes);
++
++  // The presets are the ones the host offers (camera_controls.hpp, awb_preset), and only a
++  // camera with manual white balance has them.
++  std::vector<uint8_t> awb_modes;
++  if (manual_wb) {
++    awb_modes.push_back(ANDROID_CONTROL_AWB_MODE_OFF);
++  }
++  awb_modes.push_back(ANDROID_CONTROL_AWB_MODE_AUTO);
++  if ((desc.flags & abi::feature::manual_white_balance) != 0) {
++    awb_modes.insert(awb_modes.end(),
++                     {static_cast<uint8_t>(ANDROID_CONTROL_AWB_MODE_INCANDESCENT),
++                      static_cast<uint8_t>(ANDROID_CONTROL_AWB_MODE_FLUORESCENT),
++                      static_cast<uint8_t>(ANDROID_CONTROL_AWB_MODE_DAYLIGHT),
++                      static_cast<uint8_t>(ANDROID_CONTROL_AWB_MODE_CLOUDY_DAYLIGHT),
++                      static_cast<uint8_t>(ANDROID_CONTROL_AWB_MODE_SHADE)});
++  }
++  Put(m, ANDROID_CONTROL_AWB_AVAILABLE_MODES, awb_modes);
++
++  if (has_af) {
++    // AF OFF is always offered (CTS requires it of every LIMITED camera); on a camera without
++    // manual focus it holds the lens.
++    std::vector<uint8_t> af_modes = {static_cast<uint8_t>(ANDROID_CONTROL_AF_MODE_OFF),
++                                     static_cast<uint8_t>(ANDROID_CONTROL_AF_MODE_AUTO),
++                                     static_cast<uint8_t>(ANDROID_CONTROL_AF_MODE_MACRO),
++                                     static_cast<uint8_t>(ANDROID_CONTROL_AF_MODE_CONTINUOUS_VIDEO),
++                                     static_cast<uint8_t>(ANDROID_CONTROL_AF_MODE_CONTINUOUS_PICTURE)};
++    Put(m, ANDROID_CONTROL_AF_AVAILABLE_MODES, af_modes);
++  } else {
++    Put<uint8_t>(m, ANDROID_CONTROL_AF_AVAILABLE_MODES, {ANDROID_CONTROL_AF_MODE_OFF});
++  }
++  Put<int32_t>(m, ANDROID_CONTROL_MAX_REGIONS, {1, 0, has_af ? 1 : 0});
++
++  if (caps.manual_sensor) {
++    Put<uint8_t>(m, ANDROID_CONTROL_AVAILABLE_MODES,
++                 {ANDROID_CONTROL_MODE_OFF, ANDROID_CONTROL_MODE_AUTO,
++                  ANDROID_CONTROL_MODE_OFF_KEEP_STATE});
++  } else {
++    Put<uint8_t>(m, ANDROID_CONTROL_AVAILABLE_MODES, {ANDROID_CONTROL_MODE_AUTO});
++  }
++  Put(m, ANDROID_CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES, plan::fps_ranges(formats));
++
++  // Streams.
++  const plan::StreamTables tables = plan::stream_tables(formats, caps);
++  Put(m, ANDROID_SCALER_AVAILABLE_STREAM_CONFIGURATIONS, tables.configurations);
++  Put(m, ANDROID_SCALER_AVAILABLE_MIN_FRAME_DURATIONS, tables.min_frame_durations);
++  Put(m, ANDROID_SCALER_AVAILABLE_STALL_DURATIONS, tables.stall_durations);
++  Put(m, ANDROID_JPEG_AVAILABLE_THUMBNAIL_SIZES, plan::thumbnail_sizes());
++  PutOne<int32_t>(m, ANDROID_JPEG_MAX_SIZE, plan::jpeg_max_size(formats));
++
++  // RAW: the sensor's own numbers, or none of its keys.
++  if (raw) {
++    uint8_t arrangement = ANDROID_SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_RGGB;
++    switch (desc.bayer_order) {
++      case abi::bayer::grbg:
++        arrangement = ANDROID_SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_GRBG;
++        break;
++      case abi::bayer::gbrg:
++        arrangement = ANDROID_SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_GBRG;
++        break;
++      case abi::bayer::bggr:
++        arrangement = ANDROID_SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_BGGR;
++        break;
++      default:
++        break;
++    }
++    PutOne<uint8_t>(m, ANDROID_SENSOR_INFO_COLOR_FILTER_ARRANGEMENT, arrangement);
++    // The template, made for a camera without RAW, states OFF alone for the lens shading map and the hot pixel
++    // map and lists neither the hot pixel map nor the shading state: the device info rejects a RAW capable
++    // camera like that at boot, and the camera is then gone from the list (camera_plan.hpp,
++    // state_raw_metadata).
++    MetadataSink sink(m);
++    plan::state_raw_metadata(sink);
++    PutOne<int32_t>(m, ANDROID_SENSOR_INFO_WHITE_LEVEL, static_cast<int32_t>(desc.white_level));
++    const int32_t black = static_cast<int32_t>(desc.black_level);
++    Put<int32_t>(m, ANDROID_SENSOR_BLACK_LEVEL_PATTERN, {black, black, black, black});
++    PutOne<uint8_t>(m, ANDROID_SENSOR_REFERENCE_ILLUMINANT1, IlluminantOf(desc.reference_illuminant1));
++    if (!IsZero(desc.color_matrix1_q16)) {
++      Put(m, ANDROID_SENSOR_COLOR_TRANSFORM1, Matrix(desc.color_matrix1_q16));
++    }
++    if (!IsZero(desc.forward_matrix1_q16)) {
++      Put(m, ANDROID_SENSOR_FORWARD_MATRIX1, Matrix(desc.forward_matrix1_q16));
++    }
++    if (desc.reference_illuminant2 != 0 && !IsZero(desc.color_matrix2_q16) &&
++        !IsZero(desc.forward_matrix2_q16)) {
++      PutOne<uint8_t>(m, ANDROID_SENSOR_REFERENCE_ILLUMINANT2, IlluminantOf(desc.reference_illuminant2));
++      Put(m, ANDROID_SENSOR_COLOR_TRANSFORM2, Matrix(desc.color_matrix2_q16));
++      Put(m, ANDROID_SENSOR_FORWARD_MATRIX2, Matrix(desc.forward_matrix2_q16));
++      Put<camera_metadata_rational_t>(m, ANDROID_SENSOR_CALIBRATION_TRANSFORM2,
++                                      {{1, 1}, {0, 1}, {0, 1}, {0, 1}, {1, 1}, {0, 1}, {0, 1}, {0, 1}, {1, 1}});
++      for (uint32_t tag : {ANDROID_SENSOR_REFERENCE_ILLUMINANT2, ANDROID_SENSOR_COLOR_TRANSFORM2,
++                           ANDROID_SENSOR_FORWARD_MATRIX2, ANDROID_SENSOR_CALIBRATION_TRANSFORM2}) {
++        AddCharacteristic(m, tag);
++      }
++    }
++  } else {
++    for (uint32_t tag :
++         {ANDROID_SENSOR_INFO_WHITE_LEVEL, ANDROID_SENSOR_BLACK_LEVEL_PATTERN,
++          ANDROID_SENSOR_REFERENCE_ILLUMINANT1, ANDROID_SENSOR_CALIBRATION_TRANSFORM1,
++          ANDROID_SENSOR_COLOR_TRANSFORM1, ANDROID_SENSOR_FORWARD_MATRIX1,
++          ANDROID_CONTROL_POST_RAW_SENSITIVITY_BOOST_RANGE,
++          ANDROID_STATISTICS_INFO_AVAILABLE_HOT_PIXEL_MAP_MODES}) {
++      RemoveCharacteristic(m, tag);
++    }
++    const std::set<int32_t> raw_results = {ANDROID_SENSOR_NOISE_PROFILE, ANDROID_SENSOR_GREEN_SPLIT,
++                                           ANDROID_SENSOR_NEUTRAL_COLOR_POINT};
++    EditKeyList(m, ANDROID_REQUEST_AVAILABLE_RESULT_KEYS, raw_results, {});
++    EditKeyList(m, ANDROID_REQUEST_AVAILABLE_RESULT_KEYS, {ANDROID_CONTROL_POST_RAW_SENSITIVITY_BOOST}, {});
++    EditKeyList(m, ANDROID_REQUEST_AVAILABLE_REQUEST_KEYS, {ANDROID_CONTROL_POST_RAW_SENSITIVITY_BOOST}, {});
++  }
++  return OK;
++}
++
++// The characteristics of one camera, or nullptr.
++std::unique_ptr<HalCameraMetadata> Describe(const Json::Value& templ, const v4l2cam::CameraNodes& nodes) {
++  CameraConfiguration config;
++  if (ParseCharacteristics(templ, &config) != OK) {
++    ALOGE("%s: the template does not parse", __FUNCTION__);
++    return nullptr;
++  }
++  if (Specialize(nodes, config.characteristics.get()) != OK) {
++    return nullptr;
++  }
++  SensorCharacteristics sensor;
++  if (GetSensorCharacteristics(config.characteristics.get(), &sensor) != OK ||
++      !EmulatedSensor::AreCharacteristicsSupported(sensor)) {
++    ALOGE("%s: the sensor of camera %u is not supported", __FUNCTION__, nodes.camera_index);
++    return nullptr;
++  }
++  return std::move(config.characteristics);
++}
++
++}  // namespace
++
++status_t GetV4l2CameraConfigurations(const std::string& config_dir,
++                                     std::vector<CameraConfiguration>* configs) {
++  if (configs == nullptr) {
++    return BAD_VALUE;
++  }
++  configs->clear();
++
++  std::string content;
++  const std::string path = config_dir + kTemplateFile;
++  if (!android::base::ReadFileToString(path, &content)) {
++    ALOGE("%s: cannot read %s", __FUNCTION__, path.c_str());
++    return BAD_VALUE;
++  }
++  Json::CharReaderBuilder builder;
++  std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
++  Json::Value templ;
++  std::string error;
++  if (!reader->parse(content.data(), content.data() + content.size(), &templ, &error)) {
++    ALOGE("%s: cannot parse %s: %s", __FUNCTION__, path.c_str(), error.c_str());
++    return BAD_VALUE;
++  }
++
++  const std::vector<v4l2cam::CameraNodes> found = v4l2cam::DiscoverCameraNodes();
++  std::vector<plan::CameraKey> keys;
++  for (const auto& nodes : found) {
++    keys.push_back({nodes.camera_index, nodes.desc.facing, nodes.desc.lens});
++  }
++
++  std::map<uint32_t, v4l2cam::CameraNodes> registry;
++  for (const auto& assignment : plan::assign_ids(keys)) {
++    auto nodes = std::find_if(found.begin(), found.end(), [&](const v4l2cam::CameraNodes& candidate) {
++      return candidate.camera_index == assignment.index;
++    });
++    if (nodes == found.end()) {
++      continue;
++    }
++    auto characteristics = Describe(templ, *nodes);
++    if (characteristics == nullptr) {
++      ALOGE("%s: camera %u is left out", __FUNCTION__, assignment.index);
++      continue;
++    }
++    CameraConfiguration config;
++    config.id = assignment.id;
++    config.characteristics = std::move(characteristics);
++    config.source_config.type = "v4l2";
++    configs->push_back(std::move(config));
++    registry[assignment.id] = *nodes;
++    ALOGI("%s: camera %u of the host is camera %u", __FUNCTION__, assignment.index, assignment.id);
++  }
++  v4l2cam::CameraRegistry::Get().Replace(std::move(registry));
++  return OK;
++}
++
++}  // namespace android
+diff --git a/devices/EmulatedCamera/hwl/V4l2Characteristics.h b/devices/EmulatedCamera/hwl/V4l2Characteristics.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..413d37e1691516ce3b8346be27a98014c2db45b4
+--- /dev/null
++++ b/devices/EmulatedCamera/hwl/V4l2Characteristics.h
+@@ -0,0 +1,37 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef HW_EMULATOR_CAMERA_V4L2_CHARACTERISTICS_H
++#define HW_EMULATOR_CAMERA_V4L2_CHARACTERISTICS_H
++
++#include <string>
++#include <vector>
++
++#include "ConfigUtils.h"
++
++namespace android {
++
++// The cameras of a device whose cameras are the V4L2 nodes of the camera
++// device (ro.vendor.camera.config=v4l2). Each camera that the nodes present
++// gets the characteristics its description and formats earn, on the template
++// emu_camera_v4l2.json in `config_dir`, and a frame source that reads the
++// nodes. A host without cameras gives an empty list.
++status_t GetV4l2CameraConfigurations(const std::string& config_dir,
++                                     std::vector<CameraConfiguration>* configs);
++
++}  // namespace android
++
++#endif  // HW_EMULATOR_CAMERA_V4L2_CHARACTERISTICS_H
+diff --git a/devices/EmulatedCamera/hwl/V4l2FrameSource.cpp b/devices/EmulatedCamera/hwl/V4l2FrameSource.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..a8abb58cc4209beb6a2539b77019f402046b4831
+--- /dev/null
++++ b/devices/EmulatedCamera/hwl/V4l2FrameSource.cpp
+@@ -0,0 +1,1011 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#define LOG_TAG "V4l2FrameSource"
++#include "V4l2FrameSource.h"
++
++#include <cutils/properties.h>
++#include <fcntl.h>
++#include <libyuv.h>
++#include <log/log.h>
++#include <system/camera_metadata.h>
++#include <unistd.h>
++
++#include <algorithm>
++#include <cerrno>
++#include <cmath>
++#include <cstring>
++#include <span>
++#include <vector>
++
++#include "JpegCompressor.h"
++#include "V4l2Thumbnail.h"
++#include "camera_exif.hpp"
++#include "camera_streams.hpp"
++#include "utils/ExifUtils.h"
++
++namespace android {
++namespace framesource {
++
++namespace abi = andarium::camera::abi;
++namespace av = andarium::camera::android_value;
++using andarium::camera::ControlPlanner;
++using andarium::camera::Request;
++using v4l2cam::V4l2Stream;
++
++// The platform's values that the planner's tables repeat.
++static_assert(av::ae_off == ANDROID_CONTROL_AE_MODE_OFF);
++static_assert(av::ae_on == ANDROID_CONTROL_AE_MODE_ON);
++static_assert(av::ae_on_auto_flash == ANDROID_CONTROL_AE_MODE_ON_AUTO_FLASH);
++static_assert(av::ae_on_always_flash == ANDROID_CONTROL_AE_MODE_ON_ALWAYS_FLASH);
++static_assert(av::af_off == ANDROID_CONTROL_AF_MODE_OFF);
++static_assert(av::af_auto == ANDROID_CONTROL_AF_MODE_AUTO);
++static_assert(av::af_macro == ANDROID_CONTROL_AF_MODE_MACRO);
++static_assert(av::af_continuous_video == ANDROID_CONTROL_AF_MODE_CONTINUOUS_VIDEO);
++static_assert(av::af_continuous_picture == ANDROID_CONTROL_AF_MODE_CONTINUOUS_PICTURE);
++static_assert(av::af_trigger_idle == ANDROID_CONTROL_AF_TRIGGER_IDLE);
++static_assert(av::af_trigger_start == ANDROID_CONTROL_AF_TRIGGER_START);
++static_assert(av::af_trigger_cancel == ANDROID_CONTROL_AF_TRIGGER_CANCEL);
++static_assert(av::ae_trigger_start == ANDROID_CONTROL_AE_PRECAPTURE_TRIGGER_START);
++static_assert(av::awb_off == ANDROID_CONTROL_AWB_MODE_OFF);
++static_assert(av::awb_auto == ANDROID_CONTROL_AWB_MODE_AUTO);
++static_assert(av::awb_incandescent == ANDROID_CONTROL_AWB_MODE_INCANDESCENT);
++static_assert(av::awb_fluorescent == ANDROID_CONTROL_AWB_MODE_FLUORESCENT);
++static_assert(av::awb_warm_fluorescent == ANDROID_CONTROL_AWB_MODE_WARM_FLUORESCENT);
++static_assert(av::awb_daylight == ANDROID_CONTROL_AWB_MODE_DAYLIGHT);
++static_assert(av::awb_cloudy_daylight == ANDROID_CONTROL_AWB_MODE_CLOUDY_DAYLIGHT);
++static_assert(av::awb_twilight == ANDROID_CONTROL_AWB_MODE_TWILIGHT);
++static_assert(av::awb_shade == ANDROID_CONTROL_AWB_MODE_SHADE);
++static_assert(av::flash_off == ANDROID_FLASH_MODE_OFF);
++static_assert(av::flash_single == ANDROID_FLASH_MODE_SINGLE);
++static_assert(av::flash_torch == ANDROID_FLASH_MODE_TORCH);
++static_assert(av::pattern_off == ANDROID_SENSOR_TEST_PATTERN_MODE_OFF);
++static_assert(av::pattern_solid_color == ANDROID_SENSOR_TEST_PATTERN_MODE_SOLID_COLOR);
++static_assert(av::pattern_black == ANDROID_SENSOR_TEST_PATTERN_MODE_BLACK);
++static_assert(av::rotate_none == ANDROID_SCALER_ROTATE_AND_CROP_NONE);
++static_assert(av::rotate_90 == ANDROID_SCALER_ROTATE_AND_CROP_90);
++static_assert(av::rotate_180 == ANDROID_SCALER_ROTATE_AND_CROP_180);
++static_assert(av::rotate_270 == ANDROID_SCALER_ROTATE_AND_CROP_270);
++static_assert(av::rotate_auto == ANDROID_SCALER_ROTATE_AND_CROP_AUTO);
++static_assert(av::ae_state_precapture == ANDROID_CONTROL_AE_STATE_PRECAPTURE);
++static_assert(av::af_state_focused_locked == ANDROID_CONTROL_AF_STATE_FOCUSED_LOCKED);
++static_assert(av::awb_state_converged == ANDROID_CONTROL_AWB_STATE_CONVERGED);
++static_assert(av::flash_state_ready == ANDROID_FLASH_STATE_READY);
++
++namespace {
++
++constexpr nsecs_t kMetaTimeout = 200000000LL;
++// Frames and stills are queued two at a time at most: one in flight and one
++// spare, since a request waits for its own buffers.
++constexpr uint32_t kStreamSlots = 2;
++
++template <typename T>
++void Replace(HalCameraMetadata* metadata, uint32_t tag, const T* data, uint32_t count) {
++  camera_metadata_ro_entry_t entry;
++  if (metadata->Get(tag, &entry) == OK) {
++    metadata->Set(tag, data, count);
++  }
++}
++
++// Where the chroma rows of an NV12 frame of the stream start: right after the
++// luma rows, which the node may pad (its image is then larger than 3/2 of the
++// luma rows it was asked for). The layout is luma, then chroma at one stride.
++size_t ChromaOffset(const V4l2Stream& stream) {
++  const size_t stride = stream.bytes_per_line();
++  const size_t height = stream.params().height;
++  const size_t luma = static_cast<size_t>(stream.size_image()) * 2 / 3;
++  return stride != 0 && luma >= stride * height && luma % stride == 0 ? luma : stride * height;
++}
++
++// NV12 rows, luma and chroma at one stride, into the planes of a framework buffer.
++void CopyNv12(const uint8_t* luma, const uint8_t* chroma, uint32_t stride, SensorBuffer* buffer) {
++  const YCbCrPlanes& planes = buffer->plane.img_y_crcb;
++  for (uint32_t y = 0; y < buffer->height; ++y) {
++    memcpy(planes.img_y + static_cast<size_t>(y) * planes.y_stride,
++           luma + static_cast<size_t>(y) * stride, buffer->width);
++  }
++  for (uint32_t y = 0; y < buffer->height / 2; ++y) {
++    const uint8_t* source = chroma + static_cast<size_t>(y) * stride;
++    uint8_t* cb = planes.img_cb + static_cast<size_t>(y) * planes.cbcr_stride;
++    uint8_t* cr = planes.img_cr + static_cast<size_t>(y) * planes.cbcr_stride;
++    if (planes.cbcr_step == 2 && cr == cb + 1) {
++      memcpy(cb, source, buffer->width);
++    } else {
++      for (uint32_t x = 0; x < buffer->width / 2; ++x) {
++        cb[x * planes.cbcr_step] = source[2 * x];
++        cr[x * planes.cbcr_step] = source[2 * x + 1];
++      }
++    }
++  }
++}
++
++}  // namespace
++
++std::unique_ptr<V4l2FrameSource> V4l2FrameSource::Create(const LogicalCharacteristics& /*chars*/,
++                                                         uint32_t camera_id) {
++  v4l2cam::CameraNodes nodes;
++  if (!v4l2cam::CameraRegistry::Get().Find(camera_id, &nodes)) {
++    ALOGE("%s: no camera nodes for camera %u", __FUNCTION__, camera_id);
++    return nullptr;
++  }
++  std::unique_ptr<V4l2FrameSource> source(new V4l2FrameSource());
++  Camera& camera = source->cameras_[camera_id];
++  camera.nodes = nodes;
++  camera.capabilities = andarium::camera::capabilities_of(nodes.desc, nodes.formats);
++  camera.limits = andarium::camera::Limits::of(
++      nodes.desc, camera.capabilities,
++      andarium::camera::array_size(nodes.desc, camera.capabilities));
++  camera.limits.has_jpeg = nodes.has_jpeg;
++  camera.planner = std::make_unique<ControlPlanner>(camera.limits);
++  camera.sizes = andarium::camera::derive_sizes(nodes.formats);
++  camera.buffers = kStreamSlots;
++  camera.use_dmabuf = property_get_bool("vendor.camera.v4l2.dmabuf", true);
++
++  camera.control_fd.reset(open(nodes.capture_path.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC));
++  if (!camera.control_fd.valid()) {
++    ALOGE("%s: cannot open %s: %s", __FUNCTION__, nodes.capture_path.c_str(), strerror(errno));
++    return nullptr;
++  }
++  camera.meta = v4l2cam::V4l2MetaReader::Create(nodes.meta_path);
++  if (camera.meta == nullptr) {
++    return nullptr;
++  }
++  return source;
++}
++
++V4l2FrameSource::~V4l2FrameSource() {
++  pending_.clear();
++  cameras_.clear();
++}
++
++Request V4l2FrameSource::RequestOf(const SensorSettings& settings) {
++  Request request;
++  const auto& host = settings.host;
++  request.ae_mode = host.ae_mode;
++  request.ae_lock = host.ae_lock;
++  request.ae_compensation_steps = host.ae_compensation;
++  request.exposure_ns = settings.exposure_time;
++  request.sensitivity = static_cast<int32_t>(settings.gain);
++  request.ae_precapture_trigger = host.ae_precapture_trigger;
++  request.af_mode = host.af_mode;
++  request.af_trigger = host.af_trigger;
++  request.focus_distance = host.focus_distance;
++  request.awb_mode = host.awb_mode;
++  request.awb_lock = host.awb_lock;
++  for (size_t i = 0; i < 4; ++i) {
++    request.wb_gains[i] = host.color_correction_gains[i];
++  }
++  request.zoom_ratio = settings.zoom_ratio;
++  request.flash_mode = host.flash_mode;
++  request.test_pattern = settings.test_pattern_mode;
++  request.rotate_and_crop = settings.rotate_and_crop;
++  request.jpeg_quality = host.jpeg_quality;
++  request.video_stabilization = settings.video_stab != ANDROID_CONTROL_VIDEO_STABILIZATION_MODE_OFF;
++  request.ae_region = {host.ae_regions[0], host.ae_regions[1], host.ae_regions[2],
++                       host.ae_regions[3], host.ae_regions[4]};
++  request.af_region = {host.af_regions[0], host.af_regions[1], host.af_regions[2],
++                       host.af_regions[3], host.af_regions[4]};
++  return request;
++}
++
++V4l2FrameSource::Route V4l2FrameSource::RouteOf(const Camera& camera, const SensorBuffer& buffer) {
++  namespace plan = andarium::camera;
++  Route route;
++  route.key = {V4l2Stream::Kind::kVideo, camera.nodes.video_pixel_format, buffer.width,
++               buffer.height};
++  // A size that the device does not serve is made from a frame of a native mode.
++  const auto made_here = [&](const std::vector<plan::SizeSource>& list) -> const plan::SizeSource* {
++    for (const auto& entry : list) {
++      if (entry.size.width == buffer.width && entry.size.height == buffer.height) {
++        return entry.host ? nullptr : &entry;
++      }
++    }
++    return nullptr;
++  };
++  const auto derive = [&](const plan::SizeSource& entry) {
++    route.key = {V4l2Stream::Kind::kVideo, camera.nodes.video_pixel_format, entry.source.width,
++                 entry.source.height, true};
++    route.window = entry.window;
++  };
++  if (buffer.format == PixelFormat::BLOB) {
++    if (const auto* entry = made_here(camera.sizes.jpeg)) {
++      derive(*entry);
++    } else if (camera.nodes.has_jpeg) {
++      route.key = {V4l2Stream::Kind::kStill, V4L2_PIX_FMT_JPEG, buffer.width, buffer.height};
++      route.group_still = true;
++    } else {
++      return route;
++    }
++  } else if (buffer.format == PixelFormat::RAW16) {
++    if (camera.nodes.raw_pixel_format == 0) {
++      return route;
++    }
++    route.key = {V4l2Stream::Kind::kStill, camera.nodes.raw_pixel_format, buffer.width,
++                 buffer.height};
++    route.group_still = true;
++  } else if (buffer.format == PixelFormat::YCBCR_420_888 ||
++             buffer.format == PixelFormat::YCRCB_420_SP) {
++    if (const auto* entry = made_here(camera.sizes.yuv)) {
++      derive(*entry);
++    }
++    route.key.output = static_cast<uint32_t>(buffer.stream_buffer.stream_id) + 1;
++  } else {
++    return route;
++  }
++  route.ok = true;
++  return route;
++}
++
++V4l2Stream* V4l2FrameSource::StreamFor(Camera* camera, const StreamKey& key) {
++  auto found = camera->streams.find(key);
++  if (found != camera->streams.end()) {
++    return found->second.get();
++  }
++  V4l2Stream::Params params;
++  params.path = camera->nodes.capture_path;
++  params.kind = key.kind;
++  params.pixel_format = key.pixel_format;
++  params.width = key.width;
++  params.height = key.height;
++  params.fps = camera->fps;
++  params.buffers = camera->buffers;
++  params.try_dmabuf = camera->use_dmabuf && !key.derived;
++  auto stream = V4l2Stream::Create(params);
++  if (stream == nullptr) {
++    return nullptr;
++  }
++  if (!key.derived && !stream->uses_dmabuf()) {
++    ALOGI("%s: the %ux%u stream copies its frames (%s)", __FUNCTION__, key.width, key.height,
++          camera->use_dmabuf ? "the node would not take dma-bufs"
++                             : "dma-bufs were given up for this camera");
++  }
++  auto* raw = stream.get();
++  camera->streams[key] = std::move(stream);
++  return raw;
++}
++
++// The characteristics that the Exif data of a picture is made from. The Exif
++// focal length in 35 mm film is the field of view's own, which the camera's
++// stated focal length and physical size give together. A description that
++// states no such pair gives the Exif writer zeros, and the tag is left out: the
++// static metadata keeps the template's default size for a camera that states
++// none (the platform requires a size), and that default is no stated size.
++SensorCharacteristics V4l2FrameSource::ExifCharacteristics(const Camera& camera,
++                                                           SensorCharacteristics chars) {
++  const auto optics = andarium::camera::stated_optics(camera.nodes.desc);
++  chars.focal_length = optics.focal_length_mm;
++  chars.physical_size[0] = optics.sensor_width_mm;
++  chars.physical_size[1] = optics.sensor_height_mm;
++  return chars;
++}
++
++// The platform runs at the largest size of the streams that are open, and a
++// change restarts it with black frames. The stream of a video output that stays
++// configured but leaves the requests (a recording that stopped) is closed soon,
++// so that the restart comes then and not in a recording started a few seconds
++// later; an output that leaves the configuration needs no rule, as the
++// framework's reconfiguration makes a new frame source. A stream that the
++// request about to begin uses is never closed, and a request that takes a still
++// does not count towards an absence, because a still holds the pipeline and the
++// preview's requests wait behind it, and the absences that a video output earned
++// before such a request start again from zero at it: the rule is in
++// camera_streams.hpp.
++void V4l2FrameSource::CloseIdleStreams(Camera* camera, const std::set<StreamKey>& used) {
++  const nsecs_t now = systemTime(SYSTEM_TIME_MONOTONIC);
++  for (auto it = camera->streams.begin(); it != camera->streams.end();) {
++    bool in_flight = false;
++    for (const auto& entry : pending_) {
++      if (entry.second.stream == it->second.get()) {
++        in_flight = true;
++      }
++    }
++    const auto last = camera->stream_last_request.find(it->first);
++    const uint64_t since_use = last == camera->stream_last_request.end()
++                                   ? still_free_requests_begun_
++                                   : still_free_requests_begun_ - last->second;
++    if (!in_flight && used.count(it->first) == 0 &&
++        andarium::camera::closes_when_idle(it->first.output != 0, since_use,
++                                           now - it->second->last_used())) {
++      camera->stream_last_request.erase(it->first);
++      it = camera->streams.erase(it);
++    } else {
++      ++it;
++    }
++  }
++}
++
++namespace {
++
++// The dma-buf of a framework buffer that the stream can write in place, if it
++// has the layout the device writes.
++bool DmabufOf(const SensorBuffer& buffer, const V4l2Stream& stream, int* fd, size_t* length,
++              const char** why) {
++  const native_handle_t* handle = buffer.stream_buffer.buffer;
++  if (handle == nullptr || handle->numFds < 1) {
++    *why = "the buffer has no dma-buf";
++    return false;
++  }
++  if (buffer.format == PixelFormat::YCBCR_420_888) {
++    const YCbCrPlanes& planes = buffer.plane.img_y_crcb;
++    // The device writes luma and then chroma rows at one stride, and the chroma
++    // where the node's image puts it (ChromaOffset): a gralloc buffer whose
++    // height is padded is taken when the node pads it the same way.
++    if (planes.img_y == nullptr || planes.y_stride != stream.bytes_per_line()) {
++      *why = "the luma stride is not the node's";
++      return false;
++    }
++    if (planes.cbcr_stride != planes.y_stride || planes.cbcr_step != 2 ||
++        planes.img_cr != planes.img_cb + 1) {
++      *why = "the chroma is not interleaved at the luma stride";
++      return false;
++    }
++    if (planes.img_cb != planes.img_y + ChromaOffset(stream)) {
++      *why = "the chroma starts at another offset than the node's";
++      return false;
++    }
++  } else if (buffer.format == PixelFormat::RAW16) {
++    if (buffer.plane.img.stride_in_bytes != stream.bytes_per_line()) {
++      *why = "the stride is not the node's";
++      return false;
++    }
++  } else if (buffer.format != PixelFormat::BLOB) {
++    *why = "the format is not one the node writes in place";
++    return false;
++  }
++  const int dma_fd = handle->data[0];
++  const off_t size = lseek(dma_fd, 0, SEEK_END);
++  lseek(dma_fd, 0, SEEK_SET);
++  if (size < 0 || static_cast<size_t>(size) < stream.size_image()) {
++    *why = "the buffer is smaller than the node's image";
++    return false;
++  }
++  *fd = dma_fd;
++  *length = static_cast<size_t>(size);
++  return true;
++}
++
++}  // namespace
++
++bool V4l2FrameSource::QueueBuffer(Camera* camera, V4l2Stream* stream, SensorBuffer* buffer,
++                                  const Route& route, uint32_t cookie, bool last_of_group) {
++  int dma_fd = -1;
++  size_t dma_length = 0;
++  const char* why = "";
++  if (stream->uses_dmabuf() && !DmabufOf(*buffer, *stream, &dma_fd, &dma_length, &why)) {
++    ALOGI("%s: the %ux%u stream copies its frames from now on: %s", __FUNCTION__,
++          stream->params().width, stream->params().height, why);
++    camera->use_dmabuf = false;
++    if (stream->SwitchToMmap() != OK) {
++      return false;
++    }
++  }
++  int slot = stream->Queue(dma_fd, dma_length, cookie, last_of_group);
++  if (slot < 0 && stream->uses_dmabuf()) {
++    ALOGW("%s: the node refused the dma-buf; the %ux%u stream copies from now on", __FUNCTION__,
++          stream->params().width, stream->params().height);
++    camera->use_dmabuf = false;
++    if (stream->SwitchToMmap() != OK) {
++      return false;
++    }
++    slot = stream->Queue(-1, 0, cookie, last_of_group);
++  }
++  if (slot < 0) {
++    return false;
++  }
++  pending_[buffer] = {stream, slot, camera, route.key.derived, route.window};
++  return true;
++}
++
++status_t V4l2FrameSource::BeginRequest(const LogicalCameraSettings& settings, Buffers* buffers) {
++  if (buffers == nullptr) {
++    return BAD_VALUE;
++  }
++  // Every request collects the buffers it queued, so a buffer still pending
++  // here was never collected: a request that stopped on its way. Take it back
++  // now, or its slot stays with the device for good and every later request
++  // finds the stream full.
++  if (!pending_.empty()) {
++    ALOGW("%s: %zu buffers of earlier requests were never collected", __FUNCTION__,
++          pending_.size());
++    for (const auto& entry : pending_) {
++      V4l2Stream::Completion unused;
++      entry.second.stream->Wait(entry.second.slot, 0, nullptr, &unused);
++    }
++    pending_.clear();
++  }
++  // The stills the device takes in this request are one capture. A JPEG made
++  // here from a video frame is not one of them. The whole request has one
++  // deadline.
++  std::map<uint32_t, int> still_count;
++  // The streams that the request uses: none of them is idle.
++  std::map<uint32_t, std::set<StreamKey>> used;
++  bool any_still = false;
++  for (const auto& buffer : *buffers) {
++    if (buffer->is_input || buffer->stream_buffer.status == google_camera_hal::BufferStatus::kError) {
++      continue;
++    }
++    if (buffer->format == PixelFormat::BLOB || buffer->format == PixelFormat::RAW16) {
++      any_still = true;
++    }
++    auto camera_entry = cameras_.find(buffer->camera_id);
++    if (camera_entry != cameras_.end()) {
++      const Route route = RouteOf(camera_entry->second, *buffer);
++      if (route.ok) {
++        used[buffer->camera_id].insert(route.key);
++      }
++      if (route.group_still) {
++        ++still_count[buffer->camera_id];
++      }
++    }
++  }
++  request_clock_.begin(systemTime(SYSTEM_TIME_MONOTONIC), any_still);
++
++  for (auto& entry : cameras_) {
++    CloseIdleStreams(&entry.second, used[entry.first]);
++  }
++  if (!any_still) {
++    ++still_free_requests_begun_;
++  } else {
++    // The absences a video output earned before this request do not carry over
++    // it: the requests that wait behind a still wait behind all of it, so the
++    // count of the requests without a still starts again for every open video
++    // output (the idle time is left as it is).
++    for (auto& entry : cameras_) {
++      for (const auto& stream : entry.second.streams) {
++        if (stream.first.output != 0) {
++          entry.second.stream_last_request[stream.first] = still_free_requests_begun_;
++        }
++      }
++    }
++  }
++
++  std::map<uint32_t, bool> controls_written;
++  std::map<uint32_t, int> stills_queued;
++  status_t result = OK;
++  for (auto& buffer : *buffers) {
++    if (buffer->is_input || buffer->stream_buffer.status == google_camera_hal::BufferStatus::kError) {
++      continue;
++    }
++    auto camera_entry = cameras_.find(buffer->camera_id);
++    auto settings_entry = settings.find(buffer->camera_id);
++    if (camera_entry == cameras_.end() || settings_entry == settings.end()) {
++      buffer->stream_buffer.status = google_camera_hal::BufferStatus::kError;
++      result = BAD_VALUE;
++      continue;
++    }
++    Camera& camera = camera_entry->second;
++    const SensorSettings& sensor_settings = settings_entry->second;
++
++    if (!controls_written[buffer->camera_id]) {
++      controls_written[buffer->camera_id] = true;
++      camera.last_request = RequestOf(sensor_settings);
++      // The planner learns of a write only when the camera took it.
++      ControlPlanner* planner = camera.planner.get();
++      v4l2cam::WriteControls(camera.control_fd.get(), planner->plan(camera.last_request),
++                             &camera.unsupported_controls,
++                             [planner](const andarium::camera::ControlWrite& write) {
++                               planner->commit(write);
++                             });
++      camera.request_timestamp = 0;
++      // The camera cannot vary its rate: with AE on it runs at the top of the
++      // requested range (frame_duration holds the middle of it).
++      double wanted = 0;
++      if (sensor_settings.host.ae_mode != ANDROID_CONTROL_AE_MODE_OFF &&
++          sensor_settings.host.ae_max_fps > 0) {
++        wanted = sensor_settings.host.ae_max_fps;
++      } else if (sensor_settings.frame_duration > 0) {
++        wanted = 1e9 / static_cast<double>(sensor_settings.frame_duration);
++      }
++      if (wanted > 0) {
++        const uint32_t fps =
++            static_cast<uint32_t>(std::clamp<int64_t>(std::llround(wanted), 1, 240));
++        if (fps != camera.fps) {
++          camera.fps = fps;
++          for (auto& stream : camera.streams) {
++            if (stream.first.kind == V4l2Stream::Kind::kVideo) {
++              stream.second->SetFrameRate(fps);
++            }
++          }
++        }
++      }
++    }
++
++    const Route route = RouteOf(camera, *buffer);
++    if (!route.ok) {
++      ALOGE("%s: the camera cannot serve a %ux%u buffer of format %x", __FUNCTION__,
++            buffer->width, buffer->height, static_cast<int>(buffer->format));
++      buffer->stream_buffer.status = google_camera_hal::BufferStatus::kError;
++      result = BAD_VALUE;
++      continue;
++    }
++    camera.stream_last_request[route.key] = still_free_requests_begun_;
++    uint32_t cookie = 0;
++    bool last_of_group = false;
++    if (route.group_still && still_count[buffer->camera_id] > 1) {
++      cookie = buffer->frame_number + 1;
++      last_of_group = ++stills_queued[buffer->camera_id] == still_count[buffer->camera_id];
++    }
++
++    V4l2Stream* stream = StreamFor(&camera, route.key);
++    if (stream == nullptr ||
++        !QueueBuffer(&camera, stream, buffer.get(), route, cookie, last_of_group)) {
++      ALOGE("%s: cannot queue a %ux%u buffer of format %x", __FUNCTION__, buffer->width,
++            buffer->height, static_cast<int>(buffer->format));
++      buffer->stream_buffer.status = google_camera_hal::BufferStatus::kError;
++      result = UNKNOWN_ERROR;
++    }
++  }
++  return result;
++}
++
++bool V4l2FrameSource::FailsRequest(size_t outputs, size_t failed) const {
++  return andarium::camera::request_end(outputs, failed) ==
++         andarium::camera::RequestEnd::request_error;
++}
++
++bool V4l2FrameSource::MetaOf(Camera* camera, uint64_t sequence, abi::Meta* meta) {
++  if (camera->meta->WaitFor(sequence, kMetaTimeout, meta)) {
++    return true;
++  }
++  ALOGW("%s: no metadata for exposure %llu; using the latest", __FUNCTION__,
++        static_cast<unsigned long long>(sequence));
++  return camera->meta->Latest(meta);
++}
++
++bool V4l2FrameSource::WaitFor(const SensorBuffer* buffer, V4l2Stream::Completion* completion,
++                              const uint8_t** mapped, Pending* pending) {
++  auto found = pending_.find(buffer);
++  if (found == pending_.end()) {
++    ALOGE("%s: a buffer that was not queued", __FUNCTION__);
++    return false;
++  }
++  *pending = found->second;
++  pending_.erase(found);
++  // What is left of the request's deadline; a wait that ends without the buffer
++  // takes the stream's buffers back, so the rest of the request fails at once.
++  const nsecs_t remaining = request_clock_.remaining(systemTime(SYSTEM_TIME_MONOTONIC));
++  status_t status = pending->stream->Wait(pending->slot, remaining, &interrupted_, completion);
++  if (status != OK) {
++    ALOGE("%s: the camera did not deliver a buffer (%d)", __FUNCTION__, status);
++    return false;
++  }
++  *mapped = pending->stream->uses_dmabuf() ? nullptr : pending->stream->Mapped(pending->slot);
++  return true;
++}
++
++status_t V4l2FrameSource::ProduceFrame(uint32_t camera_id, nsecs_t /*timestamp*/,
++                                       const SensorSettings& /*settings*/,
++                                       SensorBuffer* buffer,
++                                       const SensorBuffer* /*input_buffer*/) {
++  if (buffer == nullptr) {
++    return BAD_VALUE;
++  }
++  Pending pending;
++  V4l2Stream::Completion completion;
++  const uint8_t* mapped = nullptr;
++  if (!WaitFor(buffer, &completion, &mapped, &pending)) {
++    return UNKNOWN_ERROR;
++  }
++  Camera* camera = pending.camera;
++  if (camera == nullptr || cameras_.find(camera_id) == cameras_.end()) {
++    return BAD_VALUE;
++  }
++  if (completion.error) {
++    return UNKNOWN_ERROR;
++  }
++  if (camera->request_timestamp == 0) {
++    camera->request_timestamp = completion.timestamp;
++  }
++  abi::Meta meta;
++  if (MetaOf(camera, completion.sequence, &meta)) {
++    camera->last_meta = meta;
++    camera->have_meta = true;
++    if ((meta.flags & abi::frame_flag::still) != 0) {
++      camera->last_still_meta = meta;
++      camera->have_still_meta = true;
++    }
++  }
++  if (mapped == nullptr) {
++    return OK;  // the device wrote the framework's buffer
++  }
++
++  if (pending.derived) {
++    return ScaleInto(pending, mapped, buffer);
++  }
++
++  const uint32_t stride = pending.stream->bytes_per_line();
++  if (buffer->format == PixelFormat::RAW16) {
++    const size_t row = static_cast<size_t>(buffer->width) * 2;
++    for (uint32_t y = 0; y < buffer->height; ++y) {
++      memcpy(buffer->plane.img.img + static_cast<size_t>(y) * buffer->plane.img.stride_in_bytes,
++             mapped + static_cast<size_t>(y) * stride, row);
++    }
++    return OK;
++  }
++
++  // NV12 rows, luma and then chroma at one stride, into the buffer's planes.
++  CopyNv12(mapped, mapped + ChromaOffset(*pending.stream), stride, buffer);
++  return OK;
++}
++
++// Scales the window of a native NV12 frame to `width` x `height` into the two
++// planes at `dst_y` and `dst_uv`.
++static int ScaleWindow(const V4l2Stream& stream, const andarium::camera::Window& window,
++                       const uint8_t* mapped,
++                       uint8_t* dst_y, int dst_stride_y, uint8_t* dst_uv, int dst_stride_uv,
++                       uint32_t width, uint32_t height) {
++  const size_t stride = stream.bytes_per_line();
++  const uint8_t* src_y = mapped + static_cast<size_t>(window.y) * stride + window.x;
++  const uint8_t* src_uv = mapped + ChromaOffset(stream) + static_cast<size_t>(window.y / 2) * stride + window.x;
++  return libyuv::NV12Scale(src_y, static_cast<int>(stride), src_uv, static_cast<int>(stride),
++                           static_cast<int>(window.width), static_cast<int>(window.height), dst_y,
++                           dst_stride_y, dst_uv, dst_stride_uv, static_cast<int>(width),
++                           static_cast<int>(height), libyuv::kFilterBox);
++}
++
++status_t V4l2FrameSource::ScaleInto(const Pending& pending, const uint8_t* mapped,
++                                    SensorBuffer* buffer) {
++  const YCbCrPlanes& planes = buffer->plane.img_y_crcb;
++  if (planes.img_y == nullptr || pending.window.width == 0 || pending.window.height == 0) {
++    return BAD_VALUE;
++  }
++  int result;
++  if (planes.cbcr_step == 2 && planes.img_cr == planes.img_cb + 1) {
++    // The buffer's chroma is NV12: scale straight into it.
++    result = ScaleWindow(*pending.stream, pending.window, mapped, planes.img_y,
++                         static_cast<int>(planes.y_stride), planes.img_cb,
++                         static_cast<int>(planes.cbcr_stride), buffer->width, buffer->height);
++  } else {
++    const size_t luma = static_cast<size_t>(buffer->width) * buffer->height;
++    std::vector<uint8_t> scaled(luma + luma / 2);
++    result = ScaleWindow(*pending.stream, pending.window, mapped, scaled.data(),
++                         static_cast<int>(buffer->width), scaled.data() + luma,
++                         static_cast<int>(buffer->width), buffer->width, buffer->height);
++    if (result == 0) {
++      CopyNv12(scaled.data(), scaled.data() + luma, buffer->width, buffer);
++    }
++  }
++  if (result != 0) {
++    ALOGE("%s: scaling to %ux%u failed (%d)", __FUNCTION__, buffer->width, buffer->height, result);
++    return UNKNOWN_ERROR;
++  }
++  return OK;
++}
++
++status_t V4l2FrameSource::ProduceBlob(uint32_t camera_id, const SensorSettings& /*settings*/,
++                                      SensorBuffer* buffer, HalCameraMetadata* result_metadata,
++                                      const SensorCharacteristics& chars) {
++  if (buffer == nullptr || result_metadata == nullptr) {
++    return BAD_VALUE;
++  }
++  Pending pending;
++  V4l2Stream::Completion completion;
++  const uint8_t* mapped = nullptr;
++  if (!WaitFor(buffer, &completion, &mapped, &pending)) {
++    return UNKNOWN_ERROR;
++  }
++  Camera* camera = pending.camera;
++  if (camera == nullptr || cameras_.find(camera_id) == cameras_.end() || completion.error) {
++    return UNKNOWN_ERROR;
++  }
++  if (camera->request_timestamp == 0) {
++    camera->request_timestamp = completion.timestamp;
++  }
++  abi::Meta meta;
++  if (!MetaOf(camera, completion.sequence, &meta)) {
++    return UNKNOWN_ERROR;
++  }
++  camera->last_meta = meta;
++  camera->have_meta = true;
++  if (pending.derived) {
++    // The device completes a frame it made black (blocked, interrupted, or
++    // starting after a restart) as a good frame; a picture of it is no picture,
++    // and a still of the device's own kind fails then too.
++    if ((meta.flags & (abi::frame_flag::interrupted | abi::frame_flag::blocked |
++                       abi::frame_flag::resuming)) != 0) {
++      ALOGW("%s: the frame for a %ux%u picture was black (flags %x)", __FUNCTION__, buffer->width,
++            buffer->height, meta.flags);
++      return UNKNOWN_ERROR;
++    }
++    // A picture made here from a video frame: the results first, as the Exif
++    // data says what the exposure did.
++    nsecs_t unused = 0;
++    FrameResult(camera_id, result_metadata, &unused);
++    return EncodeDerived(camera, pending, mapped, buffer, result_metadata, chars);
++  }
++  camera->last_still_meta = meta;
++  camera->have_still_meta = true;
++
++  uint8_t* image = buffer->plane.img.img;
++  const size_t capacity = buffer->plane.img.buffer_size;
++  const size_t jpeg_size = completion.bytes_used;
++  if (image == nullptr || jpeg_size == 0 || jpeg_size + sizeof(andarium::camera::JpegBlobHeader) > capacity) {
++    ALOGE("%s: a %zu byte picture does not fit a %zu byte buffer", __FUNCTION__, jpeg_size, capacity);
++    return UNKNOWN_ERROR;
++  }
++  if (mapped != nullptr) {
++    memcpy(image, mapped, jpeg_size);
++  }
++
++  // The results first, so that the Exif data says what the still did.
++  nsecs_t unused = 0;
++  FrameResult(camera_id, result_metadata, &unused);
++
++  if (meta.jpeg_gap_length != 0) {
++    std::unique_ptr<ExifUtils> exif(ExifUtils::Create(ExifCharacteristics(*camera, chars)));
++    bool placed = false;
++    if (exif != nullptr && exif->Initialize() &&
++        exif->SetFromMetadata(*result_metadata, buffer->width, buffer->height)) {
++      char value[PROPERTY_VALUE_MAX];
++      property_get("ro.product.manufacturer", value, "unknown");
++      exif->SetMake(value);
++      property_get("ro.product.model", value, "unknown");
++      exif->SetModel(value);
++      exif->SetColorSpace(COLOR_SPACE_SRGB);
++
++      std::vector<uint8_t> thumbnail;
++      camera_metadata_ro_entry_t entry;
++      if (result_metadata->Get(ANDROID_JPEG_THUMBNAIL_SIZE, &entry) == OK && entry.count == 2 &&
++          entry.data.i32[0] > 0 && entry.data.i32[1] > 0) {
++        if (!v4l2cam::MakeThumbnail(image, jpeg_size, entry.data.i32[0], entry.data.i32[1], 80,
++                                    &thumbnail)) {
++          thumbnail.clear();
++        }
++      }
++      for (int attempt = 0; attempt < 2 && !placed; ++attempt) {
++        const bool with_thumbnail = attempt == 0 && !thumbnail.empty();
++        if (exif->GenerateApp1(with_thumbnail ? thumbnail.data() : nullptr,
++                               with_thumbnail ? static_cast<uint32_t>(thumbnail.size()) : 0)) {
++          placed = andarium::camera::place_exif(
++              std::span<uint8_t>(image, jpeg_size), meta.jpeg_gap_offset, meta.jpeg_gap_length,
++              std::span<const uint8_t>(exif->GetApp1Buffer(), exif->GetApp1Length()));
++        }
++      }
++    }
++    if (!placed) {
++      ALOGW("%s: the Exif data was not placed", __FUNCTION__);
++    }
++  }
++  if (!andarium::camera::write_blob_header(std::span<uint8_t>(image, capacity),
++                                           static_cast<uint32_t>(jpeg_size))) {
++    return UNKNOWN_ERROR;
++  }
++  return OK;
++}
++
++status_t V4l2FrameSource::EncodeDerived(Camera* camera, const Pending& pending,
++                                        const uint8_t* mapped, SensorBuffer* buffer,
++                                        HalCameraMetadata* result_metadata,
++                                        const SensorCharacteristics& chars) {
++  uint8_t* image = buffer->plane.img.img;
++  const size_t capacity = buffer->plane.img.buffer_size;
++  const uint32_t width = buffer->width;
++  const uint32_t height = buffer->height;
++  if (mapped == nullptr || image == nullptr || capacity <= sizeof(andarium::camera::JpegBlobHeader) ||
++      width == 0 || height == 0 || ((width | height) & 1u) != 0) {
++    return BAD_VALUE;
++  }
++
++  // The window of the native frame, scaled to the picture's size, as I420.
++  const size_t luma = static_cast<size_t>(width) * height;
++  std::vector<uint8_t> scaled(luma + luma / 2);
++  std::vector<uint8_t> i420(luma + luma / 2);
++  uint8_t* y_plane = i420.data();
++  uint8_t* u_plane = y_plane + luma;
++  uint8_t* v_plane = u_plane + luma / 4;
++  if (ScaleWindow(*pending.stream, pending.window, mapped, scaled.data(),
++                  static_cast<int>(width), scaled.data() + luma, static_cast<int>(width), width,
++                  height) != 0 ||
++      libyuv::NV12ToI420(scaled.data(), static_cast<int>(width), scaled.data() + luma,
++                         static_cast<int>(width), y_plane, static_cast<int>(width), u_plane,
++                         static_cast<int>(width / 2), v_plane, static_cast<int>(width / 2),
++                         static_cast<int>(width), static_cast<int>(height)) != 0) {
++    ALOGE("%s: cannot scale the frame to %ux%u", __FUNCTION__, width, height);
++    return UNKNOWN_ERROR;
++  }
++  YCbCrPlanes planes;
++  planes.img_y = y_plane;
++  planes.img_cb = u_plane;
++  planes.img_cr = v_plane;
++  planes.y_stride = width;
++  planes.cbcr_stride = width / 2;
++  planes.cbcr_step = 1;
++
++  // The Exif thumbnail: the window of the same frame that has the thumbnail's aspect
++  // ratio, centred, scaled and encoded (the picture is cropped to the shape, not
++  // stretched to it).
++  std::vector<uint8_t> thumbnail;
++  camera_metadata_ro_entry_t entry;
++  if (result_metadata->Get(ANDROID_JPEG_THUMBNAIL_SIZE, &entry) == OK && entry.count == 2 &&
++      entry.data.i32[0] > 1 && entry.data.i32[1] > 1) {
++    const uint32_t thumb_width = static_cast<uint32_t>(entry.data.i32[0]) & ~1u;
++    const uint32_t thumb_height = static_cast<uint32_t>(entry.data.i32[1]) & ~1u;
++    const andarium::camera::Window crop = andarium::camera::centred_window(
++        {width, height}, {thumb_width, thumb_height});
++    const size_t thumb_luma = static_cast<size_t>(thumb_width) * thumb_height;
++    std::vector<uint8_t> small(thumb_luma + thumb_luma / 2);
++    YCbCrPlanes small_planes;
++    small_planes.img_y = small.data();
++    small_planes.img_cb = small.data() + thumb_luma;
++    small_planes.img_cr = small_planes.img_cb + thumb_luma / 4;
++    small_planes.y_stride = thumb_width;
++    small_planes.cbcr_stride = thumb_width / 2;
++    small_planes.cbcr_step = 1;
++    // The window starts on even pixels, so the chroma of its corner is half.
++    const size_t luma_offset = static_cast<size_t>(crop.y) * width + crop.x;
++    const size_t chroma_offset = static_cast<size_t>(crop.y / 2) * (width / 2) + crop.x / 2;
++    if (crop.width >= 2 && crop.height >= 2 &&
++        libyuv::I420Scale(y_plane + luma_offset, static_cast<int>(width),
++                          u_plane + chroma_offset, static_cast<int>(width / 2),
++                          v_plane + chroma_offset, static_cast<int>(width / 2),
++                          static_cast<int>(crop.width), static_cast<int>(crop.height),
++                          small_planes.img_y, static_cast<int>(small_planes.y_stride),
++                          small_planes.img_cb, static_cast<int>(small_planes.cbcr_stride),
++                          small_planes.img_cr, static_cast<int>(small_planes.cbcr_stride),
++                          static_cast<int>(thumb_width), static_cast<int>(thumb_height),
++                          libyuv::kFilterBox) == 0) {
++      thumbnail.resize(64 * 1024);  // an APP1 segment is limited to 64 KiB
++      JpegCompressor::YUV420Frame frame = {.output_buffer = thumbnail.data(),
++                                           .output_buffer_size = thumbnail.size(),
++                                           .yuv_planes = small_planes,
++                                           .width = thumb_width,
++                                           .height = thumb_height,
++                                           .app1_buffer = nullptr,
++                                           .app1_buffer_size = 0,
++                                           .color_space = buffer->color_space,
++                                           .quality = 80};
++      thumbnail.resize(JpegCompressor::EncodeYUV420(frame));
++    }
++  }
++
++  // The Exif data, as the stock sensor makes it.
++  std::unique_ptr<ExifUtils> exif(ExifUtils::Create(ExifCharacteristics(*camera, chars)));
++  const uint8_t* app1 = nullptr;
++  size_t app1_size = 0;
++  if (exif != nullptr && exif->Initialize() &&
++      exif->SetFromMetadata(*result_metadata, width, height)) {
++    char value[PROPERTY_VALUE_MAX];
++    property_get("ro.product.manufacturer", value, "unknown");
++    exif->SetMake(value);
++    property_get("ro.product.model", value, "unknown");
++    exif->SetModel(value);
++    exif->SetColorSpace(COLOR_SPACE_ICC_PROFILE);
++    if (exif->GenerateApp1(thumbnail.empty() ? nullptr : thumbnail.data(),
++                           static_cast<uint32_t>(thumbnail.size()))) {
++      app1 = exif->GetApp1Buffer();
++      app1_size = exif->GetApp1Length();
++    }
++  }
++  if (app1 == nullptr) {
++    ALOGW("%s: the Exif data was not made", __FUNCTION__);
++  }
++
++  const int quality = std::clamp<int>(camera->last_request.jpeg_quality, 1, 100);
++  JpegCompressor::YUV420Frame frame = {
++      .output_buffer = image,
++      .output_buffer_size = capacity - sizeof(andarium::camera::JpegBlobHeader),
++      .yuv_planes = planes,
++      .width = width,
++      .height = height,
++      .app1_buffer = app1,
++      .app1_buffer_size = app1_size,
++      .color_space = buffer->color_space,
++      .quality = quality};
++  const size_t jpeg_size = JpegCompressor::EncodeYUV420(frame);
++  if (jpeg_size == 0) {
++    ALOGE("%s: cannot encode a %ux%u picture", __FUNCTION__, width, height);
++    return UNKNOWN_ERROR;
++  }
++  if (!andarium::camera::write_blob_header(std::span<uint8_t>(image, capacity),
++                                           static_cast<uint32_t>(jpeg_size))) {
++    return UNKNOWN_ERROR;
++  }
++  return OK;
++}
++
++bool V4l2FrameSource::FrameResult(uint32_t camera_id, HalCameraMetadata* result,
++                                  nsecs_t* timestamp) {
++  auto found = cameras_.find(camera_id);
++  if (found == cameras_.end() || result == nullptr) {
++    return false;
++  }
++  Camera& camera = found->second;
++  if (timestamp != nullptr && camera.request_timestamp != 0) {
++    *timestamp = camera.request_timestamp;
++  }
++  if (!camera.have_meta) {
++    return false;
++  }
++  const bool flash = (camera.nodes.desc.flags & (abi::feature::flash | abi::feature::torch)) != 0;
++  const auto values = andarium::camera::result_of(camera.last_meta, camera.last_request, flash,
++                                                   camera.planner->af_engaged());
++
++  const uint8_t ae_state = static_cast<uint8_t>(values.ae_state);
++  const uint8_t af_state = static_cast<uint8_t>(values.af_state);
++  const uint8_t awb_state = static_cast<uint8_t>(values.awb_state);
++  const uint8_t flash_state = static_cast<uint8_t>(values.flash_state);
++  Replace(result, ANDROID_CONTROL_AE_STATE, &ae_state, 1);
++  Replace(result, ANDROID_CONTROL_AF_STATE, &af_state, 1);
++  Replace(result, ANDROID_CONTROL_AWB_STATE, &awb_state, 1);
++  Replace(result, ANDROID_FLASH_STATE, &flash_state, 1);
++  Replace(result, ANDROID_SENSOR_EXPOSURE_TIME, &values.exposure_ns, 1);
++  Replace(result, ANDROID_SENSOR_FRAME_DURATION, &values.frame_duration_ns, 1);
++  Replace(result, ANDROID_SENSOR_SENSITIVITY, &values.sensitivity, 1);
++  Replace(result, ANDROID_LENS_FOCUS_DISTANCE, &values.focus_distance, 1);
++  Replace(result, ANDROID_LENS_APERTURE, &values.aperture, 1);
++  Replace(result, ANDROID_LENS_FOCAL_LENGTH, &values.focal_length_mm, 1);
++  Replace(result, ANDROID_CONTROL_ZOOM_RATIO, &values.zoom_ratio, 1);
++  Replace(result, ANDROID_COLOR_CORRECTION_GAINS, values.wb_gains.data(), 4);
++  return true;
++}
++
++bool V4l2FrameSource::AppendNeutralColorPoint(uint32_t camera_id, HalCameraMetadata* result) {
++  auto found = cameras_.find(camera_id);
++  if (found == cameras_.end() || result == nullptr || !found->second.have_still_meta) {
++    return false;
++  }
++  const auto& meta = found->second.last_still_meta;
++  if (meta.neutral_point_q16[0] == 0 || meta.neutral_point_q16[1] == 0 ||
++      meta.neutral_point_q16[2] == 0) {
++    return false;
++  }
++  camera_metadata_rational_t neutral[3];
++  for (size_t i = 0; i < 3; ++i) {
++    neutral[i] = {static_cast<int32_t>(meta.neutral_point_q16[i]), 65536};
++  }
++  result->Set(ANDROID_SENSOR_NEUTRAL_COLOR_POINT, neutral, 3);
++  return true;
++}
++
++void V4l2FrameSource::CalculateAndAppendNoiseProfile(float gain /*in ISO*/,
++                                                     float /*max_raw_value*/,
++                                                     HalCameraMetadata* result /*out*/) {
++  if (result == nullptr) {
++    return;
++  }
++  double profile[8];
++  bool measured = false;
++  for (const auto& entry : cameras_) {
++    const Camera& camera = entry.second;
++    if (!camera.have_still_meta) {
++      continue;
++    }
++    // The still's own noise model, as pairs of binary32 values.
++    measured = true;
++    for (size_t i = 0; i < 8; ++i) {
++      float value;
++      memcpy(&value, &camera.last_still_meta.noise_profile_f32[i], sizeof(value));
++      profile[i] = value;
++      if (!(value > 0.0f)) {
++        measured = false;
++      }
++    }
++    break;
++  }
++  if (!measured) {
++    // Nominal until a still has measured the sensor: the shot noise grows with
++    // the gain and the read noise with its square.
++    const double scale = std::max(gain, 1.0f) / 100.0;
++    for (size_t i = 0; i < 8; i += 2) {
++      profile[i] = 2.0e-4 * scale;
++      profile[i + 1] = 1.0e-6 * scale * scale + 4.0e-7;
++    }
++  }
++  result->Set(ANDROID_SENSOR_NOISE_PROFILE, profile, 8);
++}
++
++}  // namespace framesource
++}  // namespace android
+diff --git a/devices/EmulatedCamera/hwl/V4l2FrameSource.h b/devices/EmulatedCamera/hwl/V4l2FrameSource.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..715b9241d8e7a547a69ee3abf3e07391c448e75e
+--- /dev/null
++++ b/devices/EmulatedCamera/hwl/V4l2FrameSource.h
+@@ -0,0 +1,180 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef HW_EMULATOR_CAMERA_V4L2_FRAME_SOURCE_H
++#define HW_EMULATOR_CAMERA_V4L2_FRAME_SOURCE_H
++
++#include <atomic>
++#include <map>
++#include <memory>
++#include <set>
++#include <string>
++#include <tuple>
++#include <vector>
++
++#include "IFrameSource.h"
++#include "V4l2Stream.h"
++#include "V4l2Utils.h"
++#include "camera_controls.hpp"
++#include "camera_request.hpp"
++
++namespace android {
++namespace framesource {
++
++// The frames, stills and metadata of a camera that the host drives, through
++// the camera device's V4L2 nodes. The sensor thread asks it to queue a request's
++// buffers (BeginRequest), then collects them one by one (ProduceFrame for video
++// and RAW, ProduceBlob for JPEG); the exposure's metadata then fills the
++// request's results (FrameResult).
++//
++// A size that the camera device does not serve itself (camera_plan.hpp,
++// derive_sizes) is made here from a frame of a native NV12 mode: the source
++// queues a mapped buffer of that mode, scales a window of the frame to the
++// stream's size with libyuv and, for a JPEG, encodes it with the HAL's own
++// compressor. The device's JPEG sizes keep the device's JPEG.
++class V4l2FrameSource : public IFrameSource {
++ public:
++  // Opens the camera's nodes; nullptr if it has none.
++  static std::unique_ptr<V4l2FrameSource> Create(const LogicalCharacteristics& chars,
++                                                 uint32_t camera_id);
++  ~V4l2FrameSource() override;
++
++  status_t ProduceFrame(uint32_t camera_id, nsecs_t timestamp,
++                        const SensorSettings& settings, SensorBuffer* buffer,
++                        const SensorBuffer* input_buffer) override;
++
++  void CalculateAndAppendNoiseProfile(float gain /*in ISO*/, float max_raw_value,
++                                      HalCameraMetadata* result /*out*/) override;
++
++  bool IsHostDriven() const override {
++    return true;
++  }
++  status_t BeginRequest(const LogicalCameraSettings& settings, Buffers* buffers) override;
++  bool FailsRequest(size_t outputs, size_t failed) const override;
++  status_t ProduceBlob(uint32_t camera_id, const SensorSettings& settings,
++                       SensorBuffer* buffer, HalCameraMetadata* result_metadata,
++                       const SensorCharacteristics& chars) override;
++  bool FrameResult(uint32_t camera_id, HalCameraMetadata* result,
++                   nsecs_t* timestamp) override;
++  bool AppendNeutralColorPoint(uint32_t camera_id, HalCameraMetadata* result) override;
++  void Interrupt() override {
++    interrupted_ = true;
++  }
++  void ClearInterrupt() override {
++    interrupted_ = false;
++  }
++
++ private:
++  struct StreamKey {
++    v4l2cam::V4l2Stream::Kind kind;
++    uint32_t pixel_format;
++    uint32_t width;
++    uint32_t height;
++    // The stream serves a size made here: its frames are mapped and copied,
++    // never imported.
++    bool derived = false;
++    // The framework stream of a video output, plus one; 0 for a still or a JPEG
++    // made here. Two outputs of one request that need the same frame size have
++    // a host stream each, so that one exposure fills both: on one stream they
++    // would take an exposure each, and halve the frame rate.
++    uint32_t output = 0;
++    bool operator<(const StreamKey& other) const {
++      return std::tie(kind, pixel_format, width, height, derived, output) <
++             std::tie(other.kind, other.pixel_format, other.width, other.height, other.derived,
++                      other.output);
++    }
++  };
++
++  // How one output buffer of a request is served.
++  struct Route {
++    bool ok = false;
++    StreamKey key{};
++    // A size made here: the part of the native frame it is scaled from.
++    andarium::camera::Window window;
++    // A device still that belongs to the request's capture group.
++    bool group_still = false;
++  };
++
++  struct Camera {
++    v4l2cam::CameraNodes nodes;
++    andarium::camera::Capabilities capabilities;
++    andarium::camera::Limits limits;
++    std::unique_ptr<andarium::camera::ControlPlanner> planner;
++    v4l2cam::UniqueFd control_fd;
++    std::vector<uint32_t> unsupported_controls;
++    std::unique_ptr<v4l2cam::V4l2MetaReader> meta;
++    std::map<StreamKey, std::unique_ptr<v4l2cam::V4l2Stream>> streams;
++    // What still_free_requests_begun_ was when a request last used each stream
++    // (or, for a video output, when a request that takes a still began), for the
++    // rule that closes an idle stream.
++    std::map<StreamKey, uint64_t> stream_last_request;
++    uint32_t buffers = 4;
++    uint32_t fps = 0;
++    andarium::camera::Request last_request;
++    andarium::camera::abi::Meta last_meta{};
++    bool have_meta = false;
++    andarium::camera::abi::Meta last_still_meta{};
++    bool have_still_meta = false;
++    // The CLOCK_BOOTTIME time of the first buffer of the request that completed.
++    nsecs_t request_timestamp = 0;
++    bool use_dmabuf = true;
++    // The sizes the camera serves, with how each is made.
++    andarium::camera::StreamSizes sizes;
++  };
++
++  struct Pending {
++    v4l2cam::V4l2Stream* stream = nullptr;
++    int slot = -1;
++    Camera* camera = nullptr;
++    bool derived = false;
++    andarium::camera::Window window;
++  };
++
++  V4l2FrameSource() = default;
++
++  static Route RouteOf(const Camera& camera, const SensorBuffer& buffer);
++  v4l2cam::V4l2Stream* StreamFor(Camera* camera, const StreamKey& key);
++  void CloseIdleStreams(Camera* camera, const std::set<StreamKey>& used);
++  static SensorCharacteristics ExifCharacteristics(const Camera& camera, SensorCharacteristics chars);
++  bool QueueBuffer(Camera* camera, v4l2cam::V4l2Stream* stream, SensorBuffer* buffer,
++                   const Route& route, uint32_t cookie, bool last_of_group);
++  bool WaitFor(const SensorBuffer* buffer, v4l2cam::V4l2Stream::Completion* completion,
++               const uint8_t** mapped, Pending* pending);
++  static status_t ScaleInto(const Pending& pending, const uint8_t* mapped, SensorBuffer* buffer);
++  status_t EncodeDerived(Camera* camera, const Pending& pending, const uint8_t* mapped,
++                         SensorBuffer* buffer, HalCameraMetadata* result_metadata,
++                         const SensorCharacteristics& chars);
++  bool MetaOf(Camera* camera, uint64_t sequence, andarium::camera::abi::Meta* meta);
++  static andarium::camera::Request RequestOf(const SensorSettings& settings);
++
++  std::map<uint32_t, Camera> cameras_;
++  std::map<const SensorBuffer*, Pending> pending_;
++  // The requests that took no still and have begun so far. A request that takes
++  // a still does not count: it holds the pipeline for as long as the host takes
++  // to make the picture, and the requests of the preview wait behind it, and it
++  // starts the count of absences again for every open video output.
++  uint64_t still_free_requests_begun_ = 0;
++  // A flush or a close is under way (Interrupt); the sensor clears it as it takes the next request.
++  std::atomic<bool> interrupted_{false};
++  // When the request being collected has to be complete, whatever its buffers
++  // wait for: one deadline for the whole request.
++  andarium::camera::RequestClock request_clock_;
++};
++
++}  // namespace framesource
++}  // namespace android
++
++#endif  // HW_EMULATOR_CAMERA_V4L2_FRAME_SOURCE_H
+diff --git a/devices/EmulatedCamera/hwl/V4l2Stream.cpp b/devices/EmulatedCamera/hwl/V4l2Stream.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..7a72eb4df5da4d068f588026c028401d11e9af01
+--- /dev/null
++++ b/devices/EmulatedCamera/hwl/V4l2Stream.cpp
+@@ -0,0 +1,468 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#define LOG_TAG "V4l2Stream"
++#include "V4l2Stream.h"
++
++#include <fcntl.h>
++#include <log/log.h>
++#include <poll.h>
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++#include <unistd.h>
++
++#include <algorithm>
++#include <cerrno>
++#include <chrono>
++#include <cstring>
++
++namespace android {
++namespace v4l2cam {
++
++namespace abi = andarium::camera::abi;
++
++namespace {
++constexpr size_t kMetaBuffers = 16;
++constexpr size_t kMetaRecordsKept = 64;
++}  // namespace
++
++std::unique_ptr<V4l2Stream> V4l2Stream::Create(const Params& params) {
++  std::unique_ptr<V4l2Stream> stream(new V4l2Stream(params));
++  if (stream->Initialize() != OK) {
++    return nullptr;
++  }
++  return stream;
++}
++
++V4l2Stream::~V4l2Stream() {
++  FreeBuffers();
++}
++
++status_t V4l2Stream::Initialize() {
++  fd_.reset(open(params_.path.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC));
++  if (!fd_.valid()) {
++    ALOGE("%s: cannot open %s: %s", __FUNCTION__, params_.path.c_str(), strerror(errno));
++    return NO_INIT;
++  }
++
++  struct v4l2_format format = {};
++  format.type = TypeOf();
++  format.fmt.pix_mp.width = params_.width;
++  format.fmt.pix_mp.height = params_.height;
++  format.fmt.pix_mp.pixelformat = params_.pixel_format;
++  format.fmt.pix_mp.field = V4L2_FIELD_NONE;
++  format.fmt.pix_mp.num_planes = 1;
++  if (Ioctl(fd_.get(), VIDIOC_S_FMT, &format) != 0) {
++    ALOGE("%s: S_FMT %ux%u %08x: %s", __FUNCTION__, params_.width, params_.height,
++          params_.pixel_format, strerror(errno));
++    return BAD_VALUE;
++  }
++  if (format.fmt.pix_mp.width != params_.width ||
++      format.fmt.pix_mp.height != params_.height ||
++      format.fmt.pix_mp.pixelformat != params_.pixel_format ||
++      format.fmt.pix_mp.num_planes != 1) {
++    ALOGE("%s: the node would not give %ux%u %08x in one plane (got %ux%u %08x, %u planes)",
++          __FUNCTION__, params_.width, params_.height, params_.pixel_format,
++          format.fmt.pix_mp.width, format.fmt.pix_mp.height,
++          format.fmt.pix_mp.pixelformat, format.fmt.pix_mp.num_planes);
++    return BAD_VALUE;
++  }
++  num_planes_ = format.fmt.pix_mp.num_planes;
++  bytes_per_line_ = format.fmt.pix_mp.plane_fmt[0].bytesperline;
++  size_image_ = format.fmt.pix_mp.plane_fmt[0].sizeimage;
++
++  if (params_.kind == Kind::kVideo && params_.fps != 0) {
++    SetFrameRate(params_.fps);
++  }
++
++  status_t result = params_.try_dmabuf ? AllocateBuffers(true) : BAD_VALUE;
++  if (result != OK) {
++    result = AllocateBuffers(false);
++  }
++  return result;
++}
++
++status_t V4l2Stream::AllocateBuffers(bool dmabuf) {
++  struct v4l2_requestbuffers request = {};
++  request.type = TypeOf();
++  request.memory = dmabuf ? V4L2_MEMORY_DMABUF : V4L2_MEMORY_MMAP;
++  request.count = params_.buffers;
++  if (Ioctl(fd_.get(), VIDIOC_REQBUFS, &request) != 0 || request.count == 0) {
++    ALOGW("%s: REQBUFS (%s): %s", __FUNCTION__, dmabuf ? "dma-buf" : "mmap",
++          strerror(errno));
++    return BAD_VALUE;
++  }
++  slots_.assign(request.count, Slot());
++  cookies_.assign(request.count, 0);
++  dmabuf_ = dmabuf;
++  if (dmabuf) {
++    return OK;
++  }
++  for (uint32_t index = 0; index < request.count; ++index) {
++    struct v4l2_plane planes[VIDEO_MAX_PLANES] = {};
++    struct v4l2_buffer buffer = {};
++    buffer.type = TypeOf();
++    buffer.memory = V4L2_MEMORY_MMAP;
++    buffer.index = index;
++    buffer.m.planes = planes;
++    buffer.length = num_planes_;
++    if (Ioctl(fd_.get(), VIDIOC_QUERYBUF, &buffer) != 0) {
++      ALOGE("%s: QUERYBUF: %s", __FUNCTION__, strerror(errno));
++      FreeBuffers();
++      return BAD_VALUE;
++    }
++    void* mapped = mmap(nullptr, planes[0].length, PROT_READ | PROT_WRITE, MAP_SHARED,
++                        fd_.get(), planes[0].m.mem_offset);
++    if (mapped == MAP_FAILED) {
++      ALOGE("%s: mmap: %s", __FUNCTION__, strerror(errno));
++      FreeBuffers();
++      return NO_MEMORY;
++    }
++    slots_[index].mapped = static_cast<uint8_t*>(mapped);
++    slots_[index].mapped_length = planes[0].length;
++  }
++  return OK;
++}
++
++void V4l2Stream::FreeBuffers() {
++  if (fd_.valid()) {
++    if (streaming_) {
++      int type = TypeOf();
++      Ioctl(fd_.get(), VIDIOC_STREAMOFF, &type);
++      streaming_ = false;
++    }
++    for (auto& slot : slots_) {
++      if (slot.mapped != nullptr) {
++        munmap(slot.mapped, slot.mapped_length);
++        slot.mapped = nullptr;
++      }
++    }
++    if (!slots_.empty()) {
++      struct v4l2_requestbuffers request = {};
++      request.type = TypeOf();
++      request.memory = dmabuf_ ? V4L2_MEMORY_DMABUF : V4L2_MEMORY_MMAP;
++      request.count = 0;
++      Ioctl(fd_.get(), VIDIOC_REQBUFS, &request);
++    }
++  }
++  slots_.clear();
++  cookies_.clear();
++}
++
++status_t V4l2Stream::SwitchToMmap() {
++  std::lock_guard<std::mutex> lock(mutex_);
++  if (!dmabuf_) {
++    return OK;
++  }
++  FreeBuffers();
++  return AllocateBuffers(false);
++}
++
++void V4l2Stream::SetFrameRate(uint32_t fps) {
++  if (fps == 0 || !fd_.valid()) {
++    return;
++  }
++  struct v4l2_streamparm parameters = {};
++  parameters.type = TypeOf();
++  parameters.parm.capture.timeperframe.numerator = 1;
++  parameters.parm.capture.timeperframe.denominator = fps;
++  if (Ioctl(fd_.get(), VIDIOC_S_PARM, &parameters) != 0) {
++    ALOGV("%s: S_PARM %u: %s", __FUNCTION__, fps, strerror(errno));
++  }
++}
++
++int V4l2Stream::Queue(int dma_fd, size_t dma_length, uint32_t group_cookie,
++                      bool last_of_group) {
++  std::lock_guard<std::mutex> lock(mutex_);
++  int slot = -1;
++  for (size_t index = 0; index < slots_.size(); ++index) {
++    if (!slots_[index].queued && !slots_[index].done) {
++      slot = static_cast<int>(index);
++      break;
++    }
++  }
++  if (slot < 0) {
++    ALOGE("%s: every buffer of the stream is in flight", __FUNCTION__);
++    return -1;
++  }
++  if (dmabuf_ && (dma_fd < 0 || dma_length < size_image_)) {
++    return -1;
++  }
++
++  struct v4l2_plane planes[VIDEO_MAX_PLANES] = {};
++  struct v4l2_buffer buffer = {};
++  buffer.type = TypeOf();
++  buffer.memory = dmabuf_ ? V4L2_MEMORY_DMABUF : V4L2_MEMORY_MMAP;
++  buffer.index = slot;
++  buffer.m.planes = planes;
++  buffer.length = num_planes_;
++  if (dmabuf_) {
++    planes[0].m.fd = dma_fd;
++    planes[0].length = dma_length;
++  }
++  if (group_cookie != 0) {
++    buffer.timestamp.tv_sec = group_cookie;
++    if (last_of_group) {
++      buffer.flags |= V4L2_BUF_FLAG_LAST;
++    }
++  }
++  if (Ioctl(fd_.get(), VIDIOC_QBUF, &buffer) != 0) {
++    ALOGE("%s: QBUF: %s", __FUNCTION__, strerror(errno));
++    return -1;
++  }
++  slots_[slot].queued = true;
++  slots_[slot].done = false;
++  if (!streaming_) {
++    int type = TypeOf();
++    if (Ioctl(fd_.get(), VIDIOC_STREAMON, &type) != 0) {
++      ALOGE("%s: STREAMON: %s", __FUNCTION__, strerror(errno));
++      // The buffer just queued is not going to be filled: take it back, so that
++      // no slot stays with a device that is not running.
++      ResetLocked();
++      return -1;
++    }
++    streaming_ = true;
++  }
++  last_used_ = systemTime(SYSTEM_TIME_MONOTONIC);
++  return slot;
++}
++
++status_t V4l2Stream::DequeueLocked() {
++  struct v4l2_plane planes[VIDEO_MAX_PLANES] = {};
++  struct v4l2_buffer buffer = {};
++  buffer.type = TypeOf();
++  buffer.memory = dmabuf_ ? V4L2_MEMORY_DMABUF : V4L2_MEMORY_MMAP;
++  buffer.m.planes = planes;
++  buffer.length = num_planes_;
++  if (Ioctl(fd_.get(), VIDIOC_DQBUF, &buffer) != 0) {
++    return errno == EAGAIN ? WOULD_BLOCK : UNKNOWN_ERROR;
++  }
++  if (buffer.index >= slots_.size()) {
++    return UNKNOWN_ERROR;
++  }
++  auto& slot = slots_[buffer.index];
++  slot.queued = false;
++  slot.done = true;
++  slot.completion.sequence = buffer.sequence;
++  slot.completion.timestamp = BufferTimeAsBoottime(buffer.timestamp);
++  slot.completion.bytes_used = planes[0].bytesused;
++  slot.completion.error = (buffer.flags & V4L2_BUF_FLAG_ERROR) != 0;
++  return OK;
++}
++
++void V4l2Stream::ResetLocked() {
++  if (fd_.valid()) {
++    int type = TypeOf();
++    Ioctl(fd_.get(), VIDIOC_STREAMOFF, &type);
++  }
++  streaming_ = false;
++  for (auto& slot : slots_) {
++    slot.queued = false;
++    slot.done = false;
++  }
++}
++
++status_t V4l2Stream::Wait(int slot, nsecs_t timeout_ns, const std::atomic<bool>* cancel,
++                          Completion* completion) {
++  const nsecs_t deadline = systemTime(SYSTEM_TIME_MONOTONIC) + timeout_ns;
++  for (;;) {
++    {
++      std::lock_guard<std::mutex> lock(mutex_);
++      if (slot < 0 || static_cast<size_t>(slot) >= slots_.size()) {
++        return BAD_VALUE;
++      }
++      while (DequeueLocked() == OK) {
++      }
++      if (slots_[slot].done) {
++        *completion = slots_[slot].completion;
++        slots_[slot].done = false;
++        last_used_ = systemTime(SYSTEM_TIME_MONOTONIC);
++        return OK;
++      }
++      if (!slots_[slot].queued) {
++        // Another wait's reset took the buffer back.
++        return DEAD_OBJECT;
++      }
++      if (cancel != nullptr && cancel->load()) {
++        ResetLocked();
++        return DEAD_OBJECT;
++      }
++      if (deadline - systemTime(SYSTEM_TIME_MONOTONIC) <= 0) {
++        ALOGW("%s: the camera did not deliver the buffer of slot %d; the stream starts over",
++              __FUNCTION__, slot);
++        ResetLocked();
++        return TIMED_OUT;
++      }
++    }
++    const nsecs_t remaining = deadline - systemTime(SYSTEM_TIME_MONOTONIC);
++    struct pollfd wait = {fd_.get(), POLLIN | POLLRDNORM, 0};
++    int ready = poll(&wait, 1, static_cast<int>(std::clamp<nsecs_t>(remaining / 1000000 + 1, 1, 1000)));
++    if (ready < 0 && errno != EINTR) {
++      return UNKNOWN_ERROR;
++    }
++  }
++}
++
++const uint8_t* V4l2Stream::Mapped(int slot) const {
++  std::lock_guard<std::mutex> lock(mutex_);
++  if (slot < 0 || static_cast<size_t>(slot) >= slots_.size()) {
++    return nullptr;
++  }
++  return slots_[slot].mapped;
++}
++
++std::unique_ptr<V4l2MetaReader> V4l2MetaReader::Create(const std::string& path) {
++  std::unique_ptr<V4l2MetaReader> reader(new V4l2MetaReader());
++  if (reader->Initialize(path) != OK) {
++    return nullptr;
++  }
++  return reader;
++}
++
++status_t V4l2MetaReader::Initialize(const std::string& path) {
++  fd_.reset(open(path.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC));
++  if (!fd_.valid()) {
++    ALOGE("%s: cannot open %s: %s", __FUNCTION__, path.c_str(), strerror(errno));
++    return NO_INIT;
++  }
++  struct v4l2_format format = {};
++  format.type = V4L2_BUF_TYPE_META_CAPTURE;
++  if (Ioctl(fd_.get(), VIDIOC_G_FMT, &format) != 0) {
++    ALOGE("%s: G_FMT on %s: %s", __FUNCTION__, path.c_str(), strerror(errno));
++    return BAD_VALUE;
++  }
++  record_size_ = format.fmt.meta.buffersize;
++  if (record_size_ < sizeof(abi::Meta)) {
++    ALOGE("%s: the metadata buffer of %s is %zu bytes, a record is %zu", __FUNCTION__,
++          path.c_str(), record_size_, sizeof(abi::Meta));
++    return BAD_VALUE;
++  }
++
++  struct v4l2_requestbuffers request = {};
++  request.type = V4L2_BUF_TYPE_META_CAPTURE;
++  request.memory = V4L2_MEMORY_MMAP;
++  request.count = kMetaBuffers;
++  if (Ioctl(fd_.get(), VIDIOC_REQBUFS, &request) != 0 || request.count == 0) {
++    ALOGE("%s: REQBUFS on %s: %s", __FUNCTION__, path.c_str(), strerror(errno));
++    return BAD_VALUE;
++  }
++  for (uint32_t index = 0; index < request.count; ++index) {
++    struct v4l2_buffer buffer = {};
++    buffer.type = V4L2_BUF_TYPE_META_CAPTURE;
++    buffer.memory = V4L2_MEMORY_MMAP;
++    buffer.index = index;
++    if (Ioctl(fd_.get(), VIDIOC_QUERYBUF, &buffer) != 0) {
++      ALOGE("%s: QUERYBUF: %s", __FUNCTION__, strerror(errno));
++      return BAD_VALUE;
++    }
++    void* mapped = mmap(nullptr, buffer.length, PROT_READ | PROT_WRITE, MAP_SHARED,
++                        fd_.get(), buffer.m.offset);
++    if (mapped == MAP_FAILED) {
++      ALOGE("%s: mmap: %s", __FUNCTION__, strerror(errno));
++      return NO_MEMORY;
++    }
++    mapped_.push_back(static_cast<uint8_t*>(mapped));
++    mapped_length_.push_back(buffer.length);
++    if (Ioctl(fd_.get(), VIDIOC_QBUF, &buffer) != 0) {
++      ALOGE("%s: QBUF: %s", __FUNCTION__, strerror(errno));
++      return BAD_VALUE;
++    }
++  }
++  int type = V4L2_BUF_TYPE_META_CAPTURE;
++  if (Ioctl(fd_.get(), VIDIOC_STREAMON, &type) != 0) {
++    ALOGE("%s: STREAMON: %s", __FUNCTION__, strerror(errno));
++    return BAD_VALUE;
++  }
++  thread_ = std::thread([this] { Run(); });
++  return OK;
++}
++
++V4l2MetaReader::~V4l2MetaReader() {
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    stop_ = true;
++  }
++  if (thread_.joinable()) {
++    thread_.join();
++  }
++  if (fd_.valid()) {
++    int type = V4L2_BUF_TYPE_META_CAPTURE;
++    Ioctl(fd_.get(), VIDIOC_STREAMOFF, &type);
++  }
++  for (size_t index = 0; index < mapped_.size(); ++index) {
++    munmap(mapped_[index], mapped_length_[index]);
++  }
++}
++
++void V4l2MetaReader::Run() {
++  for (;;) {
++    {
++      std::lock_guard<std::mutex> lock(mutex_);
++      if (stop_) {
++        return;
++      }
++    }
++    struct pollfd wait = {fd_.get(), POLLIN | POLLRDNORM, 0};
++    int ready = poll(&wait, 1, 100);
++    if (ready <= 0) {
++      continue;
++    }
++    for (;;) {
++      struct v4l2_buffer buffer = {};
++      buffer.type = V4L2_BUF_TYPE_META_CAPTURE;
++      buffer.memory = V4L2_MEMORY_MMAP;
++      if (Ioctl(fd_.get(), VIDIOC_DQBUF, &buffer) != 0) {
++        break;
++      }
++      if (buffer.index < mapped_.size() && buffer.bytesused >= sizeof(abi::Meta)) {
++        abi::Meta meta;
++        memcpy(&meta, mapped_[buffer.index], sizeof(meta));
++        {
++          std::lock_guard<std::mutex> lock(mutex_);
++          records_[meta.sequence] = meta;
++          while (records_.size() > kMetaRecordsKept) {
++            records_.erase(records_.begin());
++          }
++        }
++        arrived_.notify_all();
++      }
++      buffer.bytesused = 0;
++      Ioctl(fd_.get(), VIDIOC_QBUF, &buffer);
++    }
++  }
++}
++
++bool V4l2MetaReader::WaitFor(uint64_t sequence, nsecs_t timeout_ns, abi::Meta* meta) {
++  std::unique_lock<std::mutex> lock(mutex_);
++  auto found = [&] { return records_.find(sequence) != records_.end(); };
++  if (!arrived_.wait_for(lock, std::chrono::nanoseconds(timeout_ns), found)) {
++    return false;
++  }
++  *meta = records_.at(sequence);
++  return true;
++}
++
++bool V4l2MetaReader::Latest(abi::Meta* meta) {
++  std::lock_guard<std::mutex> lock(mutex_);
++  if (records_.empty()) {
++    return false;
++  }
++  *meta = records_.rbegin()->second;
++  return true;
++}
++
++}  // namespace v4l2cam
++}  // namespace android
+diff --git a/devices/EmulatedCamera/hwl/V4l2Stream.h b/devices/EmulatedCamera/hwl/V4l2Stream.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..780eb786800cffc0c72097ff32cbd25344247a2c
+--- /dev/null
++++ b/devices/EmulatedCamera/hwl/V4l2Stream.h
+@@ -0,0 +1,179 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef HW_EMULATOR_CAMERA_V4L2_STREAM_H
++#define HW_EMULATOR_CAMERA_V4L2_STREAM_H
++
++#include <atomic>
++#include <condition_variable>
++#include <map>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <vector>
++
++#include "V4l2Utils.h"
++
++namespace android {
++namespace v4l2cam {
++
++// One open file of a camera's capture node: a stream of the camera device. The
++// device writes each frame (or still) into a buffer that the guest queued, so a
++// request queues the framework's buffer, as a dma-buf where the node can import
++// it and as a mapped buffer of the stream's own (copied by the caller) where not,
++// and waits for it.
++class V4l2Stream {
++ public:
++  enum class Kind { kVideo, kStill };
++
++  struct Params {
++    std::string path;
++    Kind kind = Kind::kVideo;
++    uint32_t pixel_format = 0;
++    uint32_t width = 0;
++    uint32_t height = 0;
++    // The frame interval a video stream is asked for; 0 leaves the node's own.
++    uint32_t fps = 0;
++    uint32_t buffers = 4;
++    bool try_dmabuf = true;
++  };
++
++  struct Completion {
++    uint64_t sequence = 0;
++    nsecs_t timestamp = 0;  // CLOCK_BOOTTIME
++    uint32_t bytes_used = 0;
++    bool error = false;
++  };
++
++  static std::unique_ptr<V4l2Stream> Create(const Params& params);
++  ~V4l2Stream();
++
++  V4l2Stream(const V4l2Stream&) = delete;
++  V4l2Stream& operator=(const V4l2Stream&) = delete;
++
++  bool uses_dmabuf() const {
++    return dmabuf_;
++  }
++  uint32_t bytes_per_line() const {
++    return bytes_per_line_;
++  }
++  uint32_t size_image() const {
++    return size_image_;
++  }
++  const Params& params() const {
++    return params_;
++  }
++  nsecs_t last_used() const {
++    return last_used_;
++  }
++
++  // Queues a buffer and returns its slot, or -1. `dma_fd` is the framework
++  // buffer's dma-buf when the stream uses them. A still that is not the last of
++  // a group (a JPEG that a Bayer still follows) passes `group_cookie`, which
++  // is not zero; the last of a group passes the cookie and `last_of_group`.
++  int Queue(int dma_fd, size_t dma_length, uint32_t group_cookie, bool last_of_group);
++
++  // Waits for the slot's buffer, in slices of at most a second, until
++  // `timeout_ns` has passed or `*cancel` (when given) is set. A wait that ends
++  // without the buffer takes every buffer of the stream back from the device
++  // (STREAMOFF, which the next Queue starts again), so that the device cannot
++  // write later into memory that the framework has reused. TIMED_OUT when the
++  // time ran out; DEAD_OBJECT when the wait was cancelled or the buffer was
++  // already taken back by another wait's reset.
++  status_t Wait(int slot, nsecs_t timeout_ns, const std::atomic<bool>* cancel,
++                Completion* completion);
++
++  // The mapped buffer of a slot when the stream does not use dma-bufs.
++  const uint8_t* Mapped(int slot) const;
++
++  // Gives up dma-bufs: the stream's own mapped buffers from now on.
++  status_t SwitchToMmap();
++
++  // The frame interval of a running video stream.
++  void SetFrameRate(uint32_t fps);
++
++ private:
++  struct Slot {
++    bool queued = false;
++    uint8_t* mapped = nullptr;
++    size_t mapped_length = 0;
++    bool done = false;
++    Completion completion;
++  };
++
++  explicit V4l2Stream(const Params& params) : params_(params) {
++  }
++  status_t Initialize();
++  status_t AllocateBuffers(bool dmabuf);
++  void FreeBuffers();
++  int TypeOf() const {
++    return V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++  }
++  status_t DequeueLocked();
++  // STREAMOFF, and every slot free again: the device holds no buffer afterwards.
++  void ResetLocked();
++
++  Params params_;
++  UniqueFd fd_;
++  bool dmabuf_ = false;
++  bool streaming_ = false;
++  uint32_t bytes_per_line_ = 0;
++  uint32_t size_image_ = 0;
++  uint32_t num_planes_ = 1;
++  std::vector<Slot> slots_;
++  std::vector<uint32_t> cookies_;
++  nsecs_t last_used_ = 0;
++  mutable std::mutex mutex_;
++};
++
++// The metadata node of a camera: a record for each exposure, which a reader
++// thread keeps for the last few exposures so that a frame finds its record by
++// sequence.
++class V4l2MetaReader {
++ public:
++  static std::unique_ptr<V4l2MetaReader> Create(const std::string& path);
++  ~V4l2MetaReader();
++
++  V4l2MetaReader(const V4l2MetaReader&) = delete;
++  V4l2MetaReader& operator=(const V4l2MetaReader&) = delete;
++
++  // Waits up to `timeout_ns` for the record of `sequence`.
++  bool WaitFor(uint64_t sequence, nsecs_t timeout_ns,
++               andarium::camera::abi::Meta* meta);
++  // The newest record, if any.
++  bool Latest(andarium::camera::abi::Meta* meta);
++
++ private:
++  V4l2MetaReader() = default;
++  status_t Initialize(const std::string& path);
++  void Run();
++
++  UniqueFd fd_;
++  std::vector<uint8_t*> mapped_;
++  std::vector<size_t> mapped_length_;
++  size_t record_size_ = 0;
++  std::thread thread_;
++  bool stop_ = false;
++  std::mutex mutex_;
++  std::condition_variable arrived_;
++  std::map<uint64_t, andarium::camera::abi::Meta> records_;
++};
++
++}  // namespace v4l2cam
++}  // namespace android
++
++#endif  // HW_EMULATOR_CAMERA_V4L2_STREAM_H
+diff --git a/devices/EmulatedCamera/hwl/V4l2Thumbnail.cpp b/devices/EmulatedCamera/hwl/V4l2Thumbnail.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..a9c8c24477da327544aa3ce2c05f62cf678cd267
+--- /dev/null
++++ b/devices/EmulatedCamera/hwl/V4l2Thumbnail.cpp
+@@ -0,0 +1,180 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#define LOG_TAG "V4l2Thumbnail"
++#include "V4l2Thumbnail.h"
++
++#include <log/log.h>
++
++#include <algorithm>
++#include <csetjmp>
++#include <cstdio>
++#include <cstdlib>
++
++extern "C" {
++#include <jpeglib.h>
++}
++
++namespace android {
++namespace v4l2cam {
++
++namespace {
++
++struct ErrorManager {
++  struct jpeg_error_mgr base;
++  jmp_buf jump;
++};
++
++void OnError(j_common_ptr info) {
++  longjmp(reinterpret_cast<ErrorManager*>(info->err)->jump, 1);
++}
++
++// Decodes `jpeg` to RGB at a scale of 1, 1/2, 1/4 or 1/8 that keeps both sides
++// at least as large as the thumbnail. The pixels are malloc'd; the caller frees
++// them.
++uint8_t* Decode(const uint8_t* jpeg, size_t size, uint32_t want_width,
++                uint32_t want_height, uint32_t* width, uint32_t* height) {
++  struct jpeg_decompress_struct decoder;
++  ErrorManager error;
++  // Assigned after setjmp and read after the longjmp, so it is volatile.
++  uint8_t* volatile pixels = nullptr;
++  decoder.err = jpeg_std_error(&error.base);
++  error.base.error_exit = OnError;
++  if (setjmp(error.jump) != 0) {
++    jpeg_destroy_decompress(&decoder);
++    free(pixels);
++    return nullptr;
++  }
++  jpeg_create_decompress(&decoder);
++  jpeg_mem_src(&decoder, jpeg, size);
++  if (jpeg_read_header(&decoder, TRUE) != JPEG_HEADER_OK) {
++    jpeg_destroy_decompress(&decoder);
++    return nullptr;
++  }
++  decoder.out_color_space = JCS_RGB;
++  unsigned int denominator = 1;
++  while (denominator < 8 && decoder.image_width / (denominator * 2) >= want_width &&
++         decoder.image_height / (denominator * 2) >= want_height) {
++    denominator *= 2;
++  }
++  decoder.scale_num = 1;
++  decoder.scale_denom = denominator;
++  jpeg_start_decompress(&decoder);
++  *width = decoder.output_width;
++  *height = decoder.output_height;
++  pixels = static_cast<uint8_t*>(malloc(static_cast<size_t>(*width) * *height * 3));
++  if (pixels == nullptr) {
++    jpeg_destroy_decompress(&decoder);
++    return nullptr;
++  }
++  while (decoder.output_scanline < decoder.output_height) {
++    JSAMPROW row = pixels + static_cast<size_t>(decoder.output_scanline) * *width * 3;
++    jpeg_read_scanlines(&decoder, &row, 1);
++  }
++  jpeg_finish_decompress(&decoder);
++  jpeg_destroy_decompress(&decoder);
++  return pixels;
++}
++
++// Encodes RGB pixels; the output is malloc'd by the encoder.
++bool Encode(const uint8_t* pixels, uint32_t width, uint32_t height, int quality,
++            std::vector<uint8_t>* out) {
++  struct jpeg_compress_struct encoder;
++  ErrorManager error;
++  unsigned char* buffer = nullptr;
++  unsigned long length = 0;
++  encoder.err = jpeg_std_error(&error.base);
++  error.base.error_exit = OnError;
++  if (setjmp(error.jump) != 0) {
++    jpeg_destroy_compress(&encoder);
++    free(buffer);
++    return false;
++  }
++  jpeg_create_compress(&encoder);
++  jpeg_mem_dest(&encoder, &buffer, &length);
++  encoder.image_width = width;
++  encoder.image_height = height;
++  encoder.input_components = 3;
++  encoder.in_color_space = JCS_RGB;
++  jpeg_set_defaults(&encoder);
++  jpeg_set_quality(&encoder, quality, TRUE);
++  jpeg_start_compress(&encoder, TRUE);
++  while (encoder.next_scanline < encoder.image_height) {
++    JSAMPROW row = const_cast<uint8_t*>(pixels) +
++                   static_cast<size_t>(encoder.next_scanline) * width * 3;
++    jpeg_write_scanlines(&encoder, &row, 1);
++  }
++  jpeg_finish_compress(&encoder);
++  out->assign(buffer, buffer + length);
++  jpeg_destroy_compress(&encoder);
++  free(buffer);
++  return true;
++}
++
++}  // namespace
++
++bool MakeThumbnail(const uint8_t* jpeg, size_t size, uint32_t width, uint32_t height,
++                   int quality, std::vector<uint8_t>* thumbnail) {
++  if (jpeg == nullptr || width == 0 || height == 0 || thumbnail == nullptr) {
++    return false;
++  }
++  uint32_t source_width = 0;
++  uint32_t source_height = 0;
++  uint8_t* source = Decode(jpeg, size, width, height, &source_width, &source_height);
++  if (source == nullptr) {
++    ALOGW("%s: cannot decode the picture", __FUNCTION__);
++    return false;
++  }
++  // The window of the source with the thumbnail's aspect ratio, centred.
++  uint64_t crop_width = source_width;
++  uint64_t crop_height = source_height;
++  if (crop_width * height > crop_height * width) {
++    crop_width = crop_height * width / height;
++  } else {
++    crop_height = crop_width * height / width;
++  }
++  const uint64_t left = (source_width - crop_width) / 2;
++  const uint64_t top = (source_height - crop_height) / 2;
++
++  std::vector<uint8_t> scaled(static_cast<size_t>(width) * height * 3);
++  for (uint32_t y = 0; y < height; ++y) {
++    const uint64_t y0 = top + crop_height * y / height;
++    const uint64_t y1 = std::max<uint64_t>(top + crop_height * (y + 1) / height, y0 + 1);
++    for (uint32_t x = 0; x < width; ++x) {
++      const uint64_t x0 = left + crop_width * x / width;
++      const uint64_t x1 = std::max<uint64_t>(left + crop_width * (x + 1) / width, x0 + 1);
++      uint64_t sum[3] = {0, 0, 0};
++      for (uint64_t sy = y0; sy < y1 && sy < source_height; ++sy) {
++        for (uint64_t sx = x0; sx < x1 && sx < source_width; ++sx) {
++          const uint8_t* pixel = source + (sy * source_width + sx) * 3;
++          sum[0] += pixel[0];
++          sum[1] += pixel[1];
++          sum[2] += pixel[2];
++        }
++      }
++      const uint64_t count = std::max<uint64_t>((y1 - y0) * (x1 - x0), 1);
++      uint8_t* out = scaled.data() + (static_cast<size_t>(y) * width + x) * 3;
++      out[0] = static_cast<uint8_t>(sum[0] / count);
++      out[1] = static_cast<uint8_t>(sum[1] / count);
++      out[2] = static_cast<uint8_t>(sum[2] / count);
++    }
++  }
++  free(source);
++  return Encode(scaled.data(), width, height, quality, thumbnail);
++}
++
++}  // namespace v4l2cam
++}  // namespace android
+diff --git a/devices/EmulatedCamera/hwl/V4l2Thumbnail.h b/devices/EmulatedCamera/hwl/V4l2Thumbnail.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..e671cdfd7b004559427cc93beb7c47c75ad5863c
+--- /dev/null
++++ b/devices/EmulatedCamera/hwl/V4l2Thumbnail.h
+@@ -0,0 +1,36 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef HW_EMULATOR_CAMERA_V4L2_THUMBNAIL_H
++#define HW_EMULATOR_CAMERA_V4L2_THUMBNAIL_H
++
++#include <cstddef>
++#include <cstdint>
++#include <vector>
++
++namespace android {
++namespace v4l2cam {
++
++// Makes the Exif thumbnail of a JPEG that the host encoded: the picture is
++// decoded at a reduced scale (so that a large picture costs little), cropped to
++// the thumbnail's aspect ratio, scaled to `width` x `height` and encoded.
++bool MakeThumbnail(const uint8_t* jpeg, size_t size, uint32_t width, uint32_t height,
++                   int quality, std::vector<uint8_t>* thumbnail);
++
++}  // namespace v4l2cam
++}  // namespace android
++
++#endif  // HW_EMULATOR_CAMERA_V4L2_THUMBNAIL_H
+diff --git a/devices/EmulatedCamera/hwl/V4l2Utils.cpp b/devices/EmulatedCamera/hwl/V4l2Utils.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..a45fffff8d38d7a0b9268cd1feffba260ebe57d2
+--- /dev/null
++++ b/devices/EmulatedCamera/hwl/V4l2Utils.cpp
+@@ -0,0 +1,479 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#define LOG_TAG "V4l2Utils"
++#include "V4l2Utils.h"
++
++#include <dirent.h>
++#include <fcntl.h>
++#include <log/log.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++
++#include <algorithm>
++#include <array>
++#include <cerrno>
++#include <cstdlib>
++#include <cstring>
++#include <ctime>
++#include <set>
++#include <span>
++
++#include "camera_ids.hpp"
++
++namespace android {
++namespace v4l2cam {
++
++using andarium::camera::ControlWrite;
++using andarium::camera::Formats;
++using andarium::camera::Size;
++using andarium::camera::VideoMode;
++namespace abi = andarium::camera::abi;
++
++void UniqueFd::reset(int fd) {
++  if (fd_ >= 0) {
++    close(fd_);
++  }
++  fd_ = fd;
++}
++
++int Ioctl(int fd, unsigned long request, void* arg) {
++  int ret;
++  do {
++    ret = ioctl(fd, request, arg);
++  } while (ret == -1 && errno == EINTR);
++  return ret;
++}
++
++nsecs_t BufferTimeAsBoottime(const struct timeval& timestamp) {
++  struct timespec monotonic;
++  struct timespec boottime;
++  clock_gettime(CLOCK_MONOTONIC, &monotonic);
++  clock_gettime(CLOCK_BOOTTIME, &boottime);
++  const nsecs_t offset = (static_cast<nsecs_t>(boottime.tv_sec) -
++                          static_cast<nsecs_t>(monotonic.tv_sec)) *
++                             1000000000LL +
++                         (static_cast<nsecs_t>(boottime.tv_nsec) -
++                          static_cast<nsecs_t>(monotonic.tv_nsec));
++  return static_cast<nsecs_t>(timestamp.tv_sec) * 1000000000LL +
++         static_cast<nsecs_t>(timestamp.tv_usec) * 1000LL + offset;
++}
++
++namespace {
++
++constexpr uint32_t kRawFormats[] = {V4L2_PIX_FMT_SRGGB16, V4L2_PIX_FMT_SGRBG16,
++                                    V4L2_PIX_FMT_SGBRG16, V4L2_PIX_FMT_SBGGR16};
++
++bool ParseCameraIndex(const std::string& bus_info, uint32_t* index) {
++  const std::string prefix = kBusInfoPrefix;
++  if (bus_info.compare(0, prefix.size(), prefix) != 0) {
++    return false;
++  }
++  char* end = nullptr;
++  errno = 0;
++  unsigned long value = strtoul(bus_info.c_str() + prefix.size(), &end, 10);
++  if (errno != 0 || end == bus_info.c_str() + prefix.size() || *end != '\0' ||
++      value >= abi::max_cameras) {
++    return false;
++  }
++  *index = static_cast<uint32_t>(value);
++  return true;
++}
++
++// The frame rates a size runs at, from ENUM_FRAMEINTERVALS.
++bool FrameRates(int fd, uint32_t pixel_format, uint32_t width, uint32_t height,
++                uint32_t* min_fps, uint32_t* max_fps) {
++  struct v4l2_frmivalenum interval = {};
++  interval.pixel_format = pixel_format;
++  interval.width = width;
++  interval.height = height;
++  uint32_t low = UINT32_MAX;
++  uint32_t high = 0;
++  for (interval.index = 0; Ioctl(fd, VIDIOC_ENUM_FRAMEINTERVALS, &interval) == 0;
++       ++interval.index) {
++    auto fps_of = [](const struct v4l2_fract& fraction) -> uint32_t {
++      return fraction.numerator == 0 ? 0 : fraction.denominator / fraction.numerator;
++    };
++    if (interval.type == V4L2_FRMIVAL_TYPE_DISCRETE) {
++      const uint32_t fps = fps_of(interval.discrete);
++      low = std::min(low, fps);
++      high = std::max(high, fps);
++    } else {
++      // The shortest interval is the highest rate.
++      high = std::max(high, fps_of(interval.stepwise.min));
++      low = std::min(low, fps_of(interval.stepwise.max));
++      break;
++    }
++  }
++  if (high == 0) {
++    return false;
++  }
++  *min_fps = low == UINT32_MAX ? high : std::max<uint32_t>(low, 1);
++  *max_fps = high;
++  return true;
++}
++
++// The discrete sizes of a pixel format, from ENUM_FRAMESIZES.
++std::vector<Size> FrameSizes(int fd, uint32_t pixel_format) {
++  std::vector<Size> sizes;
++  struct v4l2_frmsizeenum size = {};
++  size.pixel_format = pixel_format;
++  for (size.index = 0; Ioctl(fd, VIDIOC_ENUM_FRAMESIZES, &size) == 0; ++size.index) {
++    if (size.type == V4L2_FRMSIZE_TYPE_DISCRETE) {
++      sizes.push_back({size.discrete.width, size.discrete.height});
++    } else {
++      ALOGW("%s: format %08x offers a stepwise size range; ignored", __FUNCTION__,
++            pixel_format);
++      break;
++    }
++  }
++  return sizes;
++}
++
++bool EnumerateFormats(int fd, CameraNodes* nodes) {
++  std::vector<uint32_t> pixel_formats;
++  struct v4l2_fmtdesc description = {};
++  description.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++  for (description.index = 0; Ioctl(fd, VIDIOC_ENUM_FMT, &description) == 0;
++       ++description.index) {
++    pixel_formats.push_back(description.pixelformat);
++  }
++  auto has = [&](uint32_t format) {
++    return std::find(pixel_formats.begin(), pixel_formats.end(), format) !=
++           pixel_formats.end();
++  };
++
++  if (has(V4L2_PIX_FMT_NV12)) {
++    nodes->video_pixel_format = V4L2_PIX_FMT_NV12;
++  } else if (has(V4L2_PIX_FMT_NV12M)) {
++    nodes->video_pixel_format = V4L2_PIX_FMT_NV12M;
++  } else {
++    ALOGE("%s: camera %u offers no NV12 video", __FUNCTION__, nodes->camera_index);
++    return false;
++  }
++  for (const auto& size : FrameSizes(fd, nodes->video_pixel_format)) {
++    uint32_t low = 0;
++    uint32_t high = 0;
++    if (!FrameRates(fd, nodes->video_pixel_format, size.width, size.height, &low, &high)) {
++      // A size without intervals runs at the usual rate.
++      low = 1;
++      high = 30;
++    }
++    nodes->formats.video.push_back({size.width, size.height, low, high});
++  }
++  if (nodes->formats.video.empty()) {
++    ALOGE("%s: camera %u offers no video size", __FUNCTION__, nodes->camera_index);
++    return false;
++  }
++
++  if (has(V4L2_PIX_FMT_JPEG)) {
++    nodes->has_jpeg = true;
++    nodes->formats.jpeg = FrameSizes(fd, V4L2_PIX_FMT_JPEG);
++  }
++  for (uint32_t format : kRawFormats) {
++    if (has(format)) {
++      const auto sizes = FrameSizes(fd, format);
++      if (!sizes.empty()) {
++        nodes->raw_pixel_format = format;
++        nodes->formats.raw = andarium::camera::largest(sizes);
++      }
++      break;
++    }
++  }
++  return true;
++}
++
++// The pixel format a Bayer order is offered as.
++uint32_t RawFormatOf(uint32_t bayer_order) {
++  switch (bayer_order) {
++    case abi::bayer::rggb:
++      return V4L2_PIX_FMT_SRGGB16;
++    case abi::bayer::grbg:
++      return V4L2_PIX_FMT_SGRBG16;
++    case abi::bayer::gbrg:
++      return V4L2_PIX_FMT_SGBRG16;
++    case abi::bayer::bggr:
++      return V4L2_PIX_FMT_SBGGR16;
++    default:
++      return 0;
++  }
++}
++
++}  // namespace
++
++status_t ReadControl(int fd, uint32_t id, int64_t* value) {
++  // The kernel fills the 64-bit member for a 64-bit control and the 32-bit one
++  // for every other integer, so the control's type says which to read.
++  struct v4l2_query_ext_ctrl query = {};
++  query.id = id;
++  if (Ioctl(fd, VIDIOC_QUERY_EXT_CTRL, &query) != 0) {
++    return BAD_VALUE;
++  }
++  struct v4l2_ext_control control = {};
++  control.id = id;
++  struct v4l2_ext_controls controls = {};
++  controls.which = V4L2_CTRL_WHICH_CUR_VAL;
++  controls.count = 1;
++  controls.controls = &control;
++  if (Ioctl(fd, VIDIOC_G_EXT_CTRLS, &controls) != 0) {
++    return BAD_VALUE;
++  }
++  *value = query.type == V4L2_CTRL_TYPE_INTEGER64 ? control.value64
++                                                  : static_cast<int64_t>(control.value);
++  return OK;
++}
++
++static status_t ReadDescription(int fd, abi::Desc* desc) {
++  struct v4l2_ext_control control = {};
++  control.id = kDescriptionControl;
++  control.size = sizeof(*desc);
++  control.ptr = desc;
++  struct v4l2_ext_controls controls = {};
++  controls.which = V4L2_CTRL_WHICH_CUR_VAL;
++  controls.count = 1;
++  controls.controls = &control;
++  if (Ioctl(fd, VIDIOC_G_EXT_CTRLS, &controls) != 0) {
++    return BAD_VALUE;
++  }
++  return OK;
++}
++
++namespace {
++
++// Whether the node has the control. VIDIOC_S_EXT_CTRLS says EINVAL both for a
++// control the node lacks and for a value it refuses; this tells them apart.
++bool ControlExists(int fd, uint32_t id) {
++  struct v4l2_query_ext_ctrl query = {};
++  query.id = id;
++  if (Ioctl(fd, VIDIOC_QUERY_EXT_CTRL, &query) == 0) {
++    return (query.flags & V4L2_CTRL_FLAG_DISABLED) == 0;
++  }
++  return errno != EINVAL;
++}
++
++// Logs a refused value once for each control and value (a request writes the
++// same ones again and again).
++void LogRefused(uint32_t id, int64_t value, int error) {
++  static std::mutex mutex;
++  static std::set<std::pair<uint32_t, int64_t>> seen;
++  constexpr size_t kLimit = 256;
++  std::lock_guard<std::mutex> lock(mutex);
++  if (seen.size() >= kLimit) {
++    seen.clear();
++  }
++  if (seen.insert({id, value}).second) {
++    ALOGW("%s: the camera refused %lld for control %08x: %s", __FUNCTION__,
++          static_cast<long long>(value), id, strerror(error));
++  }
++}
++
++}  // namespace
++
++status_t WriteControls(int fd, const std::vector<ControlWrite>& writes,
++                       std::vector<uint32_t>* unsupported,
++                       const std::function<void(const ControlWrite&)>& written) {
++  status_t result = OK;
++  for (const auto& write : writes) {
++    if (unsupported != nullptr &&
++        std::find(unsupported->begin(), unsupported->end(), write.id) !=
++            unsupported->end()) {
++      continue;
++    }
++    struct v4l2_ext_control control = {};
++    control.id = write.id;
++    std::array<uint32_t, abi::region_words> words = write.region;
++    if (write.is_region) {
++      control.size = sizeof(uint32_t) * words.size();
++      control.ptr = words.data();
++    } else {
++      control.value64 = write.value;
++    }
++    struct v4l2_ext_controls controls = {};
++    controls.which = V4L2_CTRL_WHICH_CUR_VAL;
++    controls.count = 1;
++    controls.controls = &control;
++    if (Ioctl(fd, VIDIOC_S_EXT_CTRLS, &controls) == 0) {
++      if (written) {
++        written(write);
++      }
++      continue;
++    }
++    const int error = errno;
++    if (error == ENOTTY || (error == EINVAL && !ControlExists(fd, write.id))) {
++      if (unsupported != nullptr) {
++        unsupported->push_back(write.id);
++      }
++      ALOGV("%s: the camera has no control %08x", __FUNCTION__, write.id);
++    } else {
++      LogRefused(write.id, write.is_region ? static_cast<int64_t>(write.region[0]) : write.value, error);
++      result = UNKNOWN_ERROR;
++    }
++  }
++  return result;
++}
++
++std::vector<CameraNodes> DiscoverCameraNodes(const std::string& dev_dir) {
++  std::map<uint32_t, CameraNodes> by_index;
++  DIR* dir = opendir(dev_dir.c_str());
++  if (dir == nullptr) {
++    ALOGE("%s: cannot read %s: %s", __FUNCTION__, dev_dir.c_str(), strerror(errno));
++    return {};
++  }
++  std::vector<std::string> names;
++  while (struct dirent* entry = readdir(dir)) {
++    // Only the camera device's nodes (video10 and above) are opened: opening a codec node starts
++    // a session on the host.
++    if (abi::may_be_camera_node(entry->d_name)) {
++      names.push_back(entry->d_name);
++    }
++  }
++  closedir(dir);
++  std::sort(names.begin(), names.end());
++
++  for (const auto& name : names) {
++    const std::string path = dev_dir + "/" + name;
++    UniqueFd fd(open(path.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC));
++    if (!fd.valid()) {
++      continue;
++    }
++    struct v4l2_capability capability = {};
++    if (Ioctl(fd.get(), VIDIOC_QUERYCAP, &capability) != 0) {
++      continue;
++    }
++    const uint32_t caps = (capability.capabilities & V4L2_CAP_DEVICE_CAPS) != 0
++                              ? capability.device_caps
++                              : capability.capabilities;
++    const std::string bus_info(reinterpret_cast<const char*>(capability.bus_info),
++                               strnlen(reinterpret_cast<const char*>(capability.bus_info),
++                                       sizeof(capability.bus_info)));
++    uint32_t index = 0;
++    if (!ParseCameraIndex(bus_info, &index)) {
++      continue;
++    }
++    auto& nodes = by_index[index];
++    nodes.camera_index = index;
++    if ((caps & V4L2_CAP_META_CAPTURE) != 0) {
++      nodes.meta_path = path;
++    } else if ((caps & V4L2_CAP_VIDEO_CAPTURE_MPLANE) != 0 &&
++               (caps & V4L2_CAP_STREAMING) != 0) {
++      nodes.capture_path = path;
++      if (ReadDescription(fd.get(), &nodes.desc) != OK ||
++          nodes.desc.index != index) {
++        ALOGE("%s: %s: no description for camera %u", __FUNCTION__, path.c_str(), index);
++        nodes.capture_path.clear();
++        continue;
++      }
++      if (!EnumerateFormats(fd.get(), &nodes)) {
++        nodes.capture_path.clear();
++        continue;
++      }
++      // The Bayer order the node offers must be the description's.
++      if (nodes.raw_pixel_format != 0 &&
++          nodes.raw_pixel_format != RawFormatOf(nodes.desc.bayer_order)) {
++        ALOGW("%s: camera %u: the Bayer still's format does not match the description",
++              __FUNCTION__, index);
++        nodes.raw_pixel_format = 0;
++        nodes.formats.raw = {};
++      }
++      int64_t privacy = 0;
++      nodes.blocked = ReadControl(fd.get(), abi::cid::privacy, &privacy) == OK && privacy != 0;
++    }
++  }
++
++  std::vector<CameraNodes> cameras;
++  for (auto& [index, nodes] : by_index) {
++    if (nodes.capture_path.empty() || nodes.meta_path.empty()) {
++      ALOGW("%s: camera %u lacks a capture or a metadata node", __FUNCTION__, index);
++      continue;
++    }
++    cameras.push_back(std::move(nodes));
++  }
++  return cameras;
++}
++
++status_t SetTorch(const CameraNodes& nodes, bool on) {
++  UniqueFd fd(open(nodes.capture_path.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC));
++  if (!fd.valid()) {
++    ALOGE("%s: cannot open %s: %s", __FUNCTION__, nodes.capture_path.c_str(), strerror(errno));
++    return NO_INIT;
++  }
++  int64_t privacy = 0;
++  if (ReadControl(fd.get(), abi::cid::privacy, &privacy) == OK && privacy != 0) {
++    return INVALID_OPERATION;
++  }
++  ControlWrite write;
++  write.id = abi::cid::flash_led_mode;
++  write.value = on ? abi::v4l2_value::flash_led_torch : abi::v4l2_value::flash_led_off;
++  return WriteControls(fd.get(), {write}, nullptr);
++}
++
++CameraRegistry& CameraRegistry::Get() {
++  static CameraRegistry registry;
++  return registry;
++}
++
++void CameraRegistry::Replace(std::map<uint32_t, CameraNodes> cameras) {
++  std::lock_guard<std::mutex> lock(mutex_);
++  cameras_ = std::move(cameras);
++}
++
++bool CameraRegistry::Find(uint32_t camera_id, CameraNodes* nodes) const {
++  std::lock_guard<std::mutex> lock(mutex_);
++  auto found = cameras_.find(camera_id);
++  if (found == cameras_.end()) {
++    return false;
++  }
++  *nodes = found->second;
++  return true;
++}
++
++namespace {
++
++std::vector<andarium::camera::Concurrency> ConcurrencyOf(const std::map<uint32_t, CameraNodes>& cameras) {
++  std::vector<andarium::camera::Concurrency> result;
++  for (const auto& entry : cameras) {
++    const auto& desc = entry.second.desc;
++    result.push_back({entry.first, entry.second.camera_index, desc.concurrent_mask, desc.conflict_mask});
++  }
++  return result;
++}
++
++}  // namespace
++
++std::vector<std::vector<uint32_t>> CameraRegistry::ReportedConcurrentSets(
++    const std::function<bool(uint32_t)>& meets) const {
++  std::lock_guard<std::mutex> lock(mutex_);
++  const auto cameras = ConcurrencyOf(cameras_);
++  return andarium::camera::reported_concurrent_sets(
++      std::span<const andarium::camera::Concurrency>(cameras), meets);
++}
++
++std::vector<uint32_t> CameraRegistry::ConflictingIds(uint32_t camera_id) const {
++  std::lock_guard<std::mutex> lock(mutex_);
++  return andarium::camera::conflicting_ids(ConcurrencyOf(cameras_), camera_id);
++}
++
++std::vector<uint32_t> CameraRegistry::Ids() const {
++  std::lock_guard<std::mutex> lock(mutex_);
++  std::vector<uint32_t> ids;
++  for (const auto& entry : cameras_) {
++    ids.push_back(entry.first);
++  }
++  return ids;
++}
++
++}  // namespace v4l2cam
++}  // namespace android
+diff --git a/devices/EmulatedCamera/hwl/V4l2Utils.h b/devices/EmulatedCamera/hwl/V4l2Utils.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..61c0f8a25514b7bbd1782ef8e79e3a4d9db0f071
+--- /dev/null
++++ b/devices/EmulatedCamera/hwl/V4l2Utils.h
+@@ -0,0 +1,154 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef HW_EMULATOR_CAMERA_V4L2_UTILS_H
++#define HW_EMULATOR_CAMERA_V4L2_UTILS_H
++
++#include <linux/videodev2.h>
++#include <utils/Errors.h>
++#include <utils/Timers.h>
++
++#include <cstdint>
++#include <functional>
++#include <map>
++#include <mutex>
++#include <string>
++#include <vector>
++
++#include "camera_abi.hpp"
++#include "camera_controls.hpp"
++#include "camera_plan.hpp"
++
++namespace android {
++namespace v4l2cam {
++
++// The control that returns a camera's static description (the record of
++// virtio_video_camera_desc) on its capture node. It is a read-only U8 compound
++// control of the camera device's private range.
++constexpr uint32_t kDescriptionControl = andarium::camera::abi::cid::private_base + 16;
++
++// The first bytes of a camera node's bus_info; the camera's index follows.
++constexpr const char kBusInfoPrefix[] = "virtio-camera:";
++
++// A file descriptor that closes itself.
++class UniqueFd {
++ public:
++  UniqueFd() = default;
++  explicit UniqueFd(int fd) : fd_(fd) {
++  }
++  UniqueFd(UniqueFd&& other) noexcept : fd_(other.release()) {
++  }
++  UniqueFd& operator=(UniqueFd&& other) noexcept {
++    if (this != &other) {
++      reset(other.release());
++    }
++    return *this;
++  }
++  UniqueFd(const UniqueFd&) = delete;
++  UniqueFd& operator=(const UniqueFd&) = delete;
++  ~UniqueFd() {
++    reset();
++  }
++
++  int get() const {
++    return fd_;
++  }
++  bool valid() const {
++    return fd_ >= 0;
++  }
++  int release() {
++    int fd = fd_;
++    fd_ = -1;
++    return fd;
++  }
++  void reset(int fd = -1);
++
++ private:
++  int fd_ = -1;
++};
++
++// ioctl() that retries when a signal interrupts it.
++int Ioctl(int fd, unsigned long request, void* arg);
++
++// The CLOCK_MONOTONIC time of a V4L2 buffer's timestamp as CLOCK_BOOTTIME.
++nsecs_t BufferTimeAsBoottime(const struct timeval& timestamp);
++
++// One camera as its nodes present it.
++struct CameraNodes {
++  uint32_t camera_index = 0;
++  std::string capture_path;
++  std::string meta_path;
++  andarium::camera::abi::Desc desc{};
++  andarium::camera::Formats formats;
++  // The pixel format of the video kind and of the Bayer still the node offers.
++  uint32_t video_pixel_format = 0;
++  uint32_t raw_pixel_format = 0;
++  bool has_jpeg = false;
++  // The camera's session is blocked: every frame is black.
++  bool blocked = false;
++};
++
++// Scans `dev_dir` for the camera device's capture and metadata nodes, reads
++// each camera's description and formats, and returns the cameras that have both
++// nodes, by ascending camera index. Only video10 and above are opened
++// (abi::may_be_camera_node): the codec nodes below are not.
++std::vector<CameraNodes> DiscoverCameraNodes(const std::string& dev_dir = "/dev");
++
++// Writes the controls, one at a time so that one the camera lacks does not stop
++// the rest. A control that the node does not have (VIDIOC_QUERY_EXT_CTRL says
++// EINVAL) is remembered in `unsupported` and not written again; a value the
++// camera refuses is logged once for the control and value and retires nothing.
++// `written`, when given, is called with each write the camera accepted.
++status_t WriteControls(int fd,
++                       const std::vector<andarium::camera::ControlWrite>& writes,
++                       std::vector<uint32_t>* unsupported,
++                       const std::function<void(const andarium::camera::ControlWrite&)>& written = nullptr);
++
++// Reads one integer control (a 64-bit one through its 64-bit member, the rest
++// through the 32-bit one); BAD_VALUE if the camera has none.
++status_t ReadControl(int fd, uint32_t id, int64_t* value);
++
++// Turns a camera's torch on or off through its capture node, without a stream.
++// INVALID_OPERATION when the camera's session is blocked: there is no torch then.
++status_t SetTorch(const CameraNodes& nodes, bool on);
++
++// What discovery found, by the camera ID Android uses. The characteristics, the
++// frame source and the torch read it.
++class CameraRegistry {
++ public:
++  static CameraRegistry& Get();
++
++  void Replace(std::map<uint32_t, CameraNodes> cameras);
++  bool Find(uint32_t camera_id, CameraNodes* nodes) const;
++  std::vector<uint32_t> Ids() const;
++
++  // The sets of cameras, by Android's IDs, that Android is told can stream at
++  // once: each set the host streams together, reduced to the cameras for which
++  // `meets` holds (the guaranteed concurrent stream sizes), when two remain.
++  // Also the cameras that cannot be open while `camera_id` is.
++  std::vector<std::vector<uint32_t>> ReportedConcurrentSets(
++      const std::function<bool(uint32_t)>& meets) const;
++  std::vector<uint32_t> ConflictingIds(uint32_t camera_id) const;
++
++ private:
++  mutable std::mutex mutex_;
++  std::map<uint32_t, CameraNodes> cameras_;
++};
++
++}  // namespace v4l2cam
++}  // namespace android
++
++#endif  // HW_EMULATOR_CAMERA_V4L2_UTILS_H
+diff --git a/devices/EmulatedCamera/hwl/configs/Android.bp b/devices/EmulatedCamera/hwl/configs/Android.bp
+index 459a51066756a625ab79f2ba3416b32b7bb57a20..af05f4730aa14070410ba7a965732a55ba558cea 100644
+--- a/devices/EmulatedCamera/hwl/configs/Android.bp
++++ b/devices/EmulatedCamera/hwl/configs/Android.bp
+@@ -49,6 +49,12 @@ prebuilt_etc {
+     defaults: ["emu_camera_config_defaults"],
+ }
+ 
++prebuilt_etc {
++    name: "emu_camera_v4l2.json",
++    src: "emu_camera_v4l2.json",
++    defaults: ["emu_camera_config_defaults"],
++}
++
+ prebuilt_etc {
+     name: "emu_camera_main.json",
+     src: "emu_camera_main.json",
+diff --git a/devices/EmulatedCamera/hwl/configs/emu_camera_v4l2.json b/devices/EmulatedCamera/hwl/configs/emu_camera_v4l2.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..6d356b8cc74536c97cfa1b4a2a7d4d5ba6fb2619
+--- /dev/null
++++ b/devices/EmulatedCamera/hwl/configs/emu_camera_v4l2.json
+@@ -0,0 +1,592 @@
++{
++ "android.colorCorrection.availableAberrationModes": [
++  "0"
++ ],
++ "android.control.aeAvailableAntibandingModes": [
++  "0",
++  "3"
++ ],
++ "android.control.aeAvailableModes": [
++  "0",
++  "1",
++  "2",
++  "3"
++ ],
++ "android.control.aeAvailablePriorityModes": [
++  "0"
++ ],
++ "android.control.aeAvailableTargetFpsRanges": [
++  "15",
++  "15",
++  "5",
++  "30",
++  "15",
++  "30",
++  "30",
++  "30"
++ ],
++ "android.control.aeCompensationRange": [
++  "-9",
++  "9"
++ ],
++ "android.control.aeCompensationStep": [
++  "1",
++  "3"
++ ],
++ "android.control.aeLockAvailable": [
++  "TRUE"
++ ],
++ "android.control.afAvailableModes": [
++  "0",
++  "1",
++  "2",
++  "3",
++  "4"
++ ],
++ "android.control.availableEffects": [
++  "0"
++ ],
++ "android.control.availableModes": [
++  "0",
++  "1",
++  "2",
++  "4"
++ ],
++ "android.control.availableSceneModes": [
++  "0"
++ ],
++ "android.control.availableSettingsOverrides": [
++  "0"
++ ],
++ "android.control.availableVideoStabilizationModes": [
++  "0",
++  "1"
++ ],
++ "android.control.awbAvailableModes": [
++  "0",
++  "1",
++  "2",
++  "3",
++  "5",
++  "8"
++ ],
++ "android.control.awbLockAvailable": [
++  "TRUE"
++ ],
++ "android.control.autoframingAvailable": [
++  "FALSE"
++ ],
++ "android.control.maxRegions": [
++  "1",
++  "0",
++  "1"
++ ],
++ "android.control.postRawSensitivityBoostRange": [
++  "100",
++  "100"
++ ],
++ "android.control.zoomRatioRange": [
++  "1.0",
++  "10.0"
++ ],
++ "android.edge.availableEdgeModes": [
++  "0",
++  "1",
++  "2"
++ ],
++ "android.flash.info.available": [
++  "TRUE"
++ ],
++ "android.hotPixel.availableHotPixelModes": [
++  "0",
++  "1",
++  "2"
++ ],
++ "android.info.supportedHardwareLevel": [
++  "LIMITED"
++ ],
++ "android.info.deviceType": [
++  "VIRTUAL"
++ ],
++ "android.jpeg.availableThumbnailSizes": [
++  "0",
++  "0",
++  "160",
++  "120",
++  "320",
++  "240"
++ ],
++ "android.jpeg.maxSize": [
++  "300000"
++ ],
++ "android.lens.facing": [
++  "BACK"
++ ],
++ "android.lens.info.availableApertures": [
++  "2.79999995"
++ ],
++ "android.lens.info.availableFilterDensities": [
++  "0.00000000"
++ ],
++ "android.lens.info.availableFocalLengths": [
++  "3.29999995"
++ ],
++ "android.lens.info.availableOpticalStabilization": [
++  "0"
++ ],
++ "android.lens.info.focusDistanceCalibration": [
++  "APPROXIMATE"
++ ],
++ "android.lens.info.hyperfocalDistance": [
++  "0.20000000"
++ ],
++ "android.lens.info.minimumFocusDistance": [
++  "20.00000000"
++ ],
++ "android.lens.info.shadingMapSize": [
++  "17",
++  "13"
++ ],
++ "android.noiseReduction.availableNoiseReductionModes": [
++  "0",
++  "1",
++  "2"
++ ],
++ "android.request.availableCapabilities": [
++  "BACKWARD_COMPATIBLE"
++ ],
++ "android.sensor.referenceIlluminant1": [
++  "D50"
++ ],
++ "android.statistics.info.availableHotPixelMapModes": [
++  "0"
++ ],
++ "android.request.maxNumInputStreams": [
++  "0"
++ ],
++ "android.request.availableCharacteristicsKeys": [
++  "983043",
++  "983044",
++  "983041",
++  "917517",
++  "983045",
++  "983046",
++  "983040",
++  "917518",
++  "983048",
++  "983042",
++  "983047",
++  "917516",
++  "917529",
++  "589826",
++  "589829",
++  "589828",
++  "589824",
++  "589825",
++  "589827",
++  "589830",
++  "589831",
++  "524293",
++  "327680",
++  "1245189",
++  "851978",
++  "851979",
++  "851980",
++  "851981",
++  "851972",
++  "458759",
++  "458760",
++  "1179648",
++  "1179650",
++  "1179655",
++  "1507329",
++  "65589",
++  "65574",
++  "65561",
++  "65560",
++  "65564",
++  "65555",
++  "65558",
++  "65557",
++  "65556",
++  "65554",
++  "65572",
++  "65563",
++  "65573",
++  "65559",
++  "65562",
++  "4",
++  "196610",
++  "1376256",
++  "1376262",
++  "655362",
++  "1048578",
++  "786438",
++  "786442",
++  "786443",
++  "786444",
++  "786445",
++  "786446",
++  "786447",
++  "65575",
++  "65582",
++  "65592",
++  "983050",
++  "393217",
++  "786440",
++  "917507",
++  "917509",
++  "917511",
++  "917513",
++  "1179654",
++  "851984",
++  "-2080374781"
++ ],
++ "android.request.availableRequestKeys": [
++  "65596",
++  "786435",
++  "786433",
++  "786432",
++  "524290",
++  "524291",
++  "524288",
++  "524289",
++  "524292",
++  "917504",
++  "917505",
++  "917506",
++  "262146",
++  "262144",
++  "262145",
++  "393216",
++  "131072",
++  "655360",
++  "1048576",
++  "0",
++  "1245187",
++  "196608",
++  "1",
++  "2",
++  "1245186",
++  "1245185",
++  "1245184",
++  "851968",
++  "458756",
++  "458758",
++  "458757",
++  "458752",
++  "458753",
++  "458754",
++  "458755",
++  "1114112",
++  "1114115",
++  "65549",
++  "65551",
++  "65541",
++  "65550",
++  "65552",
++  "65539",
++  "65538",
++  "65540",
++  "65537",
++  "65536",
++  "65542",
++  "65547",
++  "65546",
++  "65543",
++  "65544",
++  "65545",
++  "65553",
++  "65588",
++  "1441792",
++  "1114128",
++  "3",
++  "917528",
++  "65576",
++  "65583",
++  "851985",
++  "-2080374783",
++  "-2080374782",
++  "-2080374780",
++  "2097152"
++ ],
++ "android.request.availableResultKeys": [
++  "65596",
++  "786435",
++  "786433",
++  "786432",
++  "524290",
++  "524291",
++  "524288",
++  "524289",
++  "524292",
++  "917504",
++  "917505",
++  "917506",
++  "262146",
++  "262144",
++  "262145",
++  "393216",
++  "131072",
++  "655360",
++  "1048576",
++  "0",
++  "1245187",
++  "196608",
++  "1",
++  "2",
++  "1245186",
++  "1245185",
++  "1245184",
++  "851968",
++  "458756",
++  "458758",
++  "458757",
++  "458752",
++  "458753",
++  "458754",
++  "458755",
++  "1114112",
++  "1114115",
++  "65549",
++  "65551",
++  "65541",
++  "65550",
++  "65552",
++  "65539",
++  "65538",
++  "65540",
++  "65537",
++  "65536",
++  "65542",
++  "65547",
++  "65546",
++  "65543",
++  "65544",
++  "65545",
++  "65553",
++  "65588",
++  "65590",
++  "1441792",
++  "1114128",
++  "3",
++  "917528",
++  "65567",
++  "65568",
++  "65570",
++  "262149",
++  "524297",
++  "524296",
++  "917530",
++  "1114126",
++  "1114123",
++  "786441",
++  "917520",
++  "917522",
++  "65576",
++  "65583",
++  "917523",
++  "917526",
++  "851985",
++  "-2080374783",
++  "-2080374782",
++  "1376262"
++ ],
++ "android.request.availableSessionKeys": [
++  "786435",
++  "-2080374782"
++ ],
++ "android.request.maxNumOutputStreams": [
++  "1",
++  "3",
++  "1"
++ ],
++ "android.request.partialResultCount": [
++  "2"
++ ],
++ "android.request.pipelineMaxDepth": [
++  "8"
++ ],
++ "android.scaler.availableMaxDigitalZoom": [
++  "10.00000000"
++ ],
++ "android.scaler.availableRotateAndCropModes": [
++  "0",
++  "1",
++  "4"
++ ],
++ "android.scaler.availableMinFrameDurations": [
++  "35",
++  "640",
++  "480",
++  "33331760",
++  "34",
++  "640",
++  "480",
++  "33331760",
++  "33",
++  "640",
++  "480",
++  "33331760"
++ ],
++ "android.scaler.availableStallDurations": [
++  "33",
++  "640",
++  "480",
++  "33331760"
++ ],
++ "android.scaler.availableStreamConfigurations": [
++  "35",
++  "640",
++  "480",
++  "OUTPUT",
++  "34",
++  "640",
++  "480",
++  "OUTPUT",
++  "33",
++  "640",
++  "480",
++  "OUTPUT"
++ ],
++ "android.scaler.croppingType": [
++  "CENTER_ONLY"
++ ],
++ "android.sensor.calibrationTransform1": [
++  "128",
++  "128",
++  "0",
++  "128",
++  "0",
++  "128",
++  "0",
++  "128",
++  "128",
++  "128",
++  "0",
++  "128",
++  "0",
++  "128",
++  "0",
++  "128",
++  "128",
++  "128"
++ ],
++ "android.sensor.colorTransform1": [
++  "3209",
++  "1024",
++  "-1655",
++  "1024",
++  "-502",
++  "1024",
++  "-1002",
++  "1024",
++  "1962",
++  "1024",
++  "34",
++  "1024",
++  "73",
++  "1024",
++  "-234",
++  "1024",
++  "1438",
++  "1024"
++ ],
++ "android.sensor.forwardMatrix1": [
++  "446",
++  "1024",
++  "394",
++  "1024",
++  "146",
++  "1024",
++  "227",
++  "1024",
++  "734",
++  "1024",
++  "62",
++  "1024",
++  "14",
++  "1024",
++  "99",
++  "1024",
++  "731",
++  "1024"
++ ],
++ "android.sensor.availableTestPatternModes": [
++  "0",
++  "5"
++ ],
++ "android.sensor.blackLevelPattern": [
++  "64",
++  "64",
++  "64",
++  "64"
++ ],
++ "android.sensor.info.activeArraySize": [
++  "0",
++  "0",
++  "1856",
++  "1392"
++ ],
++ "android.sensor.info.colorFilterArrangement": [
++  "RGGB"
++ ],
++ "android.sensor.info.exposureTimeRange": [
++  "1000",
++  "300000000"
++ ],
++ "android.sensor.info.maxFrameDuration": [
++  "300000000"
++ ],
++ "android.sensor.info.physicalSize": [
++  "3.20000005",
++  "2.40000010"
++ ],
++ "android.sensor.info.pixelArraySize": [
++  "1856",
++  "1392"
++ ],
++ "android.sensor.info.preCorrectionActiveArraySize": [
++  "0",
++  "0",
++  "1856",
++  "1392"
++ ],
++ "android.sensor.info.sensitivityRange": [
++  "100",
++  "1600"
++ ],
++ "android.sensor.info.timestampSource": [
++  "REALTIME"
++ ],
++ "android.sensor.info.whiteLevel": [
++  "4000"
++ ],
++ "android.sensor.maxAnalogSensitivity": [
++  "1600"
++ ],
++ "android.sensor.orientation": [
++  "90"
++ ],
++ "android.shading.availableModes": [
++  "0",
++  "1",
++  "2"
++ ],
++ "android.statistics.info.availableFaceDetectModes": [
++  "0"
++ ],
++ "android.statistics.info.availableLensShadingMapModes": [
++  "0"
++ ],
++ "android.statistics.info.maxFaceCount": [
++  "0"
++ ],
++ "android.sync.maxLatency": [
++  "PER_FRAME_CONTROL"
++ ],
++ "android.tonemap.availableToneMapModes": [
++  "1",
++  "2"
++ ]
++}
+\ No newline at end of file
+diff --git a/devices/EmulatedCamera/hwl/utils/ExifUtils.cpp b/devices/EmulatedCamera/hwl/utils/ExifUtils.cpp
+index 2f3ca4c85933547400d0963174cebf69ded3da70..ea839e861cc491069d7ca9ffbb10a3f3739b0d71 100644
+--- a/devices/EmulatedCamera/hwl/utils/ExifUtils.cpp
++++ b/devices/EmulatedCamera/hwl/utils/ExifUtils.cpp
+@@ -29,6 +29,7 @@
+ #include <vector>
+ 
+ #include "../EmulatedSensor.h"
++#include "camera_exif.hpp"
+ 
+ extern "C" {
+ #include <libexif/exif-data.h>
+@@ -466,17 +467,15 @@ bool ExifUtilsImpl::SetFocalLength(float focal_length) {
+ bool ExifUtilsImpl::SetFocalLengthIn35mmFilm(float focal_length,
+                                              float sensor_size_x,
+                                              float sensor_size_y) {
+-  static const float film_diagonal = 43.27;  // diagonal of 35mm film
+-  static const float min_sensor_diagonal = 0.01;
+-  float sensor_diagonal =
+-      std::sqrt(sensor_size_x * sensor_size_x + sensor_size_y * sensor_size_y);
+-  sensor_diagonal = std::max(sensor_diagonal, min_sensor_diagonal);
+-  float focal_length35mm_film =
+-      std::round(focal_length * film_diagonal / sensor_diagonal);
+-  focal_length35mm_film = std::min(1.0f * 65535, focal_length35mm_film);
+-
+-  SET_SHORT(EXIF_IFD_EXIF, EXIF_TAG_FOCAL_LENGTH_IN_35MM_FILM,
+-            static_cast<uint16_t>(focal_length35mm_film));
++  // A sensor of no known size has no such focal length: the tag is left out,
++  // not computed from a diagonal clamped to a hundredth of a millimetre.
++  const auto film = andarium::camera::focal_length_in_35mm_film(
++      focal_length, sensor_size_x, sensor_size_y);
++  if (!film) {
++    return true;
++  }
++
++  SET_SHORT(EXIF_IFD_EXIF, EXIF_TAG_FOCAL_LENGTH_IN_35MM_FILM, *film);
+   return true;
+ }
+ 
+@@ -935,16 +934,21 @@ bool ExifUtilsImpl::SetFromMetadata(const HalCameraMetadata& metadata,
+       ALOGE("%s: setting focal length failed.", __FUNCTION__);
+       return false;
+     }
+-
+-    if (!SetFocalLengthIn35mmFilm(focal_length, sensor_chars_.physical_size[0],
+-                                  sensor_chars_.physical_size[1])) {
+-      ALOGE("%s: setting focal length in 35mm failed.", __FUNCTION__);
+-      return false;
+-    }
+   } else {
+     ALOGV("%s: Cannot find focal length in metadata.", __FUNCTION__);
+   }
+ 
++  // The camera's stated focal length and sensor size give the field of view,
++  // and so the focal length in 35 mm film; the lens's focal length of this
++  // picture, above, does not go with a stated size once a calibration
++  // replaces it. The tag is left out where the camera states no pair.
++  if (!SetFocalLengthIn35mmFilm(sensor_chars_.focal_length,
++                                sensor_chars_.physical_size[0],
++                                sensor_chars_.physical_size[1])) {
++    ALOGE("%s: setting focal length in 35mm failed.", __FUNCTION__);
++    return false;
++  }
++
+   ret = metadata.Get(ANDROID_SCALER_CROP_REGION, &entry);
+   if (ret == OK) {
+     if (!SetDigitalZoomRatio(entry.data.i32[2], entry.data.i32[3],
+@@ -1006,8 +1010,10 @@ bool ExifUtilsImpl::SetFromMetadata(const HalCameraMetadata& metadata,
+     }
+   }
+ 
++  // An absent, zero or negative exposure is no measurement: the tags are left out
++  // (the logarithm of zero is infinite, and an infinite float does not convert).
+   ret = metadata.Get(ANDROID_SENSOR_EXPOSURE_TIME, &entry);
+-  if (ret == OK) {
++  if (ret == OK && entry.count == 1 && entry.data.i64[0] > 0) {
+     float exposure_time = 1.0f * entry.data.i64[0] / 1e9;
+     if (!SetExposureTime(exposure_time)) {
+       ALOGE("%s: setting exposure time failed.", __FUNCTION__);
+@@ -1045,7 +1051,7 @@ bool ExifUtilsImpl::SetFromMetadata(const HalCameraMetadata& metadata,
+   }
+ 
+   ret = metadata.Get(ANDROID_LENS_APERTURE, &entry);
+-  if (ret == OK) {
++  if (ret == OK && entry.count == 1 && std::isfinite(entry.data.f[0]) && entry.data.f[0] > 0.f) {
+     if (!SetFNumber(entry.data.f[0])) {
+       ALOGE("%s: setting F number failed.", __FUNCTION__);
+       return false;
+diff --git a/devices/EmulatedCamera/hwl/utils/HWLUtils.cpp b/devices/EmulatedCamera/hwl/utils/HWLUtils.cpp
+index 2d156ab877eba6084da1dfb2f2e865740409a1f0..62135a80c2b94947769f039ea73133202e1e8258 100644
+--- a/devices/EmulatedCamera/hwl/utils/HWLUtils.cpp
++++ b/devices/EmulatedCamera/hwl/utils/HWLUtils.cpp
+@@ -87,6 +87,22 @@ status_t GetSensorCharacteristics(const HalCameraMetadata* metadata,
+   sensor_chars->full_res_width = sensor_chars->width;
+   sensor_chars->full_res_height = sensor_chars->height;
+ 
++  // The Exif data needs the camera's focal length and sensor size, as the
++  // static metadata states them, for the focal length in 35 mm film. Whatever
++  // the static metadata holds is read here, a template's default included;
++  // a source that knows the camera states none (the V4L2 frame source) says so
++  // where it makes the Exif data.
++  ret = metadata->Get(ANDROID_SENSOR_INFO_PHYSICAL_SIZE, &entry);
++  if ((ret == OK) && (entry.count == 2) && (entry.data.f[0] > 0.f) &&
++      (entry.data.f[1] > 0.f)) {
++    sensor_chars->physical_size[0] = entry.data.f[0];
++    sensor_chars->physical_size[1] = entry.data.f[1];
++  }
++  ret = metadata->Get(ANDROID_LENS_INFO_AVAILABLE_FOCAL_LENGTHS, &entry);
++  if ((ret == OK) && (entry.count >= 1) && (entry.data.f[0] > 0.f)) {
++    sensor_chars->focal_length = entry.data.f[0];
++  }
++
+   ret = metadata->Get(ANDROID_SENSOR_INFO_PIXEL_ARRAY_SIZE_MAXIMUM_RESOLUTION,
+                       &entry);
+   if ((ret == OK) && (entry.count == 2)) {
+@@ -294,6 +310,16 @@ status_t GetSensorCharacteristics(const HalCameraMetadata* metadata,
+       return BAD_VALUE;
+     }
+ 
++    // A RAW camera that states the hot pixel map mode ON returns the map for a request of it.
++    ret = metadata->Get(ANDROID_STATISTICS_INFO_AVAILABLE_HOT_PIXEL_MAP_MODES, &entry);
++    if (ret == OK) {
++      for (size_t i = 0; i < entry.count; i++) {
++        if (entry.data.u8[i] == ANDROID_STATISTICS_HOT_PIXEL_MAP_MODE_ON) {
++          sensor_chars->hot_pixel_map_supported = true;
++        }
++      }
++    }
++
+     ret = metadata->Get(ANDROID_SENSOR_COLOR_TRANSFORM1, &entry);
+     if ((ret != OK) || (entry.count != (3 * 3))) {  // 3x3 rational matrix
+       ALOGE("%s: Invalid ANDROID_SENSOR_COLOR_TRANSFORM1!", __FUNCTION__);

@@ -434,10 +434,10 @@ index ddd8da4fe0b709afab3950c38f12d55c4b3b8ff4..fcb0582b3f6092b1eeec6b2d258a5e2b
        mtl_set_address(cmd->argument_table, dev->samplers.table.bo->gpu, 1u);
        mtl_release(desc);
 diff --git a/src/kosmickrisp/vulkan/kk_cmd_draw.c b/src/kosmickrisp/vulkan/kk_cmd_draw.c
-index 8509deb688d8ea16d02a4ad7cd6454cf089bc08a..a368cf60c9d750005d83a2efad44e97cc472c576 100644
+index 7834a95e5171c76b9aeddf8c2bd41932463fa27a..8eba16b8772510bcec2321437d1c06871d8089e3 100644
 --- a/src/kosmickrisp/vulkan/kk_cmd_draw.c
 +++ b/src/kosmickrisp/vulkan/kk_cmd_draw.c
-@@ -1808,8 +1808,20 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
+@@ -1809,8 +1809,20 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
     }
  
     if (IS_DIRTY(VI) || IS_DIRTY(VI_BINDINGS_VALID) ||
@@ -459,7 +459,7 @@ index 8509deb688d8ea16d02a4ad7cd6454cf089bc08a..a368cf60c9d750005d83a2efad44e97c
        unsigned slot = 0;
        u_foreach_bit(i, vs->info.vs.attribs_read) {
           if (dyn->vi->attributes_valid & BITFIELD_BIT(i)) {
-@@ -1826,6 +1838,7 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
+@@ -1827,6 +1839,7 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
           slot++;
        }
        desc->root_dirty = true;
@@ -468,7 +468,7 @@ index 8509deb688d8ea16d02a4ad7cd6454cf089bc08a..a368cf60c9d750005d83a2efad44e97c
  
     if (desc->root_dirty)
 diff --git a/src/kosmickrisp/vulkan/kk_debug.c b/src/kosmickrisp/vulkan/kk_debug.c
-index 9dd178a198295175aab10f8abc237e06c9fd1c89..65ab042575d453620727cbb71bec861e53f6b329 100644
+index ec1eb26966ef12c4faebe9a3c8a962243f26f807..74c1a9dd7c2428b70ad9325b5b29eaaf46a9c98b 100644
 --- a/src/kosmickrisp/vulkan/kk_debug.c
 +++ b/src/kosmickrisp/vulkan/kk_debug.c
 @@ -13,6 +13,7 @@ const struct debug_named_value flags[] = {
@@ -476,11 +476,11 @@ index 9dd178a198295175aab10f8abc237e06c9fd1c89..65ab042575d453620727cbb71bec861e
     {"submit_timing", KK_DEBUG_SUBMIT_TIMING},
     {"no_metal_blend", KK_DEBUG_NO_METAL_BLEND},
 +   {"no_metal_vertex_fetch", KK_DEBUG_NO_METAL_VERTEX_FETCH},
+    {"unroll", KK_DEBUG_UNROLL},
     {NULL, 0},
  };
- 
 diff --git a/src/kosmickrisp/vulkan/kk_debug.h b/src/kosmickrisp/vulkan/kk_debug.h
-index e5664b76bb857eebe1b7d2bd0d39c02c2d4949bf..cb572c11c52ba8b3ee23e9bb69bd78bd5ad7cd5f 100644
+index 0d8bb6e2407132a1f868124d4b87bf8d864bcfb4..f189fbb279506d5be2516a9ac4652e8fb3b6e9a5 100644
 --- a/src/kosmickrisp/vulkan/kk_debug.h
 +++ b/src/kosmickrisp/vulkan/kk_debug.h
 @@ -19,6 +19,10 @@ enum kk_debug {
@@ -491,9 +491,9 @@ index e5664b76bb857eebe1b7d2bd0d39c02c2d4949bf..cb572c11c52ba8b3ee23e9bb69bd78bd
 +    * Metal's own vertex descriptor could fetch.  The companion of
 +    * no_metal_blend, for the same two reasons. */
 +   KK_DEBUG_NO_METAL_VERTEX_FETCH = 1ull << 5,
- };
- 
- extern enum kk_debug kk_mesa_debug_flags;
+    /* Report, for every draw, whether the driver unrolled it and whether it
+     * rewrote the draw's vertex order for the provoking vertex, so a workload's
+     * unrolls can be counted. */
 diff --git a/src/kosmickrisp/vulkan/kk_gpl.h b/src/kosmickrisp/vulkan/kk_gpl.h
 index 9a3f458f98a38ced65e9838be6b35a78f53bfb1c..7fd010454cd4c5495d28e83b31d0d54d8431d967 100644
 --- a/src/kosmickrisp/vulkan/kk_gpl.h

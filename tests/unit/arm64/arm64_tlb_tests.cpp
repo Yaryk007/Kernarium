@@ -464,6 +464,33 @@ void tagged_aliases_follow_a_history_overflow()
 
 } // namespace
 
+/* The all-ones address is what an empty cell of the engine's indirect branch
+ * caches holds. A TLB entry is keyed on the page number, which no address can
+ * make equal to the empty key, so a lookup of it misses -- on an empty table
+ * and on a filled one, tagged or not. */
+void the_all_ones_address_never_matches_an_empty_entry()
+{
+	constexpr unsigned long generation = 223;
+	constexpr std::uint64_t base = 0x1700'0000;
+	constexpr std::uint64_t all_ones = ~std::uint64_t{};
+	Mapping mapping{generation, base, 8};
+	auto tlb = std::make_unique<Tlb>();
+	for (const bool tagged : {false, true}) {
+		tlb->tagged_addresses = tagged;
+		tlb->prepare(generation, changes(generation));
+		for (const bool filled : {false, true}) {
+			if (filled)
+				fill(*tlb, base, 8);
+			require(tlb->translate(all_ones, Access::read) == nullptr);
+			require(tlb->translate(all_ones, Access::write) == nullptr);
+			require(tlb->translate_tagged(all_ones, Access::read) ==
+				nullptr);
+			require(tlb->translate_tagged(all_ones, Access::write) ==
+				nullptr);
+		}
+	}
+}
+
 int main()
 {
 	const uml::testing::RuntimeTestRoute runtime_route;
@@ -478,4 +505,5 @@ int main()
 	tagged_aliases_follow_a_protection_change();
 	tagged_aliases_follow_a_generation_switch();
 	tagged_aliases_follow_a_history_overflow();
+	the_all_ones_address_never_matches_an_empty_entry();
 }

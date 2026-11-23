@@ -30,8 +30,7 @@ gadget movbe_\width\()_mr
 	and x8, x23, #0xffff
 	\load \host_register\()24, [_vcpu, x8]
 	reverse_scalar \width, \host_register\()24, \host_register\()24
-	page_cross_check (\width / 8), Lx86_movbe_store_cross\@
-	translate 1, UML_X86_64_TLB_WRITE_PAGE, (\width / 8)
+	translate 1, UML_X86_64_TLB_WRITE_PAGE, (\width / 8), cross=Lx86_movbe_store_cross\@
 	\store \host_register\()24, [x7]
 	finish_store (\width / 8)
 Lx86_movbe_store_cross\@:

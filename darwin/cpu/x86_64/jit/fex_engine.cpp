@@ -27,6 +27,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <mutex>
 #include <new>
 #include <optional>
@@ -287,6 +288,32 @@ struct Space final {
 	CodePageRegistry::Participant participant;
 	/* The pages this space counted in the registry. */
 	std::unordered_set<std::uint64_t> code_pages;
+	/* A participant the registry could not settle a page against, as the
+	 * join and the odd epoch it did not leave, with the pages of this space
+	 * that depend on it. The compile that registered such a page goes on,
+	 * and its code is cached; the space drops the pages' code at every
+	 * hand-over until the participant has moved (`settle_stuck`). */
+	struct StuckRecord final {
+		std::shared_ptr<CodePageRegistry> registry;
+		std::uint64_t serial{};
+		std::uint64_t epoch{};
+		std::vector<std::uint64_t> pages;
+	};
+	std::vector<StuckRecord> stuck;
+	/* A record could not be made: the next hand-over drops all code. */
+	bool stuck_lost{};
+	/* Registrations of a page's frame that failed or were refused since one
+	 * last succeeded. At the limit the space takes the failed-space outcome:
+	 * the kernel resolves the fetch fault each one reports whenever the page
+	 * is executable, so without a bound a refusal could repeat for good. */
+	std::uint64_t consecutive_failures{};
+	bool failed{};
+	FexEngine::Diagnostics *diagnostics{};
+	/* The engine's count of spaces with records, so a hand-over with none
+	 * costs one load. */
+	std::size_t *stuck_spaces{};
+	/* The engine's count of pages invalidated for a stuck participant. */
+	std::uint64_t *escalation_invalidations{};
 	/* The locked operand across a granule whose copy the bounce buffer
 	 * holds while this thread holds the split-operand lock. */
 	std::uint64_t split_address{};
@@ -322,6 +349,7 @@ struct Space final {
 	Space &operator=(const Space &) = delete;
 	~Space()
 	{
+		drop_stuck();
 		release_code_pages();
 		/* After leave() no other thread retires an entry of the TLB. */
 		if (registry)
@@ -335,6 +363,12 @@ struct Space final {
 	static void retire_write_translation(void *context, std::uint64_t page) noexcept
 	{
 		auto &space = *static_cast<Space *>(context);
+		if (page == CodePageRegistry::all_pages) {
+			for (std::size_t index = 0; index < tlb_entries; ++index)
+				std::atomic_ref<std::uint64_t>{space.tlb[index].WriteTag}
+					.store(0, std::memory_order_relaxed);
+			return;
+		}
 		std::atomic_ref<std::uint64_t>{space.tlb[(page >> 12U) & (tlb_entries - 1)].WriteTag}
 			.store(0, std::memory_order_relaxed);
 	}
@@ -373,27 +407,76 @@ struct Space final {
 		}
 	}
 
-	/* Counts `page` in before the decoder reads it, so a store another vCPU
-	 * already translated lands first and every later one publishes. */
-	void hold_code_page(std::uint64_t page) noexcept
+	/* Registers `page` before the decoder reads it (defined after the
+	 * engine). False when no code may be compiled from it now. */
+	[[nodiscard]] bool hold_code_page(std::uint64_t page) noexcept;
+
+	[[nodiscard]] bool has_stuck() const noexcept
 	{
-		if (!registry || code_pages.contains(page))
-			return;
+		return !stuck.empty() || stuck_lost;
+	}
+
+	void drop_stuck() noexcept
+	{
+		if (has_stuck() && stuck_spaces != nullptr)
+			--*stuck_spaces;
+		stuck.clear();
+		stuck_lost = false;
+	}
+
+	/* Remembers that `page` depends on the participants `settlement` waited
+	 * out. Allocation failing here costs a full drop of this space's code at
+	 * the next hand-over, which is exact. */
+	void note_stuck(std::uint64_t page, const std::shared_ptr<CodePageRegistry> &waited,
+		const CodePageRegistry::Settlement &settlement) noexcept
+	{
+		const bool had = has_stuck();
 		try {
-			code_pages.insert(page);
+			for (const auto &member : settlement.stuck) {
+				auto record = std::find_if(stuck.begin(), stuck.end(), [&](const StuckRecord &held) {
+					return held.registry == waited && held.serial == member.serial &&
+						held.epoch == member.epoch;
+				});
+				if (record == stuck.end()) {
+					stuck.push_back({waited, member.serial, member.epoch, {}});
+					record = std::prev(stuck.end());
+				}
+				if (std::find(record->pages.begin(), record->pages.end(), page) == record->pages.end())
+					record->pages.push_back(page);
+			}
 		} catch (...) {
-			/* The count can never be returned: the page stays held,
-			 * which costs publications, not correctness. */
+			stuck_lost = true;
 		}
-		/* A compile runs between two guest instructions, with no store
-		 * translated and pending, so the registration need not wait for
-		 * this participant to leave the engine. */
-		const bool inside = (participant.engine_epoch.load(std::memory_order_relaxed) & 1U) != 0;
-		if (inside)
-			participant.engine_epoch.fetch_add(1, std::memory_order_release);
-		registry->add(page, &participant);
-		if (inside)
-			participant.engine_epoch.fetch_add(1, std::memory_order_seq_cst);
+		if (!had && has_stuck() && stuck_spaces != nullptr)
+			++*stuck_spaces;
+	}
+
+	/* At a hand-over, before the run: drops the code that depends on a
+	 * participant that was stuck inside the engine when it was compiled.
+	 * The participant's stores may land after the compile read its bytes
+	 * and publish nothing; a vCPU that saw one reaches a hand-over, and the
+	 * code compiled after the drop reads the bytes after the store. The
+	 * record goes only once the participant has moved: the drop comes first,
+	 * so that nothing compiled before the store survives the move. */
+	void settle_stuck() noexcept
+	{
+		if (stuck_lost) {
+			clear_code();
+			return;
+		}
+		for (auto record = stuck.begin(); record != stuck.end();) {
+			for (const auto page : record->pages) {
+				invalidate_code(page, guest_page_size);
+				if (escalation_invalidations != nullptr)
+					++*escalation_invalidations;
+			}
+			if (record->registry->left_or_moved(record->serial, record->epoch))
+				record = stuck.erase(record);
+			else
+				++record;
+		}
+		if (stuck.empty() && stuck_spaces != nullptr)
+			--*stuck_spaces;
 	}
 
 	void release_code_pages() noexcept
@@ -446,6 +529,7 @@ struct Space final {
 	{
 		context->ClearCodeCache(thread, false);
 		release_code_pages();
+		drop_stuck();
 	}
 
 	/* Makes this space another address space's: its generation is gone, so
@@ -463,6 +547,8 @@ struct Space final {
 		generation = next;
 		mapping_sequence = 0;
 		code_sequence = 0;
+		consecutive_failures = 0;
+		failed = false;
 		split_address = 0;
 		split_size = 0;
 		gather_fault = false;
@@ -481,9 +567,17 @@ struct Space final {
 
 	/* Whether a store to the guest page holding `address` may change a
 	 * translation some translator of this address space holds. */
-	[[nodiscard]] bool stores_publish(GuestAddressSpace &memory, std::uint64_t address) const
+	[[nodiscard]] bool stores_publish(GuestAddressSpace &memory, std::uint64_t address) const;
+
+	/* The page's own part of the question: a translator of this address
+	 * space holds code at this location. Its frame's holders elsewhere are
+	 * the rest (a fill reads them with the fill's own settling). A space with
+	 * no registry cannot be retired from a holder's registration, so every
+	 * store it makes publishes, a non-executable page's included: a write
+	 * entry filled before a holder existed would outlive it. */
+	[[nodiscard]] bool publishes_by_page(GuestAddressSpace &memory, std::uint64_t address) const
 	{
-		return memory.is_executable(address) && (!registry || registry->holds(address));
+		return !registry || (memory.is_executable(address) && registry->holds(address));
 	}
 };
 
@@ -492,6 +586,10 @@ struct Space final {
 struct FexEngine::Impl final {
 	FEXCore::HostFeatures host_features;
 	FEXCore::SignalDelegator signal_delegator;
+	/* The spaces with participants stuck inside the engine to settle. After
+	 * the spaces' own storage is released, so declared before them. */
+	std::size_t stuck_spaces{};
+	FexEngine::Diagnostics diagnostics;
 	std::vector<std::unique_ptr<Space>> spaces;
 	std::uint64_t clock{};
 	/* Valid during run(). */
@@ -541,6 +639,87 @@ struct FexEngine::Impl final {
 
 namespace {
 
+bool Space::hold_code_page(std::uint64_t page) noexcept
+{
+	/* A compile runs between two guest instructions, with no store translated
+	 * and pending, so neither registration below need wait for this
+	 * participant to leave the engine: the epoch is even for both, because a
+	 * registration that owes a writer waits for every participant inside the
+	 * engine, and two vCPUs each waiting with an odd epoch would wait for
+	 * each other until the deadline. */
+	const bool inside = (participant.engine_epoch.load(std::memory_order_relaxed) & 1U) != 0;
+	if (inside)
+		participant.engine_epoch.fetch_add(1, std::memory_order_release);
+	const struct Reenter final {
+		Space &space;
+		bool inside;
+		~Reenter()
+		{
+			if (inside)
+				space.participant.engine_epoch.fetch_add(1, std::memory_order_seq_cst);
+		}
+	} reenter{*this, inside};
+	/* The frame is registered at every query, before the early returns
+	 * below: a space with no registry (its acquisition or join failed under
+	 * memory pressure) still compiles from the frame, and a store through
+	 * another mapping of it must reach this space. */
+	auto registration = register_frame(
+		*engine->memory, engine->execution_context, &participant, page);
+	if (diagnostics != nullptr)
+		++diagnostics->frame_registrations;
+	if (registration.status == FrameRegistration::failed ||
+		registration.status == FrameRegistration::refused) {
+		++consecutive_failures;
+		if (diagnostics != nullptr) {
+			++diagnostics->registration_failures;
+			diagnostics->consecutive_registration_failures = consecutive_failures;
+		}
+		if (consecutive_failures >= FexEngine::registration_failure_limit && !failed) {
+			failed = true;
+			if (diagnostics != nullptr)
+				++diagnostics->failed_spaces;
+			std::fputs("Darwin x86 JIT: registering the frames of an address "
+				"space failed too often in a row\n", stderr);
+		}
+		return false;
+	}
+	consecutive_failures = 0;
+	if (diagnostics != nullptr)
+		diagnostics->consecutive_registration_failures = 0;
+	CodePageRegistry::Settlement settlement;
+	if (registry && !code_pages.contains(page)) {
+		try {
+			code_pages.insert(page);
+		} catch (...) {
+			/* The count can never be returned: the page stays held,
+			 * which costs publications, not correctness. */
+		}
+		settlement = registry->add(page, &participant);
+	}
+	/* A participant stuck inside the engine may still land a store that
+	 * publishes nothing; the code compiled from this page is dropped at
+	 * each hand-over until it has moved. */
+	if (!settlement.settled)
+		note_stuck(page, registry, settlement);
+	for (const auto &wait : registration.stuck)
+		note_stuck(page, wait.registry, wait.settlement);
+	if (registration.stuck_lost) {
+		const bool had = has_stuck();
+		stuck_lost = true;
+		if (!had && stuck_spaces != nullptr)
+			++*stuck_spaces;
+	}
+	return true;
+}
+
+bool Space::stores_publish(GuestAddressSpace &memory, std::uint64_t address) const
+{
+	if (publishes_by_page(memory, address))
+		return true;
+	::uml::memory::FrameFill frame;
+	return memory.frame_fill(address, engine->execution_context, frame) && frame.other_holder;
+}
+
 FEXCore::HLE::ExecutableRangeInfo EmbeddedSyscallHandler::QueryGuestExecutableRange(
 	Core::InternalThreadState *, uint64_t address)
 {
@@ -555,7 +734,10 @@ FEXCore::HLE::ExecutableRangeInfo EmbeddedSyscallHandler::QueryGuestExecutableRa
 		space_.fetch_fault = address;
 		return {};
 	}
-	space_.hold_code_page(page);
+	if (!space_.hold_code_page(page)) {
+		space_.fetch_fault = address;
+		return {};
+	}
 	return {page, guest_page_size, false, reinterpret_cast<const uint8_t *>(host)};
 }
 
@@ -605,8 +787,27 @@ void record_unsupported(Core::CpuStateFrame &frame, std::uint64_t address, ExitA
 	bool publishes = false;
 	for (auto page = address & guest_page_mask; page < address + size; page += guest_page_size)
 		publishes = publishes || space.stores_publish(memory, page);
-	return publishes && space.context->IsAddressInCurrentBlock(space.thread, address, size) &&
-		!space.context->IsCurrentBlockSingleInst(space.thread);
+	if (!publishes || space.context->IsCurrentBlockSingleInst(space.thread))
+		return false;
+	if (space.context->IsAddressInCurrentBlock(space.thread, address, size))
+		return true;
+	/* The same frame at another address of this address space: a holder
+	 * there that lies in the unit would run the old bytes after the store. */
+	for (auto page = address & guest_page_mask; page < address + size; page += guest_page_size) {
+		const auto begin = std::max(page, address);
+		const auto length = std::min<std::uint64_t>(page + guest_page_size, address + size) - begin;
+		std::array<std::uint64_t, 32> own;
+		::uml::memory::FramePublication holders;
+		if (!memory.frame_own_holders(begin, length, space.engine->execution_context, own.data(),
+			own.size(), holders))
+			continue;
+		if (holders.overflow)
+			return true;
+		for (std::size_t index = 0; index < holders.own_count; ++index)
+			if (space.context->IsAddressInCurrentBlock(space.thread, own[index], length))
+				return true;
+	}
+	return false;
 }
 
 void record_code_write(Core::CpuStateFrame &frame, ExitAt at) noexcept
@@ -767,7 +968,12 @@ uintptr_t translate_miss(Core::CpuStateFrame *frame, std::uint64_t address, std:
 		 * bump, so either it sees the fill or the fill sees the bump. */
 		for (;;) {
 			const auto changes = space.code_changes();
-			if (space.stores_publish(memory, address)) {
+			/* A frame that a translator holds at another address owes this
+			 * store a publication whatever this page holds: it is read with
+			 * the fill and settled like the registry's count. */
+			::uml::memory::FrameFill fill;
+			const bool framed = memory.frame_fill(address, engine.execution_context, fill);
+			if (space.publishes_by_page(memory, address) || (framed && fill.other_holder)) {
 				if (store_ends_unit(space, memory, address, size)) {
 					record_code_write(*frame, at);
 					return 0;
@@ -798,7 +1004,7 @@ uintptr_t translate_miss(Core::CpuStateFrame *frame, std::uint64_t address, std:
 			std::atomic_ref<std::uint64_t>{entry.WriteDelta}.store(delta, std::memory_order_relaxed);
 			std::atomic_ref<std::uint64_t>{entry.WriteTag}.store(~page, std::memory_order_relaxed);
 			std::atomic_thread_fence(std::memory_order_seq_cst);
-			if (space.code_changes() == changes)
+			if (space.code_changes() == changes && (!framed || memory.frame_fill_unchanged(fill)))
 				return reinterpret_cast<uintptr_t>(pointer);
 			std::atomic_ref<std::uint64_t>{entry.WriteTag}.store(0, std::memory_order_relaxed);
 		}
@@ -1449,6 +1655,9 @@ Space *FexEngine::Impl::create(unsigned long generation, ExecutionMode mode, boo
 	 * used, so making the next one never evicts it. */
 	space->last_use = ++clock;
 	space->engine = this;
+	space->stuck_spaces = &stuck_spaces;
+	space->escalation_invalidations = &diagnostics.escalation_invalidations;
+	space->diagnostics = &diagnostics;
 	if (!space->callret.reserve())
 		return nullptr;
 	space->flush_tlb();
@@ -1499,10 +1708,31 @@ void FexEngine::Impl::publish_code_write(Space &space, std::uint64_t address, st
 {
 	if (size == 0)
 		return;
-	for (auto page = address & guest_page_mask; page < address + size; page += guest_page_size)
+	/* A page whose frame a translator holds at another address publishes at
+	 * every holder, in each holder's own generation, and cools this space's
+	 * blocks at the holders' addresses in its own; every other page
+	 * publishes as it always did. */
+	std::uint64_t plain_begin = 0;
+	std::uint64_t plain_end = 0;
+	for (auto page = address & guest_page_mask; page < address + size; page += guest_page_size) {
+		const auto begin = std::max(page, address);
+		const auto length = std::min<std::uint64_t>(page + guest_page_size, address + size) - begin;
+		std::array<std::uint64_t, 32> own;
+		::uml::memory::FramePublication done;
+		if (memory->publish_frame_store(begin, length, execution_context, own.data(), own.size(), done)) {
+			if (done.overflow)
+				space.invalidate_code(0, std::uint64_t{1} << 47);
+			for (std::size_t index = 0; index < done.own_count; ++index)
+				space.invalidate_code(own[index], length);
+			continue;
+		}
 		memory->invalidate_code(page, execution_context);
-	space.invalidate_code(address & guest_page_mask,
-		((address + size - 1) & guest_page_mask) + guest_page_size - (address & guest_page_mask));
+		if (plain_end == 0)
+			plain_begin = page;
+		plain_end = page + guest_page_size;
+	}
+	if (plain_end != 0)
+		space.invalidate_code(plain_begin, plain_end - plain_begin);
 }
 
 FexEngine::FexEngine(const ::uml::platform::HostCapabilities &host, FexEngineOptions options) noexcept
@@ -1542,6 +1772,20 @@ bool FexEngine::consumed_sequences(unsigned long generation, ExecutionMode mode,
 	mapping_sequence = space->mapping_sequence;
 	code_sequence = space->code_sequence;
 	return true;
+}
+
+FexEngine::Diagnostics FexEngine::diagnostics() const noexcept
+{
+	return impl_ ? impl_->diagnostics : Diagnostics{};
+}
+
+void FexEngine::settle_stuck_participants(unsigned long generation, ExecutionMode mode) noexcept
+{
+	if (!impl_ || impl_->stuck_spaces == 0)
+		return;
+	for (auto &held : impl_->spaces)
+		if (held->generation == generation && held->mode == mode && held->has_stuck())
+			held->settle_stuck();
 }
 
 void FexEngine::apply_changes(unsigned long generation, ExecutionMode mode,
@@ -1731,6 +1975,10 @@ JitRunResult FexEngine::dispatch(CpuState &cpu, GuestAddressSpace &memory, const
 		space->mapping_sequence = mapping_sequence;
 		space->code_sequence = code_sequence;
 	}
+	/* The registrations of this address space's frames failed too often in a
+	 * row: it runs no more, as for a space that could not be made. */
+	if (space->failed)
+		return run;
 	run.stores_ordered = space->orders_stores;
 	space->last_use = ++impl_->clock;
 	impl_->memory = &memory;

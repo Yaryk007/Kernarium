@@ -2,8 +2,8 @@
 /*
  * The run loop of a Kernarium launch, with a recording machine in place of the
  * guest: the order of the steps of a restart, the retry of a refused run, the
- * stop flag, the hold on the next boot, the loop guard and the runtime's
- * restart events.
+ * stop flag, the hold on the next boot, the loop guard (the early window and
+ * the boots that never finished) and the runtime's restart events.
  */
 #include "KernariumRestartLoop.hpp"
 #include "named_tests.hpp"
@@ -37,6 +37,8 @@ struct Boot final {
     int status {0};
     RunEnd end {RunEnd::Kind::powerOff, ""};
     std::chrono::seconds lasted {60};
+    /* The library marked the run as refused for want of memory. */
+    bool refusedForMemory {false};
 };
 
 Boot powersOff(std::chrono::seconds lasted = 60s)
@@ -47,6 +49,15 @@ Boot powersOff(std::chrono::seconds lasted = 60s)
 Boot restarts(std::string command = "", std::chrono::seconds lasted = 60s)
 {
     return {2, {RunEnd::Kind::restart, std::move(command)}, lasted};
+}
+
+using uml::emulator::BootCompletion;
+
+/* A restart of an Android guest, whose console says whether its boot had
+ * finished. */
+Boot restartsAndroid(BootCompletion completion, std::chrono::seconds lasted)
+{
+    return {2, {RunEnd::Kind::restart, "", completion}, lasted};
 }
 
 /* The machine the loop drives. Every step is recorded in `calls`, in order,
@@ -136,6 +147,11 @@ public:
         record("end");
         end = current_.end;
         return !endUnknown;
+    }
+
+    bool startRefusedForMemory() noexcept override
+    {
+        return current_.refusedForMemory;
     }
 
     void stopBoot() noexcept override { record("stop-services"); }
@@ -387,6 +403,9 @@ void aStopBeforeTheFirstRunKeepsTheGuestFromRunning()
             "a stop before the first run still ran the guest");
 }
 
+/* The loop's side only: the machine's `held` is the test's own switch. What makes the real machine held (a hold asked for
+ * with the gate still open) is the Lifecycle's, in aHoldAskedForHoldsTheNextBootBeforeTheGateCloses, and the restart that
+ * meets a hold that waits for the guest's camera is kernarium-gpu-hold. */
 void theNextBootWaitsWhileTheApplicationHoldsIt()
 {
     FakeMachine machine;
@@ -419,6 +438,60 @@ void theFirstBootIsNeverHeld()
             "a hold kept the first boot back");
     require(machine.count("wait-held") == 0U,
             "the first boot waited for a hold");
+}
+
+/* A hold that arrives while the next boot is built: the loop's guard found none before it, and the guest must not be run
+ * behind the hold either. What remains by design is the hold that lands after the guest runs. */
+void aHoldThatArrivesWhileTheNextBootIsBuiltKeepsTheGuestFromRunningUntilItEnds()
+{
+    FakeMachine machine;
+    machine.script = {restarts(), powersOff()};
+    machine.onCall = [](FakeMachine& self, const std::string& call) {
+        if (call == "start 1")
+            self.held.store(true);
+        if (self.count("wait-held") == 3U)
+            self.held.store(false);
+    };
+    require(kernarium::restart::run(machine, quickly) == 0,
+            "a released hold did not let the guest run");
+    require((machine.calls() == Calls {"start 0", "enter", "end", "stop-services",
+                "reset-link", "began 1", "start 1", "wait-held", "wait-held",
+                "wait-held", "enter", "end"}),
+            "the hold that arrived while the boot was built did not keep the guest from running");
+    require(contains(machine.said(), "the restarted guest may boot"),
+            "the end of the hold was not logged");
+}
+
+void aStopEndsTheWaitForAHoldThatArrivedWhileTheNextBootWasBuilt()
+{
+    FakeMachine machine;
+    machine.script = {restarts(), powersOff()};
+    machine.onCall = [](FakeMachine& self, const std::string& call) {
+        if (call == "start 1")
+            self.held.store(true);
+        if (self.count("wait-held") == 2U)
+            self.stop.store(true);
+    };
+    require(kernarium::restart::run(machine, quickly) == 0,
+            "a stop during the hold did not end the launch");
+    require(machine.count("enter") == 1U,
+            "a stop during the hold still ran the restarted guest");
+}
+
+/* The first boot is run as it is asked for: a hold that arrives while it is built is applied to the GPU the guest has
+ * (the runtime's registration), and the guest runs, as it does when the hold was there before. */
+void aHoldThatArrivesWhileTheFirstBootIsBuiltDoesNotKeepItBack()
+{
+    FakeMachine machine;
+    machine.script = {powersOff()};
+    machine.onCall = [](FakeMachine& self, const std::string& call) {
+        if (call == "start 0")
+            self.held.store(true);
+    };
+    require(kernarium::restart::run(machine, quickly) == 0,
+            "a hold kept the first boot back");
+    require(machine.count("wait-held") == 0U && machine.count("enter") == 1U,
+            "the first boot waited for a hold that arrived while it was built");
 }
 
 void aStopEndsTheWaitForTheHold()
@@ -457,6 +530,72 @@ void fiveEarlyRestartsInARowEndTheLoopWithItsOwnResult()
             "the loop guard's end was not logged");
     require(KERNARIUM_RUNTIME_RESULT_RESTART_LOOP < -UML_EMULATOR_RUNTIME_ERROR,
             "the loop result collides with a uml_emulator error");
+    /* The applications name the host's refusal of the guest's memory by its
+     * own constant, which no uml_emulator error, the loop result or a status
+     * the emulator returns shares. */
+    require(KERNARIUM_RUNTIME_RESULT_MEMORY_REFUSED < -UML_EMULATOR_RUNTIME_ERROR &&
+                KERNARIUM_RUNTIME_RESULT_MEMORY_REFUSED !=
+                    KERNARIUM_RUNTIME_RESULT_RESTART_LOOP,
+            "the memory-refused result collides with another result");
+}
+
+/* The status the library returns for a run the host refused for want of
+ * memory, and the one it returns for a failed allocation of its own, which
+ * is the same number. */
+Boot refusedForMemory()
+{
+    return {-UML_EMULATOR_OUT_OF_MEMORY, {RunEnd::Kind::none, ""}, 0s, true};
+}
+
+Boot outOfMemoryWithoutARefusal()
+{
+    return {-UML_EMULATOR_OUT_OF_MEMORY, {RunEnd::Kind::none, ""}, 0s, false};
+}
+
+void aRunTheHostRefusedForMemoryHasAResultOfItsOwn()
+{
+    FakeMachine machine;
+    machine.script = {refusedForMemory()};
+    require(kernarium::restart::run(machine, quickly) ==
+                KERNARIUM_RUNTIME_RESULT_MEMORY_REFUSED,
+            "a run refused for want of memory did not return its own result");
+    require(machine.count("enter") == 1U, "the refused run was entered again");
+}
+
+void aBareOutOfMemoryIsNotARefusalOfTheGuestsSize()
+{
+    /* The library's own allocation failed (the argument vector, say): the
+     * run returned the same status with no window and no mark. */
+    FakeMachine bare;
+    bare.script = {outOfMemoryWithoutARefusal()};
+    require(kernarium::restart::run(bare, quickly) == -UML_EMULATOR_OUT_OF_MEMORY,
+            "an allocation failure of the library read as a refusal of the "
+            "guest's size");
+
+    /* A guest that ran and ended with the same number as its status. */
+    FakeMachine guest;
+    guest.script = {{-UML_EMULATOR_OUT_OF_MEMORY,
+        {RunEnd::Kind::failed, ""}, 30s, false}};
+    require(kernarium::restart::run(guest, quickly) == -UML_EMULATOR_OUT_OF_MEMORY,
+            "a guest's own status of the same number read as a refusal");
+}
+
+void aRestartedBootTheHostRefusedForMemoryEndsTheLaunchWithTheResult()
+{
+    FakeMachine machine;
+    machine.script = {restarts(), refusedForMemory()};
+    require(kernarium::restart::run(machine, quickly) ==
+                KERNARIUM_RUNTIME_RESULT_MEMORY_REFUSED,
+            "a restarted boot refused for want of memory did not return its "
+            "own result");
+    require(contains(machine.said(), "unable to boot the restarted guest: -2"),
+            "the refused restart was not logged");
+
+    FakeMachine bare;
+    bare.script = {restarts(), outOfMemoryWithoutARefusal()};
+    require(kernarium::restart::run(bare, quickly) == -UML_EMULATOR_OUT_OF_MEMORY,
+            "a restarted boot's allocation failure read as a refusal of the "
+            "guest's size");
 }
 
 void aBootThatLastsFifteenSecondsResetsTheCount()
@@ -468,6 +607,97 @@ void aBootThatLastsFifteenSecondsResetsTheCount()
     require(kernarium::restart::run(machine, quickly) == 0,
             "a boot of fifteen seconds did not reset the early count");
     require(machine.count("enter") == 10U, "the script did not run through");
+}
+
+void aBootThatNeverFinishedCountsHoweverLongItRan()
+{
+    FakeMachine machine;
+    // The loop the 15 s window let through: a restart every 20 s, before the
+    // boot ever finished. Android's own boot-loop rescue gets its five boots
+    // first; the loop ends at the eighth.
+    machine.script = {restartsAndroid(BootCompletion::unfinished, 20s)};
+    require(kernarium::restart::run(machine, quickly) ==
+                KERNARIUM_RUNTIME_RESULT_RESTART_LOOP,
+            "a guest that never finishes booting did not end with the loop "
+            "result");
+    require(machine.count("enter") == 8U,
+            "the loop guard did not end the late loop at eight boots");
+    require(machine.count("began") == 7U,
+            "a restart the guard refused was announced");
+    require(machine.count("stop-services") == 8U &&
+                machine.count("reset-link") == 8U,
+            "the services of the last guest were left running");
+    require(contains(machine.said(),
+                "the guest restarted 8 times in a row, each before it "
+                "finished booting or within 15 s of booting; not booting it "
+                "again"),
+            "the late loop's end was not logged with its reason");
+}
+
+void anAndroidGuestRestartingAtOnceEndsAtFive()
+{
+    FakeMachine machine;
+    machine.script = {restartsAndroid(BootCompletion::unfinished, 3s)};
+    require(kernarium::restart::run(machine, quickly) ==
+                KERNARIUM_RUNTIME_RESULT_RESTART_LOOP,
+            "a guest that restarts at once did not end with the loop result");
+    require(machine.count("enter") == 5U,
+            "the loop guard did not end the early loop at five boots");
+    require(contains(machine.said(),
+                "the guest restarted 5 times in a row within 15 s of "
+                "booting; not booting it again"),
+            "the early loop's end was not logged with its reason");
+}
+
+void aConsoleThatShowsNothingOfInitIsNotAnUnfinishedBoot()
+{
+    FakeMachine machine;
+    // A healthy Android guest on a console the host does not read: boots of
+    // 20 s are no loop.
+    machine.script.assign(12, restartsAndroid(BootCompletion::unobserved, 20s));
+    machine.script.push_back(powersOff(20s));
+    require(kernarium::restart::run(machine, quickly) == 0,
+            "boots of 20 s on an unread console ended the loop");
+}
+
+void restartsAfterFinishedBootsAreNeverLimited()
+{
+    FakeMachine machine;
+    // A reboot suite: every boot finished and lasted, twelve times over.
+    machine.script.assign(12, restartsAndroid(BootCompletion::completed, 40s));
+    machine.script.push_back(powersOff(40s));
+    require(kernarium::restart::run(machine, quickly) == 0,
+            "restarts after finished boots ended the loop");
+    require(machine.count("enter") == 13U, "the script did not run through");
+    require(machine.count("began") == 12U, "a restart was not announced");
+}
+
+void aFinishedBootResetsTheCountOfUnfinishedOnes()
+{
+    FakeMachine machine;
+    // Seven boots that did not finish, one that did, seven more: never eight
+    // in a row.
+    for (int round = 0; round != 2; ++round) {
+        for (int slow = 0; slow != 7; ++slow)
+            machine.script.push_back(
+                restartsAndroid(BootCompletion::unfinished, 30s));
+        machine.script.push_back(
+            restartsAndroid(BootCompletion::completed, 30s));
+    }
+    machine.script.push_back(powersOff(30s));
+    require(kernarium::restart::run(machine, quickly) == 0,
+            "a finished boot did not reset the count of unfinished ones");
+    require(machine.count("enter") == 17U, "the script did not run through");
+}
+
+void aGuestWhoseConsoleSaysNothingKeepsTheWindowAlone()
+{
+    FakeMachine machine;
+    // A Linux guest: boots of 20 s are no loop, whatever the host can tell.
+    machine.script.assign(12, restarts("", 20s));
+    machine.script.push_back(powersOff(20s));
+    require(kernarium::restart::run(machine, quickly) == 0,
+            "boots of 20 s with no console signal ended the loop");
 }
 
 void aBootThatCannotBeBuiltFailsTheLaunch()
@@ -587,6 +817,33 @@ void aStoppedAndQuiescedLifecycleHoldsTheNextBoot()
     require(!lifecycle.held(), "an unregistered GPU still held the boot");
 }
 
+void aHoldAskedForHoldsTheNextBootBeforeTheGateCloses()
+{
+    Lifecycle lifecycle;
+    std::atomic_bool gate {};
+    lifecycle.setGpuHeld([&] { return gate.load(); });
+    require(!lifecycle.gpuHoldRequested(), "a fresh lifecycle had a hold asked for");
+
+    // The application has asked, and the gate is still open: it waits for the
+    // guest's camera first, and a guest that boots meanwhile would find the gate
+    // closed behind it.
+    lifecycle.setGpuHoldRequested(true);
+    require(lifecycle.gpuHoldRequested(), "the hold asked for was not kept");
+    require(lifecycle.held(), "a hold asked for with the gate open did not hold the boot");
+    require(!lifecycle.quiesced(), "a hold asked for is not a quiesced guest");
+
+    // It holds with no GPU service registered, between two boots.
+    lifecycle.setGpuHeld({});
+    require(lifecycle.held(), "a hold asked for was forgotten when the GPU service went away");
+
+    // The requests given back release the boot, whatever the gate does.
+    lifecycle.setGpuHoldRequested(false);
+    require(!lifecycle.held(), "a hold given back still held the boot");
+    gate.store(true);
+    lifecycle.setGpuHeld([&] { return gate.load(); });
+    require(lifecycle.held(), "a closed gate stopped holding the boot");
+}
+
 /* Calls `nudge` until `done`, so that a wake-up sent before the waiter began
  * to wait is sent again. */
 template<typename Nudge, typename Done>
@@ -666,11 +923,32 @@ const uml::testing::NamedTest tests[] {
     {"the-next-boot-waits-while-held", theNextBootWaitsWhileTheApplicationHoldsIt},
     {"the-first-boot-is-never-held", theFirstBootIsNeverHeld},
     {"a-stop-ends-the-wait-for-the-hold", aStopEndsTheWaitForTheHold},
+    {"a-hold-that-arrives-while-the-next-boot-is-built-keeps-the-guest-from-running",
+        aHoldThatArrivesWhileTheNextBootIsBuiltKeepsTheGuestFromRunningUntilItEnds},
+    {"a-stop-ends-the-wait-for-a-hold-that-arrived-while-the-next-boot-was-built",
+        aStopEndsTheWaitForAHoldThatArrivedWhileTheNextBootWasBuilt},
+    {"a-hold-that-arrives-while-the-first-boot-is-built-does-not-keep-it-back",
+        aHoldThatArrivesWhileTheFirstBootIsBuiltDoesNotKeepItBack},
     {"five-early-restarts-end-the-loop",
         fiveEarlyRestartsInARowEndTheLoopWithItsOwnResult},
     {"a-fifteen-second-boot-resets-the-count",
         aBootThatLastsFifteenSecondsResetsTheCount},
+    {"an-android-guest-restarting-at-once-ends-at-five",
+        anAndroidGuestRestartingAtOnceEndsAtFive},
+    {"a-console-that-shows-nothing-of-init-is-not-an-unfinished-boot",
+        aConsoleThatShowsNothingOfInitIsNotAnUnfinishedBoot},
+    {"an-unfinished-boot-counts-however-long-it-ran",
+        aBootThatNeverFinishedCountsHoweverLongItRan},
+    {"restarts-after-finished-boots-are-unlimited",
+        restartsAfterFinishedBootsAreNeverLimited},
+    {"a-finished-boot-resets-the-unfinished-count",
+        aFinishedBootResetsTheCountOfUnfinishedOnes},
+    {"a-guest-with-no-console-signal-keeps-the-window",
+        aGuestWhoseConsoleSaysNothingKeepsTheWindowAlone},
     {"a-boot-that-cannot-be-built", aBootThatCannotBeBuiltFailsTheLaunch},
+    {"a-run-the-host-refused-for-memory", aRunTheHostRefusedForMemoryHasAResultOfItsOwn},
+    {"a-bare-out-of-memory-is-no-refusal", aBareOutOfMemoryIsNotARefusalOfTheGuestsSize},
+    {"a-restarted-boot-refused-for-memory", aRestartedBootTheHostRefusedForMemoryEndsTheLaunchWithTheResult},
     {"the-booted-event-follows-the-console",
         theBootedEventFollowsTheNewGuestsConsole},
     {"the-first-boot-asks-nothing-of-the-console",
@@ -681,6 +959,8 @@ const uml::testing::NamedTest tests[] {
         noBootedEventIsSentWhenTheGuestEndsFirst},
     {"the-lifecycle-holds-the-next-boot",
         aStoppedAndQuiescedLifecycleHoldsTheNextBoot},
+    {"a-hold-asked-for-holds-the-next-boot-before-the-gate-closes",
+        aHoldAskedForHoldsTheNextBootBeforeTheGateCloses},
     {"a-waiting-boot-wakes-when-the-hold-ends", aWaitingBootWakesWhenTheHoldEnds},
     {"a-stop-wakes-a-waiting-boot",
         aStopWakesAWaitingBootAndIsNotInheritedByTheNextRun},

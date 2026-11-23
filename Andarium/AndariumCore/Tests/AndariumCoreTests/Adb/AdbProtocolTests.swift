@@ -162,6 +162,30 @@ struct AdbStreamTests {
         #expect(adbd.servicesOpened == ["abb_exec:package\0install\0-t\0-S\0123"])
     }
 
+    @Test func anOpenReportsItsRequestAsSentOnceItIsWrittenWhateverTheAnswerIs() throws {
+        let adbd = FakeAdbd(services: ["there:*": { _ in }])
+        defer { adbd.shutdown() }
+        let connection = try connected(adbd)
+        var sent = 0
+        _ = try connection.open("there:x", sent: { sent += 1 })
+        #expect(sent == 1)
+        // A service the device refuses was asked for all the same.
+        #expect(throws: AdbError.serviceRefused("nothing:")) { try connection.open("nothing:", sent: { sent += 1 }) }
+        #expect(sent == 2)
+    }
+
+    @Test func anOpenThatCouldNotBeWrittenIsNotReportedAsSent() {
+        final class Broken: AdbTransport, @unchecked Sendable {
+            func readExactly(_ count: Int) throws -> Data { throw AdbError.guestGone }
+            func writeAll(_ data: Data) throws { throw AdbError.io(EPIPE) }
+            func shutdown() {}
+        }
+        let connection = AdbConnection(transport: Broken())
+        var sent = 0
+        #expect(throws: AdbError.io(EPIPE)) { try connection.open("there:", sent: { sent += 1 }) }
+        #expect(sent == 0)
+    }
+
     @Test func dataGoesOutInPayloadsOfTheNegotiatedSizeEachAnsweredBeforeTheNext() throws {
         let adbd = FakeAdbd(maxData: 10, services: ["sink:": { stream in
             var lengths: [Int] = []

@@ -39,6 +39,9 @@ disk; `validateDataDisk` checks it.
   whose tables are exactly the template's for that size. Only the tables are
   written, so any capacity costs the same, and the guest formats `metadata` and
   `userdata` itself and grows its filesystem at the next boot.
+- While the guest runs, a full host volume holds the guest's I/O to a disk
+  until it has room instead of failing it
+  ([kernel contract](../../../kernel/common/README.md#block-devices-and-filesystems)).
 - A disk is created beside its path and linked into place, so it never replaces
   a file and a failure leaves nothing behind. A disk only grows, on an APFS
   clone renamed over the disk (a failure leaves the old disk); a volume without
@@ -46,7 +49,35 @@ disk; `validateDataDisk` checks it.
   validation. The grow is refused while another process, or another open file
   description of this one, holds a lock on the disk, as a running guest does.
 - `prepareDataDisk` is the single entry point of both products: create when
-  absent, grow when asked for more, leave it otherwise, refuse less.
+  absent, grow when asked for more, leave it otherwise. A request below the
+  disk's capacity keeps the disk and reports its capacity, so a caller whose
+  record lags a disk that already grew still starts.
+
+## Installation identity
+
+`android_identity.hpp` gives each installation of the guest its own serial
+number and its own eth0 address, in place of the release's `umlandroid17` and
+the user network's default. `resolveIdentity` keeps them in `identity.json`
+beside the data disk: it is made at random when it is absent or invalid and
+when a start created the data disk, is private to its owner, and is never
+rewritten while valid, so the values follow the disk through updates, resizes,
+snapshot restores and the guest's own factory reset and go with it when the
+instance is erased. A start holds the installation's lock (`identity.lock`, an
+exclusive flock beside the file that is never removed) from preparing the data
+disk to resolving the identity, as the tools' reset, restore and create do (a
+create or restore decided before the lock is checked again under it and refused
+when another start has since made the disk), so
+the first start to find no identity makes it and every other reads that one;
+the file is read as one opened, regular file of at most 4096 bytes, and an
+address of the user network's router (`52:55:0a:00:02:xx`) is never an eth0
+address. A launcher that states a value uses it and touches no file.
+`readKernelCommandLine` drops the release's `androidboot.serialno=` argument
+when the launcher sets its own, a quoted word included, so exactly one serial
+number reaches Android; it refuses a release command line whose `"` group spans
+words or never closes, because the launcher's arguments follow the release's. The host's own messages never contain the values (the
+session record masks the serial number, the adb key and the time zone the kernel
+echoes); what the guest itself reports,
+such as an Android bug report, carries them as on any Android device.
 
 ## Exactly two disks
 
@@ -77,3 +108,13 @@ partition picks the boot in automatic mode: `boot-recovery` selects recovery.
 There is no bootloader, so a restart clears the one-shot `bootonce-bootloader`
 request that `reboot bootloader` leaves, and every restart selects its ramdisk
 in automatic mode whatever the first boot was given.
+
+A release that carries root has `root/init_boot-magisk.img` beside its system
+disk: its own `init_boot` with Magisk patched in. A launch that asks for root
+(`RootMode::on`) takes the normal boot's ramdisk, on every boot and restart,
+from that file and nowhere else; no caller names a path. `root/` must be a
+real directory and the file a regular file in it, reached without following a
+link and checked on the descriptor it was opened on. It is at most 256 MiB with
+the same kernel-less v4 header as the partition and a ramdisk in a format the
+kernel unpacks, and its kernel and command line are never read. Recovery keeps the release's own ramdisk, and a
+release without the file refuses the request.

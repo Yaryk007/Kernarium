@@ -92,9 +92,10 @@ POKE_SECONDS = 0.25
 REQUEST_SECONDS = 60.0
 RESUME_SECONDS = 30.0
 GUEST_PORT = 7000
-# An experimental Virtio device ID (65535 is the battery's) that no guest
-# driver binds: the guest acknowledges each config change and does no more.
-CHURN_DEVICE = 65534
+# An experimental Virtio device ID (65535 is the battery's and 65534 the GNSS
+# receiver's) that no guest driver binds: the guest acknowledges each config
+# change and does no more.
+CHURN_DEVICE = 65520
 CHURN_PERIOD_MS = 50
 # The backend raises one change at a time and waits for the guest to
 # acknowledge it, so the suspend holds one back. The runner asks the backend

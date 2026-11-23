@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "domain_heap.hpp"
 
+#include "heap_region_size.hpp"
+
+#include <TargetConditionals.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -16,6 +19,10 @@ namespace uml::memory {
 namespace {
 
 constexpr std::size_t region_bytes = UML_HEAP_REGION_BYTES;
+#if TARGET_OS_IPHONE
+static_assert(region_bytes == device_heap_region_bytes,
+	"the budget of the guest's memory counts another heap region");
+#endif
 constexpr std::size_t first_chunk = std::size_t{256} << 10;
 constexpr std::size_t last_chunk = std::size_t{4} << 20;
 /* Space ahead of a large block's payload, for its header. */
@@ -76,6 +83,14 @@ bool HeapRegion::reserve_locked() noexcept
 	tail_ = reinterpret_cast<std::uintptr_t>(memory);
 	base_.store(tail_, std::memory_order_release);
 	return true;
+}
+
+bool HeapRegion::reserve() noexcept
+{
+	os_unfair_lock_lock(&lock_);
+	const bool reserved = reserve_locked();
+	os_unfair_lock_unlock(&lock_);
+	return reserved;
 }
 
 void *HeapRegion::take(std::size_t bytes, int tag) noexcept

@@ -12,7 +12,7 @@ output into byte buffers saw stale pictures, and an ImageReader reader
 saw the same.
 
 The decoder flag no longer makes a mapping transfer from the host. A
-buffer that is also rendered into, or that the camera writes, still does.
+buffer that is also rendered into still does.
 ---
  virtgpu_virgl.c | 5 +++--
  1 file changed, 3 insertions(+), 2 deletions(-)

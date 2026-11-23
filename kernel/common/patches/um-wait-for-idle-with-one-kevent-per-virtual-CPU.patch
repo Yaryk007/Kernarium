@@ -1,0 +1,850 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 12:17:25 +0900
+Subject: [PATCH] um: wait for idle with one kevent per virtual CPU
+
+An idle virtual CPU on Darwin waited in pselect(), whose read set held
+its IPI wake pipe, the host's stop descriptor and a kqueue with its
+deadline timer. A wake by the clock cost four calls: a read of the
+signal mask, the add of the timer, the wait and the delete of the
+timer. CPU0 added a signal and its return, and two dispatches. The timer
+is a critical kqueue timer because Darwin coalesces a wait's own
+timeout; pselect() stayed for its atomic signal mask.
+
+The wait is now one kevent() on a per-CPU queue. The queue holds the
+pipe and the stop descriptor, registered once when the CPU first
+idles (a failure panics: a missing registration is a lost wake), and
+on CPU0 a user event. The call adds the same one-shot critical timer in
+its change list and passes no timeout, so a wake by the clock is that
+one call. Nothing disarms the timer. One left by a wake by something
+else is replaced by the next wait's add, which also discards a delivery
+nobody collected, and a wait with no deadline deletes it in the call
+that waits. The wait tracks whether the knote exists, since deleting a
+missing one returns an error at once. If the host refuses the timer
+the waits fall back to the call's own timeout and warn once.
+
+The result set replaces the fd_set. A pipe that the call reports
+carries its byte count: the exit reads those bytes, and one more it
+finds, with no poll(), and then takes the pending mask without a second
+drain. A call that returns without reporting the pipe found it empty,
+as the previous topic has it, and an error drains in full as before.
+
+A wait skips the sleep when the dispatch before it ran a handler, as
+it did, since a task the handler made runnable is switched to by the
+idle loop and not by the wait.
+
+CPU0's wake from the notification thread is a trigger of the user event
+in CPU0's queue, because kevent() has no signal mask to change
+atomically and EVFILT_SIGNAL does not report a signal the thread
+blocks. The store and load pairs of darwin_irq_idle_begin() and the
+parking proof are unchanged; only the transport is, and a trigger sent
+after CPU0 left its wait stays pending and ends its next wait early, as
+the blocked signal did. SIGUSR2's handler and CPU0's block of it stay.
+SIGUSR1 stays blocked on an SME run's carrier throughout, since the
+pipe does the waking.
+
+A wake by the clock or the stop descriptor now costs one kevent(),
+and a wake by an IPI byte that and one read(). With the signal mask
+read, the timer's delete and CPU0's signal return gone, a wake by the
+clock takes one call on a secondary CPU, down from four, and three on
+CPU0, down from six, which keeps its two dispatches.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ arch/um/os-Darwin/internal.h |   2 +
+ arch/um/os-Darwin/irq.c      |  88 +++++---
+ arch/um/os-Darwin/irq.h      |   8 +-
+ arch/um/os-Darwin/smp.c      |  51 ++++-
+ arch/um/os-Darwin/time.c     | 424 ++++++++++++++++++++---------------
+ 5 files changed, 349 insertions(+), 224 deletions(-)
+
+diff --git a/arch/um/os-Darwin/internal.h b/arch/um/os-Darwin/internal.h
+index 4e3b7fbf5f87cfce35da0f47a577a2a9b5228a89..f8fd72858927cfb1baac0872a7787984f1b414fc 100644
+--- a/arch/um/os-Darwin/internal.h
++++ b/arch/um/os-Darwin/internal.h
+@@ -76,6 +76,7 @@ void darwin_ipi_idle_begin(void);
+ int darwin_ipi_idle_pending(void);
+ void darwin_ipi_idle_end(void);
+ void darwin_ipi_idle_drain(void);
++void darwin_ipi_idle_consume(long bytes);
+ int darwin_wake_idle_secondary(void);
+ unsigned int darwin_ipi_guest_snapshot(const unsigned int **sequence);
+ void darwin_ipi_guest_begin(void);
+@@ -115,6 +116,7 @@ static inline void darwin_ipi_idle_begin(void) { }
+ static inline int darwin_ipi_idle_pending(void) { return 0; }
+ static inline void darwin_ipi_idle_end(void) { }
+ static inline void darwin_ipi_idle_drain(void) { }
++static inline void darwin_ipi_idle_consume(long bytes) { (void)bytes; }
+ static inline int darwin_wake_idle_secondary(void) { return -1; }
+ static inline unsigned int darwin_ipi_guest_snapshot(
+ 	const unsigned int **sequence)
+diff --git a/arch/um/os-Darwin/irq.c b/arch/um/os-Darwin/irq.c
+index 4b5b71ba5844764bd62f952da75e16856981d56a..aba6c41cc4f6b3adf45f4dd616877bf0effd6b2b 100644
+--- a/arch/um/os-Darwin/irq.c
++++ b/arch/um/os-Darwin/irq.c
+@@ -38,10 +38,14 @@ static int notification_kqueue = -1;
+  */
+ static int park_kqueue = -1;
+ static int dispatch_kqueue = -1;
+-static pthread_t idle_waiter;
+ static pthread_t notification_worker;
+ static int notification_worker_joinable;
+-/* CPU0's carrier is stored in idle_waiter at its first idle entry, once. */
++/*
++ * CPU0's idle queue, the kqueue its idle wait blocks on, is stored in
++ * idle_waiter_queue at its first idle entry, once.  The notification thread
++ * triggers the queue's DARWIN_IRQ_IDLE_WAKE_IDENT event to end the wait.
++ */
++static int idle_waiter_queue = -1;
+ static int idle_waiter_set;
+ /*
+  * The wake of CPU0's idle wait, shared between the notification thread and
+@@ -101,6 +105,23 @@ static void wake_signal_handler(int signal)
+ 	(void)signal;
+ }
+ 
++/*
++ * End CPU0's idle wait.  The trigger waits in the wait's own kqueue until a
++ * kevent() collects it, so it needs no atomic signal mask, and it is posted
++ * without taking anything CPU0 holds: the host can stop CPU0's carrier,
++ * inside its wait or out of it, and the trigger returns all the same.
++ */
++static void wake_idle_waiter(void)
++{
++	struct kevent trigger;
++	int queue = __atomic_load_n(&idle_waiter_queue, __ATOMIC_RELAXED);
++
++	EV_SET(&trigger, DARWIN_IRQ_IDLE_WAKE_IDENT, EVFILT_USER, 0,
++	       NOTE_TRIGGER, 0, NULL);
++	while (kevent(queue, &trigger, 1, NULL, 0, NULL) < 0 && errno == EINTR)
++		;
++}
++
+ /* True once a dispatch has begun at or after `edge'. */
+ static int dispatched_since(unsigned long long edge)
+ {
+@@ -184,9 +205,9 @@ static struct timespec relative_time(unsigned long long target,
+  * the edge, which stays in the dispatch queue; it makes sure a CPU comes to
+  * collect it:
+  *
+- * - a CPU0 in its idle wait is signalled, which ends the wait, and one that
+- *   is not idle is signalled at its next idle entry (idle_wake_pending; a
+- *   system suspend drains nothing before it sleeps, so it relies on this); and
++ * - a CPU0 in its idle wait is woken, which ends the wait, and one that is
++ *   not idle is woken at its next idle entry (idle_wake_pending; a system
++ *   suspend drains nothing before it sleeps, so it relies on this); and
+  * - an edge that no dispatch has begun after for DARWIN_IRQ_TAKEOVER_NS means
+  *   CPU0 is late, busy or idle, so an idle secondary is woken to dispatch it,
+  *   and again after each interval until a dispatch begins.  A secondary that
+@@ -350,7 +371,7 @@ static void *notification_thread(void *unused)
+ 		if (__atomic_load_n(&idle_waiter_valid, __ATOMIC_SEQ_CST)) {
+ 			if (__atomic_exchange_n(&idle_wake_pending, 0,
+ 						__ATOMIC_SEQ_CST))
+-				(void)pthread_kill(idle_waiter, SIGUSR2);
++				wake_idle_waiter();
+ 		} else if (unserved) {
+ 			/* CPU0 is not idle: park until it is. */
+ 			__atomic_store_n(&notification_parked, 1,
+@@ -484,36 +505,43 @@ int os_irq_wake_pending(void)
+ }
+ 
+ /*
+- * CPU0's carrier enters an idle wait.  Returns whether an edge was left for
+- * it, in which case the wait must not sleep.
++ * CPU0's carrier enters an idle wait, which blocks on `queue'.  Returns whether
++ * an edge was left for it, in which case the wait must not sleep.
+  *
+  * The notification thread wakes CPU0 without taking anything CPU0 holds, so
+  * a carrier the host has stopped cannot hold the thread up with it.  They share
+- * `idle_waiter_valid' (CPU0 is in, or about to enter, the wait that SIGUSR2
+- * ends) and `idle_wake_pending' (an edge is waiting for CPU0), in sequentially
+- * consistent order, and each side stores one and then loads the other:
++ * `idle_waiter_valid' (CPU0 is in, or about to enter, the wait that a trigger
++ * of `queue' ends) and `idle_wake_pending' (an edge is waiting for CPU0), in
++ * sequentially consistent order, and each side stores one and then loads the
++ * other:
+  *
+  *	thread: (1) store idle_wake_pending = 1
+  *	        (2) load idle_waiter_valid; if set, (3) exchange idle_wake_pending
+- *	            for 0, and if that was 1, signal CPU0
++ *	            for 0, and if that was 1, trigger CPU0's queue
+  *	CPU0:   (a) store idle_waiter_valid = 1
+  *	        (b) exchange idle_wake_pending for 0, and if that was 1, do not
+  *	            sleep
+  *
+  * In the one total order either (1) precedes (b), so CPU0 takes the edge and
+  * does not sleep; or (b) precedes (1), so (a) precedes (2), the thread sees
+- * the wait and, unless CPU0 has left it, takes the edge and signals.  If CPU0
++ * the wait and, unless CPU0 has left it, takes the edge and triggers.  If CPU0
+  * has left it, valid is clear and the edge stays pending for the next entry.
+- * The exchange gives the edge to one side only, so a signal is not repeated.
+- * A signal sent after CPU0 left the wait stays pending: SIGUSR2 is blocked on
+- * this carrier from its first idle entry on, except inside the idle
+- * pselect()'s mask, so it can never interrupt guest code (nor a carrier that
+- * is not allowed asynchronous signals, see carriers_block_async_signals()),
+- * and ends the next idle wait early at the worst.  The thread signals only
+- * after it saw `idle_waiter_valid' set, which is after the first entry, so
+- * the signal is blocked by then.  The mask changes with pthread_sigmask(), as
+- * sigprocmask() rewrites every thread's mask on Darwin.  `idle_waiter' is
+- * stored before the first (a), so a thread that saw valid set sees it.
++ * The exchange gives the edge to one side only, so a trigger is not repeated.
++ * A trigger posted after CPU0 left the wait stays pending in the queue, which
++ * clears it only when a wait returns it, and ends the next idle wait early at
++ * the worst; unlike a signal it cannot interrupt guest code.  The thread
++ * triggers only after it saw `idle_waiter_valid' set, which is after the first
++ * entry, and `idle_waiter_queue' is stored before the first (a), so a thread
++ * that saw valid set sees the queue.  The queue holds the trigger's event from
++ * its creation, before the first entry.
++ *
++ * The wait is a kevent(), which has no signal mask to change atomically, so
++ * the wake is not a signal.  CPU0 still installs SIGUSR2's no-op handler and
++ * blocks the signal from its first idle entry on, as it did when the signal
++ * was the wake: a stray process-directed SIGUSR2 then never lands on the
++ * carrier between its waits (nor on one that is not allowed asynchronous
++ * signals, see carriers_block_async_signals()).  The mask changes with
++ * pthread_sigmask(), as sigprocmask() rewrites every thread's mask on Darwin.
+  *
+  * Parking.  A thread that read an edge while CPU0 is not idle waits on
+  * park_kqueue instead of reading further edges (see notification_thread()),
+@@ -533,7 +561,7 @@ int os_irq_wake_pending(void)
+  * whenever the thread is parked the flag is set or an event is on the way,
+  * and CPU0's next entry wakes it.  For an edge that arrives while CPU0 is
+  * in its wait, the thread therefore either is reading edges or is woken by
+- * that entry to read them, and signals CPU0 after a wake-up latency; it is
++ * that entry to read them, and wakes CPU0 after a wake-up latency; it is
+  * never left to the takeover deadline, which is only the timeout of a wait
+  * that CPU0's entry ends.  The edge that parked the thread is not lost
+  * either: (1) precedes (p1), so the pending flag is set, and (b) of the
+@@ -541,7 +569,7 @@ int os_irq_wake_pending(void)
+  * its deadline it clears the flag itself; if CPU0 cleared it first, that
+  * event ends the thread's next park early, which costs one wake.
+  */
+-int darwin_irq_idle_begin(void)
++int darwin_irq_idle_begin(int queue)
+ {
+ 	int edge;
+ 
+@@ -552,7 +580,7 @@ int darwin_irq_idle_begin(void)
+ 		sigaddset(&block, SIGUSR2);
+ 		if (pthread_sigmask(SIG_BLOCK, &block, NULL) != 0)
+ 			panic("Darwin: unable to block the IRQ wake signal");
+-		idle_waiter = pthread_self();
++		__atomic_store_n(&idle_waiter_queue, queue, __ATOMIC_RELAXED);
+ 		idle_waiter_set = 1;
+ 	}
+ 	__atomic_store_n(&idle_waiter_valid, 1, __ATOMIC_SEQ_CST);
+@@ -630,11 +658,13 @@ int os_setup_epoll(void)
+ 	__atomic_store_n(&idle_wake_pending, 0, __ATOMIC_SEQ_CST);
+ 	__atomic_store_n(&notification_parked, 0, __ATOMIC_SEQ_CST);
+ 	idle_waiter_set = 0;
++	__atomic_store_n(&idle_waiter_queue, -1, __ATOMIC_RELAXED);
+ 	action.sa_handler = wake_signal_handler;
+ 	sigemptyset(&action.sa_mask);
+-	/* SIGUSR2 is a wake edge for the idle pselect(), not work to run from a
+-	 * signal frame.  It must interrupt that wait so the idle kernel context
+-	 * can poll and deliver descriptor IRQs.
++	/* SIGUSR2 once ended CPU0's idle wait and no longer does; CPU0 blocks it
++	 * from its first idle entry on (darwin_irq_idle_begin()).  The handler
++	 * stays, so the signal is never fatal and, were one unblocked, it would
++	 * only end a system call early.
+ 	 */
+ 	action.sa_flags = 0;
+ 	if (sigaction(SIGUSR2, &action, NULL) < 0)
+diff --git a/arch/um/os-Darwin/irq.h b/arch/um/os-Darwin/irq.h
+index ef46033e02219a7e0fd4904757a3307c8d7d1fc0..c99fc7d6d0f1b109b6c163ebfef55aa99599cca7 100644
+--- a/arch/um/os-Darwin/irq.h
++++ b/arch/um/os-Darwin/irq.h
+@@ -15,7 +15,13 @@ struct uml_pt_regs;
+ /* What darwin_irq_dispatch() returns when it ran the handlers of an edge. */
+ #define DARWIN_IRQ_HANDLED 2
+ 
+-int darwin_irq_idle_begin(void);
++/*
++ * The user event CPU0's idle queue holds for the notification thread to
++ * trigger; it ends the idle wait (see darwin_irq_idle_begin()).
++ */
++#define DARWIN_IRQ_IDLE_WAKE_IDENT 1
++
++int darwin_irq_idle_begin(int queue);
+ void darwin_irq_idle_end(void);
+ int darwin_irq_dispatch(int cpu, unsigned long long now,
+ 			struct uml_pt_regs *registers);
+diff --git a/arch/um/os-Darwin/smp.c b/arch/um/os-Darwin/smp.c
+index e78d9de7ac1fcd819ad68f198c5345ef649de671..1ce68154da03765b0a2ca1c3e732f9ce7db5b035 100644
+--- a/arch/um/os-Darwin/smp.c
++++ b/arch/um/os-Darwin/smp.c
+@@ -291,7 +291,7 @@ static void drain_ipis(int drain_pipe)
+ 	/*
+ 	 * A sender leaves one pipe edge when the target is in host kernel or idle
+ 	 * code.  Consume that edge whenever the corresponding pending mask is
+-	 * handled, not only after pselect().  Otherwise kernel-boundary delivery
++	 * handled, not only after an idle wait.  Otherwise kernel-boundary delivery
+ 	 * clears pending_ipis while stale bytes accumulate until the nonblocking
+ 	 * pipe is full and can no longer wake a genuinely idle vCPU.  An idle exit
+ 	 * which has just drained the pipe passes drain_pipe as 0.
+@@ -496,6 +496,37 @@ void darwin_wake_cpu_threads_for_shutdown(void)
+ 	pthread_mutex_unlock(&futex_lock);
+ }
+ 
++/*
++ * Take the bytes an idle wait reported in the wake pipe.  This CPU is the
++ * pipe's only reader and the wait saw `bytes' of them, so a read returns at
++ * once whatever the descriptor's status flags are.  The first read asks for
++ * more than was counted, which takes a byte that landed since the wait looked
++ * as well and so leaves none behind to end the next wait; the reads that may
++ * follow take no more than what is still known to be there.  Unlike
++ * darwin_ipi_idle_drain(), which does not know whether anything is there, it
++ * needs no poll() before each read.
++ */
++void darwin_ipi_idle_consume(long bytes)
++{
++	char buffer[64];
++	size_t size = sizeof(buffer);
++	int fd = darwin_ipi_idle_fd();
++	int saved_errno = errno;
++
++	if (fd < 0)
++		return;
++	while (bytes > 0) {
++		ssize_t count = read(fd, buffer, size);
++
++		if (count <= 0)
++			break;
++		bytes -= count;
++		if (bytes > 0 && bytes < (long)sizeof(buffer))
++			size = (size_t)bytes;
++	}
++	errno = saved_errno;
++}
++
+ void darwin_ipi_idle_drain(void)
+ {
+ 	char bytes[64];
+@@ -560,8 +591,8 @@ int os_send_ipi(int cpu, int vector)
+ 	target_in_guest = __atomic_load_n(&guest_executing[cpu],
+ 					  __ATOMIC_ACQUIRE);
+ 	/* A pipe is the reliable idle wake transport.  Darwin can restart an
+-	 * interrupted pselect or pthread wait even when a signal handler is meant
+-	 * to be only a wake edge.  One byte is sufficient for every transition
++	 * interrupted pthread wait even when a signal handler is meant to be only
++	 * a wake edge.  One byte is sufficient for every transition
+ 	 * from no pending vectors to at least one; the pending bitmask coalesces
+ 	 * later IPIs until the target drains it.  A target already executing guest
+ 	 * code observes guest_ipi_sequences at every translated block and must not
+@@ -576,8 +607,9 @@ int os_send_ipi(int cpu, int vector)
+ 	/* An idle target is waiting on the pipe above.  Avoid a Darwin signal for
+ 	 * that common case: pthread_kill() is substantially more expensive than
+ 	 * the coalesced pipe edge and was the dominant active cost in SMP wakeup
+-	 * profiles.  The idle flag is published before pselect(), so an edge sent
+-	 * during the transition remains readable when the target starts waiting.
++	 * profiles.  The idle flag is published before the idle wait, so an edge
++	 * sent during the transition remains readable when the target starts
++	 * waiting.
+ 	 */
+ 	if (pipe_error == 0 &&
+ 	    __atomic_load_n(&ipi_idle_waiting[cpu], __ATOMIC_ACQUIRE))
+@@ -618,9 +650,10 @@ int os_send_ipi(int cpu, int vector)
+  * XNU delivers a signal to a thread in streaming mode without leaving it, and
+  * the return loses the upper bits of the Z registers, so when the run
+  * implements SME no asynchronous signal may reach a carrier while it can run
+- * translated streaming code.  The IPI wake signal stays blocked on carriers
+- * except inside the idle pselect(), whose mask unblocks it; it is only a wake
+- * edge, and every other carrier wait polls the pending IPIs or does not rely
++ * translated streaming code.  The IPI wake signal stays blocked on such a
++ * carrier throughout, the idle wait included; it is only a wake edge, and the
++ * idle wait ends on the wake pipe, which every sender writes before it would
++ * signal.  Every other carrier wait polls the pending IPIs or does not rely
+  * on its EINTR.  The process-directed signals stay blocked on carriers from
+  * their creation, so the process takes them on a thread that runs no guest:
+  * the launcher, or a thread of the embedding host.
+@@ -812,7 +845,7 @@ void os_init_smp(void)
+ 
+ 	action.sa_handler = ipi_signal_handler;
+ 	/* The handler deliberately does not run Linux interrupt code.  Its only
+-	 * purpose is to make a target blocked in pselect() return to the idle
++	 * purpose is to make a target blocked in a host wait return to the idle
+ 	 * boundary, where darwin_ipi_poll() can drain the pending vector safely.
+ 	 * SA_RESTART defeats that contract on Darwin and can leave a reschedule
+ 	 * IPI pending indefinitely while an idle vCPU remains asleep.
+diff --git a/arch/um/os-Darwin/time.c b/arch/um/os-Darwin/time.c
+index 368166312a42b6fe01982a06108e215ae6e98bcc..ce12545935cc9f7e3f6bb4914afe97c30f229b67 100644
+--- a/arch/um/os-Darwin/time.c
++++ b/arch/um/os-Darwin/time.c
+@@ -5,7 +5,6 @@
+ #include <signal.h>
+ #include <string.h>
+ #include <sys/event.h>
+-#include <sys/select.h>
+ #include <sys/time.h>
+ #include <time.h>
+ #include <unistd.h>
+@@ -17,13 +16,31 @@
+ #include "irq.h"
+ #include "internal.h"
+ 
++/* What the idle wait of a CPU keeps between waits.  The CPU's carrier owns it
++ * and it survives the CPU going offline and coming back; see idle_wait().
++ */
++struct darwin_idle_wait {
++	/* The kqueue the wait blocks on, once created. */
++	int created;
++	int queue;
++	/* The host's stop descriptor registered on it, or -1. */
++	int stop_fd;
++	/* The deadline timer's knote may exist: set by the wait that adds it,
++	 * cleared when a wait returns it or deletes it.
++	 */
++	int timer_armed;
++	/* The host refused the deadline timer: waits time out instead. */
++	int timer_refused;
++	/* The wait itself failed, which was reported. */
++	int wait_failed;
++};
++
+ struct darwin_cpu_timer {
+ 	unsigned long long delay_ns;
+ 	unsigned long long deadline_ns;
+ 	int active;
+ 	int periodic;
+-	/* Owned by the CPU's carrier; see arm_idle_deadline(). */
+-	int deadline_queue;
++	struct darwin_idle_wait idle;
+ };
+ 
+ static struct darwin_cpu_timer cpu_timers[CONFIG_NR_CPUS];
+@@ -59,11 +76,11 @@ long long os_nsecs(void)
+ int os_timer_create(void)
+ {
+ 	struct darwin_cpu_timer *state = timer_for_cpu(uml_curr_cpu());
+-	int deadline_queue = state->deadline_queue;
++	struct darwin_idle_wait idle = state->idle;
+ 
+ 	/* A re-onlined CPU keeps the queue its carrier already created. */
+ 	memset(state, 0, sizeof(*state));
+-	state->deadline_queue = deadline_queue;
++	state->idle = idle;
+ 	return 0;
+ }
+ 
+@@ -178,70 +195,231 @@ void darwin_timer_poll(struct uml_pt_regs *registers)
+ 	}
+ }
+ 
+-/* A pselect() timeout is subject to Darwin timer coalescing, which lets a
+- * one-millisecond wait overrun by about half a millisecond.  A critical
+- * kqueue timer is delivered on time, and the queue is readable once it fires,
+- * so the idle wait keeps pselect() for its atomic signal mask and adds the
+- * queue to its read set.  Returns the descriptor, or -1 to fall back to the
+- * pselect() timeout alone.
++/* The most results one idle wait takes at once: the deadline timer, the IPI
++ * wake pipe, the stop descriptor and CPU0's trigger.  What does not fit is
++ * returned by the next wait, since the pipe and the stop descriptor stay
++ * readable and the timer and the trigger stay pending.
+  */
+-static int arm_idle_deadline(struct darwin_cpu_timer *state,
+-			     unsigned long long remaining)
++#define DARWIN_IDLE_EVENTS 4
++
++/* Add the registrations an idle wait watches.  A missing one is a lost wake,
++ * so a failure here is fatal, as the IPI pipes' is in os_init_smp().
++ */
++static void idle_watch(struct darwin_idle_wait *idle, int cpu, short filter,
++		       uintptr_t ident, unsigned short flags)
+ {
+-	struct kevent timer;
+-
+-	if (state->deadline_queue < 0)
+-		return -1;
+-	if (!state->deadline_queue) {
+-		int queue = kqueue();
+-
+-		if (queue < 0 || queue >= FD_SETSIZE) {
+-			if (queue >= 0)
+-				close(queue);
+-			state->deadline_queue = -1;
+-			return -1;
+-		}
+-		(void)os_set_exec_close(queue);
+-		state->deadline_queue = queue;
+-	}
+-	EV_SET(&timer, 0, EVFILT_TIMER, EV_ADD | EV_ONESHOT,
+-	       NOTE_NSECONDS | NOTE_CRITICAL, (intptr_t)remaining, NULL);
+-	if (kevent(state->deadline_queue, &timer, 1, NULL, 0, NULL) < 0)
+-		return -1;
+-	return state->deadline_queue;
++	struct kevent registration;
++
++	EV_SET(&registration, ident, filter, EV_ADD | flags, 0, 0, NULL);
++	if (kevent(idle->queue, &registration, 1, NULL, 0, NULL) < 0)
++		panic("Darwin: CPU%d cannot watch %lu (filter %d) for its idle wait: %d",
++		      cpu, (unsigned long)ident, (int)filter, errno);
+ }
+ 
+-static void disarm_idle_deadline(struct darwin_cpu_timer *state)
++/* A CPU's idle wait blocks on one kqueue that holds everything which ends it:
++ * the deadline timer, armed by the wait itself, the IPI wake pipe, the host's
++ * stop descriptor and, on CPU0, the event the IRQ notification thread
++ * triggers (darwin_irq_idle_begin()).  The queue is created at the CPU's first
++ * cooperative idle wait.  Cooperative timers start after os_init_smp(), so the
++ * pipe exists by then.
++ */
++static void idle_queue_create(struct darwin_idle_wait *idle, int cpu)
+ {
+-	static const struct timespec poll_only;
+-	struct kevent timer;
+-	struct kevent result;
+-
+-	/* Deleting the knote also discards a delivery nobody collected. */
+-	EV_SET(&timer, 0, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
+-	(void)kevent(state->deadline_queue, &timer, 1, &result, 1, &poll_only);
++	int ipi_fd = darwin_ipi_idle_fd();
++	int queue = kqueue();
++
++	if (queue < 0)
++		panic("Darwin: CPU%d cannot create its idle queue: %d", cpu, errno);
++	(void)os_set_exec_close(queue);
++	idle->queue = queue;
++	idle->stop_fd = -1;
++	if (ipi_fd >= 0)
++		idle_watch(idle, cpu, EVFILT_READ, (uintptr_t)ipi_fd, 0);
++	if (cpu == 0)
++		idle_watch(idle, cpu, EVFILT_USER, DARWIN_IRQ_IDLE_WAKE_IDENT,
++			   EV_CLEAR);
++	idle->created = 1;
+ }
+ 
+-static void add_wake_fd(fd_set *read_fds, int fd)
++/* The stop descriptor belongs to the run, so it is watched as it is found. */
++static void idle_watch_stop(struct darwin_idle_wait *idle, int cpu, int stop_fd)
+ {
+-	/* Darwin's fortified FD_SET asks libc to validate the backing
+-	 * object.  UML kernel stacks are outside a native pthread's
+-	 * conventional stack allocation, so that check rejects this valid
+-	 * local fd_set and silently leaves it empty.  Callers bound fd by
+-	 * FD_SETSIZE, which provides the required safety instead.
+-	 */
+-	read_fds->fds_bits[(unsigned int)fd /
+-		(sizeof(read_fds->fds_bits[0]) * 8)] |=
+-		1U << ((unsigned int)fd % (sizeof(read_fds->fds_bits[0]) * 8));
++	if (stop_fd >= 0)
++		idle_watch(idle, cpu, EVFILT_READ, (uintptr_t)stop_fd, 0);
++	idle->stop_fd = stop_fd;
+ }
+ 
+-static int wake_fd_ready(const fd_set *read_fds, int fd)
++/*
++ * A critical kqueue timer is delivered on time, where a wait's own timeout is
++ * subject to Darwin timer coalescing, which lets a one-millisecond wait overrun
++ * by about half a millisecond with pselect() and by an eighth of its length
++ * with kevent().  So the deadline is a one-shot critical timer that the call
++ * which waits adds in its change list, and the call has no timeout of its own.
++ * That is the whole wait: one kevent() when the deadline ends it.
++ *
++ * A wake by anything else leaves the timer in the queue.  No wait deletes it,
++ * which would cost a call: the next wait that has a deadline adds it again,
++ * which replaces it and discards a delivery that nobody collected, and one
++ * that has none deletes it in the same call that waits.  A timer left over
++ * can only fire while its CPU is not waiting, which does no more than the
++ * kernel's work for a timer.  `timer_armed' tracks whether the knote may exist,
++ * since deleting one that does not returns an error at once.
++ *
++ * Nothing the timer, the pipe or the stop descriptor deliver is trusted for
++ * more than its wake: the deadline is read from the clock, the vectors are the
++ * pending mask and the stop checkpoint reads its flag.  The pipe's count of
++ * bytes is the exception, and only decides how the exit drains it.
++ *
++ * The call takes no signal mask, so a signal which ends the wait does so with
++ * EINTR whenever it is not blocked: the IPI signal, except on an SME run's
++ * carrier (carriers_block_async_signals()), where only the pipe wakes it.  An
++ * error leaves the result unknown and the pipe is then drained in full.
++ */
++static void idle_wait(struct darwin_cpu_timer *state, int cpu)
+ {
+-	/* Unfortified for the same reason as add_wake_fd(). */
+-	return (read_fds->fds_bits[(unsigned int)fd /
+-		(sizeof(read_fds->fds_bits[0]) * 8)] &
+-		(1U << ((unsigned int)fd %
+-			(sizeof(read_fds->fds_bits[0]) * 8)))) != 0;
++	static const struct timespec poll_only;
++	struct darwin_idle_wait *idle = &state->idle;
++	struct kevent events[DARWIN_IDLE_EVENTS];
++	struct kevent change = { };
++	struct uml_pt_regs registers;
++	struct timespec fallback;
++	const struct timespec *timeout = NULL;
++	unsigned long long now;
++	unsigned long long remaining;
++	long pipe_bytes;
++	int ipi_fd = darwin_ipi_idle_fd();
++	int stop_fd = darwin_uml_stop_fd();
++	int fire_timer = 0;
++	int edge_left = 0;
++	int handled = 0;
++	int changes = 0;
++	int count;
++	int index;
++
++	if (!idle->created)
++		idle_queue_create(idle, cpu);
++	if (stop_fd != idle->stop_fd)
++		idle_watch_stop(idle, cpu, stop_fd);
++	if (cpu == 0)
++		edge_left = darwin_irq_idle_begin(idle->queue);
++	/* Drain readiness which appeared before the kqueue waiter was
++	 * published.  Any later edge triggers CPU0's event in the queue, which
++	 * ends the wait below whatever the order.
++	 */
++	memset(&registers, 0, sizeof(registers));
++	if (cpu == 0)
++		handled = darwin_irq_dispatch(0, (unsigned long long)os_nsecs(),
++					      &registers) == DARWIN_IRQ_HANDLED;
++	if (state->active) {
++		now = (unsigned long long)os_nsecs();
++		remaining = state->deadline_ns > now ? state->deadline_ns - now : 0;
++		if (!remaining) {
++			timeout = &poll_only;
++		} else if (idle->timer_refused) {
++			fallback.tv_sec = (time_t)(remaining / UM_NSEC_PER_SEC);
++			fallback.tv_nsec = (long)(remaining % UM_NSEC_PER_SEC);
++			timeout = &fallback;
++		} else {
++			EV_SET(&change, 0, EVFILT_TIMER, EV_ADD | EV_ONESHOT,
++			       NOTE_NSECONDS | NOTE_CRITICAL, (intptr_t)remaining,
++			       NULL);
++			changes = 1;
++		}
++	} else if (idle->timer_armed) {
++		/* No deadline (a suspend, or nothing queued): the wait is
++		 * for the other wakes only.
++		 */
++		EV_SET(&change, 0, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
++		changes = 1;
++	}
++	darwin_ipi_idle_begin();
++	/* A vector pending here has no wake edge of its own; see
++	 * darwin_ipi_idle_pending().  Drain it below rather than sleep on it.
++	 * Nor has an edge which the notification thread left for this idle
++	 * entry (darwin_irq_idle_begin()).  Nor has a task which a handler of
++	 * the dispatch above made runnable here: it set this idle task's
++	 * need-resched flag, which the idle loop reads only when this function
++	 * returns, so the wait is skipped for it to switch.
++	 */
++	if (darwin_ipi_idle_pending() || edge_left || handled) {
++		timeout = &poll_only;
++		changes = 0;
++	}
++	count = kevent(idle->queue, changes ? &change : NULL, changes, events,
++		       DARWIN_IDLE_EVENTS, timeout);
++	if (count < 0 && errno != EINTR && !idle->wait_failed) {
++		idle->wait_failed = 1;
++		os_warn("Darwin: CPU%d idle wait failed: %d\n", cpu, errno);
++	}
++	if (changes)
++		idle->timer_armed = (change.flags & EV_ADD) != 0;
++	/* A pipe the wait did not report is empty, as it is at nearly every
++	 * wake by the deadline or the stop descriptor; after an error, or a
++	 * refused change, nothing is known (-1).
++	 */
++	pipe_bytes = count >= 0 ? 0 : -1;
++	for (index = 0; index < count; index++) {
++		const struct kevent *event = &events[index];
++
++		if (event->filter == EVFILT_TIMER) {
++			/* Delivered or refused, it is not in the queue now. */
++			idle->timer_armed = 0;
++			/* A refused change ends the call before it looks at the
++			 * queue, so the pipe is not known to be empty.
++			 */
++			if (event->flags & EV_ERROR)
++				pipe_bytes = -1;
++			if ((event->flags & EV_ERROR) && changes &&
++			    (change.flags & EV_ADD) && !idle->timer_refused) {
++				idle->timer_refused = 1;
++				os_warn("Darwin: CPU%d cannot arm its idle timer (%d); "
++					"its waits will time out instead\n",
++					cpu, (int)event->data);
++			}
++		} else if (event->filter == EVFILT_READ &&
++			   (int)event->ident == ipi_fd && event->data > 0) {
++			pipe_bytes = (long)event->data;
++		}
++	}
++	/* Clear before draining.  A sender which observed the idle state has
++	 * already left a pipe byte; a later sender will use the signal wake
++	 * path while this CPU processes the completed wait.
++	 */
++	darwin_ipi_idle_end();
++	now = (unsigned long long)os_nsecs();
++	if (state->active)
++		fire_timer = consume_expired_timer(state, now);
++	if (cpu == 0)
++		darwin_irq_idle_end();
++	darwin_host_stop_checkpoint();
++	/* A wait which returned without an error and did not report the IPI
++	 * pipe found it empty, so draining it first would only confirm that.
++	 * Nothing is lost by not looking: the byte only ends a wait, the
++	 * vectors are the pending mask, which the poll reads whatever woke the
++	 * wait, and a sender sets its vector before it writes its byte.  A
++	 * byte which lands after the wait looked is consumed by the drain a
++	 * poll makes when it finds a vector pending, or else ends the next
++	 * wait at once.  A pipe the wait reported is read before the mask is,
++	 * so a byte which a sender wrote before then is not left behind, and
++	 * the poll makes no drain of its own.
++	 */
++	if (pipe_bytes == 0) {
++		darwin_ipi_poll();
++	} else {
++		if (pipe_bytes > 0)
++			darwin_ipi_idle_consume(pipe_bytes);
++		else
++			darwin_ipi_idle_drain();
++		darwin_ipi_idle_poll();
++	}
++	if (fire_timer)
++		timer_handler(SIGALRM, NULL, &registers);
++	/* A CPU which may dispatches descriptor IRQs here, from idle kernel
++	 * context.  The notification thread's trigger only ends the wait above;
++	 * it does no work.
++	 */
++	memset(&registers, 0, sizeof(registers));
++	darwin_irq_dispatch(cpu, (unsigned long long)os_nsecs(), &registers);
+ }
+ 
+ void os_idle_sleep(void)
+@@ -249,132 +427,8 @@ void os_idle_sleep(void)
+ 	int cpu = uml_curr_cpu();
+ 	struct darwin_cpu_timer *state = timer_for_cpu(cpu);
+ 
+-	if (!darwin_timers_cooperative()) {
++	if (!darwin_timers_cooperative())
+ 		pause();
+-	} else {
+-		sigset_t mask;
+-		fd_set read_fds;
+-		struct uml_pt_regs registers;
+-		struct timespec timeout;
+-		struct timespec *timeout_pointer = NULL;
+-		unsigned long long now;
+-		unsigned long long remaining;
+-		int ipi_fd;
+-		int stop_fd;
+-		int deadline_fd = -1;
+-		int wake_fd;
+-		int fire_timer = 0;
+-		int edge_left = 0;
+-		int handled = 0;
+-		int pipe_empty;
+-		int ready;
+-
+-		if (cpu == 0)
+-			edge_left = darwin_irq_idle_begin();
+-		pthread_sigmask(SIG_SETMASK, NULL, &mask);
+-		if (cpu == 0)
+-			sigdelset(&mask, SIGUSR2);
+-		sigdelset(&mask, DARWIN_IPI_SIGNAL);
+-		/* Drain readiness which appeared before the kqueue waiter was
+-		 * published.  Any later edge queues SIGUSR2 while it is blocked,
+-		 * making the following pselect race-free.
+-		 */
+-		memset(&registers, 0, sizeof(registers));
+-		if (cpu == 0)
+-			handled = darwin_irq_dispatch(0,
+-						      (unsigned long long)os_nsecs(),
+-						      &registers) ==
+-				  DARWIN_IRQ_HANDLED;
+-		if (state->active) {
+-			now = (unsigned long long)os_nsecs();
+-			remaining = state->deadline_ns > now ?
+-				state->deadline_ns - now : 0;
+-			timeout.tv_sec = (time_t)(remaining / UM_NSEC_PER_SEC);
+-			timeout.tv_nsec = (long)(remaining % UM_NSEC_PER_SEC);
+-			timeout_pointer = &timeout;
+-			if (remaining)
+-				deadline_fd = arm_idle_deadline(state, remaining);
+-		}
+-		ipi_fd = darwin_ipi_idle_fd();
+-		stop_fd = darwin_uml_stop_fd();
+-		FD_ZERO(&read_fds);
+-		if (ipi_fd >= FD_SETSIZE)
+-			panic("Darwin: CPU%d IPI wake fd %d exceeds FD_SETSIZE",
+-			      cpu, ipi_fd);
+-		if (ipi_fd >= 0)
+-			add_wake_fd(&read_fds, ipi_fd);
+-		if (stop_fd >= FD_SETSIZE)
+-			panic("Darwin: host stop fd %d exceeds FD_SETSIZE", stop_fd);
+-		if (stop_fd >= 0)
+-			add_wake_fd(&read_fds, stop_fd);
+-		if (deadline_fd >= 0)
+-			add_wake_fd(&read_fds, deadline_fd);
+-		wake_fd = ipi_fd > stop_fd ? ipi_fd : stop_fd;
+-		if (deadline_fd > wake_fd)
+-			wake_fd = deadline_fd;
+-		darwin_ipi_idle_begin();
+-		/* A vector pending here has no wake edge of its own; see
+-		 * darwin_ipi_idle_pending().  Drain it below rather than sleep on it.
+-		 * Nor has an edge which the notification thread left for this idle
+-		 * entry (darwin_irq_idle_begin()).  Nor has a task which a handler of
+-		 * the dispatch above made runnable here: it set this idle task's
+-		 * need-resched flag, which the idle loop reads only when this
+-		 * function returns, so the wait is skipped for it to switch.
+-		 */
+-		if (darwin_ipi_idle_pending() || edge_left || handled) {
+-			timeout.tv_sec = 0;
+-			timeout.tv_nsec = 0;
+-			timeout_pointer = &timeout;
+-		}
+-		ready = pselect(wake_fd >= 0 ? wake_fd + 1 : 0,
+-				wake_fd >= 0 ? &read_fds : NULL, NULL, NULL,
+-				timeout_pointer, &mask);
+-		if (deadline_fd >= 0)
+-			disarm_idle_deadline(state);
+-		/* Clear before draining.  A sender which observed the idle state has
+-		 * already left a pipe byte; a later sender will use the signal wake
+-		 * path while this CPU processes the completed wait.
+-		 */
+-		darwin_ipi_idle_end();
+-		now = (unsigned long long)os_nsecs();
+-		if (state->active)
+-			fire_timer = consume_expired_timer(state, now);
+-		if (cpu == 0)
+-			darwin_irq_idle_end();
+-		darwin_host_stop_checkpoint();
+-		/* A wait which returned without an error and left the IPI pipe out
+-		 * of its result set found the pipe empty, as it is at nearly every
+-		 * wake by the deadline or the stop descriptor, so draining it first
+-		 * would only confirm that.  Nothing is lost by not looking: the byte
+-		 * only ends a wait, the vectors are the pending mask, which the poll
+-		 * reads whatever woke the wait, and a sender sets its vector before
+-		 * it writes its byte.  A byte which lands after the wait looked is
+-		 * consumed by the drain a poll makes when it finds a vector pending,
+-		 * or else ends the next wait at once.  An error leaves the result
+-		 * set undefined (EINTR is how SIGUSR2 and the IPI signal end a
+-		 * wait), so then the pipe is drained first, as it always was.
+-		 */
+-		pipe_empty = ready >= 0 && ipi_fd >= 0 &&
+-			     !wake_fd_ready(&read_fds, ipi_fd);
+-		if (pipe_empty) {
+-			darwin_ipi_poll();
+-		} else {
+-			/* Drain the pipe before the bitmask.  An IPI which races after
+-			 * the mask exchange leaves a fresh byte readable for the next
+-			 * idle wait; one which races before it is included in this
+-			 * drain, so the poll makes no drain of its own.
+-			 */
+-			darwin_ipi_idle_drain();
+-			darwin_ipi_idle_poll();
+-		}
+-		if (fire_timer)
+-			timer_handler(SIGALRM, NULL, &registers);
+-		/* A CPU which may dispatches descriptor IRQs here, from idle
+-		 * kernel context.  The kqueue notification thread's SIGUSR2 only
+-		 * ends the wait above; its handler does no work.
+-		 */
+-		memset(&registers, 0, sizeof(registers));
+-		darwin_irq_dispatch(cpu, (unsigned long long)os_nsecs(),
+-				    &registers);
+-	}
++	else
++		idle_wait(state, cpu);
+ }

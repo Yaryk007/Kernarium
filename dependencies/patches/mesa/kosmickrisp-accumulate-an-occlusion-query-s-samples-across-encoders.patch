@@ -1,0 +1,127 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 03:47:09 +0900
+Subject: [PATCH] kosmickrisp: accumulate an occlusion query's samples across
+ encoders
+
+A query's samples reach its slot of the visibility buffer from every
+Metal render encoder the query spans, and a query rarely stays in one:
+a pass restarts its encoder when a draw's pipeline masks every
+attachment (a static rasterizer discard), at a barrier and at a split,
+and a query can span render passes. Metal resets the slots an encoder
+counts into when it creates the encoder, unless the pass descriptor
+accumulates, so the last encoder's count replaced the earlier ones. A
+precise query read only the samples of the encoder that counted last,
+and an encoder that set the query's mode and drew nothing it could see
+left the slot at zero.
+
+Create every pass with the accumulating result type, so that each
+encoder adds to the slot. That is sound because a slot is zero when its
+query begins: the query table zeroes a slot when a pool takes or gives
+it back, the pool's reset flag and vkResetQueryPool zero it on the host,
+and vkCmdResetQueryPool zeroes it on the GPU, in order, before the
+render pass that counts into it. Vulkan lets a query begin only after one
+of those (VUID-vkCmdBeginQuery-None-00807). A fragment function that
+counts its samples itself already adds to the slot.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/kosmickrisp/bridge/mtl_render_state.h       |  4 ++++
+ src/kosmickrisp/bridge/mtl_render_state.m       | 10 ++++++++++
+ src/kosmickrisp/bridge/mtl_types.h              |  7 +++++++
+ src/kosmickrisp/bridge/stubs/mtl_render_state.c |  6 ++++++
+ src/kosmickrisp/vulkan/kk_cmd_draw.c            | 10 ++++++++++
+ 5 files changed, 37 insertions(+)
+
+diff --git a/src/kosmickrisp/bridge/mtl_render_state.h b/src/kosmickrisp/bridge/mtl_render_state.h
+index 49914266d4b599211a38de50147fb670a1285bef..67914edd62d96773489db2e87fe07303b90ee734 100644
+--- a/src/kosmickrisp/bridge/mtl_render_state.h
++++ b/src/kosmickrisp/bridge/mtl_render_state.h
+@@ -83,6 +83,10 @@ void mtl_render_pass_descriptor_set_sample_positions(
+ void mtl_render_pass_descriptor_set_visibility_buffer(
+    mtl_render_pass_descriptor *descriptor, mtl_buffer *visibility_buffer);
+ 
++void mtl_render_pass_descriptor_set_visibility_result_type(
++   mtl_render_pass_descriptor *descriptor,
++   enum mtl_visibility_result_type type);
++
+ /* Stencil descriptor */
+ mtl_stencil_descriptor *mtl_new_stencil_descriptor(void);
+ 
+diff --git a/src/kosmickrisp/bridge/mtl_render_state.m b/src/kosmickrisp/bridge/mtl_render_state.m
+index 9a441c857ae9c4555f4c67a55fdea54e1fbe7c0b..3fad24b95476ef1a4f0a52713338c52d440270d9 100644
+--- a/src/kosmickrisp/bridge/mtl_render_state.m
++++ b/src/kosmickrisp/bridge/mtl_render_state.m
+@@ -221,6 +221,16 @@
+    }
+ }
+ 
++void
++mtl_render_pass_descriptor_set_visibility_result_type(
++   mtl_render_pass_descriptor *descriptor, enum mtl_visibility_result_type type)
++{
++   @autoreleasepool {
++      MTL4RenderPassDescriptor *desc = (MTL4RenderPassDescriptor *)descriptor;
++      desc.visibilityResultType = (MTLVisibilityResultType)type;
++   }
++}
++
+ /* Stencil descriptor */
+ mtl_stencil_descriptor *
+ mtl_new_stencil_descriptor()
+diff --git a/src/kosmickrisp/bridge/mtl_types.h b/src/kosmickrisp/bridge/mtl_types.h
+index 2abf93b7d65a1b33b82f7f3f73b6117a349de03f..90d0b0b7e6157250c6cf6be8c7f0c8063c1f23d7 100644
+--- a/src/kosmickrisp/bridge/mtl_types.h
++++ b/src/kosmickrisp/bridge/mtl_types.h
+@@ -229,6 +229,13 @@ enum mtl_visibility_result_mode {
+    MTL_VISIBILITY_RESULT_MODE_COUNTING = 2,
+ };
+ 
++/* MTLVisibilityResultType: what an encoder does with the result it counts
++ * into when it is created. */
++enum mtl_visibility_result_type {
++   MTL_VISIBILITY_RESULT_TYPE_RESET = 0,
++   MTL_VISIBILITY_RESULT_TYPE_ACCUMULATE = 1,
++};
++
+ /* MTLVertexFormat.  Only the formats KosmicKrisp can hand to Metal's own
+  * vertex fetch are listed; a Vulkan format with no entry here keeps
+  * kk_lower_vs_vbo, which reads the attribute out of memory itself. */
+diff --git a/src/kosmickrisp/bridge/stubs/mtl_render_state.c b/src/kosmickrisp/bridge/stubs/mtl_render_state.c
+index f8ecaffbcaea08539d27f83bf922572c5f81f5f5..648e969ce20e9083607729e0de374949dc551592 100644
+--- a/src/kosmickrisp/bridge/stubs/mtl_render_state.c
++++ b/src/kosmickrisp/bridge/stubs/mtl_render_state.c
+@@ -133,6 +133,12 @@ mtl_render_pass_descriptor_set_visibility_buffer(
+ {
+ }
+ 
++void
++mtl_render_pass_descriptor_set_visibility_result_type(
++   mtl_render_pass_descriptor *descriptor, enum mtl_visibility_result_type type)
++{
++}
++
+ /* Stencil descriptor */
+ mtl_stencil_descriptor *
+ mtl_new_stencil_descriptor(void)
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_draw.c b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+index c0284405ae285c65f5dacfb5ed42cfa6983e5413..5dfe1450cc5e11991466b90770f2582c7eb7f658 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -484,6 +484,16 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
+    /* Set global visibility buffer */
+    mtl_render_pass_descriptor_set_visibility_buffer(
+       pass_descriptor, dev->occlusion_queries.bo->map);
++   /* A query's samples reach its slot from every encoder the query spans: a
++    * pass restarts its encoder (a draw whose pipeline masks every attachment,
++    * a barrier, a split), and a query can span passes. An encoder created
++    * with the default type resets the slots it counts into, so each would
++    * overwrite what the encoders before it counted. Accumulating adds to the
++    * slot instead. It holds zero when its query begins: the pool or the
++    * table made it zero, and vkResetQueryPool and vkCmdResetQueryPool zero
++    * it before a query is begun again (VUID-vkCmdBeginQuery-None-00807). */
++   mtl_render_pass_descriptor_set_visibility_result_type(
++      pass_descriptor, MTL_VISIBILITY_RESULT_TYPE_ACCUMULATE);
+ 
+    // TODO_KOSMICKRISP Fragment shading rate support goes here if Metal supports
+    // it

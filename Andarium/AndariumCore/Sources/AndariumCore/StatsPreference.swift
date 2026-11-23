@@ -6,7 +6,7 @@ import Foundation
 /// screen"), kept for the install across launches. A fresh install is off.
 ///
 /// It is a stored value of its own and not a field of `DisplayOptions`, whose
-/// stored form stays as an earlier version wrote it, so the person's Retina
+/// stored form stays as an earlier version wrote it, so the person's resolution
 /// choice is never rewritten by this.
 public struct StatsPreference {
     /// The stored value's key in the defaults database.

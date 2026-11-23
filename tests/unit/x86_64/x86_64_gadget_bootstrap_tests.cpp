@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 #include "allocation_failure.hpp"
 #include "cpu/gadget_cache_budget.hpp"
+#include "cpu/x86_64/code_page_registry.hpp"
 #include "cpu/x86_64/cpu_state.hpp"
 #include "cpu/x86_64/cpuid.hpp"
 #include "cpu/x86_64/decoder.hpp"
@@ -20,6 +21,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -34,6 +36,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -2107,6 +2110,102 @@ void cache_chains_indirect_transfers()
 		"a shared-tier eviction cost a site its own trained target");
 }
 
+/* A transfer to the all-ones address, which is also what every empty cell of
+ * the indirect caches holds, leaves a site that holds two other targets as it
+ * leaves a cold one: through the exit that reports the target, never through
+ * an empty cell's link. */
+void indirect_transfers_to_the_all_ones_address_leave_like_a_cold_site()
+{
+	using namespace uml::cpu::x86_64;
+	constexpr std::uint64_t all_ones = ~std::uint64_t{};
+	for (const auto target : {all_ones, all_ones - 3, all_ones - 7,
+		     std::uint64_t{0x8000'0000'0000'0000}}) {
+		TestMemory memory;
+		memory.load(0, {0xff, 0xe0}); /* jmp rax */
+		memory.load(16, {0xb8, 0x2a, 0x00, 0x00, 0x00, 0x0f, 0x05});
+		memory.load(24, {0xb8, 0x2b, 0x00, 0x00, 0x00, 0x0f, 0x05});
+		memory.load(32, {0xc3}); /* ret */
+		memory.load(48, {0xff, 0xe0}); /* a cold jmp rax */
+		memory.load(64, {0xc3}); /* a cold ret */
+		const auto stack = [&](std::uint64_t slot, std::uint64_t value) {
+			for (unsigned byte = 0; byte < 8; ++byte)
+				memory.load(512 + slot * 8 + byte,
+					{static_cast<std::uint8_t>(value >> (8 * byte))});
+		};
+		stack(0, 16);
+		stack(1, 24);
+		stack(2, 16);
+		stack(3, target);
+
+		gadgets::Executor executor;
+		executor.prepare(memory, 42, 1, 1);
+		const auto program = [&](std::uint64_t rip) {
+			const auto selected =
+				executor.select_program(memory, rip, ExecutionMode::long64);
+			require(selected.program != nullptr,
+				"an indirect branch did not cache");
+			return selected.program;
+		};
+		const auto jump = program(0);
+		const auto ret = program(32);
+		const auto cold_jump = program(48);
+		const auto cold_ret = program(64);
+		const auto first = program(16);
+		const auto second = program(24);
+		require(first != nullptr && second != nullptr);
+
+		const auto exit_of = [&](const gadgets::Program *branch,
+					  std::uint64_t rip, std::uint64_t value,
+					  std::uint64_t slot) {
+			CpuState cpu{};
+			cpu.gpr(Register::rax) = value;
+			cpu.gpr(Register::rsp) = 512 + slot * 8;
+			cpu.rip = rip;
+			const auto result =
+				gadgets::execute(*branch, cpu, memory, executor, 64);
+			return std::pair{result, cpu};
+		};
+		const auto [cold_jump_result, cold_jump_cpu] =
+			exit_of(cold_jump, 48, target, 0);
+		const auto [cold_ret_result, cold_ret_cpu] =
+			exit_of(cold_ret, 64, 0, 3);
+		/* {one, two, one} through each site fills both its cells. */
+		for (const auto visit : {16ULL, 24ULL, 16ULL}) {
+			const auto [jumped, jumped_cpu] =
+				exit_of(jump, 0, visit, 0);
+			require(jumped.event == uml::cpu::EngineEvent::system_call,
+				"a trained jump did not reach its target");
+		}
+		for (const auto slot : {0ULL, 1ULL, 2ULL}) {
+			const auto [returned, returned_cpu] =
+				exit_of(ret, 32, 0, slot);
+			require(returned.event == uml::cpu::EngineEvent::system_call,
+				"a trained return did not reach its target");
+		}
+		const auto [jump_result, jump_cpu] = exit_of(jump, 0, target, 0);
+		const auto [ret_result, ret_cpu] = exit_of(ret, 32, 0, 3);
+		require(cold_jump_result.event != uml::cpu::EngineEvent::system_call &&
+				cold_ret_result.retired_instructions == 1 &&
+				cold_jump_result.retired_instructions == 1,
+			"a cold transfer to an unmapped address did not retire once");
+		require(jump_result.event == cold_jump_result.event &&
+				jump_result.retired_instructions ==
+					cold_jump_result.retired_instructions &&
+				jump_cpu.rip == cold_jump_cpu.rip,
+			"a trained jump to the all-ones address left differently from "
+			"a cold one");
+		require(ret_result.event == cold_ret_result.event &&
+				ret_result.retired_instructions ==
+					cold_ret_result.retired_instructions &&
+				ret_cpu.rip == cold_ret_cpu.rip,
+			"a trained return to the all-ones address left differently from "
+			"a cold one");
+		require(jump_result.event != uml::cpu::EngineEvent::system_call &&
+				ret_result.event != uml::cpu::EngineEvent::system_call,
+			"a transfer to an unmapped address ran code");
+	}
+}
+
 /* No other test here binds an execution context, so `code_link_safe` has never
  * been reachable: without one it refuses every link and the engine leaves the
  * stream. The two call tests below are about exactly that decision, so they
@@ -2657,6 +2756,62 @@ void store_publishes_only_where_some_executor_caches_code()
 		"store after the other executor retired did not run");
 	require(memory.invalidations() == 1,
 		"store to a page that lost its cached code still published");
+}
+
+/* A vCPU of another process that stays inside the engine for longer than a
+ * registration waits may still land a store that publishes nothing, so the
+ * bytes a translation reads are not final. The translation runs once and is
+ * built again at the next dispatch; once the vCPU has left, the next build
+ * is cached.
+ */
+void stuck_participant_keeps_translations_out_of_the_cache()
+{
+	using namespace uml::cpu::x86_64;
+	using namespace std::chrono_literals;
+	constexpr std::uint64_t generation = 91;
+	TestMemory memory;
+	memory.load(0, {0xb8, 0x01, 0x00, 0x00, 0x00, 0x0f, 0x05});
+	/* The registry is made before the executor joins it, with a wait short
+	 * enough for a test. */
+	const auto registry = CodePageRegistry::acquire(
+		generation, {.slice = 10ms, .slices = 3});
+	CodePageRegistry::Participant stuck;
+	registry->join(stuck);
+	stuck.engine_epoch.store(1, std::memory_order_release);
+	gadgets::Executor executor;
+	executor.prepare(memory, generation, 1, 1);
+
+	const auto first = executor.select_program(
+		memory, 0, ExecutionMode::long64);
+	require(first.status == gadgets::BuildStatus::built &&
+		first.program != nullptr && !first.cache_hit,
+		"a translation built beside a stuck vCPU did not build");
+	memory.reset_fetches();
+	const auto second = executor.select_program(
+		memory, 0, ExecutionMode::long64);
+	require(second.status == gadgets::BuildStatus::built &&
+		second.program != nullptr && !second.cache_hit &&
+		memory.fetches() != 0,
+		"a translation built beside a stuck vCPU was cached");
+
+	stuck.engine_epoch.store(2, std::memory_order_release);
+	const auto third = executor.select_program(
+		memory, 0, ExecutionMode::long64);
+	require(third.status == gadgets::BuildStatus::built &&
+		third.program != nullptr && !third.cache_hit,
+		"the build after the vCPU left did not read the bytes again");
+	memory.reset_fetches();
+	const auto fourth = executor.select_program(
+		memory, 0, ExecutionMode::long64);
+	require(fourth.status == gadgets::BuildStatus::built &&
+		fourth.program != nullptr && fourth.cache_hit &&
+		memory.fetches() == 0,
+		"the build after the vCPU left was not cached");
+	require(executor.cache_diagnostics().unheld_runnable == 0,
+		"a translation became runnable from an unsettled registration");
+	registry->leave(stuck);
+	require(registry->leaves_inside_engine() == 0,
+		"a participant left the registry inside the engine");
 }
 
 void overlapping_executable_store_stops_immediately()
@@ -3707,6 +3862,1417 @@ void execute_addressing_shapes()
 		"the address-generation zero slot is not zero");
 }
 
+/* Four pages high enough that their page numbers have bits above the
+ * software TLB's index, which an index must leave out. The middle two are a
+ * pair that an index folding those bits in would put in one entry. */
+constexpr std::uint64_t tlb_test_base = std::uint64_t{0x1ffffffe} << 12U;
+
+/* Every gadget looks a page up where the miss handler fills it, so a block
+ * of accesses to one page asks the address space for that page once: baked
+ * and segment-override loads and stores, a vector move and an
+ * element-masked one, each of which indexes the table itself, and the
+ * accesses that end on their page's last byte, whose key is still that
+ * page. */
+void each_translation_finds_the_entry_its_miss_filled()
+{
+	using namespace uml::cpu::x86_64;
+	const std::uint64_t code = tlb_test_base;
+	const std::uint64_t source = tlb_test_base + 4096U;
+	const std::uint64_t destination = tlb_test_base + 3U * 4096U;
+	TestMemory memory{tlb_test_base};
+	memory.load(code, {
+		0x48, 0x8b, 0x03,                   // mov rax,[rbx]
+		0x48, 0x8b, 0x4b, 0x08,             // mov rcx,[rbx+8]
+		0x64, 0x48, 0x8b, 0x53, 0x10,       // mov rdx,fs:[rbx+16]
+		0x64, 0x48, 0x8b, 0x7b, 0x18,       // mov rdi,fs:[rbx+24]
+		0xf3, 0x0f, 0x6f, 0x43, 0x20,       // movdqu xmm0,[rbx+32]
+		0xc4, 0xe2, 0x71, 0x8c, 0x53, 0x30, // vpmaskmovd xmm2,xmm1,[rbx+48]
+		0xc4, 0xe2, 0x71, 0x8c, 0x5b, 0x40, // vpmaskmovd xmm3,xmm1,[rbx+64]
+		0x48, 0x89, 0x06,                   // mov [rsi],rax
+		0x48, 0x89, 0x4e, 0x08,             // mov [rsi+8],rcx
+		0x64, 0x48, 0x89, 0x56, 0x10,       // mov fs:[rsi+16],rdx
+		0x64, 0x48, 0x89, 0x7e, 0x18,       // mov fs:[rsi+24],rdi
+		0xf3, 0x0f, 0x7f, 0x46, 0x20,       // movdqu [rsi+32],xmm0
+		0xc4, 0xe2, 0x71, 0x8e, 0x56, 0x30, // vpmaskmovd [rsi+48],xmm1,xmm2
+		0xc4, 0xe2, 0x71, 0x8e, 0x5e, 0x40, // vpmaskmovd [rsi+64],xmm1,xmm3
+		0x48, 0x8b, 0x83, 0xf8, 0x0f, 0x00, 0x00, // mov rax,[rbx+0xff8]
+		0x48, 0x89, 0x86, 0xf8, 0x0f, 0x00, 0x00, // mov [rsi+0xff8],rax
+		0x64, 0x4c, 0x8b, 0x83, 0xf8, 0x0f, 0x00, 0x00, // mov r8,fs:[rbx+0xff8]
+		0x64, 0x4c, 0x89, 0x86, 0xf8, 0x0f, 0x00, 0x00, // mov fs:[rsi+0xff8],r8
+		0xc4, 0xe2, 0x71, 0x8c, 0x93, 0xf0, 0x0f, 0x00, 0x00, // vpmaskmovd xmm2,xmm1,[rbx+0xff0]
+		0xc4, 0xe2, 0x71, 0x8e, 0x96, 0xf0, 0x0f, 0x00, 0x00, // vpmaskmovd [rsi+0xff0],xmm1,xmm2
+		0x0f, 0x05,                         // syscall
+	});
+	for (unsigned index = 0; index < 80U; ++index)
+		memory.load(source + index,
+			{static_cast<std::uint8_t>(index * 7U + 3U)});
+	for (unsigned index = 4080U; index < 4096U; ++index)
+		memory.load(source + index,
+			{static_cast<std::uint8_t>(index * 5U + 1U)});
+	const auto built = require_built(gadgets::build(memory, code),
+		"the one-page access sequence did not build");
+	gadgets::Executor executor;
+	executor.prepare(memory);
+	CpuState cpu{};
+	cpu.rip = code;
+	cpu.gpr(Register::rbx) = source;
+	cpu.gpr(Register::rsi) = destination;
+	std::fill(cpu.vectors[1].begin(), cpu.vectors[1].begin() + 16,
+		std::byte{0x80});
+	memory.reset_atomic_pointers();
+	const auto result = gadgets::execute(built.program, cpu, memory,
+		executor, 64);
+	require(result.event == uml::cpu::EngineEvent::system_call &&
+			result.retired_instructions == 21,
+		"the one-page access sequence did not reach SYSCALL");
+	bool copied = true;
+	for (const auto [first, end] : {std::pair{0U, 80U}, std::pair{4080U, 4096U}})
+		for (auto index = first; index < end; ++index)
+			copied = copied && memory.byte(destination + index) ==
+				memory.byte(source + index);
+	require(copied, "the one-page access sequence lost bytes");
+	/* The stores to the last bytes overlap, so the loads that end on them
+	 * are checked in their registers. */
+	const auto last = memory.qword(source + 4088U);
+	bool last_bytes = cpu.gpr(Register::rax) == last &&
+		cpu.gpr(Register::r8) == last;
+	for (unsigned index = 0; index < 16U; ++index)
+		last_bytes = last_bytes && static_cast<std::uint8_t>(
+			cpu.vectors[2][index]) == memory.byte(source + 4080U + index);
+	require(last_bytes, "a load ending on its page's last byte lost bytes");
+	require(memory.atomic_pointers() == 2,
+		"a gadget did not find the translation its page's miss filled");
+}
+
+/* An access is keyed by the page of its last byte and looked up at the
+ * entry of its first byte's, and an entry holds only its own page, so an
+ * access across a page edge matches nothing and its miss takes the
+ * crossing path. Entries for both pages that point somewhere else entirely
+ * are passed over, and the address space is never asked to map the range in
+ * one piece, which it need not be able to. Each case runs at every amount
+ * it can cross by, its last byte alone on the next page included. An
+ * element-masked access selects only its element across the edge: the
+ * others are on one page, where those entries rightly answer. */
+void a_page_crossing_access_matches_no_translation()
+{
+	using namespace uml::cpu::x86_64;
+	const std::uint64_t edge = tlb_test_base + 2U * 4096U;
+	/* Each encoding ends in its displacement from RBX, the edge. */
+	struct Case final {
+		const char *name;
+		std::vector<std::uint8_t> code;
+		unsigned size;
+		bool vector;
+		bool store;
+		bool add;
+		bool masked;
+	};
+	const Case cases[] = {
+		{"a baked load", {0x48, 0x8b, 0x43, 0x00}, 8, false, false, false,
+			false},
+		{"a segment-override load", {0x64, 0x48, 0x8b, 0x43, 0x00}, 8,
+			false, false, false, false},
+		{"a vector load", {0xf3, 0x0f, 0x6f, 0x43, 0x00}, 16, true, false,
+			false, false},
+		{"an element-masked load", {0xc4, 0xe2, 0x71, 0x8c, 0x43, 0x00}, 16,
+			true, false, false, true},
+		{"a memory-destination add", {0x48, 0x01, 0x43, 0x00}, 8, false,
+			true, true, false},
+		{"a baked store", {0x48, 0x89, 0x43, 0x00}, 8, false, true, false,
+			false},
+		{"a segment-override store", {0x64, 0x48, 0x89, 0x43, 0x00}, 8,
+			false, true, false, false},
+		{"a vector store", {0xf3, 0x0f, 0x7f, 0x43, 0x00}, 16, true, true,
+			false, false},
+		{"an element-masked store", {0xc4, 0xe2, 0x71, 0x8e, 0x43, 0x00}, 16,
+			true, true, false, true},
+	};
+	/* Each case at every amount its crossing bytes, the access or the
+	 * masked access's dword 1, can cross by. */
+	std::vector<std::pair<const Case *, unsigned>> runs;
+	for (const auto &test : cases)
+		for (unsigned over = 1; over < (test.masked ? 4U : test.size); ++over)
+			runs.emplace_back(&test, over);
+	for (const auto &[test_pointer, over] : runs) {
+		const auto &test = *test_pointer;
+		const auto before_edge = test.masked ? 8U - over : test.size - over;
+		const std::string what = std::string{test.name} + " across a page by " +
+			std::to_string(over);
+		TestMemory memory{tlb_test_base};
+		auto code = test.code;
+		code.back() = static_cast<std::uint8_t>(0x100U - before_edge);
+		code.insert(code.end(), {0x0f, 0x05}); // syscall
+		memory.fill(tlb_test_base, std::as_bytes(std::span{code}));
+		const auto address = edge - before_edge;
+		for (unsigned index = 0; index < 16U; ++index)
+			memory.load(address + index,
+				{static_cast<std::uint8_t>(0x31U + index)});
+		const auto built = require_built(
+			gadgets::build(memory, tlb_test_base), what + " did not build");
+		gadgets::Executor executor;
+		executor.prepare(memory);
+		std::vector<std::byte> elsewhere(3U * 4096U, std::byte{0xee});
+		const auto delta = reinterpret_cast<std::uintptr_t>(
+			elsewhere.data()) - (edge - 4096U);
+		for (const auto page : {edge - 4096U, edge})
+			executor.tlb_entries()[native_tlb_index(page)] = {
+				.read_page = page,
+				.read_data_minus_address = delta,
+				.write_page = page,
+				.write_data_minus_address = delta,
+			};
+		CpuState cpu{};
+		cpu.rip = tlb_test_base;
+		cpu.gpr(Register::rbx) = edge;
+		constexpr std::uint64_t value = 0x1122334455667788ULL;
+		cpu.gpr(Register::rax) = value;
+		/* The mask selects dword 1, the one across the edge. */
+		const auto selected = [&test](unsigned index) {
+			return !test.masked || index / 4U == 1U;
+		};
+		for (unsigned index = 0; index < 16U; ++index) {
+			cpu.vectors[0][index] = static_cast<std::byte>(0xc0U + index);
+			cpu.vectors[1][index] = selected(index) ? std::byte{0x80} :
+				std::byte{};
+		}
+		const auto before = memory.qword(address);
+		memory.reset_atomic_pointers();
+		const auto result = gadgets::execute(built.program, cpu, memory,
+			executor, 4);
+		require(result.event == uml::cpu::EngineEvent::system_call &&
+				result.retired_instructions == 2,
+			what + " did not reach SYSCALL");
+		std::array<std::uint8_t, 16> expected{};
+		std::array<std::uint8_t, 16> actual{};
+		for (unsigned index = 0; index < test.size; ++index) {
+			if (test.store)
+				expected[index] = static_cast<std::uint8_t>(
+					selected(index) ? 0xc0U + index : 0x31U + index);
+			else if (selected(index))
+				expected[index] = static_cast<std::uint8_t>(0x31U + index);
+			actual[index] = test.store || !test.vector ?
+				memory.byte(address + index) :
+				static_cast<std::uint8_t>(cpu.vectors[0][index]);
+		}
+		if (test.store && !test.vector)
+			std::memcpy(expected.data(), &value, sizeof(value));
+		if (test.add) {
+			const auto sum = before + value;
+			std::memcpy(expected.data(), &sum, sizeof(sum));
+		}
+		if (!test.store && !test.vector)
+			std::memcpy(actual.data(), &cpu.gpr(Register::rax),
+				sizeof(value));
+		require(expected == actual,
+			what + " used another page's translation");
+		require(std::all_of(elsewhere.begin(), elsewhere.end(),
+				[](std::byte byte) { return byte == std::byte{0xee}; }),
+			what + " wrote through another page's translation");
+		require(memory.atomic_pointers() == 0,
+			what + " asked for one mapping of both pages");
+	}
+}
+
+/* TestMemory with more pages, each at its `far` address kept in the span's
+ * page at its `near`: guest pages as far apart as a test needs. */
+class FarPageMemory final : public TestMemory {
+public:
+	struct Page final {
+		std::uint64_t far;
+		std::uint64_t near;
+	};
+
+	FarPageMemory(std::uint64_t base, std::initializer_list<Page> pages)
+		: TestMemory{base}, pages_{pages} {}
+
+	[[nodiscard]] bool read(std::uint64_t address,
+		std::span<std::byte> destination) override
+	{
+		return TestMemory::read(backing(address), destination);
+	}
+
+	[[nodiscard]] bool write(std::uint64_t address,
+		std::span<const std::byte> source) override
+	{
+		return TestMemory::write(backing(address), source);
+	}
+
+	[[nodiscard]] std::byte *atomic_pointer(std::uint64_t address,
+		std::size_t size, uml::memory::MemoryAccess access) override
+	{
+		return TestMemory::atomic_pointer(backing(address), size, access);
+	}
+
+private:
+	[[nodiscard]] std::uint64_t backing(std::uint64_t address) const noexcept
+	{
+		for (const auto &page : pages_)
+			if (address - page.far < 4096U)
+				return address - page.far + page.near;
+		return address;
+	}
+
+	std::vector<Page> pages_;
+};
+
+/* The nearest page above `page` by a multiple of `step` pages that shares
+ * its entry. */
+[[nodiscard]] std::uint64_t page_sharing_entry(std::uint64_t page,
+	std::uint64_t step)
+{
+	using namespace uml::cpu::x86_64;
+	for (std::uint64_t apart = step;
+		apart <= 2U * native_tlb_entry_count * step; apart += step)
+		if (native_tlb_index(page + apart * 4096U) == native_tlb_index(page))
+			return page + apart * 4096U;
+	require(false, "no page within two table reaches shares an entry");
+	return page;
+}
+
+/* Pages that share an entry each read and write their own page: the
+ * nearest page that shares the near page's entry, and one apart only above
+ * bit 31, which a tag compare of 32 bits would take for the near page. The
+ * baked, the segment-override and the element-masked translations each
+ * visit near, high and far in turn, so every access but the first follows
+ * one to another page of that entry. */
+void pages_sharing_an_entry_keep_their_own_bytes()
+{
+	using namespace uml::cpu::x86_64;
+	const std::uint64_t code = tlb_test_base;
+	const std::uint64_t near = tlb_test_base + 4096U;
+	const auto far = page_sharing_entry(near, 1U);
+	const auto high = page_sharing_entry(near, std::uint64_t{1} << 20U);
+	require(native_tlb_index(far) == native_tlb_index(near) &&
+			native_tlb_index(high) == native_tlb_index(near) &&
+			(high & 0xffffffffU) == (near & 0xffffffffU),
+		"the far pages do not share the near page's entry");
+	const std::uint64_t high_backing = tlb_test_base + 2U * 4096U;
+	const std::uint64_t far_backing = tlb_test_base + 3U * 4096U;
+	FarPageMemory memory{tlb_test_base,
+		{{high, high_backing}, {far, far_backing}}};
+	memory.load(code, {
+		0x48, 0x8b, 0x03,                   // mov rax,[rbx]
+		0x48, 0x8b, 0x3e,                   // mov rdi,[rsi]
+		0x4c, 0x8b, 0x12,                   // mov r10,[rdx]
+		0x4c, 0x8b, 0x63, 0x08,             // mov r12,[rbx+8]
+		0x4c, 0x8b, 0x76, 0x08,             // mov r14,[rsi+8]
+		0x4c, 0x8b, 0x6a, 0x08,             // mov r13,[rdx+8]
+		0x48, 0x89, 0x7b, 0x10,             // mov [rbx+16],rdi
+		0x4c, 0x89, 0x56, 0x10,             // mov [rsi+16],r10
+		0x48, 0x89, 0x42, 0x10,             // mov [rdx+16],rax
+		0x64, 0x4c, 0x8b, 0x03,             // mov r8,fs:[rbx]
+		0x64, 0x4c, 0x8b, 0x3e,             // mov r15,fs:[rsi]
+		0x64, 0x4c, 0x8b, 0x0a,             // mov r9,fs:[rdx]
+		0x64, 0x4c, 0x89, 0x7b, 0x18,       // mov fs:[rbx+24],r15
+		0x64, 0x4c, 0x89, 0x4e, 0x18,       // mov fs:[rsi+24],r9
+		0x64, 0x4c, 0x89, 0x42, 0x18,       // mov fs:[rdx+24],r8
+		0xc4, 0xe2, 0x71, 0x8c, 0x53, 0x20, // vpmaskmovd xmm2,xmm1,[rbx+32]
+		0xc4, 0xe2, 0x71, 0x8c, 0x66, 0x20, // vpmaskmovd xmm4,xmm1,[rsi+32]
+		0xc4, 0xe2, 0x71, 0x8c, 0x5a, 0x20, // vpmaskmovd xmm3,xmm1,[rdx+32]
+		0xc4, 0xe2, 0x71, 0x8e, 0x63, 0x30, // vpmaskmovd [rbx+48],xmm1,xmm4
+		0xc4, 0xe2, 0x71, 0x8e, 0x5e, 0x30, // vpmaskmovd [rsi+48],xmm1,xmm3
+		0xc4, 0xe2, 0x71, 0x8e, 0x52, 0x30, // vpmaskmovd [rdx+48],xmm1,xmm2
+		0x0f, 0x05,                         // syscall
+	});
+	/* Each page's bytes, in the span, in the order the accesses visit them;
+	 * a page's stores take the next page's bytes. */
+	const std::array<std::uint64_t, 3> pages{near, high_backing, far_backing};
+	for (unsigned page = 0; page < pages.size(); ++page)
+		for (unsigned index = 0; index < 48U; ++index)
+			memory.load(pages[page] + index, {static_cast<std::uint8_t>(
+				0x10U + 0x40U * page + index)});
+	const auto built = require_built(gadgets::build(memory, code),
+		"the alternating sequence did not build");
+	gadgets::Executor executor;
+	executor.prepare(memory);
+	CpuState cpu{};
+	cpu.rip = code;
+	cpu.gpr(Register::rbx) = near;
+	cpu.gpr(Register::rsi) = high;
+	cpu.gpr(Register::rdx) = far;
+	std::fill(cpu.vectors[1].begin(), cpu.vectors[1].begin() + 16,
+		std::byte{0x80});
+	const auto result = gadgets::execute(built.program, cpu, memory,
+		executor, 32);
+	require(result.event == uml::cpu::EngineEvent::system_call &&
+			result.retired_instructions == 22,
+		"the alternating sequence did not reach SYSCALL");
+	const auto first = [&](unsigned page) {
+		return memory.qword(pages[page]);
+	};
+	const auto second = [&](unsigned page) {
+		return memory.qword(pages[page] + 8U);
+	};
+	require(cpu.gpr(Register::rax) == first(0) &&
+			cpu.gpr(Register::rdi) == first(1) &&
+			cpu.gpr(Register::r10) == first(2) &&
+			cpu.gpr(Register::r12) == second(0) &&
+			cpu.gpr(Register::r14) == second(1) &&
+			cpu.gpr(Register::r13) == second(2) &&
+			cpu.gpr(Register::r8) == first(0) &&
+			cpu.gpr(Register::r15) == first(1) &&
+			cpu.gpr(Register::r9) == first(2),
+		"a load read another page that shares its entry");
+	bool kept = true;
+	for (unsigned page = 0; page < pages.size(); ++page) {
+		const auto taken = pages[(page + 1U) % pages.size()];
+		kept = kept && memory.qword(pages[page] + 16U) == memory.qword(taken) &&
+			memory.qword(pages[page] + 24U) == memory.qword(taken);
+		for (unsigned index = 0; index < 16U; ++index)
+			kept = kept && memory.byte(pages[page] + 48U + index) ==
+				memory.byte(taken + 32U + index);
+	}
+	require(kept, "a store wrote another page that shares its entry");
+}
+
+/* ---- stack twins ------------------------------------------------------------
+ *
+ * A baked [rsp + displacement] access runs a twin that tries the stack's own
+ * TLB entry (`stack_fast`, the entry of RSP's page at a run's start) before it
+ * hashes, and the ordinary entry for anything else. These run each twin
+ * against the same instruction through RBP, which takes the ordinary entry,
+ * with each page's read and write views planted to point at buffers of their
+ * own between guard pages, so a twin that used another page's translation,
+ * or the other view of its own, reads or writes other bytes.
+ */
+
+/* A fused access form around a ModRM byte whose reg field is `reg`: DL, DX,
+ * EDX or RDX, DH for 6, or an opcode extension: not RCX, which SYSCALL
+ * writes. */
+struct StackForm final {
+	const char *name;
+	std::vector<std::uint8_t> opcode;
+	std::uint8_t reg;
+	std::vector<std::uint8_t> immediate;
+	unsigned size;
+};
+
+[[nodiscard]] const std::vector<StackForm> &stack_forms()
+{
+	static const std::vector<StackForm> forms{
+		{"mov rdx,[m]", {0x48, 0x8b}, 2, {}, 8},
+		{"mov edx,[m]", {0x8b}, 2, {}, 4},
+		{"mov dx,[m]", {0x66, 0x8b}, 2, {}, 2},
+		{"mov dl,[m]", {0x8a}, 2, {}, 1},
+		{"mov dh,[m]", {0x8a}, 6, {}, 1},
+		{"movzx edx,word [m]", {0x0f, 0xb7}, 2, {}, 2},
+		{"movsx rdx,byte [m]", {0x48, 0x0f, 0xbe}, 2, {}, 1},
+		{"movsx rdx,word [m]", {0x48, 0x0f, 0xbf}, 2, {}, 2},
+		{"movsxd rdx,[m]", {0x48, 0x63}, 2, {}, 4},
+		{"mov [m],rdx", {0x48, 0x89}, 2, {}, 8},
+		{"mov [m],edx", {0x89}, 2, {}, 4},
+		{"mov [m],dx", {0x66, 0x89}, 2, {}, 2},
+		{"mov [m],dl", {0x88}, 2, {}, 1},
+		{"mov [m],dh", {0x88}, 6, {}, 1},
+		{"mov qword [m],-2", {0x48, 0xc7}, 0, {0xfe, 0xff, 0xff, 0xff}, 8},
+		{"mov dword [m],0x1234", {0xc7}, 0, {0x34, 0x12, 0x00, 0x00}, 4},
+		{"mov word [m],0x1234", {0x66, 0xc7}, 0, {0x34, 0x12}, 2},
+		{"mov byte [m],0x5a", {0xc6}, 0, {0x5a}, 1},
+		{"add rdx,[m]", {0x48, 0x03}, 2, {}, 8},
+		{"sub edx,[m]", {0x2b}, 2, {}, 4},
+		{"and dx,[m]", {0x66, 0x23}, 2, {}, 2},
+		{"xor dl,[m]", {0x32}, 2, {}, 1},
+		{"or rdx,[m]", {0x48, 0x0b}, 2, {}, 8},
+		{"cmp rdx,[m]", {0x48, 0x3b}, 2, {}, 8},
+		{"cmp [m],edx", {0x39}, 2, {}, 4},
+		{"test [m],dx", {0x66, 0x85}, 2, {}, 2},
+		{"add [m],rdx", {0x48, 0x01}, 2, {}, 8},
+		{"sub [m],edx", {0x29}, 2, {}, 4},
+		{"and [m],dx", {0x66, 0x21}, 2, {}, 2},
+		{"or [m],dl", {0x08}, 2, {}, 1},
+		{"xor [m],rdx", {0x48, 0x31}, 2, {}, 8},
+		{"add qword [m],5", {0x48, 0x83}, 0, {0x05}, 8},
+		{"sub dword [m],0x100", {0x81}, 5, {0x00, 0x01, 0x00, 0x00}, 4},
+		{"and word [m],-16", {0x66, 0x83}, 4, {0xf0}, 2},
+		{"xor byte [m],0x33", {0x80}, 6, {0x33}, 1},
+		{"cmp dword [m],7", {0x83}, 7, {0x07}, 4},
+		{"test byte [m],0x81", {0xf6}, 0, {0x81}, 1},
+	};
+	return forms;
+}
+
+/* The stack twins are the bank's last group, behind the unrecorded twins,
+ * whose last entry is XOR's at 64 bits from an immediate into R15. */
+[[nodiscard]] bool is_stack_twin(std::uintptr_t word) noexcept
+{
+	return word >
+		uml::cpu::x86_64::gadgets::baked::uml_x86_64_baked_xor_64_ri_unrecorded[15];
+}
+
+/* The data pages of the stack-twin runs follow the code page. */
+constexpr std::uint64_t stack_test_page = tlb_test_base + 2U * 4096U;
+
+/* A planted view's buffer: the page between two guard pages. */
+constexpr std::size_t planted_span = 3U * 4096U;
+
+struct StackRun final {
+	uml::cpu::EngineEvent event{};
+	std::size_t retired{};
+	std::uint64_t rdx{};
+	std::uint64_t flags{};
+	std::uintptr_t first_word{};
+	std::size_t atomic_pointers{};
+	std::vector<std::uint8_t> memory;
+	std::vector<std::uint8_t> planted;
+};
+
+[[nodiscard]] bool same_effects(const StackRun &left, const StackRun &right)
+{
+	return left.event == right.event && left.retired == right.retired &&
+		left.rdx == right.rdx && left.flags == right.flags &&
+		left.atomic_pointers == right.atomic_pointers &&
+		left.memory == right.memory && left.planted == right.planted;
+}
+
+/* What a failed comparison names: everything but the bytes. */
+[[nodiscard]] std::string describe(const StackRun &run)
+{
+	return "event " + std::to_string(static_cast<int>(run.event)) +
+		", retired " + std::to_string(run.retired) + ", rdx " +
+		std::to_string(run.rdx) + ", flags " + std::to_string(run.flags) +
+		", misses " + std::to_string(run.atomic_pointers);
+}
+
+/* The planted buffers as a run starts, a page's read view and then its
+ * write view: each view's bytes its own, the guard pages 0xee. */
+[[nodiscard]] std::vector<std::uint8_t> fresh_planted(std::size_t pages)
+{
+	std::vector<std::uint8_t> bytes(2U * pages * planted_span, 0xee);
+	for (std::size_t view = 0; view < 2U * pages; ++view)
+		for (unsigned index = 0; index < 4096U; ++index)
+			bytes[view * planted_span + 4096U + index] =
+				static_cast<std::uint8_t>(0x80U + 0x10U * view + index * 7U);
+	return bytes;
+}
+
+/* Runs `form` at `address` with RSP and RBP at `base` and the form through
+ * RSP or RBP, both views of each page in `planted` pointing into buffers of
+ * their own, and reports what it did. */
+[[nodiscard]] StackRun run_stack_form(const StackForm &form, bool through_rsp,
+	std::uint64_t base, std::uint64_t address,
+	std::initializer_list<std::uint64_t> planted)
+{
+	using namespace uml::cpu::x86_64;
+	TestMemory memory{tlb_test_base};
+	auto code = form.opcode;
+	code.push_back(static_cast<std::uint8_t>(
+		0x80U | (form.reg << 3U) | (through_rsp ? 4U : 5U)));
+	if (through_rsp)
+		code.push_back(0x24);
+	const auto displacement = static_cast<std::uint32_t>(address - base);
+	for (unsigned byte = 0; byte < 4U; ++byte)
+		code.push_back(static_cast<std::uint8_t>(displacement >> (8U * byte)));
+	code.insert(code.end(), form.immediate.begin(), form.immediate.end());
+	code.insert(code.end(), {0x0f, 0x05}); // syscall
+	memory.fill(tlb_test_base, std::as_bytes(std::span{code}));
+	std::vector<std::uint8_t> data(3U * 4096U);
+	for (unsigned index = 0; index < data.size(); ++index)
+		data[index] = static_cast<std::uint8_t>(index * 13U + 5U);
+	memory.fill(tlb_test_base + 4096U, std::as_bytes(std::span{data}));
+	const auto built = require_built(gadgets::build(memory, tlb_test_base),
+		std::string{form.name} + " did not build");
+	gadgets::Executor executor;
+	executor.prepare(memory);
+	auto buffers = fresh_planted(planted.size());
+	std::size_t index = 0;
+	for (const auto page : planted) {
+		const auto view = [&](std::size_t which) {
+			return reinterpret_cast<std::uintptr_t>(buffers.data() +
+				(2U * index + which) * planted_span + 4096U) - page;
+		};
+		executor.tlb_entries()[native_tlb_index(page)] = {
+			.read_page = page,
+			.read_data_minus_address = view(0),
+			.write_page = page,
+			.write_data_minus_address = view(1),
+		};
+		++index;
+	}
+	CpuState cpu{};
+	cpu.rip = tlb_test_base;
+	cpu.gpr(Register::rsp) = base;
+	cpu.gpr(Register::rbp) = base;
+	cpu.gpr(Register::rdx) = 0x8877'6655'4433'2211ULL;
+	memory.reset_atomic_pointers();
+	const auto result = gadgets::execute(built.program, cpu, memory,
+		executor, 4);
+	StackRun run{
+		.event = result.event,
+		.retired = result.retired_instructions,
+		.rdx = cpu.gpr(Register::rdx),
+		.flags = cpu.gpr(Register::r11),
+		.first_word = built.program.native_stream().front(),
+		.atomic_pointers = memory.atomic_pointers(),
+		.memory = {},
+		.planted = std::move(buffers),
+	};
+	for (unsigned offset = 0; offset < data.size(); ++offset)
+		run.memory.push_back(memory.byte(tlb_test_base + 4096U + offset));
+	return run;
+}
+
+/* Each twin does what its ordinary entry does at the start of RSP's page,
+ * inside it, misaligned inside it, and ending on its last byte, from a
+ * displacement below RSP and above it, and only a base of RSP takes it.
+ * RSP's page's entry is planted, so every aligned twin hits. */
+void stack_twins_match_their_ordinary_entries()
+{
+	using namespace uml::cpu::x86_64;
+	const std::uint64_t page = stack_test_page;
+	for (const auto &form : stack_forms()) {
+		for (const std::uint64_t offset : {std::uint64_t{0}, std::uint64_t{8},
+			std::uint64_t{9}, std::uint64_t{4096U - form.size}}) {
+			const auto what = std::string{form.name} + " at page offset " +
+				std::to_string(offset);
+			const auto twin = run_stack_form(form, true, page + 64U,
+				page + offset, {page - 4096U, page, page + 4096U});
+			const auto plain = run_stack_form(form, false, page + 64U,
+				page + offset, {page - 4096U, page, page + 4096U});
+			require(is_stack_twin(twin.first_word) &&
+					!is_stack_twin(plain.first_word),
+				what + " did not take a stack twin through RSP alone");
+			require(plain.event == uml::cpu::EngineEvent::system_call &&
+					plain.retired == 2 && plain.atomic_pointers == 0,
+				what + " through RBP did not use its planted entry");
+			require(same_effects(twin, plain),
+				what + " through RSP did not do what it does through RBP: " +
+					describe(twin) + " against " + describe(plain));
+		}
+	}
+}
+
+/* A twin across a page edge takes the ordinary entry's crossing path,
+ * which asks the address space for the bytes, with RSP below the edge, where
+ * the entry it starts from is the first byte's page, and above it, where it
+ * is the last byte's. Each form runs at every amount it can cross by, its
+ * last byte alone on the next page included. Both pages' entries are
+ * planted, so a twin that used either for the whole access would reach into
+ * a guard page. */
+void stack_twins_refuse_an_access_across_a_page()
+{
+	using namespace uml::cpu::x86_64;
+	const std::uint64_t edge = stack_test_page;
+	const auto untouched = fresh_planted(2);
+	for (const auto &form : stack_forms()) {
+		for (unsigned over = 1; over < form.size; ++over) {
+			for (const bool below : {true, false}) {
+				const auto what = std::string{form.name} + " across a page by " +
+					std::to_string(over) + (below ? " above RSP" : " below RSP");
+				const auto address = edge - (form.size - over);
+				const auto base = below ? edge - 64U : edge + 64U;
+				const auto twin = run_stack_form(form, true, base, address,
+					{edge - 4096U, edge});
+				const auto plain = run_stack_form(form, false, base, address,
+					{edge - 4096U, edge});
+				require(is_stack_twin(twin.first_word),
+					what + " did not take its stack twin");
+				require(plain.event == uml::cpu::EngineEvent::system_call &&
+						plain.retired == 2 && plain.atomic_pointers == 0 &&
+						plain.planted == untouched,
+					what + " through RBP used a page's translation");
+				require(same_effects(twin, plain),
+					what + " through RSP did not do what it does through RBP: " +
+						describe(twin) + " against " + describe(plain));
+			}
+		}
+	}
+}
+
+/* A twin on another page than RSP's takes the ordinary translation: the
+ * next page, and the one below RSP's page, each with an entry of its own. */
+void stack_twins_take_the_ordinary_path_off_their_page()
+{
+	using namespace uml::cpu::x86_64;
+	const std::uint64_t page = stack_test_page;
+	for (const auto &form : stack_forms()) {
+		for (const auto address : {page + 4096U + 8U, page - 16U}) {
+			const auto what = std::string{form.name} + " on the page " +
+				(address > page ? "above" : "below") + " RSP's";
+			const auto twin = run_stack_form(form, true, page + 64U, address,
+				{page - 4096U, page, page + 4096U});
+			const auto plain = run_stack_form(form, false, page + 64U, address,
+				{page - 4096U, page, page + 4096U});
+			require(is_stack_twin(twin.first_word),
+				what + " did not take its stack twin");
+			require(plain.event == uml::cpu::EngineEvent::system_call &&
+					plain.retired == 2 && plain.atomic_pointers == 0,
+				what + " through RBP did not use its planted entry");
+			require(same_effects(twin, plain),
+				what + " through RSP did not do what it does through RBP: " +
+					describe(twin) + " against " + describe(plain));
+		}
+	}
+}
+
+/* RSP moving among pages that share one entry, as a stack switch or RSP
+ * used as a pointer leaves it: the first access of each page finds the entry
+ * holding another and takes the ordinary translation, which fills it with
+ * its own page, so every load and store reaches its own page. The high page
+ * differs from the near one only above bit 31. */
+void stack_twins_keep_pages_sharing_their_entry_apart()
+{
+	using namespace uml::cpu::x86_64;
+	const std::uint64_t code = tlb_test_base;
+	const std::uint64_t near = tlb_test_base + 4096U;
+	const auto far = page_sharing_entry(near, 1U);
+	const auto high = page_sharing_entry(near, std::uint64_t{1} << 20U);
+	require(native_tlb_index(far) == native_tlb_index(near) &&
+			native_tlb_index(high) == native_tlb_index(near) &&
+			(high & 0xffffffffU) == (near & 0xffffffffU),
+		"the far pages do not share the near page's entry");
+	const std::uint64_t high_backing = tlb_test_base + 2U * 4096U;
+	const std::uint64_t far_backing = tlb_test_base + 3U * 4096U;
+	FarPageMemory memory{tlb_test_base,
+		{{high, high_backing}, {far, far_backing}}};
+	memory.load(code, {
+		0x48, 0x8b, 0x44, 0x24, 0x08,       // mov rax,[rsp+8]
+		0x48, 0x89, 0x44, 0x24, 0x10,       // mov [rsp+16],rax
+		0x48, 0x89, 0xdc,                   // mov rsp,rbx
+		0x48, 0x8b, 0x54, 0x24, 0x08,       // mov rdx,[rsp+8]
+		0x48, 0x89, 0x54, 0x24, 0x10,       // mov [rsp+16],rdx
+		0x48, 0x01, 0x54, 0x24, 0x18,       // add [rsp+24],rdx
+		0x48, 0x89, 0xf4,                   // mov rsp,rsi
+		0x4c, 0x8b, 0x44, 0x24, 0x08,       // mov r8,[rsp+8]
+		0x4c, 0x89, 0x44, 0x24, 0x10,       // mov [rsp+16],r8
+		0x48, 0x89, 0xfc,                   // mov rsp,rdi
+		0x4c, 0x8b, 0x4c, 0x24, 0x08,       // mov r9,[rsp+8]
+		0x4c, 0x01, 0x4c, 0x24, 0x18,       // add [rsp+24],r9
+		0x0f, 0x05,                         // syscall
+	});
+	const std::array<std::uint64_t, 3> pages{near, high_backing, far_backing};
+	for (unsigned page = 0; page < pages.size(); ++page)
+		for (unsigned index = 0; index < 32U; ++index)
+			memory.load(pages[page] + index, {static_cast<std::uint8_t>(
+				0x10U + 0x40U * page + index)});
+	const auto word = [&](unsigned page, unsigned offset) {
+		return memory.qword(pages[page] + offset);
+	};
+	const auto near_8 = word(0, 8);
+	const auto near_24 = word(0, 24);
+	const auto high_8 = word(1, 8);
+	const auto high_24 = word(1, 24);
+	const auto far_8 = word(2, 8);
+	const auto built = require_built(gadgets::build(memory, code),
+		"the stack-switching sequence did not build");
+	gadgets::Executor executor;
+	executor.prepare(memory);
+	CpuState cpu{};
+	cpu.rip = code;
+	cpu.gpr(Register::rsp) = near;
+	cpu.gpr(Register::rbx) = high;
+	cpu.gpr(Register::rsi) = far;
+	cpu.gpr(Register::rdi) = near;
+	const auto result = gadgets::execute(built.program, cpu, memory,
+		executor, 32);
+	require(result.event == uml::cpu::EngineEvent::system_call &&
+			result.retired_instructions == 13,
+		"the stack-switching sequence did not reach SYSCALL");
+	require(cpu.gpr(Register::rax) == near_8 &&
+			cpu.gpr(Register::rdx) == high_8 &&
+			cpu.gpr(Register::r8) == far_8 &&
+			cpu.gpr(Register::r9) == near_8,
+		"a stack load read another page that shares its entry");
+	require(word(0, 16) == near_8 && word(1, 16) == high_8 &&
+			word(2, 16) == far_8 && word(1, 24) == high_24 + high_8 &&
+			word(0, 24) == near_24 + near_8,
+		"a stack store wrote another page that shares its entry");
+}
+
+/* The publications of a run that stores through RSP or RBP, then runs a
+ * CMPXCHG whose compare fails after its write translation of a page holding
+ * code, which leaves the run's publication pending, then stores again to the
+ * page without code whose entry the first store filled. */
+[[nodiscard]] std::size_t publications_after_a_failed_compare_exchange(
+	bool through_rsp)
+{
+	using namespace uml::cpu::x86_64;
+	TestMemory memory;
+	/* mov [base+8],rcx; cmpxchg [0x800],rcx (RIP-relative);
+	 * mov [base+16],rcx; SYSCALL. */
+	std::vector<std::uint8_t> code;
+	const auto store = [&](std::uint8_t displacement) {
+		if (through_rsp)
+			code.insert(code.end(), {0x48, 0x89, 0x4c, 0x24, displacement});
+		else
+			code.insert(code.end(), {0x48, 0x89, 0x4d, displacement});
+	};
+	store(0x08);
+	const auto next = code.size() + 7U;
+	const auto relative = static_cast<std::uint32_t>(0x800U - next);
+	code.insert(code.end(), {0x48, 0x0f, 0xb1, 0x0d});
+	for (unsigned byte = 0; byte < 4U; ++byte)
+		code.push_back(static_cast<std::uint8_t>(relative >> (8U * byte)));
+	store(0x10);
+	code.insert(code.end(), {0x0f, 0x05});
+	memory.fill(0, std::as_bytes(std::span{code}));
+	memory.set_executable_page(0);
+	gadgets::Executor executor;
+	executor.prepare(memory, 11, 1, 1);
+	const auto block = executor.select_program(
+		memory, 0, ExecutionMode::long64);
+	require(block.program != nullptr &&
+			is_stack_twin(block.program->native_stream()[0]) ==
+				through_rsp,
+		"the pending-publication sequence did not build");
+	CpuState cpu{};
+	cpu.gpr(Register::rsp) = 0x2800;
+	cpu.gpr(Register::rbp) = 0x2800;
+	cpu.gpr(Register::rax) = 1;
+	cpu.gpr(Register::rcx) = 0x1122'3344'5566'7788ULL;
+	const auto result = gadgets::execute(
+		*block.program, cpu, memory, executor, 64);
+	require(result.event == uml::cpu::EngineEvent::system_call &&
+			result.retired_instructions == 4 &&
+			cpu.gpr(Register::rax) == 0 && memory.qword(0x800) == 0 &&
+			memory.qword(0x2808) == 0x1122'3344'5566'7788ULL &&
+			memory.qword(0x2810) == 0x1122'3344'5566'7788ULL,
+		"the pending-publication sequence did not run");
+	return memory.invalidations();
+}
+
+/* A twin's store owes a publication exactly where the ordinary store does:
+ * none to an executable page no executor holds code on, and one for every
+ * store once an executor, another or its own, translates code on the
+ * stack's page. Each run begins at that page's entry, whose read tag the
+ * load before the store keeps the plain page and whose write tag then
+ * carries a code bit, in a run that has not published yet. A store also
+ * settles the publication a failed CMPXCHG left pending, to a page without
+ * code. */
+void stack_twin_stores_publish_where_ordinary_stores_do()
+{
+	using namespace uml::cpu::x86_64;
+	TestMemory memory;
+	/* Page 0: mov rax,[rsp+8]; mov [rsp+16],rcx; SYSCALL. Page 1, the
+	 * stack's: SYSCALL. */
+	memory.load(0, {0x48, 0x8b, 0x44, 0x24, 0x08, 0x48, 0x89, 0x4c, 0x24,
+		0x10, 0x0f, 0x05});
+	memory.load(0x1000, {0x0f, 0x05});
+	memory.set_every_page_executable(true);
+	gadgets::Executor writer;
+	writer.prepare(memory, 7, 1, 1);
+	const auto block = writer.select_program(
+		memory, 0, ExecutionMode::long64);
+	require(block.program != nullptr &&
+			is_stack_twin(block.program->native_stream()[0]) &&
+			is_stack_twin(block.program->native_stream()[2]),
+		"the stack load and store did not take their twins");
+	const auto run = [&](std::uint64_t value, std::size_t publications,
+		const char *message, std::uint64_t stack = 0x1800) {
+		CpuState cpu{};
+		cpu.gpr(Register::rsp) = stack;
+		cpu.gpr(Register::rcx) = value;
+		const auto result = gadgets::execute(
+			*block.program, cpu, memory, writer, 64);
+		require(result.event == uml::cpu::EngineEvent::system_call &&
+				memory.qword(stack + 16U) == value,
+			"a stack store did not run");
+		require(memory.invalidations() == publications, message);
+	};
+	run(1, 0, "a stack store to a page holding no code published");
+	run(2, 0, "a stack store through its own entry published");
+	gadgets::Executor reader;
+	reader.prepare(memory, 7, 1, 1);
+	require(reader.select_program(memory, 0x1000, ExecutionMode::long64)
+			.program != nullptr,
+		"the stack page's code did not build");
+	run(3, 1, "a stack store to a page another executor translated did not "
+		"publish");
+	run(4, 2, "a stack store whose entry holds code did not publish");
+	reader = gadgets::Executor{};
+	run(5, 2, "a stack store to a page that lost its code still published");
+	require(writer.select_program(memory, 0x1000, ExecutionMode::long64)
+			.program != nullptr,
+		"the stack page's code did not build in the writer");
+	run(6, 3, "a stack store to a page its own executor translated did not "
+		"publish");
+	run(7, 4, "a stack store whose entry holds its own code did not publish");
+	/* Six bytes off, as the entry's two code bits are. */
+	run(8, 5, "a misaligned stack store whose entry holds code did not publish",
+		0x1806);
+	const auto ordinary = publications_after_a_failed_compare_exchange(false);
+	require(ordinary == 1,
+		"an ordinary store did not settle a failed CMPXCHG's publication");
+	require(publications_after_a_failed_compare_exchange(true) == ordinary,
+		"a stack store did not settle a failed CMPXCHG's publication");
+}
+
+/* TestMemory whose page `page` is backed by one of two pages of its span,
+ * as a remapping leaves it. */
+class RemappedPageMemory final : public TestMemory {
+public:
+	RemappedPageMemory(std::uint64_t base, std::uint64_t page,
+		std::uint64_t first, std::uint64_t second)
+		: TestMemory{base}, page_{page}, first_{first}, second_{second} {}
+
+	void remap() noexcept { remapped_ = !remapped_; }
+
+	[[nodiscard]] bool read(std::uint64_t address,
+		std::span<std::byte> destination) override
+	{
+		return TestMemory::read(backing(address), destination);
+	}
+
+	[[nodiscard]] bool write(std::uint64_t address,
+		std::span<const std::byte> source) override
+	{
+		return TestMemory::write(backing(address), source);
+	}
+
+	[[nodiscard]] std::byte *atomic_pointer(std::uint64_t address,
+		std::size_t size, uml::memory::MemoryAccess access) override
+	{
+		return TestMemory::atomic_pointer(backing(address), size, access);
+	}
+
+private:
+	[[nodiscard]] std::uint64_t backing(std::uint64_t address) const noexcept
+	{
+		if (address - page_ < 4096U)
+			return address - page_ + (remapped_ ? second_ : first_);
+		return address;
+	}
+
+	std::uint64_t page_;
+	std::uint64_t first_;
+	std::uint64_t second_;
+	bool remapped_{};
+};
+
+/* A twin reaches a remapped stack page through its new mapping whether the
+ * executor retires the changed range, clears the whole table because it
+ * cannot replay the change, or clears it for a new generation: the entry a
+ * run starts from is the entry each of them retires. */
+void stack_twins_follow_a_remapped_page()
+{
+	using namespace uml::cpu::x86_64;
+	const std::uint64_t code = tlb_test_base;
+	const std::uint64_t stack = tlb_test_base + 4096U;
+	const std::uint64_t first = tlb_test_base + 2U * 4096U;
+	const std::uint64_t second = tlb_test_base + 3U * 4096U;
+	RemappedPageMemory memory{tlb_test_base, stack, first, second};
+	memory.load(code, {
+		0x48, 0x8b, 0x44, 0x24, 0x08,       // mov rax,[rsp+8]
+		0x48, 0x89, 0x54, 0x24, 0x10,       // mov [rsp+16],rdx
+		0x0f, 0x05,                         // syscall
+	});
+	for (unsigned index = 0; index < 16U; ++index) {
+		memory.load(first + index, {static_cast<std::uint8_t>(0x20U + index)});
+		memory.load(second + index, {static_cast<std::uint8_t>(0x60U + index)});
+	}
+	const auto first_8 = memory.qword(first + 8U);
+	const auto second_8 = memory.qword(second + 8U);
+	const auto built = require_built(gadgets::build(memory, code),
+		"the remapped-stack sequence did not build");
+	struct Changes final {
+		std::uint64_t stack;
+		std::uint64_t sequence;
+	} changes{stack, 1};
+	const gadgets::MappingChangeReader replay = [](void *context,
+		std::uint64_t, std::uint64_t, gadgets::ProgramMappingChange *ranges,
+		std::size_t capacity, std::uint64_t *current) noexcept -> int {
+		const auto &state = *static_cast<const Changes *>(context);
+		if (capacity == 0)
+			return -1;
+		ranges[0] = {.address = state.stack, .length = 4096U};
+		*current = state.sequence;
+		return 1;
+	};
+	gadgets::Executor executor;
+	const auto run = [&](std::uint64_t value, std::uint64_t loaded,
+		std::uint64_t stored_at, const char *message) {
+		CpuState cpu{};
+		cpu.rip = code;
+		cpu.gpr(Register::rsp) = stack;
+		cpu.gpr(Register::rdx) = value;
+		const auto result = gadgets::execute(built.program, cpu, memory,
+			executor, 8);
+		require(result.event == uml::cpu::EngineEvent::system_call &&
+				cpu.gpr(Register::rax) == loaded &&
+				memory.qword(stored_at + 16U) == value,
+			message);
+	};
+	executor.prepare(memory, 5, changes.sequence, 1, &changes, nullptr,
+		nullptr, replay);
+	run(1, first_8, first, "a stack access missed its first mapping");
+	memory.remap();
+	changes.sequence = 2;
+	executor.prepare(memory, 5, changes.sequence, 1, &changes, nullptr,
+		nullptr, replay);
+	run(2, second_8, second,
+		"a stack access kept a mapping the executor retired by range");
+	require(memory.qword(first + 16U) == 1,
+		"a stack store wrote through a mapping retired by range");
+	memory.remap();
+	changes.sequence = 3;
+	executor.prepare(memory, 5, changes.sequence, 1, &changes);
+	run(3, first_8, first,
+		"a stack access kept a mapping the executor cleared");
+	memory.remap();
+	executor.prepare(memory, 6, changes.sequence, 1, &changes);
+	run(4, second_8, second,
+		"a stack access kept a mapping of another generation");
+}
+
+/* TestMemory whose page `page` is mapped read-only. */
+class ReadOnlyPageMemory final : public TestMemory {
+public:
+	ReadOnlyPageMemory(std::uint64_t base, std::uint64_t page)
+		: TestMemory{base}, page_{page} {}
+
+	[[nodiscard]] bool write(std::uint64_t address,
+		std::span<const std::byte> source) override
+	{
+		if (touches(address, source.size())) {
+			refuse(address);
+			return false;
+		}
+		return TestMemory::write(address, source);
+	}
+
+	[[nodiscard]] std::byte *atomic_pointer(std::uint64_t address,
+		std::size_t size, uml::memory::MemoryAccess access) override
+	{
+		if (access == uml::memory::MemoryAccess::write &&
+			touches(address, size)) {
+			refuse(address);
+			return nullptr;
+		}
+		return TestMemory::atomic_pointer(address, size, access);
+	}
+
+	[[nodiscard]] uml::memory::MemoryFault last_fault() const noexcept override
+	{
+		return refused_ ? fault_ : TestMemory::last_fault();
+	}
+
+	[[nodiscard]] bool has_fault() const noexcept override
+	{
+		return refused_ || TestMemory::has_fault();
+	}
+
+private:
+	[[nodiscard]] bool touches(std::uint64_t address,
+		std::size_t size) const noexcept
+	{
+		return address < page_ + 4096U && address + size > page_;
+	}
+
+	void refuse(std::uint64_t address) noexcept
+	{
+		fault_ = {address, uml::memory::MemoryAccess::write};
+		refused_ = true;
+	}
+
+	std::uint64_t page_;
+	uml::memory::MemoryFault fault_{};
+	bool refused_{};
+};
+
+/* A stack page that a load has just translated for reading but that maps
+ * read-only: the store after it faults there, at its own instruction. */
+void a_stack_twin_store_to_a_read_only_page_faults()
+{
+	using namespace uml::cpu::x86_64;
+	const std::uint64_t code = tlb_test_base;
+	const std::uint64_t stack = tlb_test_base + 4096U;
+	ReadOnlyPageMemory memory{tlb_test_base, stack};
+	memory.load(code, {
+		0x48, 0x8b, 0x44, 0x24, 0x08,       // mov rax,[rsp+8]
+		0x48, 0x89, 0x44, 0x24, 0x10,       // mov [rsp+16],rax
+		0x0f, 0x05,                         // syscall
+	});
+	memory.load(stack + 8U, {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88});
+	const auto built = require_built(gadgets::build(memory, code),
+		"the read-only stack sequence did not build");
+	gadgets::Executor executor;
+	executor.prepare(memory);
+	CpuState cpu{};
+	cpu.rip = code;
+	cpu.gpr(Register::rsp) = stack;
+	const auto result = gadgets::execute(built.program, cpu, memory,
+		executor, 8);
+	require(result.event == uml::cpu::EngineEvent::memory_fault &&
+			result.retired_instructions == 1 && cpu.rip == code + 5U &&
+			result.fault.address == stack + 16U &&
+			result.fault.access == uml::memory::MemoryAccess::write,
+		"a stack store to a read-only page did not fault at itself");
+	require(memory.qword(stack + 16U) == 0 &&
+			cpu.gpr(Register::rax) == memory.qword(stack + 8U),
+		"a stack store to a read-only page changed memory");
+}
+
+/* A twin's store into the block that is running, on a page no executor
+ * holds code on, hits the stack's entry and still leaves through the
+ * overlap exit for the instruction after it. */
+void a_stack_twin_store_into_its_block_leaves_after_itself()
+{
+	using namespace uml::cpu::x86_64;
+	TestMemory memory;
+	memory.load(0, {
+		0x48, 0x89, 0x8c, 0x24, 0x00, 0x08, 0x00, 0x00, // mov [rsp+0x800],rcx
+		0x48, 0x89, 0x4c, 0x24, 0x10,       // mov [rsp+16],rcx
+		0x90, 0x90, 0x90,                   // nop x3
+		0x0f, 0x05,                         // syscall
+	});
+	const auto built = require_built(gadgets::build(memory, 0),
+		"the self-overwriting stack sequence did not build");
+	require(is_stack_twin(built.program.native_stream()[2]),
+		"the store into its block did not take its twin");
+	gadgets::Executor executor;
+	executor.prepare(memory);
+	CpuState cpu{};
+	cpu.gpr(Register::rsp) = 0;
+	constexpr std::uint64_t value = 0x1122'3344'5566'7788ULL;
+	cpu.gpr(Register::rcx) = value;
+	const auto result = gadgets::execute(built.program, cpu, memory,
+		executor, 16);
+	require(result.event == uml::cpu::EngineEvent::continued &&
+			result.retired_instructions == 2 && cpu.rip == 13U,
+		"a stack store into its own block did not leave after itself");
+	require(memory.qword(0x10) == value && memory.qword(0x800) == value,
+		"a stack store into its own block lost its bytes");
+}
+
+/* What the builder keeps off the twins, each reading what its address names:
+ * an access with an index, one with a segment override, a 32-bit address in
+ * long mode, a locked update, and any access in compatibility mode, whose
+ * address wraps at 4 GiB. */
+void stack_operands_without_a_twin_keep_their_addresses()
+{
+	using namespace uml::cpu::x86_64;
+	struct Case final {
+		const char *name;
+		std::vector<std::uint8_t> code;
+		ExecutionMode mode;
+		std::uint64_t memory_base;
+		std::uint64_t rsp;
+		std::uint64_t address;
+		std::uint64_t fs_base;
+		bool locked_add;
+	};
+	const std::uint64_t page = 0x2000;
+	const Case cases[] = {
+		{"mov rax,[rsp+rcx*8+8]", {0x48, 0x8b, 0x44, 0xcc, 0x08},
+			ExecutionMode::long64, 0, page, page + 24U, 0, false},
+		{"mov rax,fs:[rsp+8]", {0x64, 0x48, 0x8b, 0x44, 0x24, 0x08},
+			ExecutionMode::long64, 0, page, page + 0x1008U, 0x1000, false},
+		{"mov eax,[esp+8]", {0x67, 0x8b, 0x44, 0x24, 0x08},
+			ExecutionMode::long64, 0, (std::uint64_t{1} << 32U) | page,
+			page + 8U, 0, false},
+		{"lock add [rsp+8],rax", {0xf0, 0x48, 0x01, 0x44, 0x24, 0x08},
+			ExecutionMode::long64, 0, page, page + 8U, 0, true},
+		{"compat32 mov eax,[esp+8]", {0x8b, 0x44, 0x24, 0x08},
+			ExecutionMode::compat32, 0xffff'f000ULL, 0xffff'fffcULL, 4U, 0,
+			false},
+	};
+	for (const auto &test : cases) {
+		TestMemory memory{test.memory_base};
+		memory.set_wrap32(test.mode == ExecutionMode::compat32);
+		auto code = test.code;
+		if (test.mode == ExecutionMode::compat32)
+			code.insert(code.end(), {0xcd, 0x80}); // int 80h
+		else
+			code.insert(code.end(), {0x0f, 0x05}); // syscall
+		memory.fill(test.memory_base, std::as_bytes(std::span{code}));
+		for (unsigned index = 0; index < 8U; ++index)
+			memory.load(test.address + index,
+				{static_cast<std::uint8_t>(0x31U + 0x11U * index)});
+		const auto before = memory.qword(test.address);
+		const auto built = require_built(
+			gadgets::build(memory, test.memory_base, test.mode),
+			std::string{test.name} + " did not build");
+		require(!is_stack_twin(built.program.native_stream().front()),
+			std::string{test.name} + " took a stack twin");
+		CpuState cpu{};
+		cpu.execution_mode = test.mode;
+		cpu.rip = test.memory_base;
+		cpu.fs_base = test.fs_base;
+		cpu.gpr(Register::rsp) = test.rsp;
+		cpu.gpr(Register::rcx) = 2;
+		cpu.gpr(Register::rax) = test.locked_add ? 0x1000 : 0;
+		const auto result = gadgets::execute(built.program, cpu, memory, 4);
+		require(result.retired_instructions == 2,
+			std::string{test.name} + " did not run");
+		if (test.locked_add)
+			require(memory.qword(test.address) == before + 0x1000,
+				std::string{test.name} + " updated another address");
+		else
+			require(cpu.gpr(Register::rax) == (test.code.front() == 0x67 ||
+					test.mode == ExecutionMode::compat32 ?
+					before & 0xffffffffU : before),
+				std::string{test.name} + " read another address");
+	}
+}
+
+/* An entry of `executor`'s table that sends `page` to `buffer`, for reads
+ * and for writes. */
+void plant_tlb_entry(uml::cpu::x86_64::gadgets::Executor &executor,
+	std::uint64_t page, std::span<std::byte> buffer)
+{
+	using namespace uml::cpu::x86_64;
+	const auto delta = reinterpret_cast<std::uintptr_t>(buffer.data()) - page;
+	executor.tlb_entries()[native_tlb_index(page)] = {
+		.read_page = page,
+		.read_data_minus_address = delta,
+		.write_page = page,
+		.write_data_minus_address = delta,
+	};
+}
+
+/* Baked, segment-override and element-masked loads and stores of the page
+ * at RBX, then SYSCALL: the accesses that `planted_accesses_hit` checks. */
+constexpr std::array<std::uint8_t, 31> planted_access_code{
+	0x48, 0x8b, 0x03,                   // mov rax,[rbx]
+	0x64, 0x48, 0x8b, 0x53, 0x08,       // mov rdx,fs:[rbx+8]
+	0xc4, 0xe2, 0x71, 0x8c, 0x53, 0x10, // vpmaskmovd xmm2,xmm1,[rbx+16]
+	0x48, 0x89, 0x43, 0x20,             // mov [rbx+32],rax
+	0x64, 0x48, 0x89, 0x53, 0x28,       // mov fs:[rbx+40],rdx
+	0xc4, 0xe2, 0x71, 0x8e, 0x53, 0x30, // vpmaskmovd [rbx+48],xmm1,xmm2
+	0x0f, 0x05,                         // syscall
+};
+
+/* The accesses of `planted_access_code` went through the entry planted for
+ * their page and nowhere else: their loads read `buffer`, whose first 32
+ * bytes count from `first` up, their stores wrote its next 32, and the
+ * page's own 64 bytes, counting from `real` up, are as they were. */
+[[nodiscard]] bool planted_accesses_hit(const uml::cpu::x86_64::CpuState &cpu,
+	std::span<const std::byte> buffer, std::uint8_t first,
+	TestMemory &memory, std::uint64_t page, std::uint8_t real)
+{
+	using namespace uml::cpu::x86_64;
+	const auto byte = [&](unsigned index) {
+		return static_cast<std::uint8_t>(buffer[index]);
+	};
+	bool ok = true;
+	for (unsigned index = 0; index < 32U; ++index)
+		ok = ok && byte(index) == static_cast<std::uint8_t>(first + index);
+	std::uint64_t loaded = 0;
+	std::uint64_t segment = 0;
+	std::memcpy(&loaded, buffer.data(), 8);
+	std::memcpy(&segment, buffer.data() + 8, 8);
+	std::uint64_t stored = 0;
+	std::uint64_t segment_stored = 0;
+	std::memcpy(&stored, buffer.data() + 32, 8);
+	std::memcpy(&segment_stored, buffer.data() + 40, 8);
+	ok = ok && cpu.gpr(Register::rax) == loaded &&
+		cpu.gpr(Register::rdx) == segment && stored == loaded &&
+		segment_stored == segment;
+	for (unsigned index = 0; index < 16U; ++index)
+		ok = ok && static_cast<std::uint8_t>(cpu.vectors[2][index]) ==
+				byte(16U + index) &&
+			byte(48U + index) == byte(16U + index);
+	for (unsigned index = 0; index < 64U; ++index)
+		ok = ok && memory.byte(page + index) ==
+			static_cast<std::uint8_t>(real + index);
+	return ok;
+}
+
+/* Each run translates through its own executor's table, which the run's
+ * entry puts in x22: two executors' entries for one page send it to two
+ * buffers, and runs alternating between them, one of which faults on its
+ * first instruction and is run again, each read and write their own. A
+ * baked load that misses, and so calls the miss helper, comes first. */
+void each_run_translates_through_its_executors_table()
+{
+	using namespace uml::cpu::x86_64;
+	const std::uint64_t code = tlb_test_base;
+	const std::uint64_t page = tlb_test_base + 4096U;
+	const std::uint64_t other = tlb_test_base + 2U * 4096U;
+	TestMemory memory{tlb_test_base};
+	memory.load(code, {
+		0x50,             // push rax
+		0x4c, 0x8b, 0x06, // mov r8,[rsi]
+	});
+	memory.fill(code + 4, std::as_bytes(std::span{planted_access_code}));
+	for (unsigned index = 0; index < 64U; ++index) {
+		memory.load(page + index, {static_cast<std::uint8_t>(0x10U + index)});
+		memory.load(other + index, {static_cast<std::uint8_t>(0xc0U + index)});
+	}
+	const auto built = require_built(gadgets::build(memory, code),
+		"the planted-entry sequence did not build");
+	gadgets::Executor first;
+	gadgets::Executor second;
+	first.prepare(memory);
+	second.prepare(memory);
+	std::array<std::byte, 64> first_buffer{};
+	std::array<std::byte, 64> second_buffer{};
+	for (unsigned index = 0; index < 64U; ++index) {
+		first_buffer[index] = static_cast<std::byte>(0x40U + index);
+		second_buffer[index] = static_cast<std::byte>(0x90U + index);
+	}
+	plant_tlb_entry(first, page, first_buffer);
+	plant_tlb_entry(second, page, second_buffer);
+	const auto run = [&](gadgets::Executor &executor, std::uint64_t rsp) {
+		CpuState cpu{};
+		cpu.rip = code;
+		cpu.gpr(Register::rbx) = page;
+		cpu.gpr(Register::rsi) = other;
+		cpu.gpr(Register::rsp) = rsp;
+		std::fill(cpu.vectors[1].begin(), cpu.vectors[1].begin() + 16,
+			std::byte{0x80});
+		const auto result = gadgets::execute(built.program, cpu, memory,
+			executor, 16);
+		return std::pair{result, cpu};
+	};
+	const std::uint64_t stack = tlb_test_base + 4U * 4096U;
+	for (const auto [executor, buffer, from, name] : {
+			std::tuple{&first, std::span<std::byte>{first_buffer}, 0x40U,
+				"the first executor"},
+			std::tuple{&second, std::span<std::byte>{second_buffer}, 0x90U,
+				"the second executor"},
+			std::tuple{&first, std::span<std::byte>{first_buffer}, 0x40U,
+				"the first executor again"}}) {
+		const auto [result, cpu] = run(*executor, stack);
+		require(result.event == uml::cpu::EngineEvent::system_call &&
+				result.retired_instructions == 9 &&
+				cpu.gpr(Register::r8) == memory.qword(other),
+			std::string{name} + " did not reach SYSCALL");
+		require(planted_accesses_hit(cpu, buffer,
+				static_cast<std::uint8_t>(from), memory, page, 0x10U),
+			std::string{name} + " did not translate through its own table");
+	}
+	/* A push to a page outside the span faults before anything else runs;
+	 * the run is taken again with the stack inside it. */
+	const auto [fault, faulted] = run(second, tlb_test_base + 64U * 4096U);
+	require(fault.event == uml::cpu::EngineEvent::memory_fault &&
+			fault.retired_instructions == 0 && faulted.rip == code,
+		"a push off the span did not fault at the push");
+	const auto [again, resumed] = run(second, stack);
+	require(again.event == uml::cpu::EngineEvent::system_call &&
+			planted_accesses_hit(resumed, second_buffer, 0x90U, memory, page,
+				0x10U),
+		"the run after a fault did not translate through its own table");
+}
+
+[[nodiscard]] std::uint64_t parallel_extract(std::uint64_t value,
+	std::uint64_t mask) noexcept
+{
+	std::uint64_t result = 0;
+	for (unsigned bit = 0, out = 0; bit < 64U; ++bit)
+		if (((mask >> bit) & 1U) != 0U)
+			result |= ((value >> bit) & 1U) << out++;
+	return result;
+}
+
+/* BMI's register and memory forms kept their destination's offset in x22
+ * before it held the table base, and their run goes on: each runs before
+ * accesses through a planted entry, which find it only through the table.
+ * (The other gadgets that used x22 kept an address there for a fault or
+ * another exit, which ends the run.) */
+void bmi_gadgets_keep_the_table_base()
+{
+	using namespace uml::cpu::x86_64;
+	const std::uint64_t code = tlb_test_base;
+	const std::uint64_t page = tlb_test_base + 4096U;
+	const std::uint64_t operand = tlb_test_base + 2U * 4096U;
+	TestMemory memory{tlb_test_base};
+	const std::vector<std::uint8_t> before{
+		0xc4, 0xe2, 0xa8, 0xf3, 0xd9,       // blsi r10,rcx
+		0xc4, 0xe2, 0x98, 0xf3, 0x1e,       // blsi r12,[rsi]
+		0xc4, 0x62, 0xf2, 0xf5, 0xea,       // pext r13,rcx,rdx
+		0xc4, 0x62, 0xf2, 0xf5, 0x36,       // pext r14,rcx,[rsi]
+		0xc4, 0x62, 0xb3, 0xf6, 0xc1,       // mulx r8,r9,rcx
+		0xc4, 0x63, 0xfb, 0xf0, 0xf9, 0x05, // rorx r15,rcx,5
+	};
+	memory.fill(code, std::as_bytes(std::span{before}));
+	memory.fill(code + before.size(),
+		std::as_bytes(std::span{planted_access_code}));
+	for (unsigned index = 0; index < 64U; ++index)
+		memory.load(page + index, {static_cast<std::uint8_t>(0x10U + index)});
+	constexpr std::uint64_t source = 0x00f0'0000'0000'0f00ULL;
+	constexpr std::uint64_t mask = 0x0f0f'00ff'1234'8001ULL;
+	constexpr std::uint64_t in_memory = 0x0000'3c00'0000'0000ULL;
+	for (unsigned index = 0; index < 8U; ++index)
+		memory.load(operand + index,
+			{static_cast<std::uint8_t>(in_memory >> (8U * index))});
+	const auto built = require_built(gadgets::build(memory, code),
+		"the BMI sequence did not build");
+	gadgets::Executor executor;
+	executor.prepare(memory);
+	std::array<std::byte, 64> buffer{};
+	for (unsigned index = 0; index < 64U; ++index)
+		buffer[index] = static_cast<std::byte>(0x60U + index);
+	plant_tlb_entry(executor, page, buffer);
+	CpuState cpu{};
+	cpu.rip = code;
+	cpu.gpr(Register::rbx) = page;
+	cpu.gpr(Register::rcx) = source;
+	cpu.gpr(Register::rdx) = mask;
+	cpu.gpr(Register::rsi) = operand;
+	std::fill(cpu.vectors[1].begin(), cpu.vectors[1].begin() + 16,
+		std::byte{0x80});
+	const auto result = gadgets::execute(built.program, cpu, memory,
+		executor, 32);
+	require(result.event == uml::cpu::EngineEvent::system_call &&
+			result.retired_instructions == 13,
+		"the BMI sequence did not reach SYSCALL");
+	const auto product = static_cast<unsigned __int128>(mask) * source;
+	require(cpu.gpr(Register::r10) == (source & (0 - source)) &&
+			cpu.gpr(Register::r12) == (in_memory & (0 - in_memory)) &&
+			cpu.gpr(Register::r13) == parallel_extract(source, mask) &&
+			cpu.gpr(Register::r14) == parallel_extract(source, in_memory) &&
+			cpu.gpr(Register::r8) == static_cast<std::uint64_t>(product >> 64U) &&
+			cpu.gpr(Register::r9) == static_cast<std::uint64_t>(product) &&
+			cpu.gpr(Register::r15) == std::rotr(source, 5),
+		"a BMI gadget's result is wrong");
+	require(planted_accesses_hit(cpu, buffer, 0x60U, memory, page, 0x10U),
+		"an access after a BMI gadget missed the run's table");
+}
+
+/* RORX's memory form and the ternary memory forms compute their
+ * destination's offset after their last helper call: the translation's miss,
+ * or the crossing load of an operand that runs onto the next page. Each form
+ * runs here on a first touch of its page and across a page edge. */
+void bmi_memory_forms_cross_a_page()
+{
+	using namespace uml::cpu::x86_64;
+	constexpr std::uint64_t plain = 0x2000;
+	constexpr std::uint64_t crossing = 0x3000 - 3U;
+	constexpr std::uint64_t early = 0x1000 - 6U;
+	const std::vector<std::uint8_t> code{
+		0xc4, 0x63, 0xfb, 0xf0, 0x06, 0x0d, // rorx r8,[rsi],13
+		0xc4, 0x63, 0xfb, 0xf0, 0x0f, 0x0d, // rorx r9,[rdi],13
+		0xc4, 0x62, 0xf2, 0xf5, 0x17,       // pext r10,rcx,[rdi]
+		0xc4, 0x62, 0xf0, 0xf2, 0x22,       // andn r12,rcx,[rdx]
+		0x0f, 0x05,                         // syscall
+	};
+	TestMemory memory;
+	memory.fill(0, std::as_bytes(std::span{code}));
+	constexpr std::uint64_t source = 0x00f0'0000'0000'0f00ULL;
+	const auto plant = [&](std::uint64_t address, std::uint64_t value) {
+		for (unsigned index = 0; index < 8U; ++index)
+			memory.load(address + index,
+				{static_cast<std::uint8_t>(value >> (8U * index))});
+	};
+	constexpr std::uint64_t at_plain = 0x0123'4567'89ab'cdefULL;
+	constexpr std::uint64_t at_crossing = 0x0f0f'00ff'1234'8001ULL;
+	constexpr std::uint64_t at_early = 0xff00'f0f0'0ff0'5a5aULL;
+	plant(plain, at_plain);
+	plant(crossing, at_crossing);
+	plant(early, at_early);
+	const auto built = require_built(gadgets::build(memory, 0),
+		"the BMI memory forms did not build");
+	CpuState cpu{};
+	cpu.gpr(Register::rcx) = source;
+	cpu.gpr(Register::rsi) = plain;
+	cpu.gpr(Register::rdi) = crossing;
+	cpu.gpr(Register::rdx) = early;
+	const auto result = gadgets::execute(built.program, cpu, memory, 8);
+	require(result.event == uml::cpu::EngineEvent::system_call &&
+			result.retired_instructions == 5,
+		"the BMI memory forms did not reach SYSCALL");
+	require(cpu.gpr(Register::r8) == std::rotr(at_plain, 13) &&
+			cpu.gpr(Register::r9) == std::rotr(at_crossing, 13),
+		"RORX's memory form lost its destination");
+	require(cpu.gpr(Register::r10) == parallel_extract(source, at_crossing) &&
+			cpu.gpr(Register::r12) == (~source & at_early),
+		"a ternary memory form lost its destination across a page edge");
+	require(cpu.gpr(Register::rsi) == plain &&
+			cpu.gpr(Register::rdi) == crossing &&
+			cpu.gpr(Register::rdx) == early,
+		"a BMI memory form wrote its address register");
+}
+
 /* PMOVMSKB collapses one sign bit per byte into a bit mask. The corpus carries
  * only one or two cases per width, which a lane-ordering mistake can survive,
  * so walk a single set bit through every position instead.
@@ -4087,6 +5653,53 @@ void execute_compat32_legacy_segment_stack()
 	require(decode(opcode_memory, 0, ExecutionMode::long64).status ==
 		DecodeStatus::illegal_instruction,
 		"long64 mode accepted a legacy segment-stack opcode");
+}
+
+/* POP to memory computes its address after it advances ESP, so an address
+ * that names ESP sees the popped stack. A compat32 access through FS that the
+ * engines' inline limit check cannot pass leaves for the runtime's exact
+ * check and runs again, so it must leave ESP as it found it. FS here is a
+ * writable byte-granular segment that ends at 0x2003, so the four bytes at
+ * 0x2000 pass the exact check but not the inline one.
+ */
+void a_compat32_pop_through_fs_leaves_esp_for_the_exact_check()
+{
+	using namespace uml::cpu::x86_64;
+	for (const bool mapped : {true, false}) {
+		TestMemory memory{0, mapped ? 16384U : 0x2000U};
+		memory.load(0, {0x64, 0x8f, 0x03}); // pop dword ptr fs:[ebx]
+		memory.load(0x1000, {0x11, 0x11, 0x11, 0x11, 0x22, 0x22, 0x22, 0x22});
+		CpuState cpu{};
+		linux_user_segments(cpu, ExecutionMode::compat32);
+		cpu.segment_selectors[4] = 0x63;
+		cpu.tls_descriptors[0] = 0x0040'f300'0000'2003ULL;
+		require(!enter_segments(cpu),
+			"the compat32 FS segment did not load");
+		cpu.gpr(Register::rsp) = 0x1000;
+		cpu.gpr(Register::rbx) = 0x2000;
+		const auto built = require_built(
+			gadgets::build(memory, 0, ExecutionMode::compat32, 1),
+			"compat32 POP through FS did not build");
+		const auto result = gadgets::execute(built.program, cpu, memory, 1);
+		if (mapped) {
+			require(result.event == uml::cpu::EngineEvent::continued &&
+					result.retired_instructions == 1,
+				"compat32 POP through FS did not retire once");
+			require(memory.dword(0x2000) == 0x1111'1111U &&
+					cpu.gpr(Register::rsp) == 0x1004,
+				"compat32 POP through FS popped twice after the exact "
+				"segment check");
+		} else {
+			require(result.event == uml::cpu::EngineEvent::memory_fault &&
+					result.retired_instructions == 0 &&
+					result.fault.address == 0x2000 &&
+					result.fault.access ==
+						uml::memory::MemoryAccess::write,
+				"compat32 POP through FS did not fault on its store");
+			require(cpu.gpr(Register::rsp) == 0x1000 && cpu.rip == 0,
+				"a faulting compat32 POP through FS changed ESP");
+		}
+	}
 }
 
 void execute_long64_interrupt_return_stack_switch()
@@ -5534,6 +7147,810 @@ void fused_conditional_jumps_take_the_same_edge()
 	}
 }
 
+/* The entry of a CMP or TEST of a 32- or 64-bit register against an
+ * immediate, or with `registers` against a register, that carries the
+ * conditional branch after it, or zero where the pair has none (`condition`
+ * in x86's condition-code order). */
+[[nodiscard]] std::uintptr_t compare_branch_entry(bool test, unsigned width,
+	unsigned condition, unsigned reg, bool registers = false)
+{
+	namespace baked = uml::cpu::x86_64::gadgets::baked;
+	const bool wide = width == 64U;
+	const auto *table = registers ?
+		(test ?
+			(wide ? baked::uml_x86_64_baked_test_64_rr_jcc :
+				baked::uml_x86_64_baked_test_32_rr_jcc) :
+			(wide ? baked::uml_x86_64_baked_cmp_64_rr_jcc :
+				baked::uml_x86_64_baked_cmp_32_rr_jcc)) :
+		(test ?
+			(wide ? baked::uml_x86_64_baked_test_64_ri_jcc :
+				baked::uml_x86_64_baked_test_32_ri_jcc) :
+			(wide ? baked::uml_x86_64_baked_cmp_64_ri_jcc :
+				baked::uml_x86_64_baked_cmp_32_ri_jcc));
+	return table[condition * baked::gpr_slots + reg];
+}
+
+/* CMP reg, imm32 (81 /7) or TEST reg, imm32 (F7 /0) at 32 or 64 bits. */
+void push_compare_immediate(std::vector<std::uint8_t> &code, bool test,
+	unsigned width, unsigned reg, std::uint32_t immediate)
+{
+	if (width == 64U || reg >= 8U)
+		code.push_back(static_cast<std::uint8_t>(
+			0x40U | (width == 64U ? 8U : 0U) | (reg >> 3U)));
+	code.push_back(test ? 0xf7 : 0x81);
+	code.push_back(static_cast<std::uint8_t>(
+		0xc0U | (test ? 0U : 7U << 3U) | (reg & 7U)));
+	for (unsigned shift = 0; shift < 32U; shift += 8U)
+		code.push_back(static_cast<std::uint8_t>(immediate >> shift));
+}
+
+/* CMP reg, reg (39 /r) or TEST reg, reg (85 /r) at 32 or 64 bits. */
+void push_compare_register(std::vector<std::uint8_t> &code, bool test,
+	unsigned width, unsigned destination, unsigned source)
+{
+	if (width == 64U || destination >= 8U || source >= 8U)
+		code.push_back(static_cast<std::uint8_t>(0x40U |
+			(width == 64U ? 8U : 0U) | (source >> 3U) << 2U |
+			(destination >> 3U)));
+	code.push_back(test ? 0x85 : 0x39);
+	code.push_back(static_cast<std::uint8_t>(
+		0xc0U | (source & 7U) << 3U | (destination & 7U)));
+}
+
+/* A CMP or TEST against an immediate or a register and the conditional
+ * branch right after it are one entry in a block with links, and they must be
+ * the two instructions they stand for: the same edge, the same retired count
+ * and the same flags afterwards as the pair with a NOP between, which runs
+ * the compare's own entry and a branch that reads the record. The entry
+ * stands in exactly where the host flags answer the condition: never for
+ * parity, and not for TEST with a condition that reads the carry. A register
+ * source is another register or the destination itself. */
+void compare_branch_entries_run_both_instructions()
+{
+	using namespace uml::cpu::x86_64;
+	static constexpr std::array<unsigned, 4> registers{0, 4, 9, 15};
+	static constexpr std::array<std::uint64_t, 6> values{
+		0U, 1U, 0x7fff'ffffULL, 0x8000'0000ULL, 0xffff'ffff'ffff'ff80ULL,
+		0x5555'5555'5555'5555ULL};
+	static constexpr std::array<std::uint32_t, 6> immediates{
+		0U, 1U, 0x7fff'ffffU, 0x8000'0000U, 0xffff'ff80U, 0x5555'5555U};
+	struct Outcome final {
+		std::uint64_t edge;
+		std::uint64_t flags;
+		std::size_t retired;
+		std::uintptr_t first;
+	};
+	const auto run = [](const std::vector<std::uint8_t> &code,
+		unsigned reg, std::uint64_t value, unsigned source,
+		std::uint64_t source_value) {
+		TestMemory memory;
+		memory.fill(0, std::as_bytes(std::span{code}));
+		gadgets::Executor executor;
+		executor.prepare(memory, 1, 1, 1);
+		CpuState cpu{};
+		cpu.gpr(static_cast<Register>(source)) = source_value;
+		cpu.gpr(static_cast<Register>(reg)) = value;
+		Outcome outcome{};
+		for (unsigned step = 0; step < 8U; ++step) {
+			const auto selected = executor.select_program(
+				memory, cpu.rip, ExecutionMode::long64);
+			require(selected.status == gadgets::BuildStatus::built &&
+					selected.program != nullptr,
+				"compare and branch program did not build");
+			if (step == 0U)
+				outcome.first = selected.program->native_stream().front();
+			const auto result = gadgets::execute(
+				*selected.program, cpu, memory, executor, 64);
+			outcome.retired += result.retired_instructions;
+			if (result.event == uml::cpu::EngineEvent::system_call) {
+				outcome.edge = cpu.gpr(Register::rdx);
+				outcome.flags = cpu.gpr(Register::r11);
+				return outcome;
+			}
+			require(result.event == uml::cpu::EngineEvent::continued,
+				"compare and branch program left unexpectedly");
+		}
+		fail("compare and branch program did not reach SYSCALL");
+	};
+	for (const bool test : {false, true}) {
+		for (const unsigned width : {32U, 64U}) {
+			for (unsigned condition = 0; condition < 16U; ++condition) {
+				const bool parity = condition == 10U || condition == 11U;
+				const bool carry = condition == 2U || condition == 3U ||
+					condition == 6U || condition == 7U;
+				const bool answered = !parity && !(test && carry);
+				for (std::size_t index = 0; index < registers.size(); ++index) {
+					const auto reg = registers[index];
+					const auto other =
+						registers[(index + 1U) % registers.size()];
+					/* Each form: the compare's encoding, a source register
+					 * and the values it is run with. */
+					struct Form final {
+						bool registers;
+						std::uint32_t immediate;
+						unsigned source;
+					};
+					std::vector<Form> forms;
+					for (const auto immediate : immediates)
+						forms.push_back({false, immediate, other});
+					forms.push_back({true, 0, other});
+					forms.push_back({true, 0, reg});
+					for (const auto &form : forms) {
+						const auto entry = compare_branch_entry(test, width,
+							condition, reg, form.registers);
+						require((entry != 0U) == answered,
+							"a compare-and-branch entry exists for a "
+							"condition the host flags do not answer, or is "
+							"missing");
+						/* j<cc> over MOV EDX, 1, then SYSCALL, which leaves
+						 * RFLAGS in R11; the second has a NOP after the
+						 * compare. */
+						std::array<std::vector<std::uint8_t>, 2> code;
+						for (unsigned barrier = 0; barrier < 2U; ++barrier) {
+							if (form.registers)
+								push_compare_register(code[barrier], test,
+									width, reg, form.source);
+							else
+								push_compare_immediate(code[barrier], test,
+									width, reg, form.immediate);
+							if (barrier != 0U)
+								code[barrier].push_back(0x90);
+							code[barrier].insert(code[barrier].end(), {
+								static_cast<std::uint8_t>(0x70U + condition),
+								0x05, 0xba, 0x01, 0x00, 0x00, 0x00,
+								0x0f, 0x05});
+						}
+						const bool two_values =
+							form.registers && form.source != reg;
+						for (std::size_t first = 0; first < values.size();
+							++first) {
+							for (std::size_t second = 0; second < values.size();
+								++second) {
+								/* An immediate or the register itself needs
+								 * one value; a second register four. */
+								if ((!two_values && second != 0U) ||
+									(two_values &&
+									 (first % 3U == 2U || second % 3U == 2U)))
+									continue;
+								const auto value = values[first];
+								const auto source_value = values[second];
+								const auto joined = run(code[0], reg, value,
+									form.source, source_value);
+								const auto separated = run(code[1], reg,
+									value, form.source, source_value);
+								require((joined.first == entry) == answered &&
+										separated.first != entry,
+									"the builder joined a compare and branch "
+									"it should not have, or kept apart a "
+									"pair it should have joined");
+								if (joined.edge != separated.edge ||
+									joined.flags != separated.flags ||
+									joined.retired + 1U != separated.retired) {
+									char message[224];
+									std::snprintf(message, sizeof(message),
+										"a compare-and-branch entry ran "
+										"differently from its two "
+										"instructions (%s width %u condition "
+										"%u register %u source %s%u value "
+										"%#llx source value %#llx immediate "
+										"%#x)",
+										test ? "TEST" : "CMP", width,
+										condition, reg,
+										form.registers ? "register " : "",
+										form.registers ? form.source : 0U,
+										static_cast<unsigned long long>(value),
+										static_cast<unsigned long long>(
+											source_value),
+										form.immediate);
+									fail(message);
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+/* The joined entry is chosen only when the branch takes its inline form, and
+ * its taken edge follows the link under the same budget test. A build
+ * without links (a budget-limited replay) and a block that ends at the branch
+ * keep the two apart. A budget below the block's four instructions replays it
+ * without links, so the joined entry runs from a budget of four, and its link
+ * is followed only when the target's three instructions fit what is left
+ * after both of the pair's: at five, not at four, where it leaves at the
+ * target with two retired. */
+void compare_branch_entries_keep_the_inline_contract()
+{
+	using namespace uml::cpu::x86_64;
+	/* CMP EAX, 0; JE over MOV EDX, 1 and SYSCALL to MOV EDX, 2,
+	 * MOV ESI, 3 and SYSCALL. */
+	std::vector<std::uint8_t> code;
+	push_compare_immediate(code, false, 32U, 0U, 0U);
+	code.insert(code.end(), {0x74, 0x07, 0xba, 0x01, 0x00, 0x00, 0x00,
+		0x0f, 0x05, 0xba, 0x02, 0x00, 0x00, 0x00, 0xbe, 0x03, 0x00, 0x00,
+		0x00, 0x0f, 0x05});
+	constexpr std::uint64_t target = 0x0f;
+	const auto joined = compare_branch_entry(false, 32U, 4U, 0U);
+	TestMemory memory;
+	memory.fill(0, std::as_bytes(std::span{code}));
+	const auto unlinked = require_built(gadgets::build(memory, 0),
+		"compare and branch without links did not build");
+	require(unlinked.program.native_stream().front() != joined,
+		"a build without links joined a compare and branch");
+	{
+		gadgets::Executor executor;
+		executor.prepare(memory, 1, 1, 1);
+		const auto cut = executor.select_program(
+			memory, 0, ExecutionMode::long64, 2);
+		require(cut.program != nullptr &&
+				cut.program->native_stream().front() != joined,
+			"a block that ends at its branch joined it to the compare");
+		CpuState cpu{};
+		const auto result = gadgets::execute(
+			*cut.program, cpu, memory, executor, 64);
+		require(result.event == uml::cpu::EngineEvent::continued &&
+				result.retired_instructions == 2U && cpu.rip == target,
+			"a block that ends at its branch took the wrong edge");
+	}
+	for (const std::size_t budget : {4U, 5U}) {
+		gadgets::Executor executor;
+		executor.prepare(memory, 1, 1, 1);
+		const auto landing = executor.select_program(
+			memory, target, ExecutionMode::long64);
+		const auto block = executor.select_program(
+			memory, 0, ExecutionMode::long64);
+		require(landing.program != nullptr && block.program != nullptr &&
+				landing.program->instruction_count() == 3U &&
+				block.program->instruction_count() == 4U &&
+				block.program->native_stream().front() == joined,
+			"a linked block did not join its compare and branch");
+		CpuState cpu{};
+		const auto result = gadgets::execute(
+			*block.program, cpu, memory, executor, budget);
+		if (budget < 5U)
+			require(result.event == uml::cpu::EngineEvent::continued &&
+					result.retired_instructions == 2U &&
+					cpu.rip == target && cpu.gpr(Register::rdx) == 0U,
+				"a joined branch followed its link past the budget");
+		else
+			require(result.event == uml::cpu::EngineEvent::system_call &&
+					cpu.gpr(Register::rdx) == 2U,
+				"a joined branch did not follow its link within the "
+				"budget");
+	}
+}
+
+/* A joined branch has no stream word, so the instruction behind a pair is
+ * found past both: a baked PUSH that faults after an immediate and a register
+ * pair reports itself with four instructions retired. */
+void a_stack_fault_behind_compare_branch_entries_finds_its_instruction()
+{
+	using namespace uml::cpu::x86_64;
+	TestMemory memory;
+	memory.load(0, {
+		0x83, 0xf8, 0x05, // cmp eax, 5
+		0x75, 0x07,       // jne 0x0c
+		0x85, 0xc9,       // test ecx, ecx
+		0x75, 0x03,       // jne 0x0c
+		0x53,             // push rbx
+		0x0f, 0x05,       // syscall
+		0x0f, 0x05,       // syscall
+	});
+	gadgets::Executor executor;
+	executor.prepare(memory, 1, 1, 1);
+	const auto block = executor.select_program(
+		memory, 0, ExecutionMode::long64);
+	require(block.program != nullptr, "stack block behind pairs did not build");
+	const auto stream = block.program->native_stream();
+	require(stream.size() > 6U &&
+			stream[0] == compare_branch_entry(false, 32U, 5U, 0U) &&
+			stream[3] == compare_branch_entry(true, 32U, 5U, 1U, true),
+		"the pairs in front of the PUSH were not joined");
+	CpuState cpu{};
+	cpu.gpr(Register::rax) = 5;
+	cpu.gpr(Register::rsp) = 0x20008;
+	const auto result = gadgets::execute(
+		*block.program, cpu, memory, executor, 64);
+	require(result.event == uml::cpu::EngineEvent::memory_fault &&
+			result.retired_instructions == 4U && cpu.rip == 0x09,
+		"a PUSH behind joined compares and branches faulted at the wrong "
+		"instruction");
+}
+
+/* The two-operand ALU operations by their reg, reg opcode (r/m, reg form)
+ * and the /digit of their reg, imm32 form (81 /n; TEST is F7 /0). The first
+ * five write their destination. */
+struct AluOperation final {
+	const char *name;
+	std::uint8_t register_opcode;
+	std::uint8_t immediate_digit;
+};
+constexpr std::array<AluOperation, 7> alu_operations{{
+	{"ADD", 0x01, 0}, {"SUB", 0x29, 5}, {"AND", 0x21, 4}, {"OR", 0x09, 1},
+	{"XOR", 0x31, 6}, {"CMP", 0x39, 7}, {"TEST", 0x85, 0},
+}};
+
+/* `op` reg, reg (with `immediate` empty) or reg, imm32 at 32 or 64 bits. */
+void push_alu(std::vector<std::uint8_t> &code, unsigned op, unsigned width,
+	unsigned destination, unsigned source,
+	std::optional<std::uint32_t> immediate = std::nullopt)
+{
+	const auto &operation = alu_operations[op];
+	const unsigned reg_field = immediate ? operation.immediate_digit : source;
+	if (width == 64U || destination >= 8U || reg_field >= 8U)
+		code.push_back(static_cast<std::uint8_t>(0x40U |
+			(width == 64U ? 8U : 0U) | (reg_field >> 3U) << 2U |
+			(destination >> 3U)));
+	code.push_back(immediate ? (op == 6U ? 0xf7 : 0x81) :
+		operation.register_opcode);
+	code.push_back(static_cast<std::uint8_t>(
+		0xc0U | (reg_field & 7U) << 3U | (destination & 7U)));
+	if (immediate)
+		for (unsigned shift = 0; shift < 32U; shift += 8U)
+			code.push_back(static_cast<std::uint8_t>(*immediate >> shift));
+}
+
+/* The twin with no flag record of the writing operation `op` (0 to 4), or of
+ * its reg, imm form with `immediate`. */
+[[nodiscard]] std::uintptr_t unrecorded_entry(unsigned op, unsigned width,
+	bool immediate, unsigned destination, unsigned source)
+{
+	namespace baked = uml::cpu::x86_64::gadgets::baked;
+	const bool wide = width == 64U;
+#define UML_X86_TEST_UNRECORDED(name) \
+	(immediate ? (wide ? baked::uml_x86_64_baked_##name##_64_ri_unrecorded : \
+		baked::uml_x86_64_baked_##name##_32_ri_unrecorded)[destination] : \
+	(wide ? baked::uml_x86_64_baked_##name##_64_rr_unrecorded : \
+		baked::uml_x86_64_baked_##name##_32_rr_unrecorded)[ \
+		destination * baked::gpr_slots + source])
+	switch (op) {
+	case 0: return UML_X86_TEST_UNRECORDED(add);
+	case 1: return UML_X86_TEST_UNRECORDED(sub);
+	case 2: return UML_X86_TEST_UNRECORDED(and);
+	case 3: return UML_X86_TEST_UNRECORDED(or);
+	default: return UML_X86_TEST_UNRECORDED(xor);
+	}
+#undef UML_X86_TEST_UNRECORDED
+}
+
+/* What a program left: the registers it used and the flags SYSCALL saved. */
+struct RegisterOutcome final {
+	std::array<std::uint64_t, 4> registers{};
+	std::uint64_t flags{};
+	std::uintptr_t first{};
+	bool faulted{};
+};
+
+[[nodiscard]] RegisterOutcome run_register_program(
+	const std::vector<std::uint8_t> &code,
+	const std::array<std::uint64_t, 4> &values)
+{
+	using namespace uml::cpu::x86_64;
+	static constexpr std::array<Register, 4> used{
+		Register::rax, Register::rbx, Register::r9, Register::rdx};
+	TestMemory memory;
+	memory.fill(0, std::as_bytes(std::span{code}));
+	gadgets::Executor executor;
+	executor.prepare(memory, 1, 1, 1);
+	CpuState cpu{};
+	for (std::size_t index = 0; index < used.size(); ++index)
+		cpu.gpr(used[index]) = values[index];
+	/* A memory operand through RSI faults. */
+	cpu.gpr(Register::rsi) = 0x20000;
+	const auto selected = executor.select_program(
+		memory, 0, ExecutionMode::long64);
+	require(selected.status == gadgets::BuildStatus::built &&
+			selected.program != nullptr,
+		"flag-overwrite program did not build");
+	RegisterOutcome outcome{};
+	outcome.first = selected.program->native_stream().front();
+	const auto result = gadgets::execute(
+		*selected.program, cpu, memory, executor, 64);
+	outcome.faulted = result.event == uml::cpu::EngineEvent::memory_fault;
+	require(outcome.faulted ||
+			result.event == uml::cpu::EngineEvent::system_call,
+		"flag-overwrite program left unexpectedly");
+	for (std::size_t index = 0; index < used.size(); ++index)
+		outcome.registers[index] = cpu.gpr(used[index]);
+	if (outcome.faulted) {
+		materialize_flags(cpu);
+		outcome.flags = cpu.rflags;
+	} else {
+		outcome.flags = cpu.gpr(Register::r11);
+	}
+	outcome.flags &= 0x8d5U;
+	return outcome;
+}
+
+/* A register-only ADD, SUB, AND, OR or XOR at 32 or 64 bits followed at once
+ * by a register-only ALU instruction writes no flag record, and the pair must
+ * still be the two instructions: the same registers and flags as with a NOP
+ * between, which keeps the first one's record. Every other next instruction
+ * -- one that reads the flags (SETcc, ADC, INC's carry), one with a memory
+ * operand that can fault first -- keeps the record, as does a byte or word
+ * producer. */
+void unread_flag_records_are_not_written()
+{
+	using namespace uml::cpu::x86_64;
+	static constexpr std::array<std::array<std::uint64_t, 4>, 4> values{{
+		{0U, 0U, 0U, 0U},
+		{1U, 0xffff'ffff'ffff'ffffULL, 0x7fff'ffffULL, 5U},
+		{0x8000'0000'0000'0000ULL, 0x8000'0000ULL, 1U, 0x5555'5555'5555'5555ULL},
+		{0xffff'ffffULL, 1U, 0xffff'ffff'8000'0000ULL, 0U},
+	}};
+	static constexpr std::array<std::uint32_t, 2> immediates{1U, 0x8000'0000U};
+	const auto check = [](const std::vector<std::uint8_t> &joined,
+		const std::vector<std::uint8_t> &separated, std::uintptr_t twin,
+		bool expected, const char *what) {
+		for (const auto &value : values) {
+			const auto a = run_register_program(joined, value);
+			const auto b = run_register_program(separated, value);
+			require((a.first == twin) == expected && b.first != twin,
+				std::string{what} + ": the builder chose the twin with no "
+				"record where it should not have, or did not where it "
+				"should");
+			require(a.registers == b.registers && a.flags == b.flags &&
+					a.faulted == b.faulted,
+				std::string{what} + ": a producer without its record ran "
+				"differently from the pair with a NOP between");
+		}
+	};
+	/* RAX op= RBX (or an immediate); then the next instruction on RAX and
+	 * R9; then SYSCALL. */
+	for (unsigned op = 0; op < 5U; ++op) {
+		for (const unsigned width : {32U, 64U}) {
+			for (unsigned form = 0; form <= immediates.size(); ++form) {
+				const bool immediate = form != 0U;
+				const auto first_immediate = immediate ?
+					std::optional{immediates[form - 1U]} : std::nullopt;
+				const auto twin = unrecorded_entry(op, width, immediate, 0, 3);
+				const auto program = [&](bool nop,
+					const std::vector<std::uint8_t> &next) {
+					std::vector<std::uint8_t> code;
+					push_alu(code, op, width, 0, 3, first_immediate);
+					if (nop)
+						code.push_back(0x90);
+					code.insert(code.end(), next.begin(), next.end());
+					code.insert(code.end(), {0x0f, 0x05});
+					return code;
+				};
+				for (unsigned next_op = 0; next_op < alu_operations.size();
+					++next_op) {
+					for (const unsigned next_width : {32U, 64U}) {
+						for (const bool next_immediate : {false, true}) {
+							std::vector<std::uint8_t> next;
+							push_alu(next, next_op, next_width, 0, 9,
+								next_immediate ?
+									std::optional{std::uint32_t{0x80U}} :
+									std::nullopt);
+							check(program(false, next), program(true, next),
+								twin, true, alu_operations[next_op].name);
+						}
+					}
+				}
+				/* Next instructions that keep the record, and one that
+				 * does not. */
+				const std::array<std::pair<const char *,
+					std::vector<std::uint8_t>>, 7> keeps{{
+					{"SETZ DL", {0x0f, 0x94, 0xc2}},
+					{"ADC RAX, R9", {0x4c, 0x11, 0xc8}},
+					{"INC RAX", {0x48, 0xff, 0xc0}},
+					{"ADD RAX, [RSI] (faults)", {0x48, 0x03, 0x06}},
+					{"ADD [RSI], RAX (faults)", {0x48, 0x01, 0x06}},
+					{"ADD AX, R9W", {0x66, 0x44, 0x01, 0xc8}},
+					{"MOV RAX, R9", {0x4c, 0x89, 0xc8}},
+				}};
+				for (const auto &[what, next] : keeps) {
+					/* A word-sized ALU instruction replaces every flag
+					 * as well. */
+					const bool replaced = std::string_view{what} ==
+						"ADD AX, R9W";
+					check(program(false, next), program(true, next), twin,
+						replaced, what);
+				}
+			}
+		}
+	}
+	/* A byte or word producer keeps its record. */
+	for (const unsigned width : {8U, 16U}) {
+		std::vector<std::uint8_t> joined;
+		if (width == 16U)
+			joined.push_back(0x66);
+		joined.insert(joined.end(), {0x01, 0xd8}); // add [e]ax, [e]bx
+		if (width == 8U)
+			joined.back() = 0xd8, joined.front() = 0x00;
+		auto separated = joined;
+		separated.push_back(0x90);
+		for (auto *code : {&joined, &separated})
+			code->insert(code->end(), {0x48, 0x01, 0xc8, 0x0f, 0x05});
+		for (const auto &value : values) {
+			const auto a = run_register_program(joined, value);
+			const auto b = run_register_program(separated, value);
+			require(a.first == b.first && a.registers == b.registers &&
+					a.flags == b.flags,
+				"a byte or word producer took a twin without its record");
+		}
+	}
+}
+
+/* Through a run of producers each but the last skips its record; a block
+ * that ends after the producer, and a budget that stops after it (a replay of
+ * the block cut there), keep it. */
+void unread_flag_records_keep_the_last_and_the_stopped()
+{
+	using namespace uml::cpu::x86_64;
+	/* add rax, rbx; sub rax, r9; xor rbx, rax; and rax, 0x7f; syscall */
+	const std::vector<std::uint8_t> run{
+		0x48, 0x01, 0xd8, 0x4c, 0x29, 0xc8, 0x48, 0x31, 0xc3,
+		0x48, 0x83, 0xe0, 0x7f, 0x0f, 0x05};
+	std::vector<std::uint8_t> separated;
+	for (const auto &[from, to] : std::array<std::pair<std::size_t,
+		std::size_t>, 4>{{{0, 3}, {3, 6}, {6, 9}, {9, 13}}}) {
+		separated.insert(separated.end(), run.begin() +
+			static_cast<std::ptrdiff_t>(from), run.begin() +
+			static_cast<std::ptrdiff_t>(to));
+		separated.push_back(0x90);
+	}
+	separated.insert(separated.end(), {0x0f, 0x05});
+	TestMemory memory;
+	memory.fill(0, std::as_bytes(std::span{run}));
+	gadgets::Executor executor;
+	executor.prepare(memory, 1, 1, 1);
+	const auto block = executor.select_program(
+		memory, 0, ExecutionMode::long64);
+	require(block.program != nullptr, "producer run did not build");
+	const auto stream = block.program->native_stream();
+	require(stream.size() > 5U && stream[0] == unrecorded_entry(0, 64U,
+			false, 0, 3) && stream[1] == unrecorded_entry(1, 64U, false,
+			0, 9) && stream[2] == unrecorded_entry(4, 64U, false, 3, 0) &&
+			stream[3] != unrecorded_entry(2, 64U, true, 0, 0),
+		"a run of producers did not skip every record but the last");
+	for (const auto &value : std::array<std::array<std::uint64_t, 4>, 2>{{
+		{5U, 7U, 12U, 0U}, {0x8000'0000'0000'0000ULL, 1U, 0U, 0U}}}) {
+		const auto a = run_register_program(run, value);
+		const auto b = run_register_program(separated, value);
+		require(a.registers == b.registers && a.flags == b.flags,
+			"a run of producers without their records ran differently");
+	}
+	/* The block cut after the first producer keeps its record. */
+	{
+		gadgets::Executor cut_executor;
+		cut_executor.prepare(memory, 1, 1, 1);
+		const auto cut = cut_executor.select_program(
+			memory, 0, ExecutionMode::long64, 1);
+		require(cut.program != nullptr &&
+				cut.program->native_stream().front() !=
+					unrecorded_entry(0, 64U, false, 0, 3),
+			"a producer that ends its block skipped its record");
+	}
+	/* A budget of one replays the block cut after the first producer. */
+	CpuState cpu{};
+	cpu.gpr(Register::rax) = 0xffff'ffff'ffff'ffffULL;
+	cpu.gpr(Register::rbx) = 1U;
+	const auto result = gadgets::execute(
+		*block.program, cpu, memory, executor, 1);
+	require(result.event == uml::cpu::EngineEvent::continued &&
+			result.retired_instructions == 1U && cpu.rip == 3U,
+		"a budget of one did not stop after the first producer");
+	materialize_flags(cpu);
+	/* 0xffff...ff + 1: zero, carry, parity and adjust set. */
+	require((cpu.rflags & 0x8d5U) == 0x55U,
+		"a producer a budget stopped after left no record of its flags");
+}
+
+/* A producer with a memory operand takes no twin, whatever follows: ADD, SUB,
+ * AND, OR and XOR at 32 and 64 bits with a memory source or destination before
+ * a register-only ALU instruction keep their own entry and fault there, as
+ * with a NOP between. */
+void unread_flag_records_need_a_register_producer()
+{
+	static constexpr std::array<std::array<std::uint64_t, 4>, 2> values{{
+		{5U, 7U, 12U, 0U}, {0xffff'ffff'ffff'ffffULL, 1U, 0U, 0U}}};
+	for (unsigned op = 0; op < 5U; ++op) {
+		for (const unsigned width : {32U, 64U}) {
+			for (const bool memory_source : {true, false}) {
+				/* op [e/r]ax, [rsi] or op [rsi], [e/r]ax; then ADD RAX, R9
+				 * and SYSCALL. */
+				const auto program = [&](bool nop) {
+					std::vector<std::uint8_t> code;
+					if (width == 64U)
+						code.push_back(0x48);
+					code.push_back(static_cast<std::uint8_t>(
+						alu_operations[op].register_opcode +
+						(memory_source ? 2U : 0U)));
+					code.push_back(0x06);
+					if (nop)
+						code.push_back(0x90);
+					push_alu(code, 0, 64U, 0, 9);
+					code.insert(code.end(), {0x0f, 0x05});
+					return code;
+				};
+				for (const auto &value : values) {
+					const auto a = run_register_program(program(false), value);
+					const auto b = run_register_program(program(true), value);
+					require(a.faulted && b.faulted && a.first == b.first &&
+							a.registers == b.registers && a.flags == b.flags,
+						std::string{alu_operations[op].name} + (memory_source ?
+							" with a memory source" : " with a memory destination") +
+						": a producer took a twin without its record, or ran "
+						"differently from the pair with a NOP between");
+				}
+			}
+		}
+	}
+}
+
+/* A twin and a joined compare-and-branch in one block, either way round:
+ *   ADD r, RBX; CMP r, R9 or TEST r, r; Jcc   (a twin in front of the pair)
+ *   CMP r, 5; Jcc; ADD r, RBX; SUB r, R9       (a twin pair behind it)
+ * each at 32 and 64 bits, against the same code with a NOP after every
+ * instruction that would join or skip a record. Both take the same edge with
+ * the same RAX and flags and retire the NOPs fewer, and a budget of the
+ * block's own count, which refuses the taken link into a five-instruction
+ * landing block, leaves at its start with the compare's flags recorded. */
+void unread_flag_records_beside_compare_branch_entries()
+{
+	using namespace uml::cpu::x86_64;
+	struct Outcome final {
+		std::uint64_t rax{};
+		std::uint64_t edge{};
+		std::uint64_t flags{};
+		std::size_t retired{};
+		std::vector<std::uintptr_t> stream;
+	};
+	const auto run = [](const std::vector<std::uint8_t> &code,
+		const std::array<std::uint64_t, 3> &values) {
+		TestMemory memory;
+		memory.fill(0, std::as_bytes(std::span{code}));
+		gadgets::Executor executor;
+		executor.prepare(memory, 1, 1, 1);
+		CpuState cpu{};
+		cpu.gpr(Register::rax) = values[0];
+		cpu.gpr(Register::rbx) = values[1];
+		cpu.gpr(Register::r9) = values[2];
+		Outcome outcome{};
+		for (unsigned step = 0; step < 8U; ++step) {
+			const auto selected = executor.select_program(
+				memory, cpu.rip, ExecutionMode::long64);
+			require(selected.status == gadgets::BuildStatus::built &&
+					selected.program != nullptr,
+				"twin and compare-and-branch program did not build");
+			if (step == 0U) {
+				const auto stream = selected.program->native_stream();
+				outcome.stream.assign(stream.begin(), stream.end());
+			}
+			const auto result = gadgets::execute(
+				*selected.program, cpu, memory, executor, 64);
+			outcome.retired += result.retired_instructions;
+			if (result.event == uml::cpu::EngineEvent::system_call) {
+				outcome.rax = cpu.gpr(Register::rax);
+				outcome.edge = cpu.gpr(Register::rdx) |
+					cpu.gpr(Register::rsi) << 8U;
+				outcome.flags = cpu.gpr(Register::r11) & 0x8d5U;
+				return outcome;
+			}
+			require(result.event == uml::cpu::EngineEvent::continued,
+				"twin and compare-and-branch program left unexpectedly");
+		}
+		fail("twin and compare-and-branch program did not reach SYSCALL");
+	};
+	/* The landing block: MOV ESI, 3; MOV EDI, 4; MOV R8D, 5; MOV R10D, 6;
+	 * SYSCALL. */
+	static constexpr std::array<std::uint8_t, 24> landing{
+		0xbe, 0x03, 0x00, 0x00, 0x00, 0xbf, 0x04, 0x00, 0x00, 0x00,
+		0x41, 0xb8, 0x05, 0x00, 0x00, 0x00, 0x41, 0xba, 0x06, 0x00, 0x00, 0x00,
+		0x0f, 0x05};
+	/* The fall-through: MOV EDX, 1; SYSCALL. */
+	static constexpr std::array<std::uint8_t, 7> fall_through{
+		0xba, 0x01, 0x00, 0x00, 0x00, 0x0f, 0x05};
+	static constexpr std::array<std::array<std::uint64_t, 3>, 5> values{{
+		{0U, 0U, 0U}, {1U, 0xffff'ffffU, 0U}, {0x7fff'ffffU, 1U, 0x8000'0000U},
+		{5U, 0U, 3U}, {0xffff'ffff'ffff'fff0ULL, 0x10U, 0U}}};
+	for (const unsigned width : {32U, 64U}) {
+		for (unsigned shape = 0; shape < 3U; ++shape) {
+			/* 0: ADD, CMP, Jcc; 1: ADD, TEST, Jcc; 2: CMP, Jcc, ADD, SUB. */
+			const bool test = shape == 1U;
+			for (const unsigned condition : {2U, 4U, 5U, 8U, 12U, 15U}) {
+				if (test && condition == 2U)
+					continue;
+				std::array<std::vector<std::uint8_t>, 2> code;
+				std::size_t target{};
+				for (unsigned nops = 0; nops < 2U; ++nops) {
+					auto &c = code[nops];
+					const auto nop = [&] {
+						if (nops != 0U)
+							c.push_back(0x90);
+					};
+					std::vector<std::uint8_t> body;
+					if (shape < 2U) {
+						push_alu(c, 0, width, 0, 3);
+						nop();
+						if (test)
+							push_compare_register(c, true, width, 0, 0);
+						else
+							push_compare_register(c, false, width, 0, 9);
+						nop();
+						body.assign(fall_through.begin(), fall_through.end());
+					} else {
+						push_compare_immediate(c, false, width, 0, 5U);
+						nop();
+						push_alu(body, 0, width, 0, 3);
+						if (nops != 0U)
+							body.push_back(0x90);
+						push_alu(body, 1, width, 0, 9);
+						body.insert(body.end(), fall_through.begin(),
+							fall_through.end());
+					}
+					c.push_back(static_cast<std::uint8_t>(0x70U + condition));
+					c.push_back(static_cast<std::uint8_t>(body.size()));
+					c.insert(c.end(), body.begin(), body.end());
+					if (nops == 0U)
+						target = c.size();
+					c.insert(c.end(), landing.begin(), landing.end());
+				}
+				const auto twin = unrecorded_entry(0, width, false, 0, 3);
+				const auto pair = compare_branch_entry(test, width, condition,
+					0, shape < 2U);
+				require(pair != 0U, "a compare-and-branch entry is missing");
+				for (const auto &value : values) {
+					const auto joined = run(code[0], value);
+					const auto separated = run(code[1], value);
+					const bool taken = (joined.edge >> 8U) == 3U;
+					const auto &s = joined.stream;
+					const bool built = shape < 2U ?
+						s.size() > 4U && s[0] == twin && s[1] == pair :
+						s.size() > 5U && s[0] == pair && s[3] == twin &&
+							s[4] != unrecorded_entry(1, width, false, 0, 9);
+					require(built && separated.stream.front() != s.front(),
+						"a twin beside a compare-and-branch entry was not "
+						"built as expected");
+					/* Both NOPs run in front of the branch but for the
+					 * second shape's second, on its fall-through only. */
+					require(joined.edge == separated.edge &&
+							joined.rax == separated.rax &&
+							joined.flags == separated.flags &&
+							separated.retired == joined.retired +
+								(shape < 2U || !taken ? 2U : 1U),
+						"a twin beside a compare-and-branch entry ran "
+						"differently from its instructions");
+					if (!taken)
+						continue;
+					/* The taken link refused at the block's own count. */
+					TestMemory memory;
+					memory.fill(0, std::as_bytes(std::span{code[0]}));
+					gadgets::Executor executor;
+					executor.prepare(memory, 1, 1, 1);
+					const auto land = executor.select_program(
+						memory, target, ExecutionMode::long64);
+					const auto block = executor.select_program(
+						memory, 0, ExecutionMode::long64);
+					require(land.program != nullptr && block.program != nullptr &&
+							land.program->instruction_count() == 5U,
+						"twin and compare-and-branch blocks did not build");
+					CpuState cpu{};
+					cpu.gpr(Register::rax) = value[0];
+					cpu.gpr(Register::rbx) = value[1];
+					cpu.gpr(Register::r9) = value[2];
+					const auto count = block.program->instruction_count();
+					const auto result = gadgets::execute(
+						*block.program, cpu, memory, executor, count);
+					materialize_flags(cpu);
+					require(result.event == uml::cpu::EngineEvent::continued &&
+							result.retired_instructions ==
+								(shape < 2U ? 3U : 2U) &&
+							cpu.rip == target && cpu.gpr(Register::rax) ==
+								separated.rax &&
+							(cpu.rflags & 0x8d5U) == separated.flags,
+						"a joined branch behind a twin left a refused link "
+						"without the compare's flags");
+				}
+			}
+		}
+	}
+}
+
 /* The host reports the emulated CPU to the guest kernel from cpuid.hpp, and
  * the guest reads the same CPU by executing CPUID. Both answers must be the
  * same answer: whatever /proc/cpuinfo says a program may use, CPUID has to
@@ -5797,6 +8214,75 @@ void native_into_reports_overflow_precisely()
 		clear_result.instruction_budget_exhausted &&
 		clear_result.retired_instructions == 1 && clear.rip == 101,
 		"clear-overflow INTO did not retire normally");
+}
+
+/* AAM divides AL by its immediate base into AH and AL. A zero base raises
+ * #DE, a fault: that AAM does not retire, RIP names it and AX keeps its
+ * value. The gadget reads its address back from its stream word after the
+ * flags helper, so this names a block that does not start at 0. */
+void native_aam_raises_divide_error_precisely()
+{
+	using namespace uml::cpu::x86_64;
+	TestMemory memory;
+	memory.load(100, {0xd4, 0x0a, 0xd4, 0x00});
+	const auto built = require_built(
+		gadgets::build(memory, 100, ExecutionMode::compat32, 2),
+		"native AAM block did not build");
+	CpuState cpu{};
+	cpu.execution_mode = ExecutionMode::compat32;
+	cpu.rip = 100;
+	cpu.gpr(Register::rax) = 0x1234'0023;
+	const auto result = gadgets::execute(built.program, cpu, memory, 2);
+	require(result.event == uml::cpu::EngineEvent::floating_point_trap,
+		"AAM 0 did not raise the divide error");
+	require(result.retired_instructions == 1 && cpu.rip == 102,
+		"AAM 0 retired or lost its precise RIP");
+	require(cpu.gpr(Register::rax) == 0x1234'0305,
+		"AAM 10 did not divide AL, or AAM 0 changed AX");
+}
+
+/* IRET pops its frame from RSP, and a pop that faults leaves before anything
+ * commits, with RIP naming the IRET, which the gadget reads back from its own
+ * stream word, and the fault at the slot's address: the first slot on an
+ * unmapped page, the first slot crossing into one, and a later slot on one.
+ * A NOP ahead of it keeps the IRET off both 0 and the block's start. */
+void native_iret_faults_report_the_iret()
+{
+	using namespace uml::cpu::x86_64;
+	constexpr std::uint64_t code = 0x1000;
+	constexpr std::uint64_t edge = 16384;
+	constexpr std::uint64_t unmapped = 0x20000;
+	TestMemory memory;
+	memory.load(code, {0x90, 0x48, 0xcf});
+	const auto built = require_built(gadgets::build(memory, code, 2),
+		"the IRETQ block did not build");
+	const struct {
+		std::uint64_t rsp;
+		std::uint64_t fault;
+		const char *name;
+	} cases[] = {
+		{unmapped, unmapped, "an IRETQ whose frame is unmapped"},
+		{edge - 4U, edge - 4U, "an IRETQ whose RIP slot runs onto an unmapped page"},
+		{edge - 8U, edge, "an IRETQ whose CS slot is unmapped"},
+	};
+	for (const auto &test : cases) {
+		CpuState cpu{};
+		cpu.rip = code;
+		cpu.gpr(Register::rsp) = test.rsp;
+		const auto result = gadgets::execute(built.program, cpu, memory, 2);
+		const std::string name{test.name};
+		require(result.event == uml::cpu::EngineEvent::memory_fault,
+			(name + " did not leave with a memory fault").c_str());
+		require(result.retired_instructions == 1 && cpu.rip == code + 1U,
+			(name + " reported RIP " + std::to_string(cpu.rip) +
+				" after retiring " +
+				std::to_string(result.retired_instructions)).c_str());
+		require(result.fault.address == test.fault &&
+				result.fault.access == uml::memory::MemoryAccess::read &&
+				cpu.gpr(Register::rsp) == test.rsp,
+			(name + " reported the fault at " +
+				std::to_string(result.fault.address)).c_str());
+	}
 }
 
 /* ICEBP (INT1) raises #DB as a trap in either mode: it retires, and RIP
@@ -8301,6 +10787,45 @@ void a_lane_extract_store_keeps_the_lane_across_a_page()
 		"a lane extract across a page stored something else");
 }
 
+/* VCVTPS2PH to memory narrows into a vector register before it translates the
+ * destination, and a translation that misses calls out, so the packed result
+ * must survive the call. Each float of 1.0 narrows to the half 0x3c00. */
+void a_half_precision_store_keeps_its_result_across_a_miss()
+{
+	using namespace uml::cpu::x86_64;
+	struct Width final {
+		std::uint8_t vex;
+		unsigned lanes;
+		const char *name;
+	};
+	for (const auto width : {Width{0x79, 4, "128-bit"},
+		     Width{0x7d, 8, "256-bit"}}) {
+		CallingOutMemory memory;
+		memory.load(0, {
+			0xc4, 0xe3, width.vex, 0x1d, 0x07, 0x00, // vcvtps2ph $0,x0,[rdi]
+			0x0f, 0x05,                               // syscall
+		});
+		const auto built = require_built(gadgets::build(memory, 0),
+			"the half-precision store did not build");
+		CpuState cpu{};
+		cpu.registers[7] = 0x2000; // rdi, a page no translation covers yet
+		for (unsigned lane = 0; lane < width.lanes; ++lane) {
+			const std::uint32_t one = 0x3f80'0000U;
+			std::memcpy(cpu.vectors[0].data() + 4U * lane, &one, 4);
+		}
+		const auto result = gadgets::execute(built.program, cpu, memory, 2);
+		require(result.event == uml::cpu::EngineEvent::system_call &&
+				result.retired_instructions == 2,
+			"the half-precision store did not reach SYSCALL");
+		bool exact = true;
+		for (unsigned lane = 0; lane < width.lanes; ++lane)
+			exact = exact && memory.byte(0x2000 + 2U * lane) == 0x00U &&
+				memory.byte(0x2001 + 2U * lane) == 0x3cU;
+		require(exact, std::string{"a "} + width.name +
+			" half-precision store lost its result across a miss");
+	}
+}
+
 void a_masked_store_keeps_the_unselected_bytes_across_a_miss()
 {
 	using namespace uml::cpu::x86_64;
@@ -9355,7 +11880,8 @@ struct FaultingAccess final {
 
 /* The shapes of baked access that fault: loads and stores through a base, a
  * base and an index and no base, memory,immediate forms, the widening load,
- * both stack forms, and the immediate the access word cannot hold. */
+ * both stack forms, the immediate the access word cannot hold, and the
+ * stack twins of loads, stores, a read-modify-write and a compare. */
 [[nodiscard]] std::vector<FaultingAccess> faulting_accesses()
 {
 	using uml::memory::MemoryAccess;
@@ -9391,6 +11917,17 @@ struct FaultingAccess final {
 			AddressField::absolute, MemoryAccess::read, 8, 0, false, 0},
 		{"push rax", {0x50}, none, MemoryAccess::write, 8, 0, true, 8},
 		{"pop rax", {0x58}, none, MemoryAccess::read, 8, 0, true, 0},
+		{"mov rax,[rsp+8]", {0x48, 0x8b, 0x44, 0x24, 0x08}, none,
+			MemoryAccess::read, 8, 0, true, -8},
+		{"mov [rsp-8],rax", {0x48, 0x89, 0x44, 0x24, 0xf8}, none,
+			MemoryAccess::write, 8, 0, true, 8},
+		{"mov word [rsp+8],-1",
+			{0x66, 0xc7, 0x44, 0x24, 0x08, 0xff, 0xff}, none,
+			MemoryAccess::write, 2, 0, true, -8},
+		{"add [rsp+8],eax", {0x01, 0x44, 0x24, 0x08}, none,
+			MemoryAccess::write, 4, 0, true, -8, true},
+		{"cmp rax,[rsp+8]", {0x48, 0x3b, 0x44, 0x24, 0x08}, none,
+			MemoryAccess::read, 8, 0, true, -8},
 	};
 }
 
@@ -10863,6 +13400,7 @@ int main(int argc, char **argv)
 	cache_links_common_successors();
 	cache_chains_direct_branches();
 	cache_chains_indirect_transfers();
+	indirect_transfers_to_the_all_ones_address_leave_like_a_cold_site();
 	an_unrelated_code_change_leaves_a_link_armed();
 	with_sharing(false, a_link_sweep_releases_what_only_replaced_blocks_named);
 	linked_call_crosses_a_disjoint_executable_stack_write();
@@ -10874,6 +13412,7 @@ int main(int argc, char **argv)
 	budget_limited_replay_faults_where_the_block_does();
 	executable_stores_publish_a_code_change_each();
 	store_publishes_only_where_some_executor_caches_code();
+	stuck_participant_keeps_translations_out_of_the_cache();
 	overlapping_executable_store_stops_immediately();
 	executable_store_links_only_to_unchanged_code();
 	distant_code_write_cools_its_linked_block();
@@ -10891,6 +13430,21 @@ int main(int argc, char **argv)
 	lazy_shift_flags_match_the_definition();
 	execute_segment_memory();
 	execute_addressing_shapes();
+	each_translation_finds_the_entry_its_miss_filled();
+	a_page_crossing_access_matches_no_translation();
+	pages_sharing_an_entry_keep_their_own_bytes();
+	each_run_translates_through_its_executors_table();
+	bmi_gadgets_keep_the_table_base();
+	bmi_memory_forms_cross_a_page();
+	stack_twins_match_their_ordinary_entries();
+	stack_twins_refuse_an_access_across_a_page();
+	stack_twins_take_the_ordinary_path_off_their_page();
+	stack_twins_keep_pages_sharing_their_entry_apart();
+	stack_twin_stores_publish_where_ordinary_stores_do();
+	stack_twins_follow_a_remapped_page();
+	a_stack_twin_store_to_a_read_only_page_faults();
+	a_stack_twin_store_into_its_block_leaves_after_itself();
+	stack_operands_without_a_twin_keep_their_addresses();
 	execute_byte_sign_masks();
 	execute_call_and_return();
 	decode_compat32_defaults();
@@ -10900,6 +13454,7 @@ int main(int argc, char **argv)
 	execute_compat32_pushfd_popfd();
 	execute_compat32_enter_frames();
 	execute_compat32_legacy_segment_stack();
+	a_compat32_pop_through_fs_leaves_esp_for_the_exact_check();
 	execute_long64_interrupt_return_stack_switch();
 	execute_long64_interrupt_return_operand_sizes();
 	interrupt_return_masks_user_flags();
@@ -10919,6 +13474,13 @@ int main(int argc, char **argv)
 	a_settled_carry_survives_an_increment();
 	conditional_moves_write_the_destination_either_way();
 	fused_conditional_jumps_take_the_same_edge();
+	compare_branch_entries_run_both_instructions();
+	compare_branch_entries_keep_the_inline_contract();
+	a_stack_fault_behind_compare_branch_entries_finds_its_instruction();
+	unread_flag_records_are_not_written();
+	unread_flag_records_keep_the_last_and_the_stopped();
+	unread_flag_records_need_a_register_producer();
+	unread_flag_records_beside_compare_branch_entries();
 	cpuid_table_matches_the_gadget();
 	x87_zero_results_keep_their_sign();
 	preserve_precise_memory_fault();
@@ -10926,6 +13488,8 @@ int main(int argc, char **argv)
 	migrated_gadgets_are_native_only();
 	native_divide_traps_precisely();
 	native_into_reports_overflow_precisely();
+	native_aam_raises_divide_error_precisely();
+	native_iret_faults_report_the_iret();
 	icebp_raises_a_debug_trap_after_itself();
 	bound_checks_a_signed_range();
 	privileged_instructions_raise_general_protection();
@@ -10969,6 +13533,7 @@ int main(int argc, char **argv)
 	vector_integer_forwards_only_from_the_gadget_before();
 	a_lane_extract_store_keeps_the_lane_across_a_miss();
 	a_lane_extract_store_keeps_the_lane_across_a_page();
+	a_half_precision_store_keeps_its_result_across_a_miss();
 	a_masked_store_keeps_the_unselected_bytes_across_a_miss();
 	vector_invalid_results_use_x86_indefinite_nan();
 	locked_memory_updates_select_exclusive_gadgets();

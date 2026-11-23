@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 09:21:42 +0900
+Subject: [PATCH] u_threaded_context: reclaim and retry a large buffer upload
+
+tc_buffer_subdata() sends a large, unsynchronized or whole-resource
+update through tc_buffer_map() and dropped it when the driver had no
+memory for the storage the map needs, without a word: a partial update
+of a busy buffer kept the older contents while the memory its own
+finished work held was reclaimable. It now gives back what the driver
+can, from the thread that owns the context, through u_reclaim, and maps
+once more.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/gallium/auxiliary/util/u_threaded_context.c | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/src/gallium/auxiliary/util/u_threaded_context.c b/src/gallium/auxiliary/util/u_threaded_context.c
+index ba1764b25b6df0bebfb3caebcfb65ef6115f3f8e..0075a5ef69ca980b9e12e6fe40e7bb688d1ff511 100644
+--- a/src/gallium/auxiliary/util/u_threaded_context.c
++++ b/src/gallium/auxiliary/util/u_threaded_context.c
+@@ -30,6 +30,7 @@
+ #include "util/u_framebuffer.h"
+ #include "util/u_inlines.h"
+ #include "util/u_memory.h"
++#include "util/u_reclaim.h"
+ #include "util/u_upload_mgr.h"
+ #include "driver_trace/tr_context.h"
+ #include "util/log.h"
+@@ -3218,6 +3219,18 @@ tc_buffer_subdata(struct pipe_context *_pipe,
+          usage |= TC_TRANSFER_MAP_UPLOAD_CPU_STORAGE;
+ 
+       map = tc_buffer_map(_pipe, resource, 0, usage, &box, &transfer);
++      if (!map) {
++         /* The driver had no memory for the storage the map needs, and the
++          * upload would be dropped without a word: give back what can be,
++          * from the thread that owns the context, and try once more.
++          */
++         struct u_reclaim reclaim;
++         if (u_reclaim_begin(_pipe, true, &reclaim)) {
++            u_reclaim_settle(&reclaim);
++            map = tc_buffer_map(_pipe, resource, 0, usage, &box, &transfer);
++            u_reclaim_end(&reclaim, map != NULL);
++         }
++      }
+       if (map) {
+          memcpy(map, data, size);
+          tc_buffer_unmap(_pipe, transfer);

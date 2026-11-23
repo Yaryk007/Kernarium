@@ -149,3 +149,31 @@ public enum StatsSampling {
         viewers > 0 && applicationActive && capable && hasDriver && running
     }
 }
+
+/// Which readings reach the views. A published reading redraws every view
+/// that shows the figures and has the system composite a frame, so a reading
+/// is published only when what the views draw of it differs from what the
+/// last published one drew. `Drawn` is that form: the figures as the views
+/// write them and the shares as they draw their bars. It is never the raw
+/// numbers, most of which no view shows, and never the whole reading, whose
+/// history moves on with every reading however steady the load.
+public struct StatsPublishGate<Drawn: Equatable> {
+    private var published: Drawn?
+
+    public init() {}
+
+    /// Whether to publish a reading that draws as `drawn`: the first one
+    /// always, then only one that differs from the last published. A reading
+    /// that is published is the one later readings are compared with.
+    public mutating func admits(_ drawn: Drawn) -> Bool {
+        guard published != drawn else { return false }
+        published = drawn
+        return true
+    }
+
+    /// The views show nothing of what was published any more: the next
+    /// reading is published whatever it draws.
+    public mutating func reset() {
+        published = nil
+    }
+}

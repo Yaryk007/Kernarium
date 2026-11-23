@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+# The gamepad relay runs on every device. It listens on vsock for the host
+# application, which sends the description of each game controller it has, and
+# creates a HID device for it through /dev/uhid (group uhid). With no host and no
+# controller it only waits. Init starts it again if it ever exits, and Recovery
+# does not run it.
+service kernarium_gamepad /vendor/bin/kernarium_gamepad
+    class main
+    user nobody
+    group uhid

@@ -3,3 +3,4 @@
 # export again; never edit this directory by hand.
 patch	Launcher-omit-first-screen-search-surface.patch
 patch	Launcher-guard-early-taskbar-layout.patch
+patch	Launcher-add-new-items-from-the-first-screen.patch

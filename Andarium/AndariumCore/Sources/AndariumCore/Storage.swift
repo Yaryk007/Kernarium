@@ -16,12 +16,14 @@ public protocol GuestStorage: Sendable {
     /// The guest on disk, with its measured data, or nil if there is none.
     func load() throws -> Guest?
     func create(_ guest: Guest, progress: @escaping @Sendable (Double) -> Void) async throws -> Guest
-    /// Deletes everything the guest has: its data, its record and its
-    /// choices. Afterwards `load` finds no guest, and the application is
-    /// where it was before the first one was set up.
+    /// Deletes everything the guest has: its data, its record, its snapshots
+    /// and its choices. Afterwards `load` finds no guest, and the application
+    /// is where it was before the first one was set up.
     func erase(progress: @escaping @Sendable (Double) -> Void) async throws
     /// What a start would be, from the instance on disk; nil when its record
-    /// cannot be read.
+    /// cannot be read. A snapshot restore that did not finish is planned as
+    /// the start that completes it will find the guest: from the snapshot's
+    /// record.
     func startPlan() -> StartPlan?
     /// The data Android has written: what the data disk occupies now, which
     /// the guest changes while it runs and `load` measures once. Zero where
@@ -95,11 +97,11 @@ public enum StorageError: Error, Equatable, LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .notEnoughSpace:
-            return "There is not enough free storage to set up the guest."
+            return String(localized: "There is not enough free storage to set up the virtual machine.", bundle: .module)
         case .missingRelease:
-            return "This copy of Andarium does not carry a system."
+            return String(localized: "This copy of Andarium does not carry a system.", bundle: .module)
         case .unusableDiskPath(let path):
-            return "The guest cannot start from \(path): its name has a space, comma, colon or quotation mark."
+            return String(localized: "The virtual machine cannot start from \(path): its name has a space, comma, colon or quotation mark.", bundle: .module)
         }
     }
 }
@@ -114,21 +116,28 @@ public struct TwoDiskStorage: GuestStorage {
     public let release: ReleaseIdentity
     /// The release directory inside the application.
     public let releaseDirectory: URL
+    /// The file calls of the snapshot store, which a test replaces.
+    let snapshotIO: SnapshotFileOperations
 
     public init(locations: GuestLocations, release: ReleaseIdentity, releaseDirectory: URL) {
+        self.init(locations: locations, release: release, releaseDirectory: releaseDirectory, snapshotIO: .live)
+    }
+
+    init(locations: GuestLocations, release: ReleaseIdentity, releaseDirectory: URL, snapshotIO: SnapshotFileOperations) {
         self.locations = locations
         self.release = release
         self.releaseDirectory = releaseDirectory
+        self.snapshotIO = snapshotIO
     }
 
-    private var files: InstanceFiles { InstanceFiles(directory: locations.directory) }
+    var files: InstanceFiles { InstanceFiles(directory: locations.directory) }
 
     public var createRequirementBytes: UInt64 { Limits.firstStartReserveBytes }
 
     public var dataDiskPath: String { locations.data.path }
 
     /// The data disk's size in GiB for the runtime, which creates a disk that
-    /// is absent and grows one that is smaller.
+    /// is absent, grows one that is smaller and keeps one that is larger.
     public func dataGiB(for guest: Guest) -> UInt32 {
         UInt32(clamping: guest.effectiveCapacityGiB)
     }
@@ -149,8 +158,35 @@ public struct TwoDiskStorage: GuestStorage {
         }
     }
 
+    /// Set up writes a new record over whatever is there, so for an unsigned
+    /// proof the rules decide first whether files that exist may be replaced:
+    /// when the system is a proof, or the record says a proof created the
+    /// instance, only a decision to create (no record, or no data behind it)
+    /// lets Set up go on, and anything else is the mismatch Home words. The
+    /// guest's settings can be missing while its data and record are intact;
+    /// erasing that guest stays with the explicit Erase.
+    private func requireCreationPermitted() throws {
+        let recorded: InstanceState?
+        do {
+            recorded = try files.readState()
+        } catch {
+            // A record nobody can read is the rules' to refuse for a proof. Under
+            // a signed build, Set up with an unreadable record goes on as it
+            // always did, also when that damaged record once belonged to a proof:
+            // it cannot be trusted to say what made it, and refusing would leave
+            // a signed release's user with no way to set up again.
+            if release.isUnsignedProof { throw error }
+            return
+        }
+        guard release.isUnsignedProof || recorded?.isUnsignedProof == true else { return }
+        guard try files.decide(for: release).action == .create else {
+            throw InstanceError.refused(StartBlock.mismatch.explanation)
+        }
+    }
+
     public func create(_ guest: Guest, progress: @escaping @Sendable (Double) -> Void) async throws -> Guest {
         try requireUsablePaths()
+        try requireCreationPermitted()
         let manager = FileManager.default
         try manager.createDirectory(at: locations.directory, withIntermediateDirectories: true)
         for legacy in locations.legacyImages { try? manager.removeItem(at: legacy) }
@@ -178,11 +214,22 @@ public struct TwoDiskStorage: GuestStorage {
     }
 
     public func startPlan() -> StartPlan? {
-        files.startPlan(for: release)
+        // A snapshot restore that put its data in place and did not finish
+        // completes before a start reads the files (`prepareStart`): the guest
+        // then starts as the snapshot's record says, whatever the record it
+        // replaces says, and Start is offered on that.
+        if let restored = snapshotStore.recordOfUnfinishedRestore() {
+            return InstanceRules.plan(state: restored, dataDiskExists: true, snapshotExists: false, release: release)
+        }
+        return files.startPlan(for: release)
     }
 
     public func prepareStart(_ guest: Guest, progress: @escaping @Sendable (Double) -> Void) async throws {
         try requireUsablePaths()
+        // A restore that began and did not finish completes before anything
+        // reads the files; launch does it, and this catches the one a failure
+        // left in this process.
+        if snapshotStore.restoreUnderWay { try recoverSnapshots() }
         var decision = try files.decide(for: release)
         if decision.action == .refusePending {
             // Start is Try Again; a release other than the one updating
@@ -194,7 +241,18 @@ public struct TwoDiskStorage: GuestStorage {
     }
 
     public func restoreUpdate() throws {
+        // A snapshot restore that began completes before anything else changes
+        // the guest's files; after it there is no update copy, and this then
+        // says that no update is pending.
+        if snapshotStore.restoreUnderWay { try recoverSnapshots() }
         try files.apply(files.decide(for: release, flags: InstanceFlags(restoreSnapshot: true)), release: release)
+    }
+
+    /// Whether the guest's first Android boot has not been seen to complete
+    /// (`InstanceFiles.firstBootMarker`): a start of it is long by its nature
+    /// even when an earlier one ended, and the data disk exists.
+    public func firstBootPending() -> Bool {
+        files.firstBootPending
     }
 
     /// Records that the guest reached `sys.boot_completed`, at the moment the
@@ -211,7 +269,18 @@ public struct TwoDiskStorage: GuestStorage {
         try files.complete(release: release)
     }
 
+    /// Records the guest's choices. A memory of zero is not a choice: it is
+    /// what a launch with no room for any size shows for that run alone
+    /// (`MemoryPolicy.hasRoom`), so the size already kept stays, and a later
+    /// launch with room starts from it. A record that exists and cannot be read
+    /// or decoded is not "nothing kept": the save fails with that error and the
+    /// record is as it was.
     public func save(_ guest: Guest) throws {
+        var guest = guest
+        if guest.memoryMiB <= 0, FileManager.default.fileExists(atPath: locations.settings.path) {
+            guest.memoryMiB = try JSONDecoder()
+                .decode(Guest.self, from: Data(contentsOf: locations.settings)).memoryMiB
+        }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         try FileManager.default.createDirectory(at: locations.directory, withIntermediateDirectories: true)
@@ -230,9 +299,10 @@ public struct TwoDiskStorage: GuestStorage {
 
     /// iCloud and computer backups include the guest's files only when the
     /// user chose that for the guest. The flag sits on the guest's directory,
-    /// which covers whatever is later put in it (the data disk, a snapshot),
-    /// and on its files.
-    private func applyBackupPolicy(_ guest: Guest) {
+    /// which covers whatever is later put in it (the data disk), and on its
+    /// files. The user's snapshots are never backed up, whatever the choice:
+    /// a backup would hold each at its full size.
+    func applyBackupPolicy(_ guest: Guest) {
         var excluded = URLResourceValues()
         excluded.isExcludedFromBackup = true
         var included = URLResourceValues()
@@ -246,6 +316,9 @@ public struct TwoDiskStorage: GuestStorage {
             // new file and leaves that record in place, so the flag is set
             // first and the clear then removes both.
             if guest.includeInBackups { try? target.setResourceValues(included) }
+        }
+        if FileManager.default.fileExists(atPath: files.snapshots.path) {
+            SnapshotStore.excludeFromBackup(files.snapshots)
         }
     }
 }

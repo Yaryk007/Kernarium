@@ -139,6 +139,25 @@ public:
 	}
 	[[nodiscard]] std::size_t size() const noexcept { return size_; }
 	[[nodiscard]] bool empty() const noexcept { return size_ == 0; }
+	/* Open `count` words at `at`, moving the words from there on behind
+	 * them, for a head the builder puts in front of a run it has already
+	 * emitted. The opened words are the caller's to fill. */
+	void insert(std::size_t at, std::size_t count)
+	{
+		assert(at <= size_);
+		if (size_ + count > capacity_)
+			reserve(std::max(size_ + count, capacity_ * 2));
+		std::copy_backward(data() + at, data() + size_,
+			data() + size_ + count);
+		size_ += count;
+	}
+	/* Remove the `count` words at `at`, moving the words behind them up. */
+	void erase(std::size_t at, std::size_t count) noexcept
+	{
+		assert(at + count <= size_);
+		std::copy(data() + at + count, data() + size_, data() + at);
+		size_ -= count;
+	}
 	/* Drop the words from `size` on, which a decode emitted and the builder
 	 * then rejected. */
 	void truncate(std::size_t size) noexcept
@@ -296,6 +315,10 @@ struct BuildOptions final {
 	/* Select adjacent write-through forwarding for this program. */
 	bool scalar_forwarding{true};
 	bool vector_forwarding{true};
+	/* Reuse a transfer's translation for the next transfer through the
+	 * same base (engine/same_base.inc). Production leaves this true; a
+	 * test builds a block's established form with it false. */
+	bool same_base{true};
 	/* Test and portability validation can force optional checksum operations
 	 * through their precompiled software gadgets. Production leaves this
 	 * false and selects from detected host features.
@@ -341,18 +364,53 @@ struct BuildOptions final {
 };
 
 /* Direct control-flow gadgets load these immutable-layout cells through the
- * data stream. The cache may retarget a cell from the shared exit stream to a
- * translated successor without modifying executable memory. */
-struct BlockLink final {
-	const std::uintptr_t *stream{};
-	std::size_t instruction_count{};
-	std::uint64_t guest_pc{};
-};
-static_assert(offsetof(BlockLink, stream) == 0);
-static_assert(offsetof(BlockLink, instruction_count) == 8);
-static_assert(offsetof(BlockLink, guest_pc) == 16);
-static_assert(sizeof(BlockLink) == 24);
+ * data stream. The cache may retarget a cell from its exit to a translated
+ * successor without modifying executable memory.
+ *
+ * A block a cell links to is laid out behind a header of block_header_bytes,
+ * which holds the block's guest PC in its first word and its instruction
+ * count in byte block_header_count, and then its first entry word and the
+ * rest of its stream. A cell's pair is that entry word and the stream behind
+ * it, so translated code branches to the block's first gadget from the pair
+ * alone, and reads the count it precharges, and the PC a retirement exit
+ * stores, from the header in front of the stream. A cell is itself the
+ * header of an empty block at its guest PC: unlinked, its pair names
+ * link_exit and its own stream word (unlinked_stream). */
+inline constexpr std::size_t block_header_bytes = 16;
+inline constexpr std::size_t block_header_count = 14;
 
+struct alignas(16) BlockLink final {
+	std::uint64_t guest_pc{};
+	/* The rest of the empty block's header: its count is zero. */
+	std::uint64_t header_rest{};
+	std::uintptr_t entry{};
+	const std::uintptr_t *stream{};
+};
+static_assert(offsetof(BlockLink, guest_pc) == 0);
+static_assert(offsetof(BlockLink, entry) == UML_GADGET_LINK_PAIR &&
+	UML_GADGET_LINK_PAIR == block_header_bytes);
+static_assert(offsetof(BlockLink, stream) == UML_GADGET_LINK_PAIR + 8);
+static_assert(sizeof(BlockLink) == 32);
+static_assert(UML_GADGET_LINK_HEADER_PC ==
+		-static_cast<int>(block_header_bytes + sizeof(std::uintptr_t)) &&
+	UML_GADGET_LINK_HEADER_COUNT == UML_GADGET_LINK_HEADER_PC +
+		static_cast<int>(block_header_count),
+	"the stream a pair names begins one entry word past its header");
+
+/* The stream an unlinked `link` names: its own stream word, which puts the
+ * cell's header in front of it. */
+[[nodiscard]] inline const std::uintptr_t *unlinked_stream(
+	const BlockLink &link) noexcept
+{
+	return reinterpret_cast<const std::uintptr_t *>(&link.stream);
+}
+
+/* A target and the link a hit on it follows. The default value, a zero
+ * target with no link, is not a followable entry: a translated site that
+ * matched it would load through the null link. The space that owns a site
+ * stores every cell's vacant target and its leave-to-dispatcher link before
+ * translated code reads it, and a test that builds a cell by hand does the
+ * same. */
 struct IndirectLinkEntry final {
 	std::uint64_t guest_pc{};
 	const BlockLink *link{};

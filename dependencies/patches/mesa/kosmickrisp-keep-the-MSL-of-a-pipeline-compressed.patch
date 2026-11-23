@@ -1,0 +1,2694 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 19:20:21 +0900
+Subject: [PATCH] kosmickrisp: keep the MSL of a pipeline compressed
+
+A pipeline reads the MSL it was built from again only to build another
+Metal pipeline from it, for a render pass that binds fewer attachments
+than the pipeline declares, and to write a pipeline cache. The text is
+still the largest thing a pipeline keeps, tens of KiB for a small shader
+and a third of a MiB for a large one, and the vertex shader holds a
+second copy of the fragment text.
+
+A shader now compresses each text once, when its Metal pipelines are
+built, with Apple's libcompression. LZFSE gives MSL a fifth of its size
+(LZ4 a third) and decompresses at over a GB/s; it compresses at 0.12
+GB/s, which a pipeline pays once, and the vertex shader copies the
+compressed fragment bytes instead of compressing them again. A build
+from the text, a variant for another set of attachments or a pipeline
+loaded from a cache, decompresses into a temporary copy that it frees
+once Metal has the library. A pipeline library's precompile, which hands
+its text to Metal's library cache and is destroyed, and a dynamic
+vertex-input variant, which drops its text for the parent to regenerate,
+never compress.
+
+A pipeline cache carries the compressed bytes, and a shader read from
+one keeps them compressed, so a cache is smaller by what the text saves
+and loading it compresses nothing. The serialized text gains its stored
+length and codec, and the cache UUID now takes in
+KK_SHADER_BINARY_FORMAT, so an older driver's blobs are refused rather
+than read as the new layout. A length a blob cannot hold is refused
+before anything is allocated for it.
+
+Twenty-four graphics and twenty-four compute pipelines of 19 KiB and 14
+KiB texts hold 1.28 MB of MSL, now 0.25 MB; the heap grows by a third
+less, and their cache is 0.63 MB instead of 1.67 MB. Compressing costs
+about 9 us per KiB of text: 0.19 ms on a pipeline Metal already has
+cached (2.5 ms), and within the run-to-run spread on one it compiles (36
+ms).
+
+test_msl_packing checks that the MSL of created pipelines is held packed
+and that the heap holds the compressed size, that a cache is smaller
+than the text and a cache loaded from it holds the same text, still
+packed, that raster variants are packed and cached, and that a render
+pass that binds fewer attachments renders from the packed text. Run with
+--bench N it prints what N pipelines cost, for a comparison against a
+driver that keeps the text. test_msl_pack checks the compressed form on
+its own, including the bytes a cache cannot legitimately hold.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/kosmickrisp/vulkan/kk_msl_pack.c          | 241 ++++++
+ src/kosmickrisp/vulkan/kk_msl_pack.h          |  95 +++
+ src/kosmickrisp/vulkan/kk_physical_device.c   |   5 +
+ src/kosmickrisp/vulkan/kk_shader.c            | 190 +++--
+ src/kosmickrisp/vulkan/kk_shader.h            |   9 +-
+ src/kosmickrisp/vulkan/meson.build            |  14 +
+ .../tests/msl_packing_shaders/pack.comp       |  30 +
+ .../tests/msl_packing_shaders/pack.comp.h     | 221 ++++++
+ .../tests/msl_packing_shaders/pack.frag       |  38 +
+ .../tests/msl_packing_shaders/pack.frag.h     | 323 ++++++++
+ .../tests/msl_packing_shaders/pack.vert       |  10 +
+ .../tests/msl_packing_shaders/pack.vert.h     |  59 ++
+ .../vulkan/tests/msl_packing_state.c          | 176 +++++
+ .../vulkan/tests/msl_packing_state.h          |  52 ++
+ src/kosmickrisp/vulkan/tests/test_msl_pack.c  | 167 +++++
+ .../vulkan/tests/test_msl_packing.cpp         | 692 ++++++++++++++++++
+ 16 files changed, 2253 insertions(+), 69 deletions(-)
+ create mode 100644 src/kosmickrisp/vulkan/kk_msl_pack.c
+ create mode 100644 src/kosmickrisp/vulkan/kk_msl_pack.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/msl_packing_shaders/pack.comp
+ create mode 100644 src/kosmickrisp/vulkan/tests/msl_packing_shaders/pack.comp.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/msl_packing_shaders/pack.frag
+ create mode 100644 src/kosmickrisp/vulkan/tests/msl_packing_shaders/pack.frag.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/msl_packing_shaders/pack.vert
+ create mode 100644 src/kosmickrisp/vulkan/tests/msl_packing_shaders/pack.vert.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/msl_packing_state.c
+ create mode 100644 src/kosmickrisp/vulkan/tests/msl_packing_state.h
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_msl_pack.c
+ create mode 100644 src/kosmickrisp/vulkan/tests/test_msl_packing.cpp
+
+diff --git a/src/kosmickrisp/vulkan/kk_msl_pack.c b/src/kosmickrisp/vulkan/kk_msl_pack.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..59a2546b4aefefa0ca3553c7b28e2295dc229f48
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/kk_msl_pack.c
+@@ -0,0 +1,241 @@
++/*
++ * Copyright 2026 Google LLC
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "kk_msl_pack.h"
++
++#include <stdlib.h>
++#include <string.h>
++
++#include "util/ralloc.h"
++
++#if defined(__APPLE__)
++#include <compression.h>
++#endif
++
++/* LZFSE gives MSL a fifth of its size (LZ4 a third) and decompresses at over
++ * a GB/s, so a build from the compressed text costs a few tenths of a
++ * millisecond more than one from the plain text. */
++#if defined(__APPLE__)
++#define KK_MSL_CODEC KK_MSL_CODEC_LZFSE
++#else
++#define KK_MSL_CODEC KK_MSL_CODEC_STORED
++#endif
++
++/* Compresses text[0, size) into a buffer of exactly the compressed size, or
++ * returns NULL when the codec does not make it smaller. */
++static uint8_t *
++kk_msl_compress(const char *text, uint32_t size, uint32_t *packed_size)
++{
++#if defined(__APPLE__)
++   /* The codec writes at most `size - 1` bytes, because anything that does not
++    * fit is not worth keeping. */
++   if (size < 2)
++      return NULL;
++
++   uint8_t *buffer = malloc(size - 1);
++   if (buffer == NULL)
++      return NULL;
++
++   const size_t written = compression_encode_buffer(
++      buffer, size - 1, (const uint8_t *)text, size, NULL,
++      COMPRESSION_LZFSE);
++   if (written == 0) {
++      free(buffer);
++      return NULL;
++   }
++
++   /* The buffer is as large as the text.  Keep a block of exactly the
++    * compressed size, since holding the rest would defeat the purpose of
++    * compressing. */
++   uint8_t *packed = malloc(written);
++   if (packed != NULL) {
++      memcpy(packed, buffer, written);
++      *packed_size = written;
++   }
++   free(buffer);
++   return packed;
++#else
++   (void)text;
++   (void)size;
++   (void)packed_size;
++   return NULL;
++#endif
++}
++
++bool
++kk_msl_pack(struct msl_compile_data *data)
++{
++   if (data->code == NULL || data->packed != NULL)
++      return data->packed != NULL;
++
++   const size_t length = strlen(data->code) + 1;
++   if (length > KK_MSL_MAX_CODE_SIZE)
++      return false;
++
++   uint32_t packed_size = 0;
++   uint8_t *packed = kk_msl_compress(data->code, length, &packed_size);
++   if (packed == NULL)
++      return false;
++
++   ralloc_free(data->code);
++   data->code = NULL;
++   data->packed = packed;
++   data->packed_size = packed_size;
++   data->code_size = length;
++   data->codec = KK_MSL_CODEC;
++   return true;
++}
++
++bool
++kk_msl_pack_copy(struct msl_compile_data *dst,
++                 const struct msl_compile_data *src)
++{
++   if (dst->code == NULL || dst->packed != NULL || src->packed == NULL)
++      return false;
++
++   /* The same text compresses to the same bytes, so the sizes tell the texts
++    * apart cheaply; the caller says they are the same text. */
++   if (strlen(dst->code) + 1 != src->code_size)
++      return false;
++
++   uint8_t *packed = malloc(src->packed_size);
++   if (packed == NULL)
++      return false;
++   memcpy(packed, src->packed, src->packed_size);
++
++   ralloc_free(dst->code);
++   dst->code = NULL;
++   dst->packed = packed;
++   dst->packed_size = src->packed_size;
++   dst->code_size = src->code_size;
++   dst->codec = src->codec;
++   return true;
++}
++
++bool
++kk_msl_adopt(struct msl_compile_data *data, enum kk_msl_codec codec,
++             const void *bytes, uint32_t packed_size, uint32_t code_size)
++{
++   if (codec >= KK_MSL_CODEC_COUNT || code_size < 1 ||
++       code_size > KK_MSL_MAX_CODE_SIZE || packed_size < 1 ||
++       packed_size > code_size)
++      return false;
++   if (codec == KK_MSL_CODEC_STORED && packed_size != code_size)
++      return false;
++#if !defined(__APPLE__)
++   if (codec != KK_MSL_CODEC_STORED)
++      return false;
++#endif
++
++   if (codec == KK_MSL_CODEC_STORED) {
++      /* The text itself is no smaller packed than plain, so keep it plain. */
++      char *code = ralloc_size(NULL, code_size);
++      if (code == NULL)
++         return false;
++      memcpy(code, bytes, code_size);
++      if (code[code_size - 1] != '\0') {
++         ralloc_free(code);
++         return false;
++      }
++      data->code = code;
++      return true;
++   }
++
++   uint8_t *packed = malloc(packed_size);
++   if (packed == NULL)
++      return false;
++   memcpy(packed, bytes, packed_size);
++
++   data->packed = packed;
++   data->packed_size = packed_size;
++   data->code_size = code_size;
++   data->codec = codec;
++   return true;
++}
++
++bool
++kk_msl_has_text(const struct msl_compile_data *data)
++{
++   return data->code != NULL || data->packed != NULL;
++}
++
++const char *
++kk_msl_text(const struct msl_compile_data *data, char **scratch)
++{
++   *scratch = NULL;
++   if (data->code != NULL)
++      return data->code;
++   if (data->packed == NULL)
++      return NULL;
++
++#if defined(__APPLE__)
++   if (data->codec != KK_MSL_CODEC_LZFSE)
++      return NULL;
++
++   char *text = malloc(data->code_size);
++   if (text == NULL)
++      return NULL;
++
++   const size_t read = compression_decode_buffer(
++      (uint8_t *)text, data->code_size, data->packed, data->packed_size, NULL,
++      COMPRESSION_LZFSE);
++   /* The terminator is part of the text, and a text that is not terminated is
++    * not one this driver compressed. */
++   if (read != data->code_size || text[data->code_size - 1] != '\0') {
++      free(text);
++      return NULL;
++   }
++
++   *scratch = text;
++   return text;
++#else
++   return NULL;
++#endif
++}
++
++void
++kk_msl_text_release(char *scratch)
++{
++   free(scratch);
++}
++
++size_t
++kk_msl_resident_bytes(const struct msl_compile_data *data)
++{
++   if (data->packed != NULL)
++      return data->packed_size;
++   if (data->code != NULL)
++      return strlen(data->code) + 1;
++   return 0;
++}
++
++size_t
++kk_msl_text_bytes(const struct msl_compile_data *data)
++{
++   if (data->packed != NULL)
++      return data->code_size;
++   if (data->code != NULL)
++      return strlen(data->code) + 1;
++   return 0;
++}
++
++void
++kk_msl_drop(struct msl_compile_data *data)
++{
++   ralloc_free(data->code);
++   data->code = NULL;
++   free(data->packed);
++   data->packed = NULL;
++   data->packed_size = 0;
++   data->code_size = 0;
++}
++
++void
++kk_msl_finish(struct msl_compile_data *data)
++{
++   kk_msl_drop(data);
++   ralloc_free(data->entrypoint_name);
++   data->entrypoint_name = NULL;
++}
+diff --git a/src/kosmickrisp/vulkan/kk_msl_pack.h b/src/kosmickrisp/vulkan/kk_msl_pack.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..116e3f3cb4b3ed4fde9e440832d10bac8fe8ac6f
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/kk_msl_pack.h
+@@ -0,0 +1,95 @@
++/*
++ * Copyright 2026 Google LLC
++ * SPDX-License-Identifier: MIT
++ */
++
++#ifndef KK_MSL_PACK_H
++#define KK_MSL_PACK_H 1
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* The MSL source of one Metal function and the name of the entrypoint to build
++ * it from.
++ *
++ * A shader needs its MSL again only to build another Metal pipeline from it
++ * (a render pass that binds fewer attachments than the pipeline declares) and
++ * to write it to a pipeline cache, and the text is the largest thing a
++ * pipeline keeps: tens of KiB for a small shader, a third of a MiB for a large
++ * one.  So a finished shader holds it compressed.  Exactly one of three forms
++ * is live: the plain text in `code`, the compressed text in `packed`, or
++ * neither once the owner dropped it.  kk_msl_text() gives the text of either
++ * of the first two.
++ */
++struct msl_compile_data {
++   char *code;
++   char *entrypoint_name;
++   /* malloc'd, so the heap accounts exactly for the bytes it holds. */
++   uint8_t *packed;
++   /* Bytes of `packed`, and of the text with its terminator. */
++   uint32_t packed_size;
++   uint32_t code_size;
++   /* An enum kk_msl_codec. */
++   uint8_t codec;
++};
++
++/* The serialized form of a text carries its codec, so the one a build picks
++ * can change without making the bytes of an older one unreadable. */
++enum kk_msl_codec {
++   /* The bytes are the text itself. */
++   KK_MSL_CODEC_STORED = 0,
++   KK_MSL_CODEC_LZFSE = 1,
++   KK_MSL_CODEC_COUNT,
++};
++
++/* The most a text may hold, which is what a cache can ask a driver to hold. */
++#define KK_MSL_MAX_CODE_SIZE (256u << 20)
++
++/* Replaces the plain text by its compressed form when that is smaller.  The
++ * text stays when it is not, or when memory is short.  Returns whether the
++ * text is now compressed. */
++bool kk_msl_pack(struct msl_compile_data *data);
++
++/* Gives `dst`, whose plain text is the same as the compressed text of `src`, a
++ * copy of that compressed text instead of compressing it again.  Returns
++ * whether it did, and otherwise leaves `dst` alone. */
++bool kk_msl_pack_copy(struct msl_compile_data *dst,
++                      const struct msl_compile_data *src);
++
++/* Adopts compressed bytes read from a cache without decompressing them.  The
++ * bytes are copied.  Returns false when the sizes cannot be a text or memory
++ * is short. */
++bool kk_msl_adopt(struct msl_compile_data *data, enum kk_msl_codec codec,
++                  const void *bytes, uint32_t packed_size,
++                  uint32_t code_size);
++
++/* Whether the data holds a text in either form. */
++bool kk_msl_has_text(const struct msl_compile_data *data);
++
++/* The plain text, or NULL when there is none or when decompressing it ran out
++ * of memory or found the bytes corrupt.  A compressed text is decompressed into
++ * a temporary copy, which `*scratch` points to and the caller releases with
++ * kk_msl_text_release() once it is done with the returned text. */
++const char *kk_msl_text(const struct msl_compile_data *data, char **scratch);
++void kk_msl_text_release(char *scratch);
++
++/* The bytes of the text the data holds now, and of the text it stands for. */
++size_t kk_msl_resident_bytes(const struct msl_compile_data *data);
++size_t kk_msl_text_bytes(const struct msl_compile_data *data);
++
++/* Frees the text in whichever form it is held; the entrypoint stays. */
++void kk_msl_drop(struct msl_compile_data *data);
++
++/* Frees the text and the entrypoint. */
++void kk_msl_finish(struct msl_compile_data *data);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* KK_MSL_PACK_H */
+diff --git a/src/kosmickrisp/vulkan/kk_physical_device.c b/src/kosmickrisp/vulkan/kk_physical_device.c
+index b97f3e616386dd8f89f9d34b322e6c554f4c6487..728c665b043315c0e11c6d28aff31aef69a7cec9 100644
+--- a/src/kosmickrisp/vulkan/kk_physical_device.c
++++ b/src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -11,6 +11,7 @@
+ #include "kk_image.h"
+ #include "kk_instance.h"
+ #include "kk_nir_lower_vbo.h"
++#include "kk_shader.h"
+ #include "kk_sync.h"
+ #include "kk_wsi.h"
+ 
+@@ -1037,6 +1038,10 @@ kk_physical_device_init_pipeline_cache(struct kk_physical_device *pdev)
+ 
+    _mesa_blake3_update(&blake3_ctx, instance->driver_build_sha,
+                        sizeof(instance->driver_build_sha));
++   /* The build identity changes with every build, but a driver that reads a
++    * cache must also refuse the layout of the blobs an older one wrote. */
++   const uint32_t binary_format = KK_SHADER_BINARY_FORMAT;
++   _mesa_blake3_update(&blake3_ctx, &binary_format, sizeof(binary_format));
+ 
+    unsigned char blake3[BLAKE3_KEY_LEN];
+    _mesa_blake3_final(&blake3_ctx, blake3);
+diff --git a/src/kosmickrisp/vulkan/kk_shader.c b/src/kosmickrisp/vulkan/kk_shader.c
+index 830f3ad872204d5d0bc7907d770e39adda9e15da..cf85c52ee535220910bd324947911a2eca139aab 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.c
++++ b/src/kosmickrisp/vulkan/kk_shader.c
+@@ -1532,31 +1532,18 @@ kk_shader_destroy(struct vk_device *vk_dev, struct kk_shader *shader,
+          mtl_release(pipe->gfx.pre_render[i]);
+ 
+       /* Serialization data. */
+-      u_foreach_bit(i, shader->info.vs.additional_stages_bits) {
+-         struct msl_compile_data *data = &shader->msl_data[i];
+-         ralloc_free((void *)data->entrypoint_name);
+-         ralloc_free((void *)data->code);
+-      }
++      u_foreach_bit(i, shader->info.vs.additional_stages_bits)
++         kk_msl_finish(&shader->msl_data[i]);
++
++      kk_msl_finish(&shader->transform_feedback_pre_gs_msl);
++      kk_msl_finish(&shader->line_raster_materialize_msl);
++      kk_msl_finish(&shader->line_stipple_prefix_msl);
++      kk_msl_finish(&shader->geometry_main_msl);
++      kk_msl_finish(&shader->geometry_count_msl);
++      kk_msl_finish(&shader->geometry_pre_gs_msl);
++   }
+ 
+-      ralloc_free(
+-         (void *)shader->transform_feedback_pre_gs_msl.entrypoint_name);
+-      ralloc_free((void *)shader->transform_feedback_pre_gs_msl.code);
+-      ralloc_free(
+-         (void *)shader->line_raster_materialize_msl.entrypoint_name);
+-      ralloc_free((void *)shader->line_raster_materialize_msl.code);
+-      ralloc_free((void *)shader->line_stipple_prefix_msl.entrypoint_name);
+-      ralloc_free((void *)shader->line_stipple_prefix_msl.code);
+-      ralloc_free((void *)shader->geometry_main_msl.entrypoint_name);
+-      ralloc_free((void *)shader->geometry_main_msl.code);
+-      ralloc_free((void *)shader->geometry_count_msl.entrypoint_name);
+-      ralloc_free((void *)shader->geometry_count_msl.code);
+-      ralloc_free((void *)shader->geometry_pre_gs_msl.entrypoint_name);
+-      ralloc_free((void *)shader->geometry_pre_gs_msl.code);
+-   }
+-
+-   struct msl_compile_data *data = &shader->msl_data[shader->info.stage];
+-   ralloc_free((void *)data->entrypoint_name);
+-   ralloc_free((void *)data->code);
++   kk_msl_finish(&shader->msl_data[shader->info.stage]);
+ 
+    vk_shader_free(&dev->vk, pAllocator, &shader->vk);
+ }
+@@ -4084,9 +4071,15 @@ kk_compile_compute_pipeline(struct kk_device *device,
+                             uint32_t local_size_threads, bool emulated_stage,
+                             mtl_compute_pipeline_state **pipe)
+ {
++   char *scratch = NULL;
++   const char *code = kk_msl_text(data, &scratch);
++   if (code == NULL)
++      return VK_ERROR_INVALID_SHADER_NV;
++
+    mtl_library *library = mtl_new_library(
+-      device->mtl_compiler_handle, data->code, MTL_MATH_MODE_SAFE,
++      device->mtl_compiler_handle, code, MTL_MATH_MODE_SAFE,
+       MTL_MATH_FLOATING_POINT_FUNCTIONS_PRECISE);
++   kk_msl_text_release(scratch);
+    if (library == NULL)
+       return VK_ERROR_INVALID_SHADER_NV;
+ 
+@@ -4578,12 +4571,16 @@ kk_new_render_pipeline_state(struct kk_device *device, struct kk_shader *vs,
+    const mesa_shader_stage vs_stage = kk_render_pipeline_vertex_stage(vs);
+ 
+    const struct msl_compile_data *vs_data = &vs->msl_data[vs_stage];
+-   mtl_library *vertex_library =
+-      kk_msl_library_acquire(device, vs_data->code);
++   char *vs_scratch = NULL;
++   const char *vs_code = kk_msl_text(vs_data, &vs_scratch);
++   if (vs_code == NULL)
++      return VK_ERROR_INVALID_SHADER_NV;
++   mtl_library *vertex_library = kk_msl_library_acquire(device, vs_code);
+    if (vertex_library == NULL)
+       vertex_library = mtl_new_library(
+-         device->mtl_compiler_handle, vs_data->code, MTL_MATH_MODE_SAFE,
++         device->mtl_compiler_handle, vs_code, MTL_MATH_MODE_SAFE,
+          MTL_MATH_FLOATING_POINT_FUNCTIONS_PRECISE);
++   kk_msl_text_release(vs_scratch);
+    if (vertex_library == NULL)
+       return VK_ERROR_INVALID_SHADER_NV;
+ 
+@@ -4592,12 +4589,15 @@ kk_new_render_pipeline_state(struct kk_device *device, struct kk_shader *vs,
+                                           vs_data->entrypoint_name);
+ 
+    const struct msl_compile_data *fs_data = &vs->msl_data[MESA_SHADER_FRAGMENT];
++   char *fs_scratch = NULL;
++   const char *fs_code = kk_msl_text(fs_data, &fs_scratch);
+    mtl_library *fragment_library =
+-      kk_msl_library_acquire(device, fs_data->code);
+-   if (fragment_library == NULL)
++      fs_code != NULL ? kk_msl_library_acquire(device, fs_code) : NULL;
++   if (fragment_library == NULL && fs_code != NULL)
+       fragment_library = mtl_new_library(
+-         device->mtl_compiler_handle, fs_data->code, MTL_MATH_MODE_SAFE,
++         device->mtl_compiler_handle, fs_code, MTL_MATH_MODE_SAFE,
+          MTL_MATH_FLOATING_POINT_FUNCTIONS_PRECISE);
++   kk_msl_text_release(fs_scratch);
+    if (fragment_library == NULL) {
+       result = VK_ERROR_INVALID_SHADER_NV;
+       goto destroy_vertex;
+@@ -4912,7 +4912,7 @@ kk_compile_shaders_single(struct vk_device *device, uint32_t shader_count,
+                           const VkAllocationCallbacks *pAllocator,
+                           struct vk_shader **shaders_out, bool byte_strides,
+                           bool pipeline_statistics, bool fast_link,
+-                          bool precompile_only);
++                          bool precompile_only, bool pack_msl);
+ 
+ /* The substates a graphics pipeline library does not own yet.  Each is filled
+  * with the value that selects Metal's state-independent path - Metal's own
+@@ -5075,7 +5075,7 @@ kk_precompile_library_stages(struct kk_device *dev, uint32_t shader_count,
+ 
+    VkResult result = kk_compile_shaders_single(
+       &dev->vk, shader_count, clones, &precompile.state, enabled_features,
+-      NULL, compiled, false, pipeline_statistics, true, true);
++      NULL, compiled, false, pipeline_statistics, true, true, false);
+    if (result != VK_SUCCESS)
+       return;
+ 
+@@ -5219,6 +5219,49 @@ kk_append_line_materialize(struct kk_device *dev, nir_shader **nir_shaders,
+       lower_as, state);
+ }
+ 
++/* Every Metal pipeline a shader needs is built by now, so the MSL it was built
++ * from is kept compressed: it is read again only to build a pipeline for
++ * another set of attachments, and to write a pipeline cache. */
++static void
++kk_pack_shader_msl(struct kk_shader *shader, struct kk_shader *const *sources,
++                   uint32_t source_count)
++{
++   for (uint32_t stage = 0; stage < MESA_SHADER_STAGES; stage++) {
++      struct msl_compile_data *data = &shader->msl_data[stage];
++      if (data->code == NULL)
++         continue;
++
++      /* The vertex shader of a pipeline carries a copy of each other stage's
++       * text, which that stage's own shader has compressed by now. */
++      bool copied = false;
++      if (stage != shader->info.stage) {
++         for (uint32_t i = 0; i < source_count && !copied; i++) {
++            if (sources[i] != shader && sources[i]->info.stage == stage)
++               copied = kk_msl_pack_copy(data, &sources[i]->msl_data[stage]);
++         }
++      }
++      if (!copied)
++         kk_msl_pack(data);
++   }
++
++   kk_msl_pack(&shader->transform_feedback_pre_gs_msl);
++   kk_msl_pack(&shader->line_raster_materialize_msl);
++   kk_msl_pack(&shader->line_stipple_prefix_msl);
++   kk_msl_pack(&shader->geometry_main_msl);
++   kk_msl_pack(&shader->geometry_count_msl);
++   kk_msl_pack(&shader->geometry_pre_gs_msl);
++}
++
++static void
++kk_pack_shaders_msl(struct kk_shader *const *shaders, uint32_t shader_count)
++{
++   /* The shaders that only hold their own text go first, so that the vertex
++    * shader copies theirs. */
++   for (uint32_t i = 1; i < shader_count; i++)
++      kk_pack_shader_msl(shaders[i], shaders, shader_count);
++   kk_pack_shader_msl(shaders[0], shaders, shader_count);
++}
++
+ static VkResult
+ kk_compile_shaders_single(struct vk_device *device, uint32_t shader_count,
+                         struct vk_shader_compile_info *infos,
+@@ -5227,7 +5270,7 @@ kk_compile_shaders_single(struct vk_device *device, uint32_t shader_count,
+                         const VkAllocationCallbacks *pAllocator,
+                         struct vk_shader **shaders_out, bool byte_strides,
+                         bool pipeline_statistics, bool fast_link,
+-                        bool precompile_only)
++                        bool precompile_only, bool pack_msl)
+ {
+    VkResult result = VK_SUCCESS;
+    struct kk_device *dev = container_of(device, struct kk_device, vk);
+@@ -5886,6 +5929,8 @@ kk_compile_shaders_single(struct vk_device *device, uint32_t shader_count,
+       /* Memset the output array */
+       memset(shaders_out, 0, shader_count * sizeof(*shaders_out));
+    } else {
++      if (pack_msl)
++         kk_pack_shaders_msl(shaders, shader_count);
+       memcpy(shaders_out, shaders, shader_count * sizeof(*shaders_out));
+    }
+ 
+@@ -5901,7 +5946,7 @@ kk_compile_shaders_impl(struct vk_device *device, uint32_t shader_count,
+                         const struct vk_features *enabled_features,
+                         const VkAllocationCallbacks *pAllocator,
+                         struct vk_shader **shaders_out, bool byte_strides,
+-                        bool fast_link)
++                        bool fast_link, bool pack_msl)
+ {
+    /* kk_compile_shaders keeps the NIR of incomplete GPL subsets and dynamic
+     * vertex inputs. Reachable classes are compiled once at complete creation
+@@ -5912,7 +5957,7 @@ kk_compile_shaders_impl(struct vk_device *device, uint32_t shader_count,
+       return kk_compile_shaders_single(device, shader_count, infos, state,
+                                        enabled_features, pAllocator,
+                                        shaders_out, byte_strides, false,
+-                                       fast_link, false);
++                                       fast_link, false, pack_msl);
+ 
+    /* Query masks and result addresses are draw data. Compile their guards
+     * into the executable once, so beginning or ending a query does not need
+@@ -5992,7 +6037,7 @@ kk_compile_shaders_impl(struct vk_device *device, uint32_t shader_count,
+       result = kk_compile_shaders_single(
+          device, shader_count, variant_infos, &executable, enabled_features,
+          pAllocator, compiled, byte_strides, pipeline_statistics, fast_link,
+-         false);
++         false, pack_msl);
+       if (result != VK_SUCCESS)
+          goto fail;
+ 
+@@ -6059,7 +6104,7 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
+ 
+    return kk_compile_shaders_impl(device, shader_count, infos, state,
+                                   enabled_features, pAllocator, shaders_out,
+-                                  false, false);
++                                  false, false, true);
+ }
+ 
+ /* The compile infos of a deferred graphics chain, one stage per entry in
+@@ -6387,7 +6432,7 @@ kk_compile_dynamic_vertex_input_variant(
+    result = kk_compile_shaders_impl(
+       &dev->vk, linked->dynamic.shader_count, infos, &state,
+       &dev->vk.enabled_features, &dev->vk.alloc, compiled, byte_strides,
+-      false);
++      false, false);
+    if (result != VK_SUCCESS)
+       return result;
+ 
+@@ -6417,22 +6462,14 @@ static void
+ kk_shader_drop_msl(struct kk_shader *shader,
+                    struct kk_linked_graphics_pipeline *origin)
+ {
+-   for (uint32_t stage = 0; stage < MESA_SHADER_STAGES; stage++) {
+-      ralloc_free(shader->msl_data[stage].code);
+-      shader->msl_data[stage].code = NULL;
+-   }
+-   ralloc_free(shader->transform_feedback_pre_gs_msl.code);
+-   shader->transform_feedback_pre_gs_msl.code = NULL;
+-   ralloc_free(shader->line_raster_materialize_msl.code);
+-   shader->line_raster_materialize_msl.code = NULL;
+-   ralloc_free(shader->line_stipple_prefix_msl.code);
+-   shader->line_stipple_prefix_msl.code = NULL;
+-   ralloc_free(shader->geometry_main_msl.code);
+-   shader->geometry_main_msl.code = NULL;
+-   ralloc_free(shader->geometry_count_msl.code);
+-   shader->geometry_count_msl.code = NULL;
+-   ralloc_free(shader->geometry_pre_gs_msl.code);
+-   shader->geometry_pre_gs_msl.code = NULL;
++   for (uint32_t stage = 0; stage < MESA_SHADER_STAGES; stage++)
++      kk_msl_drop(&shader->msl_data[stage]);
++   kk_msl_drop(&shader->transform_feedback_pre_gs_msl);
++   kk_msl_drop(&shader->line_raster_materialize_msl);
++   kk_msl_drop(&shader->line_stipple_prefix_msl);
++   kk_msl_drop(&shader->geometry_main_msl);
++   kk_msl_drop(&shader->geometry_count_msl);
++   kk_msl_drop(&shader->geometry_pre_gs_msl);
+    shader->msl_origin = origin;
+ }
+ 
+@@ -6759,7 +6796,7 @@ kk_link_graphics_pipeline(
+ 
+       result = kk_compile_shaders_impl(
+          vk_dev, shader_count, infos, state, &vk_dev->enabled_features,
+-         &dev->vk.alloc, compiled, false, fast_link);
++         &dev->vk.alloc, compiled, false, fast_link, true);
+       if (result == VK_SUCCESS || !fast_link)
+          break;
+ 
+@@ -6810,15 +6847,29 @@ kk_link_graphics_pipeline(
+    return VK_SUCCESS;
+ }
+ 
++/* The text goes to the blob in the form the shader holds it, so a pipeline
++ * cache holds the compressed text and loading it compresses nothing:
++ *
++ *    u32 entrypoint length, u32 text length, u32 stored length, u8 codec,
++ *    the entrypoint, the stored bytes
++ *
++ * where the stored bytes are the text itself for KK_MSL_CODEC_STORED. */
+ static void
+ kk_msl_data_serialize(const struct msl_compile_data *data, struct blob *blob)
+ {
+    uint32_t entrypoint_length = strlen(data->entrypoint_name) + 1;
+-   uint32_t code_length = strlen(data->code) + 1;
++   const void *bytes = data->packed != NULL ? (const void *)data->packed
++                                            : (const void *)data->code;
++   const uint32_t stored_length = kk_msl_resident_bytes(data);
++   const uint32_t code_length = kk_msl_text_bytes(data);
++   const uint8_t codec =
++      data->packed != NULL ? data->codec : KK_MSL_CODEC_STORED;
+    blob_write_uint32(blob, entrypoint_length);
+    blob_write_uint32(blob, code_length);
++   blob_write_uint32(blob, stored_length);
++   blob_write_uint8(blob, codec);
+    blob_write_bytes(blob, data->entrypoint_name, entrypoint_length);
+-   blob_write_bytes(blob, data->code, code_length);
++   blob_write_bytes(blob, bytes, stored_length);
+ }
+ 
+ static void
+@@ -6887,18 +6938,27 @@ kk_msl_data_deserialize(struct blob_reader *blob,
+ {
+    const uint32_t entrypoint_length = blob_read_uint32(blob);
+    const uint32_t code_length = blob_read_uint32(blob);
++   const uint32_t stored_length = blob_read_uint32(blob);
++   const uint8_t codec = blob_read_uint8(blob);
++   /* Lengths a blob cannot hold are corrupt, and are refused before anything
++    * is allocated for them. */
++   if (blob->overrun || entrypoint_length == 0 ||
++       entrypoint_length > blob->end - blob->current ||
++       stored_length > blob->end - blob->current - entrypoint_length)
++      return VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
++
+    data->entrypoint_name = ralloc_array(NULL, char, entrypoint_length);
+    if (data->entrypoint_name == NULL)
+       return VK_ERROR_OUT_OF_HOST_MEMORY;
+-
+-   data->code = ralloc_array(NULL, char, code_length);
+-   if (data->code == NULL)
+-      return VK_ERROR_OUT_OF_HOST_MEMORY;
+-
+    blob_copy_bytes(blob, (void *)data->entrypoint_name, entrypoint_length);
+-   blob_copy_bytes(blob, (void *)data->code, code_length);
++   if (data->entrypoint_name[entrypoint_length - 1] != '\0')
++      return VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
+ 
+-   if (blob->overrun)
++   /* The compressed text stays compressed: it is decompressed only to build a
++    * pipeline from it. */
++   const void *bytes = blob_read_bytes(blob, stored_length);
++   if (blob->overrun ||
++       !kk_msl_adopt(data, codec, bytes, stored_length, code_length))
+       return VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
+ 
+    return VK_SUCCESS;
+diff --git a/src/kosmickrisp/vulkan/kk_shader.h b/src/kosmickrisp/vulkan/kk_shader.h
+index 4817cc67bcc102a09ada72ff4f43402de31c33d2..f817df5a6789d8e388e7b4c8878e7cf1b61e73d6 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.h
++++ b/src/kosmickrisp/vulkan/kk_shader.h
+@@ -9,6 +9,7 @@
+ #define KK_SHADER_H 1
+ 
+ #include "kk_device_memory.h"
++#include "kk_msl_pack.h"
+ #include "kk_nir_lower_vbo.h"
+ #include "kk_private.h"
+ #include "kk_raster_variant.h"
+@@ -218,10 +219,10 @@ struct kk_pipeline_handles {
+    };
+ };
+ 
+-struct msl_compile_data {
+-   char *code;
+-   char *entrypoint_name;
+-};
++/* Layout of a serialized shader, in the pipeline cache identity: a blob of
++ * another layout is not offered to this driver.  2: MSL is serialized
++ * compressed. */
++#define KK_SHADER_BINARY_FORMAT 2
+ 
+ /* A Metal render pipeline trimmed to the colour attachments a render pass
+  * bound.  Only VK_EXT_dynamic_rendering_unused_attachments can bind fewer
+diff --git a/src/kosmickrisp/vulkan/meson.build b/src/kosmickrisp/vulkan/meson.build
+index 8115891beabed10c20187f64cf37d6ab9398c63a..a56c9d68c7c245d896c999cc7e378c56584e295d 100644
+--- a/src/kosmickrisp/vulkan/meson.build
++++ b/src/kosmickrisp/vulkan/meson.build
+@@ -95,6 +95,8 @@ kk_files = files(
+   'kk_image.h',
+   'kk_image.c',
+   'kk_line_raster.h',
++  'kk_msl_pack.h',
++  'kk_msl_pack.c',
+   'kk_raster_variant.h',
+   'kk_raster_edge.h',
+   'kk_tess_bound.h',
+@@ -145,7 +147,16 @@ kk_entrypoints = custom_target(
+ 
+ relative_dir = fs.relative_to(meson.global_source_root(), meson.global_build_root())
+ 
++# The MSL text a shader keeps is compressed (kk_msl_pack.c).  The SDK has
++# libcompression as a text stub only, which find_library does not look for
++# when the build prefers static libraries.
++kk_compression_dep = []
++if host_machine.system() == 'darwin'
++  kk_compression_dep = declare_dependency(link_args : ['-lcompression'])
++endif
++
+ kk_deps = [
++  kk_compression_dep,
+   idep_nir,
+   idep_mesautil,
+   idep_vulkan_runtime,
+@@ -494,6 +505,8 @@ if with_tests
+       ['line_raster_cache', ['test_line_raster_cache.cpp',
+                              'line_raster_cache_state.m'],
+        120, [kk_metal_frameworks], ['-Wno-unused-function']],
++      ['msl_packing', ['test_msl_packing.cpp', 'msl_packing_state.c'],
++       300, [kk_compression_dep], []],
+     ]
+       kk_metal_test_sources = []
+       foreach source : kk_metal_test[1]
+@@ -671,6 +684,7 @@ if with_tests
+     ['queue_error', ['kk_queue_error.c'], [idep_mtl_bridge]],
+     ['image_extent', ['kk_image_extent.c']],
+     ['linear_layout', []],
++    ['msl_pack', ['kk_msl_pack.c'], [idep_mesautil, kk_compression_dep]],
+   ]
+     test(
+       'kosmickrisp_' + kk_source_test[0],
+diff --git a/src/kosmickrisp/vulkan/tests/msl_packing_shaders/pack.comp b/src/kosmickrisp/vulkan/tests/msl_packing_shaders/pack.comp
+new file mode 100644
+index 0000000000000000000000000000000000000000..da4287e7842daa20177c61c929c5456ae5dd09ea
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/msl_packing_shaders/pack.comp
+@@ -0,0 +1,30 @@
++#version 450
++
++layout(local_size_x = 64) in;
++
++layout(constant_id = 0) const int variant = 0;
++
++layout(set = 0, binding = 0) buffer Data {
++   uint values[];
++};
++
++#define STEP(n)                                                               \
++   h = h * 1664525u + 1013904223u + uint(variant + n);                        \
++   h ^= h >> 13;                                                              \
++   h = (h << 7) | (h >> 25);                                                  \
++   h += h.wxyz;
++
++void main()
++{
++   uint id = gl_GlobalInvocationID.x;
++   uvec4 h = uvec4(id, id + 1u, id + 2u, id + 3u);
++   STEP(0)
++   STEP(1)
++   STEP(2)
++   STEP(3)
++   STEP(4)
++   STEP(5)
++   STEP(6)
++   STEP(7)
++   values[id] = h.x ^ h.y ^ h.z ^ h.w;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/msl_packing_shaders/pack.comp.h b/src/kosmickrisp/vulkan/tests/msl_packing_shaders/pack.comp.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..6f1d8792ad3c602b94f17d53fa52d4eba3b89370
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/msl_packing_shaders/pack.comp.h
+@@ -0,0 +1,221 @@
++{0x07230203,0x00010600,0x000d000b,0x00000112,
++0x00000000,0x00020011,0x00000001,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x0007000f,0x00000005,0x00000004,0x6e69616d,
++0x00000000,0x0000000b,0x000000f8,0x00060010,
++0x00000004,0x00000011,0x00000040,0x00000001,
++0x00000001,0x00040047,0x0000000b,0x0000000b,
++0x0000001c,0x00040047,0x00000026,0x00000001,
++0x00000000,0x00040047,0x000000f5,0x00000006,
++0x00000004,0x00030047,0x000000f6,0x00000002,
++0x00050048,0x000000f6,0x00000000,0x00000023,
++0x00000000,0x00040047,0x000000f8,0x00000021,
++0x00000000,0x00040047,0x000000f8,0x00000022,
++0x00000000,0x00020013,0x00000002,0x00030021,
++0x00000003,0x00000002,0x00040015,0x00000006,
++0x00000020,0x00000000,0x00040017,0x00000009,
++0x00000006,0x00000003,0x00040020,0x0000000a,
++0x00000001,0x00000009,0x0004003b,0x0000000a,
++0x0000000b,0x00000001,0x0004002b,0x00000006,
++0x0000000c,0x00000000,0x00040020,0x0000000d,
++0x00000001,0x00000006,0x00040017,0x00000010,
++0x00000006,0x00000004,0x0004002b,0x00000006,
++0x00000015,0x00000001,0x0004002b,0x00000006,
++0x00000018,0x00000002,0x0004002b,0x00000006,
++0x0000001b,0x00000003,0x0004002b,0x00000006,
++0x0000001f,0x0019660d,0x0004002b,0x00000006,
++0x00000022,0x3c6ef35f,0x00040015,0x00000025,
++0x00000020,0x00000001,0x00040032,0x00000025,
++0x00000026,0x00000000,0x0004002b,0x00000025,
++0x00000027,0x00000000,0x00060034,0x00000025,
++0x00000028,0x00000080,0x00000026,0x00000027,
++0x00060034,0x00000006,0x00000029,0x00000080,
++0x00000028,0x0000000c,0x0004002b,0x00000025,
++0x0000002d,0x0000000d,0x00040017,0x0000002e,
++0x00000025,0x00000004,0x0004002b,0x00000025,
++0x00000034,0x00000007,0x0004002b,0x00000025,
++0x00000038,0x00000019,0x0004002b,0x00000025,
++0x00000045,0x00000001,0x00060034,0x00000025,
++0x00000046,0x00000080,0x00000026,0x00000045,
++0x00060034,0x00000006,0x00000047,0x00000080,
++0x00000046,0x0000000c,0x0004002b,0x00000025,
++0x0000005f,0x00000002,0x00060034,0x00000025,
++0x00000060,0x00000080,0x00000026,0x0000005f,
++0x00060034,0x00000006,0x00000061,0x00000080,
++0x00000060,0x0000000c,0x0004002b,0x00000025,
++0x00000079,0x00000003,0x00060034,0x00000025,
++0x0000007a,0x00000080,0x00000026,0x00000079,
++0x00060034,0x00000006,0x0000007b,0x00000080,
++0x0000007a,0x0000000c,0x0004002b,0x00000025,
++0x00000093,0x00000004,0x00060034,0x00000025,
++0x00000094,0x00000080,0x00000026,0x00000093,
++0x00060034,0x00000006,0x00000095,0x00000080,
++0x00000094,0x0000000c,0x0004002b,0x00000025,
++0x000000ad,0x00000005,0x00060034,0x00000025,
++0x000000ae,0x00000080,0x00000026,0x000000ad,
++0x00060034,0x00000006,0x000000af,0x00000080,
++0x000000ae,0x0000000c,0x0004002b,0x00000025,
++0x000000c7,0x00000006,0x00060034,0x00000025,
++0x000000c8,0x00000080,0x00000026,0x000000c7,
++0x00060034,0x00000006,0x000000c9,0x00000080,
++0x000000c8,0x0000000c,0x00060034,0x00000025,
++0x000000e1,0x00000080,0x00000026,0x00000034,
++0x00060034,0x00000006,0x000000e2,0x00000080,
++0x000000e1,0x0000000c,0x0003001d,0x000000f5,
++0x00000006,0x0003001e,0x000000f6,0x000000f5,
++0x00040020,0x000000f7,0x0000000c,0x000000f6,
++0x0004003b,0x000000f7,0x000000f8,0x0000000c,
++0x00040020,0x00000105,0x0000000c,0x00000006,
++0x0007002c,0x00000010,0x0000010d,0x0000001f,
++0x0000001f,0x0000001f,0x0000001f,0x0007002c,
++0x00000010,0x0000010e,0x00000022,0x00000022,
++0x00000022,0x00000022,0x0007002c,0x0000002e,
++0x0000010f,0x0000002d,0x0000002d,0x0000002d,
++0x0000002d,0x0007002c,0x0000002e,0x00000110,
++0x00000034,0x00000034,0x00000034,0x00000034,
++0x0007002c,0x0000002e,0x00000111,0x00000038,
++0x00000038,0x00000038,0x00000038,0x00050036,
++0x00000002,0x00000004,0x00000000,0x00000003,
++0x000200f8,0x00000005,0x00050041,0x0000000d,
++0x0000000e,0x0000000b,0x0000000c,0x0004003d,
++0x00000006,0x0000000f,0x0000000e,0x00050080,
++0x00000006,0x00000016,0x0000000f,0x00000015,
++0x00050080,0x00000006,0x00000019,0x0000000f,
++0x00000018,0x00050080,0x00000006,0x0000001c,
++0x0000000f,0x0000001b,0x00070050,0x00000010,
++0x0000001d,0x0000000f,0x00000016,0x00000019,
++0x0000001c,0x00050084,0x00000010,0x00000021,
++0x0000001d,0x0000010d,0x00050080,0x00000010,
++0x00000024,0x00000021,0x0000010e,0x00070050,
++0x00000010,0x0000002a,0x00000029,0x00000029,
++0x00000029,0x00000029,0x00050080,0x00000010,
++0x0000002b,0x00000024,0x0000002a,0x000500c2,
++0x00000010,0x00000030,0x0000002b,0x0000010f,
++0x000500c6,0x00000010,0x00000032,0x0000002b,
++0x00000030,0x000500c4,0x00000010,0x00000036,
++0x00000032,0x00000110,0x000500c2,0x00000010,
++0x0000003a,0x00000032,0x00000111,0x000500c5,
++0x00000010,0x0000003b,0x00000036,0x0000003a,
++0x0009004f,0x00000010,0x0000003d,0x0000003b,
++0x0000003b,0x00000003,0x00000000,0x00000001,
++0x00000002,0x00050080,0x00000010,0x0000003f,
++0x0000003b,0x0000003d,0x00050084,0x00000010,
++0x00000042,0x0000003f,0x0000010d,0x00050080,
++0x00000010,0x00000044,0x00000042,0x0000010e,
++0x00070050,0x00000010,0x00000048,0x00000047,
++0x00000047,0x00000047,0x00000047,0x00050080,
++0x00000010,0x00000049,0x00000044,0x00000048,
++0x000500c2,0x00000010,0x0000004c,0x00000049,
++0x0000010f,0x000500c6,0x00000010,0x0000004e,
++0x00000049,0x0000004c,0x000500c4,0x00000010,
++0x00000051,0x0000004e,0x00000110,0x000500c2,
++0x00000010,0x00000054,0x0000004e,0x00000111,
++0x000500c5,0x00000010,0x00000055,0x00000051,
++0x00000054,0x0009004f,0x00000010,0x00000057,
++0x00000055,0x00000055,0x00000003,0x00000000,
++0x00000001,0x00000002,0x00050080,0x00000010,
++0x00000059,0x00000055,0x00000057,0x00050084,
++0x00000010,0x0000005c,0x00000059,0x0000010d,
++0x00050080,0x00000010,0x0000005e,0x0000005c,
++0x0000010e,0x00070050,0x00000010,0x00000062,
++0x00000061,0x00000061,0x00000061,0x00000061,
++0x00050080,0x00000010,0x00000063,0x0000005e,
++0x00000062,0x000500c2,0x00000010,0x00000066,
++0x00000063,0x0000010f,0x000500c6,0x00000010,
++0x00000068,0x00000063,0x00000066,0x000500c4,
++0x00000010,0x0000006b,0x00000068,0x00000110,
++0x000500c2,0x00000010,0x0000006e,0x00000068,
++0x00000111,0x000500c5,0x00000010,0x0000006f,
++0x0000006b,0x0000006e,0x0009004f,0x00000010,
++0x00000071,0x0000006f,0x0000006f,0x00000003,
++0x00000000,0x00000001,0x00000002,0x00050080,
++0x00000010,0x00000073,0x0000006f,0x00000071,
++0x00050084,0x00000010,0x00000076,0x00000073,
++0x0000010d,0x00050080,0x00000010,0x00000078,
++0x00000076,0x0000010e,0x00070050,0x00000010,
++0x0000007c,0x0000007b,0x0000007b,0x0000007b,
++0x0000007b,0x00050080,0x00000010,0x0000007d,
++0x00000078,0x0000007c,0x000500c2,0x00000010,
++0x00000080,0x0000007d,0x0000010f,0x000500c6,
++0x00000010,0x00000082,0x0000007d,0x00000080,
++0x000500c4,0x00000010,0x00000085,0x00000082,
++0x00000110,0x000500c2,0x00000010,0x00000088,
++0x00000082,0x00000111,0x000500c5,0x00000010,
++0x00000089,0x00000085,0x00000088,0x0009004f,
++0x00000010,0x0000008b,0x00000089,0x00000089,
++0x00000003,0x00000000,0x00000001,0x00000002,
++0x00050080,0x00000010,0x0000008d,0x00000089,
++0x0000008b,0x00050084,0x00000010,0x00000090,
++0x0000008d,0x0000010d,0x00050080,0x00000010,
++0x00000092,0x00000090,0x0000010e,0x00070050,
++0x00000010,0x00000096,0x00000095,0x00000095,
++0x00000095,0x00000095,0x00050080,0x00000010,
++0x00000097,0x00000092,0x00000096,0x000500c2,
++0x00000010,0x0000009a,0x00000097,0x0000010f,
++0x000500c6,0x00000010,0x0000009c,0x00000097,
++0x0000009a,0x000500c4,0x00000010,0x0000009f,
++0x0000009c,0x00000110,0x000500c2,0x00000010,
++0x000000a2,0x0000009c,0x00000111,0x000500c5,
++0x00000010,0x000000a3,0x0000009f,0x000000a2,
++0x0009004f,0x00000010,0x000000a5,0x000000a3,
++0x000000a3,0x00000003,0x00000000,0x00000001,
++0x00000002,0x00050080,0x00000010,0x000000a7,
++0x000000a3,0x000000a5,0x00050084,0x00000010,
++0x000000aa,0x000000a7,0x0000010d,0x00050080,
++0x00000010,0x000000ac,0x000000aa,0x0000010e,
++0x00070050,0x00000010,0x000000b0,0x000000af,
++0x000000af,0x000000af,0x000000af,0x00050080,
++0x00000010,0x000000b1,0x000000ac,0x000000b0,
++0x000500c2,0x00000010,0x000000b4,0x000000b1,
++0x0000010f,0x000500c6,0x00000010,0x000000b6,
++0x000000b1,0x000000b4,0x000500c4,0x00000010,
++0x000000b9,0x000000b6,0x00000110,0x000500c2,
++0x00000010,0x000000bc,0x000000b6,0x00000111,
++0x000500c5,0x00000010,0x000000bd,0x000000b9,
++0x000000bc,0x0009004f,0x00000010,0x000000bf,
++0x000000bd,0x000000bd,0x00000003,0x00000000,
++0x00000001,0x00000002,0x00050080,0x00000010,
++0x000000c1,0x000000bd,0x000000bf,0x00050084,
++0x00000010,0x000000c4,0x000000c1,0x0000010d,
++0x00050080,0x00000010,0x000000c6,0x000000c4,
++0x0000010e,0x00070050,0x00000010,0x000000ca,
++0x000000c9,0x000000c9,0x000000c9,0x000000c9,
++0x00050080,0x00000010,0x000000cb,0x000000c6,
++0x000000ca,0x000500c2,0x00000010,0x000000ce,
++0x000000cb,0x0000010f,0x000500c6,0x00000010,
++0x000000d0,0x000000cb,0x000000ce,0x000500c4,
++0x00000010,0x000000d3,0x000000d0,0x00000110,
++0x000500c2,0x00000010,0x000000d6,0x000000d0,
++0x00000111,0x000500c5,0x00000010,0x000000d7,
++0x000000d3,0x000000d6,0x0009004f,0x00000010,
++0x000000d9,0x000000d7,0x000000d7,0x00000003,
++0x00000000,0x00000001,0x00000002,0x00050080,
++0x00000010,0x000000db,0x000000d7,0x000000d9,
++0x00050084,0x00000010,0x000000de,0x000000db,
++0x0000010d,0x00050080,0x00000010,0x000000e0,
++0x000000de,0x0000010e,0x00070050,0x00000010,
++0x000000e3,0x000000e2,0x000000e2,0x000000e2,
++0x000000e2,0x00050080,0x00000010,0x000000e4,
++0x000000e0,0x000000e3,0x000500c2,0x00000010,
++0x000000e7,0x000000e4,0x0000010f,0x000500c6,
++0x00000010,0x000000e9,0x000000e4,0x000000e7,
++0x000500c4,0x00000010,0x000000ec,0x000000e9,
++0x00000110,0x000500c2,0x00000010,0x000000ef,
++0x000000e9,0x00000111,0x000500c5,0x00000010,
++0x000000f0,0x000000ec,0x000000ef,0x0009004f,
++0x00000010,0x000000f2,0x000000f0,0x000000f0,
++0x00000003,0x00000000,0x00000001,0x00000002,
++0x00050080,0x00000010,0x000000f4,0x000000f0,
++0x000000f2,0x00050051,0x00000006,0x000000fb,
++0x000000f4,0x00000000,0x00050051,0x00000006,
++0x000000fd,0x000000f4,0x00000001,0x000500c6,
++0x00000006,0x000000fe,0x000000fb,0x000000fd,
++0x00050051,0x00000006,0x00000100,0x000000f4,
++0x00000002,0x000500c6,0x00000006,0x00000101,
++0x000000fe,0x00000100,0x00050051,0x00000006,
++0x00000103,0x000000f4,0x00000003,0x000500c6,
++0x00000006,0x00000104,0x00000101,0x00000103,
++0x00060041,0x00000105,0x00000106,0x000000f8,
++0x00000027,0x0000000f,0x0003003e,0x00000106,
++0x00000104,0x000100fd,0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/msl_packing_shaders/pack.frag b/src/kosmickrisp/vulkan/tests/msl_packing_shaders/pack.frag
+new file mode 100644
+index 0000000000000000000000000000000000000000..b4c8197666f669da43a2f3792133cdbedbf995ec
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/msl_packing_shaders/pack.frag
+@@ -0,0 +1,38 @@
++#version 450
++
++/* Integer arithmetic the compiler cannot fold, so that the MSL of a pipeline
++ * is as large as a real shader's.  The specialization constant gives each
++ * pipeline text of its own. */
++layout(constant_id = 0) const int variant = 0;
++
++layout(location = 0) in vec4 color;
++layout(location = 0) out vec4 out0;
++layout(location = 1) out vec4 out1;
++
++#define STEP(n)                                                               \
++   h = h * 1664525u + 1013904223u + uint(variant + n);                        \
++   h ^= h >> 13;                                                              \
++   h = (h << 7) | (h >> 25);                                                  \
++   h += h.wxyz;
++
++void main()
++{
++   uvec4 h = uvec4(floatBitsToUint(color.x), floatBitsToUint(color.y),
++                   floatBitsToUint(color.z), floatBitsToUint(color.w));
++   STEP(0)
++   STEP(1)
++   STEP(2)
++   STEP(3)
++   STEP(4)
++   STEP(5)
++   STEP(6)
++   STEP(7)
++   STEP(8)
++   STEP(9)
++   STEP(10)
++   STEP(11)
++   /* No pixel hashes to these values, so the outputs are the constants. */
++   const bool never = h.x == 12345u && h.y == 67u && h.z == 89u;
++   out0 = never ? vec4(0.0, 0.0, 1.0, 1.0) : vec4(1.0, 0.0, 0.0, 1.0);
++   out1 = never ? vec4(0.0, 0.0, 1.0, 1.0) : vec4(0.0, 1.0, 0.0, 1.0);
++}
+diff --git a/src/kosmickrisp/vulkan/tests/msl_packing_shaders/pack.frag.h b/src/kosmickrisp/vulkan/tests/msl_packing_shaders/pack.frag.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..9bc4a66bdddeaba4782208efadbcef170163468a
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/msl_packing_shaders/pack.frag.h
+@@ -0,0 +1,323 @@
++{0x07230203,0x00010600,0x000d000b,0x00000189,
++0x00000000,0x00020011,0x00000001,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x0008000f,0x00000004,0x00000004,0x6e69616d,
++0x00000000,0x0000000d,0x00000176,0x0000017d,
++0x00030010,0x00000004,0x00000007,0x00040047,
++0x0000000d,0x0000001e,0x00000000,0x00040047,
++0x00000028,0x00000001,0x00000000,0x00040047,
++0x00000176,0x0000001e,0x00000000,0x00040047,
++0x0000017d,0x0000001e,0x00000001,0x00020013,
++0x00000002,0x00030021,0x00000003,0x00000002,
++0x00040015,0x00000006,0x00000020,0x00000000,
++0x00040017,0x00000007,0x00000006,0x00000004,
++0x00030016,0x0000000a,0x00000020,0x00040017,
++0x0000000b,0x0000000a,0x00000004,0x00040020,
++0x0000000c,0x00000001,0x0000000b,0x0004003b,
++0x0000000c,0x0000000d,0x00000001,0x0004002b,
++0x00000006,0x0000000e,0x00000000,0x00040020,
++0x0000000f,0x00000001,0x0000000a,0x0004002b,
++0x00000006,0x00000013,0x00000001,0x0004002b,
++0x00000006,0x00000017,0x00000002,0x0004002b,
++0x00000006,0x0000001b,0x00000003,0x0004002b,
++0x00000006,0x00000021,0x0019660d,0x0004002b,
++0x00000006,0x00000024,0x3c6ef35f,0x00040015,
++0x00000027,0x00000020,0x00000001,0x00040032,
++0x00000027,0x00000028,0x00000000,0x0004002b,
++0x00000027,0x00000029,0x00000000,0x00060034,
++0x00000027,0x0000002a,0x00000080,0x00000028,
++0x00000029,0x00060034,0x00000006,0x0000002b,
++0x00000080,0x0000002a,0x0000000e,0x0004002b,
++0x00000027,0x0000002f,0x0000000d,0x00040017,
++0x00000030,0x00000027,0x00000004,0x0004002b,
++0x00000027,0x00000036,0x00000007,0x0004002b,
++0x00000027,0x0000003a,0x00000019,0x0004002b,
++0x00000027,0x00000047,0x00000001,0x00060034,
++0x00000027,0x00000048,0x00000080,0x00000028,
++0x00000047,0x00060034,0x00000006,0x00000049,
++0x00000080,0x00000048,0x0000000e,0x0004002b,
++0x00000027,0x00000061,0x00000002,0x00060034,
++0x00000027,0x00000062,0x00000080,0x00000028,
++0x00000061,0x00060034,0x00000006,0x00000063,
++0x00000080,0x00000062,0x0000000e,0x0004002b,
++0x00000027,0x0000007b,0x00000003,0x00060034,
++0x00000027,0x0000007c,0x00000080,0x00000028,
++0x0000007b,0x00060034,0x00000006,0x0000007d,
++0x00000080,0x0000007c,0x0000000e,0x0004002b,
++0x00000027,0x00000095,0x00000004,0x00060034,
++0x00000027,0x00000096,0x00000080,0x00000028,
++0x00000095,0x00060034,0x00000006,0x00000097,
++0x00000080,0x00000096,0x0000000e,0x0004002b,
++0x00000027,0x000000af,0x00000005,0x00060034,
++0x00000027,0x000000b0,0x00000080,0x00000028,
++0x000000af,0x00060034,0x00000006,0x000000b1,
++0x00000080,0x000000b0,0x0000000e,0x0004002b,
++0x00000027,0x000000c9,0x00000006,0x00060034,
++0x00000027,0x000000ca,0x00000080,0x00000028,
++0x000000c9,0x00060034,0x00000006,0x000000cb,
++0x00000080,0x000000ca,0x0000000e,0x00060034,
++0x00000027,0x000000e3,0x00000080,0x00000028,
++0x00000036,0x00060034,0x00000006,0x000000e4,
++0x00000080,0x000000e3,0x0000000e,0x0004002b,
++0x00000027,0x000000fc,0x00000008,0x00060034,
++0x00000027,0x000000fd,0x00000080,0x00000028,
++0x000000fc,0x00060034,0x00000006,0x000000fe,
++0x00000080,0x000000fd,0x0000000e,0x0004002b,
++0x00000027,0x00000116,0x00000009,0x00060034,
++0x00000027,0x00000117,0x00000080,0x00000028,
++0x00000116,0x00060034,0x00000006,0x00000118,
++0x00000080,0x00000117,0x0000000e,0x0004002b,
++0x00000027,0x00000130,0x0000000a,0x00060034,
++0x00000027,0x00000131,0x00000080,0x00000028,
++0x00000130,0x00060034,0x00000006,0x00000132,
++0x00000080,0x00000131,0x0000000e,0x0004002b,
++0x00000027,0x0000014a,0x0000000b,0x00060034,
++0x00000027,0x0000014b,0x00000080,0x00000028,
++0x0000014a,0x00060034,0x00000006,0x0000014c,
++0x00000080,0x0000014b,0x0000000e,0x00020014,
++0x0000015f,0x0004002b,0x00000006,0x00000165,
++0x00003039,0x0004002b,0x00000006,0x0000016b,
++0x00000043,0x0004002b,0x00000006,0x00000172,
++0x00000059,0x00040020,0x00000175,0x00000003,
++0x0000000b,0x0004003b,0x00000175,0x00000176,
++0x00000003,0x0004002b,0x0000000a,0x00000178,
++0x00000000,0x0004002b,0x0000000a,0x00000179,
++0x3f800000,0x0007002c,0x0000000b,0x0000017a,
++0x00000178,0x00000178,0x00000179,0x00000179,
++0x0007002c,0x0000000b,0x0000017b,0x00000179,
++0x00000178,0x00000178,0x00000179,0x0004003b,
++0x00000175,0x0000017d,0x00000003,0x0007002c,
++0x0000000b,0x0000017f,0x00000178,0x00000179,
++0x00000178,0x00000179,0x0007002c,0x00000007,
++0x00000184,0x00000021,0x00000021,0x00000021,
++0x00000021,0x0007002c,0x00000007,0x00000185,
++0x00000024,0x00000024,0x00000024,0x00000024,
++0x0007002c,0x00000030,0x00000186,0x0000002f,
++0x0000002f,0x0000002f,0x0000002f,0x0007002c,
++0x00000030,0x00000187,0x00000036,0x00000036,
++0x00000036,0x00000036,0x0007002c,0x00000030,
++0x00000188,0x0000003a,0x0000003a,0x0000003a,
++0x0000003a,0x00050036,0x00000002,0x00000004,
++0x00000000,0x00000003,0x000200f8,0x00000005,
++0x00050041,0x0000000f,0x00000010,0x0000000d,
++0x0000000e,0x0004003d,0x0000000a,0x00000011,
++0x00000010,0x0004007c,0x00000006,0x00000012,
++0x00000011,0x00050041,0x0000000f,0x00000014,
++0x0000000d,0x00000013,0x0004003d,0x0000000a,
++0x00000015,0x00000014,0x0004007c,0x00000006,
++0x00000016,0x00000015,0x00050041,0x0000000f,
++0x00000018,0x0000000d,0x00000017,0x0004003d,
++0x0000000a,0x00000019,0x00000018,0x0004007c,
++0x00000006,0x0000001a,0x00000019,0x00050041,
++0x0000000f,0x0000001c,0x0000000d,0x0000001b,
++0x0004003d,0x0000000a,0x0000001d,0x0000001c,
++0x0004007c,0x00000006,0x0000001e,0x0000001d,
++0x00070050,0x00000007,0x0000001f,0x00000012,
++0x00000016,0x0000001a,0x0000001e,0x00050084,
++0x00000007,0x00000023,0x0000001f,0x00000184,
++0x00050080,0x00000007,0x00000026,0x00000023,
++0x00000185,0x00070050,0x00000007,0x0000002c,
++0x0000002b,0x0000002b,0x0000002b,0x0000002b,
++0x00050080,0x00000007,0x0000002d,0x00000026,
++0x0000002c,0x000500c2,0x00000007,0x00000032,
++0x0000002d,0x00000186,0x000500c6,0x00000007,
++0x00000034,0x0000002d,0x00000032,0x000500c4,
++0x00000007,0x00000038,0x00000034,0x00000187,
++0x000500c2,0x00000007,0x0000003c,0x00000034,
++0x00000188,0x000500c5,0x00000007,0x0000003d,
++0x00000038,0x0000003c,0x0009004f,0x00000007,
++0x0000003f,0x0000003d,0x0000003d,0x00000003,
++0x00000000,0x00000001,0x00000002,0x00050080,
++0x00000007,0x00000041,0x0000003d,0x0000003f,
++0x00050084,0x00000007,0x00000044,0x00000041,
++0x00000184,0x00050080,0x00000007,0x00000046,
++0x00000044,0x00000185,0x00070050,0x00000007,
++0x0000004a,0x00000049,0x00000049,0x00000049,
++0x00000049,0x00050080,0x00000007,0x0000004b,
++0x00000046,0x0000004a,0x000500c2,0x00000007,
++0x0000004e,0x0000004b,0x00000186,0x000500c6,
++0x00000007,0x00000050,0x0000004b,0x0000004e,
++0x000500c4,0x00000007,0x00000053,0x00000050,
++0x00000187,0x000500c2,0x00000007,0x00000056,
++0x00000050,0x00000188,0x000500c5,0x00000007,
++0x00000057,0x00000053,0x00000056,0x0009004f,
++0x00000007,0x00000059,0x00000057,0x00000057,
++0x00000003,0x00000000,0x00000001,0x00000002,
++0x00050080,0x00000007,0x0000005b,0x00000057,
++0x00000059,0x00050084,0x00000007,0x0000005e,
++0x0000005b,0x00000184,0x00050080,0x00000007,
++0x00000060,0x0000005e,0x00000185,0x00070050,
++0x00000007,0x00000064,0x00000063,0x00000063,
++0x00000063,0x00000063,0x00050080,0x00000007,
++0x00000065,0x00000060,0x00000064,0x000500c2,
++0x00000007,0x00000068,0x00000065,0x00000186,
++0x000500c6,0x00000007,0x0000006a,0x00000065,
++0x00000068,0x000500c4,0x00000007,0x0000006d,
++0x0000006a,0x00000187,0x000500c2,0x00000007,
++0x00000070,0x0000006a,0x00000188,0x000500c5,
++0x00000007,0x00000071,0x0000006d,0x00000070,
++0x0009004f,0x00000007,0x00000073,0x00000071,
++0x00000071,0x00000003,0x00000000,0x00000001,
++0x00000002,0x00050080,0x00000007,0x00000075,
++0x00000071,0x00000073,0x00050084,0x00000007,
++0x00000078,0x00000075,0x00000184,0x00050080,
++0x00000007,0x0000007a,0x00000078,0x00000185,
++0x00070050,0x00000007,0x0000007e,0x0000007d,
++0x0000007d,0x0000007d,0x0000007d,0x00050080,
++0x00000007,0x0000007f,0x0000007a,0x0000007e,
++0x000500c2,0x00000007,0x00000082,0x0000007f,
++0x00000186,0x000500c6,0x00000007,0x00000084,
++0x0000007f,0x00000082,0x000500c4,0x00000007,
++0x00000087,0x00000084,0x00000187,0x000500c2,
++0x00000007,0x0000008a,0x00000084,0x00000188,
++0x000500c5,0x00000007,0x0000008b,0x00000087,
++0x0000008a,0x0009004f,0x00000007,0x0000008d,
++0x0000008b,0x0000008b,0x00000003,0x00000000,
++0x00000001,0x00000002,0x00050080,0x00000007,
++0x0000008f,0x0000008b,0x0000008d,0x00050084,
++0x00000007,0x00000092,0x0000008f,0x00000184,
++0x00050080,0x00000007,0x00000094,0x00000092,
++0x00000185,0x00070050,0x00000007,0x00000098,
++0x00000097,0x00000097,0x00000097,0x00000097,
++0x00050080,0x00000007,0x00000099,0x00000094,
++0x00000098,0x000500c2,0x00000007,0x0000009c,
++0x00000099,0x00000186,0x000500c6,0x00000007,
++0x0000009e,0x00000099,0x0000009c,0x000500c4,
++0x00000007,0x000000a1,0x0000009e,0x00000187,
++0x000500c2,0x00000007,0x000000a4,0x0000009e,
++0x00000188,0x000500c5,0x00000007,0x000000a5,
++0x000000a1,0x000000a4,0x0009004f,0x00000007,
++0x000000a7,0x000000a5,0x000000a5,0x00000003,
++0x00000000,0x00000001,0x00000002,0x00050080,
++0x00000007,0x000000a9,0x000000a5,0x000000a7,
++0x00050084,0x00000007,0x000000ac,0x000000a9,
++0x00000184,0x00050080,0x00000007,0x000000ae,
++0x000000ac,0x00000185,0x00070050,0x00000007,
++0x000000b2,0x000000b1,0x000000b1,0x000000b1,
++0x000000b1,0x00050080,0x00000007,0x000000b3,
++0x000000ae,0x000000b2,0x000500c2,0x00000007,
++0x000000b6,0x000000b3,0x00000186,0x000500c6,
++0x00000007,0x000000b8,0x000000b3,0x000000b6,
++0x000500c4,0x00000007,0x000000bb,0x000000b8,
++0x00000187,0x000500c2,0x00000007,0x000000be,
++0x000000b8,0x00000188,0x000500c5,0x00000007,
++0x000000bf,0x000000bb,0x000000be,0x0009004f,
++0x00000007,0x000000c1,0x000000bf,0x000000bf,
++0x00000003,0x00000000,0x00000001,0x00000002,
++0x00050080,0x00000007,0x000000c3,0x000000bf,
++0x000000c1,0x00050084,0x00000007,0x000000c6,
++0x000000c3,0x00000184,0x00050080,0x00000007,
++0x000000c8,0x000000c6,0x00000185,0x00070050,
++0x00000007,0x000000cc,0x000000cb,0x000000cb,
++0x000000cb,0x000000cb,0x00050080,0x00000007,
++0x000000cd,0x000000c8,0x000000cc,0x000500c2,
++0x00000007,0x000000d0,0x000000cd,0x00000186,
++0x000500c6,0x00000007,0x000000d2,0x000000cd,
++0x000000d0,0x000500c4,0x00000007,0x000000d5,
++0x000000d2,0x00000187,0x000500c2,0x00000007,
++0x000000d8,0x000000d2,0x00000188,0x000500c5,
++0x00000007,0x000000d9,0x000000d5,0x000000d8,
++0x0009004f,0x00000007,0x000000db,0x000000d9,
++0x000000d9,0x00000003,0x00000000,0x00000001,
++0x00000002,0x00050080,0x00000007,0x000000dd,
++0x000000d9,0x000000db,0x00050084,0x00000007,
++0x000000e0,0x000000dd,0x00000184,0x00050080,
++0x00000007,0x000000e2,0x000000e0,0x00000185,
++0x00070050,0x00000007,0x000000e5,0x000000e4,
++0x000000e4,0x000000e4,0x000000e4,0x00050080,
++0x00000007,0x000000e6,0x000000e2,0x000000e5,
++0x000500c2,0x00000007,0x000000e9,0x000000e6,
++0x00000186,0x000500c6,0x00000007,0x000000eb,
++0x000000e6,0x000000e9,0x000500c4,0x00000007,
++0x000000ee,0x000000eb,0x00000187,0x000500c2,
++0x00000007,0x000000f1,0x000000eb,0x00000188,
++0x000500c5,0x00000007,0x000000f2,0x000000ee,
++0x000000f1,0x0009004f,0x00000007,0x000000f4,
++0x000000f2,0x000000f2,0x00000003,0x00000000,
++0x00000001,0x00000002,0x00050080,0x00000007,
++0x000000f6,0x000000f2,0x000000f4,0x00050084,
++0x00000007,0x000000f9,0x000000f6,0x00000184,
++0x00050080,0x00000007,0x000000fb,0x000000f9,
++0x00000185,0x00070050,0x00000007,0x000000ff,
++0x000000fe,0x000000fe,0x000000fe,0x000000fe,
++0x00050080,0x00000007,0x00000100,0x000000fb,
++0x000000ff,0x000500c2,0x00000007,0x00000103,
++0x00000100,0x00000186,0x000500c6,0x00000007,
++0x00000105,0x00000100,0x00000103,0x000500c4,
++0x00000007,0x00000108,0x00000105,0x00000187,
++0x000500c2,0x00000007,0x0000010b,0x00000105,
++0x00000188,0x000500c5,0x00000007,0x0000010c,
++0x00000108,0x0000010b,0x0009004f,0x00000007,
++0x0000010e,0x0000010c,0x0000010c,0x00000003,
++0x00000000,0x00000001,0x00000002,0x00050080,
++0x00000007,0x00000110,0x0000010c,0x0000010e,
++0x00050084,0x00000007,0x00000113,0x00000110,
++0x00000184,0x00050080,0x00000007,0x00000115,
++0x00000113,0x00000185,0x00070050,0x00000007,
++0x00000119,0x00000118,0x00000118,0x00000118,
++0x00000118,0x00050080,0x00000007,0x0000011a,
++0x00000115,0x00000119,0x000500c2,0x00000007,
++0x0000011d,0x0000011a,0x00000186,0x000500c6,
++0x00000007,0x0000011f,0x0000011a,0x0000011d,
++0x000500c4,0x00000007,0x00000122,0x0000011f,
++0x00000187,0x000500c2,0x00000007,0x00000125,
++0x0000011f,0x00000188,0x000500c5,0x00000007,
++0x00000126,0x00000122,0x00000125,0x0009004f,
++0x00000007,0x00000128,0x00000126,0x00000126,
++0x00000003,0x00000000,0x00000001,0x00000002,
++0x00050080,0x00000007,0x0000012a,0x00000126,
++0x00000128,0x00050084,0x00000007,0x0000012d,
++0x0000012a,0x00000184,0x00050080,0x00000007,
++0x0000012f,0x0000012d,0x00000185,0x00070050,
++0x00000007,0x00000133,0x00000132,0x00000132,
++0x00000132,0x00000132,0x00050080,0x00000007,
++0x00000134,0x0000012f,0x00000133,0x000500c2,
++0x00000007,0x00000137,0x00000134,0x00000186,
++0x000500c6,0x00000007,0x00000139,0x00000134,
++0x00000137,0x000500c4,0x00000007,0x0000013c,
++0x00000139,0x00000187,0x000500c2,0x00000007,
++0x0000013f,0x00000139,0x00000188,0x000500c5,
++0x00000007,0x00000140,0x0000013c,0x0000013f,
++0x0009004f,0x00000007,0x00000142,0x00000140,
++0x00000140,0x00000003,0x00000000,0x00000001,
++0x00000002,0x00050080,0x00000007,0x00000144,
++0x00000140,0x00000142,0x00050084,0x00000007,
++0x00000147,0x00000144,0x00000184,0x00050080,
++0x00000007,0x00000149,0x00000147,0x00000185,
++0x00070050,0x00000007,0x0000014d,0x0000014c,
++0x0000014c,0x0000014c,0x0000014c,0x00050080,
++0x00000007,0x0000014e,0x00000149,0x0000014d,
++0x000500c2,0x00000007,0x00000151,0x0000014e,
++0x00000186,0x000500c6,0x00000007,0x00000153,
++0x0000014e,0x00000151,0x000500c4,0x00000007,
++0x00000156,0x00000153,0x00000187,0x000500c2,
++0x00000007,0x00000159,0x00000153,0x00000188,
++0x000500c5,0x00000007,0x0000015a,0x00000156,
++0x00000159,0x0009004f,0x00000007,0x0000015c,
++0x0000015a,0x0000015a,0x00000003,0x00000000,
++0x00000001,0x00000002,0x00050080,0x00000007,
++0x0000015e,0x0000015a,0x0000015c,0x00050051,
++0x00000006,0x00000164,0x0000015e,0x00000000,
++0x000500aa,0x0000015f,0x00000166,0x00000164,
++0x00000165,0x000300f7,0x00000168,0x00000000,
++0x000400fa,0x00000166,0x00000167,0x00000168,
++0x000200f8,0x00000167,0x00050051,0x00000006,
++0x0000016a,0x0000015e,0x00000001,0x000500aa,
++0x0000015f,0x0000016c,0x0000016a,0x0000016b,
++0x000200f9,0x00000168,0x000200f8,0x00000168,
++0x000700f5,0x0000015f,0x0000016d,0x00000166,
++0x00000005,0x0000016c,0x00000167,0x000300f7,
++0x0000016f,0x00000000,0x000400fa,0x0000016d,
++0x0000016e,0x0000016f,0x000200f8,0x0000016e,
++0x00050051,0x00000006,0x00000171,0x0000015e,
++0x00000002,0x000500aa,0x0000015f,0x00000173,
++0x00000171,0x00000172,0x000200f9,0x0000016f,
++0x000200f8,0x0000016f,0x000700f5,0x0000015f,
++0x00000174,0x0000016d,0x00000168,0x00000173,
++0x0000016e,0x000600a9,0x0000000b,0x0000017c,
++0x00000174,0x0000017a,0x0000017b,0x0003003e,
++0x00000176,0x0000017c,0x000600a9,0x0000000b,
++0x00000180,0x00000174,0x0000017a,0x0000017f,
++0x0003003e,0x0000017d,0x00000180,0x000100fd,
++0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/msl_packing_shaders/pack.vert b/src/kosmickrisp/vulkan/tests/msl_packing_shaders/pack.vert
+new file mode 100644
+index 0000000000000000000000000000000000000000..ca2fbe5da356111be0ddfaddbf32f640ee3dc1d2
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/msl_packing_shaders/pack.vert
+@@ -0,0 +1,10 @@
++#version 450
++
++layout(location = 0) out vec4 color;
++
++void main()
++{
++   vec2 p = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2);
++   gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
++   color = vec4(p, 0.5, 1.0);
++}
+diff --git a/src/kosmickrisp/vulkan/tests/msl_packing_shaders/pack.vert.h b/src/kosmickrisp/vulkan/tests/msl_packing_shaders/pack.vert.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..90dc4f864d3afc212b0f3aa0154ba16d3fca9ad1
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/msl_packing_shaders/pack.vert.h
+@@ -0,0 +1,59 @@
++{0x07230203,0x00010600,0x000d000b,0x00000032,
++0x00000000,0x00020011,0x00000001,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x0008000f,0x00000000,0x00000004,0x6e69616d,
++0x00000000,0x0000000c,0x0000001d,0x0000002b,
++0x00040047,0x0000000c,0x0000000b,0x0000002a,
++0x00030047,0x0000001b,0x00000002,0x00050048,
++0x0000001b,0x00000000,0x0000000b,0x00000000,
++0x00050048,0x0000001b,0x00000001,0x0000000b,
++0x00000001,0x00050048,0x0000001b,0x00000002,
++0x0000000b,0x00000003,0x00050048,0x0000001b,
++0x00000003,0x0000000b,0x00000004,0x00040047,
++0x0000002b,0x0000001e,0x00000000,0x00020013,
++0x00000002,0x00030021,0x00000003,0x00000002,
++0x00030016,0x00000006,0x00000020,0x00040017,
++0x00000007,0x00000006,0x00000002,0x00040015,
++0x0000000a,0x00000020,0x00000001,0x00040020,
++0x0000000b,0x00000001,0x0000000a,0x0004003b,
++0x0000000b,0x0000000c,0x00000001,0x0004002b,
++0x0000000a,0x0000000e,0x00000001,0x0004002b,
++0x0000000a,0x00000010,0x00000002,0x00040017,
++0x00000017,0x00000006,0x00000004,0x00040015,
++0x00000018,0x00000020,0x00000000,0x0004002b,
++0x00000018,0x00000019,0x00000001,0x0004001c,
++0x0000001a,0x00000006,0x00000019,0x0006001e,
++0x0000001b,0x00000017,0x00000006,0x0000001a,
++0x0000001a,0x00040020,0x0000001c,0x00000003,
++0x0000001b,0x0004003b,0x0000001c,0x0000001d,
++0x00000003,0x0004002b,0x0000000a,0x0000001e,
++0x00000000,0x0004002b,0x00000006,0x00000020,
++0x40000000,0x0004002b,0x00000006,0x00000022,
++0x3f800000,0x0004002b,0x00000006,0x00000025,
++0x00000000,0x00040020,0x00000029,0x00000003,
++0x00000017,0x0004003b,0x00000029,0x0000002b,
++0x00000003,0x0004002b,0x00000006,0x0000002d,
++0x3f000000,0x0005002c,0x00000007,0x00000031,
++0x00000022,0x00000022,0x00050036,0x00000002,
++0x00000004,0x00000000,0x00000003,0x000200f8,
++0x00000005,0x0004003d,0x0000000a,0x0000000d,
++0x0000000c,0x000500c4,0x0000000a,0x0000000f,
++0x0000000d,0x0000000e,0x000500c7,0x0000000a,
++0x00000011,0x0000000f,0x00000010,0x0004006f,
++0x00000006,0x00000012,0x00000011,0x000500c7,
++0x0000000a,0x00000014,0x0000000d,0x00000010,
++0x0004006f,0x00000006,0x00000015,0x00000014,
++0x00050050,0x00000007,0x00000016,0x00000012,
++0x00000015,0x0005008e,0x00000007,0x00000021,
++0x00000016,0x00000020,0x00050083,0x00000007,
++0x00000024,0x00000021,0x00000031,0x00050051,
++0x00000006,0x00000026,0x00000024,0x00000000,
++0x00050051,0x00000006,0x00000027,0x00000024,
++0x00000001,0x00070050,0x00000017,0x00000028,
++0x00000026,0x00000027,0x00000025,0x00000022,
++0x00050041,0x00000029,0x0000002a,0x0000001d,
++0x0000001e,0x0003003e,0x0000002a,0x00000028,
++0x00070050,0x00000017,0x00000030,0x00000012,
++0x00000015,0x0000002d,0x00000022,0x0003003e,
++0x0000002b,0x00000030,0x000100fd,0x00010038}
+diff --git a/src/kosmickrisp/vulkan/tests/msl_packing_state.c b/src/kosmickrisp/vulkan/tests/msl_packing_state.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..d95d9dc43bab01b199e75e12a87ce4cd5c83e990
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/msl_packing_state.c
+@@ -0,0 +1,176 @@
++/* SPDX-License-Identifier: MIT */
++#include "msl_packing_state.h"
++
++#include <compression.h>
++#include <malloc/malloc.h>
++#include <mach/mach.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "kosmickrisp/vulkan/kk_cmd_buffer.h"
++#include "kosmickrisp/vulkan/kk_shader.h"
++
++/* The driver gets this test's checks on a tree that does not compress yet, for
++ * the comparison the measurements need: there every entry is plain. */
++#if defined(__has_include)
++#if __has_include("kosmickrisp/vulkan/kk_msl_pack.h")
++#define KK_TEST_HAS_PACKED 1
++#endif
++#endif
++
++static uint64_t
++hash_text(const char *text, size_t size)
++{
++   uint64_t hash = 1469598103934665603ull;
++   for (size_t i = 0; i < size; i++)
++      hash = (hash ^ (uint8_t)text[i]) * 1099511628211ull;
++   return hash;
++}
++
++/* What the text of `size` bytes compresses to, or `size` when it does not
++ * get smaller. */
++static uint32_t
++compressed_size(const char *text, size_t size)
++{
++   uint8_t *buffer = malloc(size);
++   size_t written = compression_encode_buffer(
++      buffer, size, (const uint8_t *)text, size, NULL, COMPRESSION_LZFSE);
++   free(buffer);
++   return written != 0 ? written : size;
++}
++
++static void
++add_entry(struct kk_test_msl_stats *out, const struct msl_compile_data *data,
++          bool raster_variant)
++{
++   if (data->code == NULL
++#ifdef KK_TEST_HAS_PACKED
++       && data->packed == NULL
++#endif
++      )
++      return;
++   if (out->count == KK_TEST_MAX_MSL_ENTRIES)
++      abort();
++
++   struct kk_test_msl_entry *entry = &out->entries[out->count++];
++   memset(entry, 0, sizeof(*entry));
++   entry->is_raster_variant = raster_variant;
++
++#ifdef KK_TEST_HAS_PACKED
++   if (data->packed != NULL) {
++      entry->packed = true;
++      entry->text_bytes = data->code_size;
++      entry->resident_bytes = data->packed_size;
++      entry->heap_bytes = malloc_size(data->packed);
++      char *text = malloc(data->code_size);
++      size_t read = compression_decode_buffer(
++         (uint8_t *)text, data->code_size, data->packed, data->packed_size,
++         NULL, COMPRESSION_LZFSE);
++      if (read != data->code_size)
++         abort();
++      entry->text_hash = hash_text(text, read);
++      entry->recompressed_bytes = compressed_size(text, read);
++      free(text);
++      return;
++   }
++#endif
++
++   entry->text_bytes = entry->resident_bytes = entry->heap_bytes =
++      strlen(data->code) + 1;
++   entry->text_hash = hash_text(data->code, entry->text_bytes);
++   entry->recompressed_bytes = compressed_size(data->code, entry->text_bytes);
++}
++
++static void
++add_shader(struct kk_test_msl_stats *out, const struct kk_shader *shader,
++           bool raster_variant)
++{
++   for (uint32_t stage = 0; stage < MESA_SHADER_STAGES; stage++)
++      add_entry(out, &shader->msl_data[stage], raster_variant);
++   add_entry(out, &shader->transform_feedback_pre_gs_msl, raster_variant);
++   add_entry(out, &shader->line_raster_materialize_msl, raster_variant);
++   add_entry(out, &shader->line_stipple_prefix_msl, raster_variant);
++   add_entry(out, &shader->geometry_main_msl, raster_variant);
++   add_entry(out, &shader->geometry_count_msl, raster_variant);
++   add_entry(out, &shader->geometry_pre_gs_msl, raster_variant);
++}
++
++void
++kk_test_bound_msl(VkCommandBuffer command, struct kk_test_msl_stats *out)
++{
++   const struct kk_cmd_buffer *cmd = kk_cmd_buffer_from_handle(command);
++   memset(out, 0, sizeof(*out));
++   for (uint32_t stage = 0; stage < MESA_SHADER_STAGES; stage++) {
++      const struct kk_shader *shader = cmd->state.shaders[stage];
++      if (shader == NULL)
++         continue;
++      add_shader(out, shader, false);
++      if (stage != MESA_SHADER_VERTEX)
++         continue;
++      for (uint32_t variant = 0; variant < KK_RASTER_VARIANT_COUNT;
++           variant++) {
++         for (uint32_t child = 0; child < MESA_SHADER_STAGES; child++) {
++            const struct kk_shader *raster =
++               shader->raster_variant_shaders[variant][child];
++            if (raster != NULL)
++               add_shader(out, raster, true);
++         }
++      }
++   }
++}
++
++uint64_t
++kk_test_msl_resident_bytes(const struct kk_test_msl_stats *stats)
++{
++   uint64_t bytes = 0;
++   for (uint32_t i = 0; i < stats->count; i++)
++      bytes += stats->entries[i].resident_bytes;
++   return bytes;
++}
++
++uint64_t
++kk_test_msl_text_bytes(const struct kk_test_msl_stats *stats)
++{
++   uint64_t bytes = 0;
++   for (uint32_t i = 0; i < stats->count; i++)
++      bytes += stats->entries[i].text_bytes;
++   return bytes;
++}
++
++uint64_t
++kk_test_msl_heap_bytes(const struct kk_test_msl_stats *stats)
++{
++   uint64_t bytes = 0;
++   for (uint32_t i = 0; i < stats->count; i++)
++      bytes += stats->entries[i].heap_bytes;
++   return bytes;
++}
++
++bool
++kk_test_msl_all_packed(const struct kk_test_msl_stats *stats)
++{
++   for (uint32_t i = 0; i < stats->count; i++) {
++      if (!stats->entries[i].packed)
++         return false;
++   }
++   return stats->count > 0;
++}
++
++uint64_t
++kk_test_heap_in_use(void)
++{
++   malloc_statistics_t statistics;
++   malloc_zone_statistics(NULL, &statistics);
++   return statistics.size_in_use;
++}
++
++uint64_t
++kk_test_footprint(void)
++{
++   task_vm_info_data_t info;
++   mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
++   if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info,
++                 &count) != KERN_SUCCESS)
++      return 0;
++   return info.phys_footprint;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/msl_packing_state.h b/src/kosmickrisp/vulkan/tests/msl_packing_state.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..e45b6f18978b817a2bfd544b868f313c5d655471
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/msl_packing_state.h
+@@ -0,0 +1,52 @@
++/* SPDX-License-Identifier: MIT */
++#pragma once
++
++#include <stdbool.h>
++#include <stdint.h>
++#include <vulkan/vulkan.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define KK_TEST_MAX_MSL_ENTRIES 128
++
++/* One MSL source a shader holds, whichever form it holds it in. */
++struct kk_test_msl_entry {
++   /* Bytes of the text, with its terminator. */
++   uint32_t text_bytes;
++   /* Bytes of the form the shader holds: the compressed bytes, or the text. */
++   uint32_t resident_bytes;
++   /* Bytes the heap reports for the block that holds the compressed form; the
++    * text's own when the shader holds it plain. */
++   uint32_t heap_bytes;
++   /* Bytes the text compresses to with LZFSE, worked out here from the
++    * plain text. */
++   uint32_t recompressed_bytes;
++   bool packed;
++   /* Hash of the plain text, decompressed here with libcompression itself. */
++   uint64_t text_hash;
++   bool is_raster_variant;
++};
++
++struct kk_test_msl_stats {
++   uint32_t count;
++   struct kk_test_msl_entry entries[KK_TEST_MAX_MSL_ENTRIES];
++};
++
++/* Every MSL source of the shaders the command buffer has bound, with the
++ * shaders of its raster variants. */
++void kk_test_bound_msl(VkCommandBuffer command, struct kk_test_msl_stats *out);
++
++uint64_t kk_test_msl_resident_bytes(const struct kk_test_msl_stats *stats);
++uint64_t kk_test_msl_text_bytes(const struct kk_test_msl_stats *stats);
++uint64_t kk_test_msl_heap_bytes(const struct kk_test_msl_stats *stats);
++bool kk_test_msl_all_packed(const struct kk_test_msl_stats *stats);
++
++/* Bytes the process holds in its malloc zones, and its physical footprint. */
++uint64_t kk_test_heap_in_use(void);
++uint64_t kk_test_footprint(void);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/src/kosmickrisp/vulkan/tests/test_msl_pack.c b/src/kosmickrisp/vulkan/tests/test_msl_pack.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..ca4496d78152ffea230e1e148a66c41ebacfbad1
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_msl_pack.c
+@@ -0,0 +1,167 @@
++/*
++ * Copyright 2026 Google LLC
++ * SPDX-License-Identifier: MIT
++ *
++ * The compressed form of a shader's MSL text: what packs and what stays plain,
++ * that the text comes back from either form, that a copy of the compressed
++ * bytes stands for the text, and that bytes that cannot be a compressed text
++ * are refused rather than decompressed into a buffer the wrong size.
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "kosmickrisp/vulkan/kk_msl_pack.h"
++#include "util/ralloc.h"
++
++#define CHECK(condition)                                                       \
++   do {                                                                        \
++      if (!(condition)) {                                                      \
++         fprintf(stderr, "%s:%d: check failed: %s\n", __FILE__, __LINE__,      \
++                 #condition);                                                  \
++         abort();                                                              \
++      }                                                                        \
++   } while (0)
++
++/* Text of about `size` bytes that looks like generated MSL. */
++static char *
++msl_like(unsigned size, unsigned seed)
++{
++   char *text = ralloc_strdup(NULL, "#include <metal_stdlib>\n");
++   for (unsigned i = 0; strlen(text) < size; i++) {
++      ralloc_asprintf_append(&text,
++                             "    t%u = t%u * float(%u.5e-01) + in.vary_%02u;\n",
++                             i, i / 2, (i * 7 + seed) % 97, i % 16);
++   }
++   return text;
++}
++
++static void
++set_text(struct msl_compile_data *data, char *text)
++{
++   memset(data, 0, sizeof(*data));
++   data->code = text;
++   data->entrypoint_name = ralloc_strdup(NULL, "main_entrypoint");
++}
++
++int main(void)
++{
++   struct msl_compile_data data;
++
++   /* A text of real size packs to a fraction of it, and comes back whole. */
++   char *original = msl_like(20000, 1);
++   const size_t original_size = strlen(original) + 1;
++   set_text(&data, ralloc_strdup(NULL, original));
++   CHECK(kk_msl_has_text(&data));
++   CHECK(kk_msl_resident_bytes(&data) == original_size);
++   CHECK(kk_msl_pack(&data));
++   CHECK(data.code == NULL && data.packed != NULL);
++   CHECK(data.code_size == original_size);
++   CHECK(data.packed_size * 3 < original_size);
++   CHECK(kk_msl_resident_bytes(&data) == data.packed_size);
++   CHECK(kk_msl_text_bytes(&data) == original_size);
++   CHECK(kk_msl_has_text(&data));
++   CHECK(kk_msl_pack(&data));
++   char *scratch = NULL;
++   const char *text = kk_msl_text(&data, &scratch);
++   CHECK(text != NULL && scratch == text);
++   CHECK(strcmp(text, original) == 0);
++   kk_msl_text_release(scratch);
++
++   /* A copy of the compressed bytes stands for the same text, and only for
++    * text of that size. */
++   struct msl_compile_data copy;
++   set_text(&copy, ralloc_strdup(NULL, original));
++   CHECK(kk_msl_pack_copy(&copy, &data));
++   CHECK(copy.code == NULL && copy.packed != NULL && copy.packed != data.packed);
++   CHECK(copy.packed_size == data.packed_size &&
++         memcmp(copy.packed, data.packed, data.packed_size) == 0);
++   struct msl_compile_data other;
++   set_text(&other, msl_like(5000, 2));
++   CHECK(!kk_msl_pack_copy(&other, &data));
++   CHECK(other.code != NULL && other.packed == NULL);
++   kk_msl_finish(&other);
++   kk_msl_finish(&copy);
++
++   /* The bytes of a cache are adopted as they are, and refused when they
++    * cannot be a text of the size they claim. */
++   struct msl_compile_data adopted;
++   memset(&adopted, 0, sizeof(adopted));
++   CHECK(kk_msl_adopt(&adopted, KK_MSL_CODEC_LZFSE, data.packed,
++                      data.packed_size, data.code_size));
++   CHECK(adopted.packed != data.packed && adopted.code == NULL);
++   text = kk_msl_text(&adopted, &scratch);
++   CHECK(text != NULL && strcmp(text, original) == 0);
++   kk_msl_text_release(scratch);
++   kk_msl_drop(&adopted);
++   CHECK(!kk_msl_has_text(&adopted));
++
++   CHECK(!kk_msl_adopt(&adopted, KK_MSL_CODEC_COUNT, data.packed,
++                       data.packed_size, data.code_size));
++   CHECK(!kk_msl_adopt(&adopted, KK_MSL_CODEC_LZFSE, data.packed, 0,
++                       data.code_size));
++   CHECK(!kk_msl_adopt(&adopted, KK_MSL_CODEC_LZFSE, data.packed,
++                       data.packed_size, 0));
++   CHECK(!kk_msl_adopt(&adopted, KK_MSL_CODEC_LZFSE, data.packed,
++                       data.code_size + 1, data.code_size));
++   CHECK(!kk_msl_adopt(&adopted, KK_MSL_CODEC_LZFSE, data.packed,
++                       data.packed_size, KK_MSL_MAX_CODE_SIZE + 1));
++   CHECK(!kk_msl_adopt(&adopted, KK_MSL_CODEC_STORED, original, 10, 11));
++   CHECK(!adopted.code && !adopted.packed);
++
++   /* Bytes cut short, or that stand for a text of another size, decompress to
++    * nothing. */
++   CHECK(kk_msl_adopt(&adopted, KK_MSL_CODEC_LZFSE, data.packed,
++                      data.packed_size / 2, data.code_size));
++   CHECK(kk_msl_text(&adopted, &scratch) == NULL && scratch == NULL);
++   kk_msl_drop(&adopted);
++   CHECK(kk_msl_adopt(&adopted, KK_MSL_CODEC_LZFSE, data.packed,
++                      data.packed_size, data.code_size - 1));
++   CHECK(kk_msl_text(&adopted, &scratch) == NULL && scratch == NULL);
++   kk_msl_drop(&adopted);
++   CHECK(kk_msl_adopt(&adopted, KK_MSL_CODEC_LZFSE, data.packed,
++                      data.packed_size, data.code_size + 1));
++   CHECK(kk_msl_text(&adopted, &scratch) == NULL && scratch == NULL);
++   kk_msl_finish(&adopted);
++
++   /* A stored text, the form of one that does not compress, stays plain. */
++   CHECK(kk_msl_adopt(&adopted, KK_MSL_CODEC_STORED, "plain text", 11, 11));
++   CHECK(adopted.code != NULL && adopted.packed == NULL);
++   text = kk_msl_text(&adopted, &scratch);
++   CHECK(text == adopted.code && scratch == NULL);
++   CHECK(!kk_msl_adopt(&adopted, KK_MSL_CODEC_STORED, "unterminated", 12, 12));
++   kk_msl_finish(&adopted);
++
++   /* Text that does not get smaller, or is too small to, is left alone. */
++   char noise[2000];
++   unsigned state = 12345;
++   for (unsigned i = 0; i < sizeof(noise) - 1; i++) {
++      state = state * 1664525u + 1013904223u;
++      noise[i] = 33 + (state >> 24) % 94;
++   }
++   noise[sizeof(noise) - 1] = '\0';
++   set_text(&data, ralloc_strdup(NULL, noise));
++   struct msl_compile_data noisy = data;
++   memset(&data, 0, sizeof(data));
++   CHECK(!kk_msl_pack(&noisy) || noisy.packed_size < sizeof(noise));
++   kk_msl_finish(&noisy);
++
++   struct msl_compile_data tiny;
++   set_text(&tiny, ralloc_strdup(NULL, ""));
++   CHECK(!kk_msl_pack(&tiny));
++   CHECK(tiny.code != NULL && kk_msl_resident_bytes(&tiny) == 1);
++   kk_msl_finish(&tiny);
++
++   /* An empty entry holds nothing, whichever way it is asked. */
++   struct msl_compile_data empty;
++   memset(&empty, 0, sizeof(empty));
++   CHECK(!kk_msl_has_text(&empty) && !kk_msl_pack(&empty));
++   CHECK(kk_msl_text(&empty, &scratch) == NULL);
++   CHECK(kk_msl_resident_bytes(&empty) == 0 && kk_msl_text_bytes(&empty) == 0);
++   kk_msl_finish(&empty);
++
++   ralloc_free(original);
++   printf("MSL text packing passed\n");
++   return 0;
++}
+diff --git a/src/kosmickrisp/vulkan/tests/test_msl_packing.cpp b/src/kosmickrisp/vulkan/tests/test_msl_packing.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..7f30af79073506b52f70bb229dea8369108d72b5
+--- /dev/null
++++ b/src/kosmickrisp/vulkan/tests/test_msl_packing.cpp
+@@ -0,0 +1,692 @@
++/*
++ * Copyright 2026 Google LLC
++ * SPDX-License-Identifier: MIT
++ *
++ * The MSL a pipeline was built from is the largest thing it keeps, and it is
++ * read again only to build another Metal pipeline from it and to write a
++ * pipeline cache.  A finished shader therefore holds the text compressed, and
++ * a pipeline cache carries the compressed bytes.  This checks that
++ *
++ *  - after pipelines are created, every MSL source a bound shader holds is the
++ *    compressed one, and the bytes the heap holds for it are the compressed
++ *    size, not the text's;
++ *  - the pipeline cache of those pipelines is smaller than the text, and a
++ *    cache loaded from it recreates the pipelines with the same text and keeps
++ *    it compressed too;
++ *  - a render pass that binds fewer attachments than the pipeline declares
++ *    builds its Metal pipeline from the compressed text and renders.
++ *
++ * "--bench N [BASE]" instead creates N pipelines, with constants from BASE up,
++ * and prints what they cost, as "metric <name> <value>" lines, for the
++ * comparison against a driver that keeps the text.
++ */
++
++#define VK_NO_PROTOTYPES
++#include <vulkan/vulkan.h>
++
++#include <algorithm>
++#include <array>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <vector>
++
++#include "msl_packing_state.h"
++#include "kk_test.h"
++
++static const uint32_t vertex_spirv[] =
++#include "msl_packing_shaders/pack.vert.h"
++;
++static const uint32_t fragment_spirv[] =
++#include "msl_packing_shaders/pack.frag.h"
++;
++static const uint32_t compute_spirv[] =
++#include "msl_packing_shaders/pack.comp.h"
++;
++
++static constexpr VkFormat kColorFormat = VK_FORMAT_R8G8B8A8_UNORM;
++/* The specialization constant of a pipeline, which gives its MSL text of its
++ * own. */
++static constexpr int kFirstVariant = 1000;
++/* A run that must not find the text of an earlier one in Metal's compile cache
++ * moves every pipeline's constant by this much. */
++static int variant_base = 0;
++
++using Clock = std::chrono::steady_clock;
++
++static double
++microseconds(Clock::time_point from, Clock::time_point to)
++{
++   return std::chrono::duration<double, std::micro>(to - from).count();
++}
++
++static double
++percentile(std::vector<double> values, double fraction)
++{
++   if (values.empty())
++      return 0;
++   std::sort(values.begin(), values.end());
++   return values[std::min(values.size() - 1,
++                          size_t(fraction * (values.size() - 1) + 0.5))];
++}
++
++int main(int argc, char **argv)
++{
++   std::setvbuf(stdout, nullptr, _IONBF, 0);
++   const bool bench = argc > 2 && std::strcmp(argv[1], "--bench") == 0;
++   const unsigned count = bench ? unsigned(std::atoi(argv[2])) : 6;
++   if (bench && argc > 3)
++      variant_base = std::atoi(argv[3]);
++   require(count > 0, "pipeline count");
++
++   kk_test_device t;
++   VkResult result;
++   kk_test_create_instance(&t, "msl-packing");
++
++   VkPhysicalDeviceDynamicRenderingUnusedAttachmentsFeaturesEXT unused{
++      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_FEATURES_EXT};
++   unused.dynamicRenderingUnusedAttachments = VK_TRUE;
++   VkPhysicalDeviceVulkan13Features features13{
++      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
++   features13.dynamicRendering = VK_TRUE;
++   features13.pNext = &unused;
++   const char *device_extensions[] = {
++      VK_EXT_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_EXTENSION_NAME};
++   kk_test_create_device(&t, &features13, nullptr, 1, device_extensions);
++   KK_LOAD_DEVICE_FUNCTIONS(t);
++   LOAD_D(vkCreateComputePipelines);
++   LOAD_D(vkCreateDescriptorSetLayout);
++   LOAD_D(vkDestroyDescriptorSetLayout);
++   LOAD_D(vkCreatePipelineCache);
++   LOAD_D(vkDestroyPipelineCache);
++   LOAD_D(vkGetPipelineCacheData);
++   LOAD_D(vkCmdSetViewport);
++   LOAD_D(vkCmdSetScissor);
++
++   VkShaderModule vertex_module =
++      kk_test_shader_module(&t, vertex_spirv, sizeof(vertex_spirv));
++   VkShaderModule fragment_module =
++      kk_test_shader_module(&t, fragment_spirv, sizeof(fragment_spirv));
++   VkShaderModule compute_module =
++      kk_test_shader_module(&t, compute_spirv, sizeof(compute_spirv));
++
++   VkPipelineLayoutCreateInfo graphics_layout_info{
++      VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
++   VkPipelineLayout graphics_layout = VK_NULL_HANDLE;
++   result = vkCreatePipelineLayout(device, &graphics_layout_info, nullptr,
++                                   &graphics_layout);
++   require(result == VK_SUCCESS, "graphics layout", result);
++
++   VkDescriptorSetLayoutBinding storage{};
++   storage.binding = 0;
++   storage.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++   storage.descriptorCount = 1;
++   storage.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
++   VkDescriptorSetLayoutCreateInfo set_layout_info{
++      VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
++   set_layout_info.bindingCount = 1;
++   set_layout_info.pBindings = &storage;
++   VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
++   result = vkCreateDescriptorSetLayout(device, &set_layout_info, nullptr,
++                                        &set_layout);
++   require(result == VK_SUCCESS, "set layout", result);
++   VkPipelineLayoutCreateInfo compute_layout_info{
++      VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
++   compute_layout_info.setLayoutCount = 1;
++   compute_layout_info.pSetLayouts = &set_layout;
++   VkPipelineLayout compute_layout = VK_NULL_HANDLE;
++   result = vkCreatePipelineLayout(device, &compute_layout_info, nullptr,
++                                   &compute_layout);
++   require(result == VK_SUCCESS, "compute layout", result);
++
++   /* Both attachments are declared; the render pass of the variant check binds
++    * only the first. */
++   auto create_graphics = [&](unsigned index, VkPipelineCache cache,
++                              VkPipelineCreateFlags flags,
++                              VkPipeline *pipeline,
++                              bool dynamic_discard = false) {
++      int variant = kFirstVariant + variant_base + int(index);
++      VkSpecializationMapEntry entry{0, 0, sizeof(variant)};
++      VkSpecializationInfo specialization{1, &entry, sizeof(variant),
++                                          &variant};
++      VkPipelineShaderStageCreateInfo stages[2]{};
++      stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++      stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
++      stages[0].module = vertex_module;
++      stages[0].pName = "main";
++      stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++      stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
++      stages[1].module = fragment_module;
++      stages[1].pName = "main";
++      stages[1].pSpecializationInfo = &specialization;
++
++      VkPipelineVertexInputStateCreateInfo vi{
++         VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
++      VkPipelineInputAssemblyStateCreateInfo ia{
++         VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
++      ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++      VkPipelineViewportStateCreateInfo vp{
++         VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
++      vp.viewportCount = vp.scissorCount = 1;
++      VkPipelineRasterizationStateCreateInfo rs{
++         VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
++      rs.lineWidth = 1.0f;
++      VkPipelineMultisampleStateCreateInfo ms{
++         VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
++      ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
++      VkPipelineColorBlendAttachmentState attachments[2]{};
++      attachments[0].colorWriteMask = attachments[1].colorWriteMask = 0xf;
++      VkPipelineColorBlendStateCreateInfo blend{
++         VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
++      blend.attachmentCount = 2;
++      blend.pAttachments = attachments;
++      /* A dynamic rasterizer discard makes a pipeline of two executables, the
++       * base one and the one that discards, which are two sets of shaders. */
++      const VkDynamicState dynamic_states[] = {
++         VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
++         VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE};
++      VkPipelineDynamicStateCreateInfo dynamic{
++         VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
++      dynamic.dynamicStateCount = dynamic_discard ? 3 : 2;
++      dynamic.pDynamicStates = dynamic_states;
++      const VkFormat formats[2] = {kColorFormat, kColorFormat};
++      VkPipelineRenderingCreateInfo rendering{
++         VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
++      rendering.colorAttachmentCount = 2;
++      rendering.pColorAttachmentFormats = formats;
++      VkGraphicsPipelineCreateInfo info{
++         VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
++      info.pNext = &rendering;
++      info.flags = flags;
++      info.stageCount = 2;
++      info.pStages = stages;
++      info.pVertexInputState = &vi;
++      info.pInputAssemblyState = &ia;
++      info.pViewportState = &vp;
++      info.pRasterizationState = &rs;
++      info.pMultisampleState = &ms;
++      info.pColorBlendState = &blend;
++      info.pDynamicState = &dynamic;
++      info.layout = graphics_layout;
++      return vkCreateGraphicsPipelines(device, cache, 1, &info, nullptr,
++                                       pipeline);
++   };
++
++   auto create_compute = [&](unsigned index, VkPipelineCache cache,
++                             VkPipelineCreateFlags flags,
++                             VkPipeline *pipeline) {
++      int variant = kFirstVariant + variant_base + int(index);
++      VkSpecializationMapEntry entry{0, 0, sizeof(variant)};
++      VkSpecializationInfo specialization{1, &entry, sizeof(variant),
++                                          &variant};
++      VkComputePipelineCreateInfo info{
++         VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
++      info.flags = flags;
++      info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++      info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
++      info.stage.module = compute_module;
++      info.stage.pName = "main";
++      info.stage.pSpecializationInfo = &specialization;
++      info.layout = compute_layout;
++      return vkCreateComputePipelines(device, cache, 1, &info, nullptr,
++                                      pipeline);
++   };
++
++   VkCommandPool pool = VK_NULL_HANDLE;
++   VkCommandBuffer command = VK_NULL_HANDLE;
++   kk_test_command_buffer(&t, 0, &pool, &command);
++
++   /* The MSL the shaders of a pipeline hold, read from a command buffer that
++    * has bound it. */
++   auto msl_of = [&](VkPipeline pipeline, VkPipelineBindPoint bind_point) {
++      result = vkResetCommandPool(device, pool, 0);
++      require(result == VK_SUCCESS, "reset command pool", result);
++      VkCommandBufferBeginInfo begin{
++         VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
++      result = vkBeginCommandBuffer(command, &begin);
++      require(result == VK_SUCCESS, "begin command", result);
++      vkCmdBindPipeline(command, bind_point, pipeline);
++      kk_test_msl_stats stats;
++      kk_test_bound_msl(command, &stats);
++      result = vkEndCommandBuffer(command);
++      require(result == VK_SUCCESS, "end command", result);
++      return stats;
++   };
++
++   struct Created {
++      std::vector<VkPipeline> graphics;
++      std::vector<VkPipeline> compute;
++      std::vector<kk_test_msl_stats> graphics_msl;
++      std::vector<kk_test_msl_stats> compute_msl;
++      std::vector<double> create_us;
++      std::vector<double> compute_us;
++   };
++   auto destroy = [&](Created &created) {
++      for (VkPipeline pipeline : created.graphics)
++         vkDestroyPipeline(device, pipeline, nullptr);
++      for (VkPipeline pipeline : created.compute)
++         vkDestroyPipeline(device, pipeline, nullptr);
++      created = Created{};
++   };
++   /* Creates `count` graphics and `count` compute pipelines. */
++   auto create_all = [&](VkPipelineCache cache, VkPipelineCreateFlags flags,
++                         VkResult *first_failure) {
++      Created created;
++      *first_failure = VK_SUCCESS;
++      for (unsigned i = 0; i < count; ++i) {
++         VkPipeline pipeline = VK_NULL_HANDLE;
++         auto start = Clock::now();
++         VkResult r = create_graphics(i, cache, flags, &pipeline);
++         created.create_us.push_back(microseconds(start, Clock::now()));
++         if (r != VK_SUCCESS) {
++            *first_failure = r;
++            continue;
++         }
++         created.graphics.push_back(pipeline);
++         created.graphics_msl.push_back(
++            msl_of(pipeline, VK_PIPELINE_BIND_POINT_GRAPHICS));
++      }
++      for (unsigned i = 0; i < count; ++i) {
++         VkPipeline pipeline = VK_NULL_HANDLE;
++         auto start = Clock::now();
++         VkResult r = create_compute(i, cache, flags, &pipeline);
++         created.compute_us.push_back(microseconds(start, Clock::now()));
++         if (r != VK_SUCCESS) {
++            *first_failure = r;
++            continue;
++         }
++         created.compute.push_back(pipeline);
++         created.compute_msl.push_back(
++            msl_of(pipeline, VK_PIPELINE_BIND_POINT_COMPUTE));
++      }
++      return created;
++   };
++   auto totals = [](const Created &created, uint64_t *resident,
++                    uint64_t *text, uint64_t *heap, bool *packed) {
++      *resident = *text = *heap = 0;
++      *packed = true;
++      for (const auto *list : {&created.graphics_msl, &created.compute_msl}) {
++         for (const kk_test_msl_stats &stats : *list) {
++            *resident += kk_test_msl_resident_bytes(&stats);
++            *text += kk_test_msl_text_bytes(&stats);
++            *heap += kk_test_msl_heap_bytes(&stats);
++            *packed &= kk_test_msl_all_packed(&stats);
++         }
++      }
++   };
++   auto cache_data = [&](VkPipelineCache cache, double *microseconds_out) {
++      size_t size = 0;
++      auto start = Clock::now();
++      result = vkGetPipelineCacheData(device, cache, &size, nullptr);
++      require(result == VK_SUCCESS, "cache size", result);
++      std::vector<uint8_t> data(size);
++      result = vkGetPipelineCacheData(device, cache, &size, data.data());
++      require(result == VK_SUCCESS, "cache data", result);
++      if (microseconds_out)
++         *microseconds_out = microseconds(start, Clock::now());
++      data.resize(size);
++      return data;
++   };
++   auto load_cache = [&](const std::vector<uint8_t> &data) {
++      VkPipelineCacheCreateInfo info{
++         VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
++      info.initialDataSize = data.size();
++      info.pInitialData = data.data();
++      VkPipelineCache cache = VK_NULL_HANDLE;
++      result = vkCreatePipelineCache(device, &info, nullptr, &cache);
++      require(result == VK_SUCCESS, "load cache", result);
++      return cache;
++   };
++
++   /* The variants: a render pass that binds only the first attachment, which
++    * a pipeline that declares two builds its Metal pipeline for at its first
++    * draw. */
++   VkImage image = VK_NULL_HANDLE;
++   {
++      VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
++      info.imageType = VK_IMAGE_TYPE_2D;
++      info.format = kColorFormat;
++      info.extent = {1, 1, 1};
++      info.mipLevels = 1;
++      info.arrayLayers = 1;
++      info.samples = VK_SAMPLE_COUNT_1_BIT;
++      info.tiling = VK_IMAGE_TILING_OPTIMAL;
++      info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
++                   VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++      result = vkCreateImage(device, &info, nullptr, &image);
++      require(result == VK_SUCCESS, "create image", result);
++   }
++   VkDeviceMemory image_memory = kk_test_image_memory(&t, image, 0);
++   VkImageView view = kk_test_image_view(&t, image, VK_IMAGE_VIEW_TYPE_2D,
++                                         kColorFormat,
++                                         VK_IMAGE_ASPECT_COLOR_BIT, 0, 1);
++   VkBuffer readback = VK_NULL_HANDLE;
++   VkDeviceMemory readback_memory = VK_NULL_HANDLE;
++   void *readback_data = nullptr;
++   kk_test_buffer(&t, 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++                  KK_TEST_HOST_MEMORY, &readback, &readback_memory,
++                  &readback_data);
++
++   /* Draws once with only the first attachment bound and returns how long the
++    * draw took to record, which is when the variant is built, and what the
++    * attachment holds. */
++   auto draw_variant = [&](VkPipeline pipeline, double *record_us,
++                           uint8_t pixel[4]) {
++      result = vkResetCommandPool(device, pool, 0);
++      require(result == VK_SUCCESS, "reset command pool", result);
++      VkCommandBufferBeginInfo begin{
++         VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
++      begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++      result = vkBeginCommandBuffer(command, &begin);
++      require(result == VK_SUCCESS, "begin command", result);
++
++      const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0,
++                                          1};
++      VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
++      barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
++      barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++      barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++      barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++      barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++      barrier.image = image;
++      barrier.subresourceRange = range;
++      vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
++                           0, nullptr, 0, nullptr, 1, &barrier);
++
++      VkRenderingAttachmentInfo attachments[2]{};
++      attachments[0].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
++      attachments[0].imageView = view;
++      attachments[0].imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++      attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
++      attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++      attachments[1].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
++      const VkRect2D area{{0, 0}, {1, 1}};
++      VkRenderingInfo render_info{VK_STRUCTURE_TYPE_RENDERING_INFO};
++      render_info.renderArea = area;
++      render_info.layerCount = 1;
++      render_info.colorAttachmentCount = 2;
++      render_info.pColorAttachments = attachments;
++      vkCmdBeginRendering(command, &render_info);
++      vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
++      const VkViewport viewport{0, 0, 1, 1, 0, 1};
++      vkCmdSetViewport(command, 0, 1, &viewport);
++      vkCmdSetScissor(command, 0, 1, &area);
++      auto start = Clock::now();
++      vkCmdDraw(command, 3, 1, 0, 0);
++      *record_us = microseconds(start, Clock::now());
++      vkCmdEndRendering(command);
++
++      barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
++      barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
++      barrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++      barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++      vkCmdPipelineBarrier(command,
++                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
++                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
++                           nullptr, 1, &barrier);
++      VkBufferImageCopy region{};
++      region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++      region.imageExtent = {1, 1, 1};
++      vkCmdCopyImageToBuffer(command, image,
++                             VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback,
++                             1, &region);
++      result = vkEndCommandBuffer(command);
++      require(result == VK_SUCCESS, "end command", result);
++      result = kk_test_submit_and_wait(&t, command, 20000000000ull);
++      require(result == VK_SUCCESS, "draw retired", result);
++      std::memcpy(pixel, readback_data, 4);
++   };
++   auto check_variants = [&](const Created &created, const char *what,
++                             std::vector<double> *times) {
++      for (VkPipeline pipeline : created.graphics) {
++         double record_us = 0;
++         uint8_t pixel[4];
++         draw_variant(pipeline, &record_us, pixel);
++         if (times)
++            times->push_back(record_us);
++         if (pixel[0] != 255 || pixel[1] != 0 || pixel[2] != 0 ||
++             pixel[3] != 255) {
++            std::fprintf(stderr,
++                         "%s: variant drew (%u, %u, %u, %u), expected "
++                         "(255, 0, 0, 255)\n",
++                         what, pixel[0], pixel[1], pixel[2], pixel[3]);
++            std::exit(1);
++         }
++      }
++   };
++
++   const uint64_t heap_before = kk_test_heap_in_use();
++   const uint64_t footprint_before = kk_test_footprint();
++
++   VkPipelineCache cache = VK_NULL_HANDLE;
++   {
++      VkPipelineCacheCreateInfo info{
++         VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
++      result = vkCreatePipelineCache(device, &info, nullptr, &cache);
++      require(result == VK_SUCCESS, "create cache", result);
++   }
++
++   VkResult failure = VK_SUCCESS;
++   Created created = create_all(cache, 0, &failure);
++   require(failure == VK_SUCCESS, "create pipelines", failure);
++   const uint64_t heap_after = kk_test_heap_in_use();
++   const uint64_t footprint_after = kk_test_footprint();
++
++   uint64_t resident, text, heap, packed;
++   bool all_packed;
++   totals(created, &resident, &text, &heap, &all_packed);
++   packed = all_packed;
++
++   double get_us = 0;
++   std::vector<uint8_t> blob = cache_data(cache, &get_us);
++
++   if (bench) {
++      std::vector<double> variant_us;
++      check_variants(created, "created pipeline", &variant_us);
++
++      const uint64_t before_load_heap = kk_test_heap_in_use();
++      const uint64_t before_load_footprint = kk_test_footprint();
++      auto start = Clock::now();
++      VkPipelineCache loaded = load_cache(blob);
++      const double load_us = microseconds(start, Clock::now());
++      const uint64_t after_load_heap = kk_test_heap_in_use();
++      const uint64_t after_load_footprint = kk_test_footprint();
++      VkResult hit_failure = VK_SUCCESS;
++      Created hits = create_all(
++         loaded, VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT,
++         &hit_failure);
++      const uint64_t hit_heap = kk_test_heap_in_use();
++
++      std::printf("metric pipelines %u\n", count);
++      std::printf("metric msl_resident_bytes %llu\n",
++                  (unsigned long long)resident);
++      std::printf("metric msl_text_bytes %llu\n", (unsigned long long)text);
++      std::printf("metric msl_heap_bytes %llu\n", (unsigned long long)heap);
++      std::printf("metric msl_packed %llu\n", (unsigned long long)packed);
++      std::printf("metric heap_growth_bytes %lld\n",
++                  (long long)(heap_after - heap_before));
++      std::printf("metric footprint_growth_bytes %lld\n",
++                  (long long)(footprint_after - footprint_before));
++      std::vector<double> graphics_us(created.create_us.begin(),
++                                      created.create_us.end());
++      std::printf("metric create_us_median %.1f\n",
++                  percentile(graphics_us, 0.5));
++      std::printf("metric create_us_p95 %.1f\n",
++                  percentile(graphics_us, 0.95));
++      std::printf("metric compute_create_us_median %.1f\n",
++                  percentile(created.compute_us, 0.5));
++      std::printf("metric compute_create_us_p95 %.1f\n",
++                  percentile(created.compute_us, 0.95));
++      std::printf("metric cache_blob_bytes %zu\n", blob.size());
++      std::printf("metric cache_get_us %.1f\n", get_us);
++      std::printf("metric cache_load_us %.1f\n", load_us);
++      std::printf("metric cache_load_heap_bytes %lld\n",
++                  (long long)(after_load_heap - before_load_heap));
++      std::printf("metric cache_load_footprint_bytes %lld\n",
++                  (long long)(after_load_footprint - before_load_footprint));
++      std::printf("metric cache_hit_result %d\n", int(hit_failure));
++      std::printf("metric cache_hit_create_us_median %.1f\n",
++                  percentile(hits.create_us, 0.5));
++      std::printf("metric heap_after_cache_hits_bytes %lld\n",
++                  (long long)(hit_heap - after_load_heap));
++      std::printf("metric variant_us_median %.1f\n",
++                  percentile(variant_us, 0.5));
++      std::printf("metric variant_us_p95 %.1f\n",
++                  percentile(variant_us, 0.95));
++
++      destroy(hits);
++      vkDestroyPipelineCache(device, loaded, nullptr);
++   } else {
++      /* Every source is the compressed one, and the heap holds the compressed
++       * size for it: the bytes the shader reports, and the heap's rounding of
++       * the block, which is a few hundred bytes at most. */
++      require(all_packed, "every MSL source of a created pipeline is packed");
++      uint64_t entries = 0;
++      for (const auto *list : {&created.graphics_msl, &created.compute_msl}) {
++         for (const kk_test_msl_stats &stats : *list) {
++            entries += stats.count;
++            for (uint32_t i = 0; i < stats.count; ++i) {
++               const kk_test_msl_entry &entry = stats.entries[i];
++               if (entry.resident_bytes != entry.recompressed_bytes) {
++                  std::fprintf(stderr,
++                               "resident %u bytes, the text compresses to %u "
++                               "(of %u)\n",
++                               entry.resident_bytes, entry.recompressed_bytes,
++                               entry.text_bytes);
++                  return 1;
++               }
++            }
++         }
++      }
++      std::printf("%llu MSL sources hold %llu bytes of the %llu of their "
++                  "text; the heap holds %llu for them\n",
++                  (unsigned long long)entries, (unsigned long long)resident,
++                  (unsigned long long)text, (unsigned long long)heap);
++      require(resident * 3 < text, "the resident MSL is a third of the text");
++      require(heap >= resident && heap <= resident + entries * 512,
++              "the heap holds the compressed size for the MSL");
++
++      /* The shaders of a pipeline that came from the cache. */
++      require(blob.size() * 4 < text * 3,
++              "the pipeline cache is under three quarters of the text");
++      std::printf("pipeline cache: %zu bytes\n", blob.size());
++
++      VkPipelineCache loaded = load_cache(blob);
++      VkResult hit_failure = VK_SUCCESS;
++      Created hits = create_all(
++         loaded, VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT,
++         &hit_failure);
++      require(hit_failure == VK_SUCCESS,
++              "every pipeline is created from the loaded cache", hit_failure);
++      uint64_t hit_resident, hit_text, hit_heap;
++      bool hit_packed;
++      totals(hits, &hit_resident, &hit_text, &hit_heap, &hit_packed);
++      require(hit_packed, "the loaded shaders keep their MSL packed");
++      require(hit_resident == resident && hit_text == text,
++              "the loaded shaders hold what the created ones did");
++      for (unsigned i = 0; i < count; ++i) {
++         const kk_test_msl_stats &a = created.graphics_msl[i];
++         const kk_test_msl_stats &b = hits.graphics_msl[i];
++         require(a.count == b.count, "the loaded pipeline has the same MSL");
++         for (uint32_t e = 0; e < a.count; ++e)
++            require(a.entries[e].text_hash == b.entries[e].text_hash,
++                    "the loaded graphics MSL is the text that was cached");
++         const kk_test_msl_stats &ca = created.compute_msl[i];
++         const kk_test_msl_stats &cb = hits.compute_msl[i];
++         require(ca.count == cb.count, "the loaded compute has the same MSL");
++         for (uint32_t e = 0; e < ca.count; ++e)
++            require(ca.entries[e].text_hash == cb.entries[e].text_hash,
++                    "the loaded compute MSL is the text that was cached");
++      }
++      require(cache_data(loaded, nullptr).size() == blob.size(),
++              "the loaded cache writes the same bytes back");
++
++      /* Variants build from the packed text, in the pipelines that were
++       * compiled here and in those that were loaded. */
++      check_variants(created, "created pipeline", nullptr);
++      check_variants(hits, "loaded pipeline", nullptr);
++      std::printf("variants of %zu created and %zu loaded pipelines "
++                  "rendered\n",
++                  created.graphics.size(), hits.graphics.size());
++
++      /* A cache cut short or damaged never hands out a broken shader: its
++       * pipelines compile again, or report that they must. */
++      std::vector<uint8_t> cut(blob.begin(),
++                               blob.begin() + (blob.size() * 3) / 5);
++      VkPipelineCache cut_cache = load_cache(cut);
++      VkResult cut_failure = VK_SUCCESS;
++      Created from_cut = create_all(cut_cache, 0, &cut_failure);
++      require(cut_failure == VK_SUCCESS, "a cut cache compiles the rest",
++              cut_failure);
++      destroy(from_cut);
++      vkDestroyPipelineCache(device, cut_cache, nullptr);
++
++      destroy(hits);
++      vkDestroyPipelineCache(device, loaded, nullptr);
++
++      /* The shaders of the executables a pipeline switches between are packed
++       * too, and a cache carries them with the pipeline. */
++      VkPipelineCache raster_cache = VK_NULL_HANDLE;
++      {
++         VkPipelineCacheCreateInfo info{
++            VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
++         result = vkCreatePipelineCache(device, &info, nullptr,
++                                        &raster_cache);
++         require(result == VK_SUCCESS, "create raster cache", result);
++      }
++      VkPipeline raster = VK_NULL_HANDLE;
++      result = create_graphics(100, raster_cache, 0, &raster, true);
++      require(result == VK_SUCCESS, "dynamic discard pipeline", result);
++      const kk_test_msl_stats raster_msl =
++         msl_of(raster, VK_PIPELINE_BIND_POINT_GRAPHICS);
++      unsigned raster_entries = 0;
++      for (uint32_t i = 0; i < raster_msl.count; ++i)
++         raster_entries += raster_msl.entries[i].is_raster_variant;
++      require(raster_entries > 0, "the pipeline has raster variant shaders");
++      require(kk_test_msl_all_packed(&raster_msl),
++              "the MSL of the raster variants is packed");
++      std::vector<uint8_t> raster_blob = cache_data(raster_cache, nullptr);
++      VkPipelineCache raster_loaded = load_cache(raster_blob);
++      VkPipeline raster_hit = VK_NULL_HANDLE;
++      result = create_graphics(
++         100, raster_loaded,
++         VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT,
++         &raster_hit, true);
++      require(result == VK_SUCCESS, "dynamic discard pipeline from cache",
++              result);
++      const kk_test_msl_stats hit_msl =
++         msl_of(raster_hit, VK_PIPELINE_BIND_POINT_GRAPHICS);
++      require(hit_msl.count == raster_msl.count &&
++                 kk_test_msl_all_packed(&hit_msl),
++              "the loaded raster variants are packed");
++      for (uint32_t i = 0; i < raster_msl.count; ++i)
++         require(raster_msl.entries[i].text_hash ==
++                    hit_msl.entries[i].text_hash,
++                 "the loaded raster variants hold the text that was cached");
++      std::printf("%u raster variant sources packed\n", raster_entries);
++      vkDestroyPipeline(device, raster_hit, nullptr);
++      vkDestroyPipeline(device, raster, nullptr);
++      vkDestroyPipelineCache(device, raster_loaded, nullptr);
++      vkDestroyPipelineCache(device, raster_cache, nullptr);
++      std::printf("MSL packing passed\n");
++   }
++
++   destroy(created);
++   vkDestroyPipelineCache(device, cache, nullptr);
++   vkDestroyImageView(device, view, nullptr);
++   vkDestroyImage(device, image, nullptr);
++   vkFreeMemory(device, image_memory, nullptr);
++   vkDestroyBuffer(device, readback, nullptr);
++   vkFreeMemory(device, readback_memory, nullptr);
++   vkDestroyCommandPool(device, pool, nullptr);
++   vkDestroyPipelineLayout(device, compute_layout, nullptr);
++   vkDestroyDescriptorSetLayout(device, set_layout, nullptr);
++   vkDestroyPipelineLayout(device, graphics_layout, nullptr);
++   vkDestroyShaderModule(device, compute_module, nullptr);
++   vkDestroyShaderModule(device, fragment_module, nullptr);
++   vkDestroyShaderModule(device, vertex_module, nullptr);
++   kk_test_destroy(&t);
++   return 0;
++}

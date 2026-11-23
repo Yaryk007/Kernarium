@@ -1,0 +1,192 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 13:22:56 +0000
+Subject: [PATCH] netd: route a bypassable VPN's UIDs before the implicit
+ network rules
+
+LineageOS's firewall gives the default network an allowlist of UID
+ranges (all UIDs unless its policy denies some) at the lowest
+sub-priority that still makes the network the default of those UIDs.
+Netd turns it into an implicit network rule for every UID at
+RULE_PRIORITY_UID_IMPLICIT_NETWORK plus that sub-priority (22998), and
+connect() marks a socket with the default network's netId even when a
+bypassable VPN applies to the UID. Such a socket matched that rule
+before the VPN's UID range rule at 24000 and left over the underlying
+network, so a VPN application that allows bypass carried no traffic
+from the applications it covers, while the resolver and unmarked
+sockets still entered the VPN.
+
+The UID range rule and the system permission rule of a bypassable VPN
+that does not exclude local routes move to 21900, just before the
+implicit network rules. AOSP needs no such order: its connect() marks
+the socket with the VPN's netId, which those rules do not match. The
+UID range rule still requires a socket that is neither explicitly
+bound to a network nor protected from the VPN, so bound and protected
+sockets bypass the VPN as before. A secure VPN's rules (13000) do not
+move, and a destination that the VPN's routing table has no route to
+continues to the network rules, so split tunnels keep their
+fallthrough. The rules of a VPN that excludes local routes stay behind
+the local routes rules.
+
+The tests follow. The bypassable VPN cases expect the physical
+network's netId in the mark, as connect() sets it, and the packet on
+the VPN. A new test installs the firewall's allowlist and checks that
+a covered UID's packets enter the VPN, that an uncovered UID's and a
+destination outside the VPN's routes stay on the default network, and
+that an explicit selection of the default network bypasses the VPN.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ server/RouteController.cpp |  6 ++++
+ server/RouteController.h   | 15 +++++++++-
+ tests/binder_test.cpp      | 59 +++++++++++++++++++++++++++++++++-----
+ 3 files changed, 72 insertions(+), 8 deletions(-)
+
+diff --git a/server/RouteController.cpp b/server/RouteController.cpp
+index 2f0e8e2225bd49533cf2c516754375d94b11cb87..4b867113d75b355cf9b2420660ed8e26b604ef6c 100644
+--- a/server/RouteController.cpp
++++ b/server/RouteController.cpp
+@@ -515,6 +515,12 @@ int modifyIncomingPacketMark(unsigned netId, const char* interface, Permission p
+ // Notice that this rule doesn't use the netId. I.e., no matter what netId the user's socket may
+ // have, if they are subject to this VPN, their traffic has to go through it. Allows the traffic to
+ // bypass the VPN if the protectedFromVpn bit is set.
++//
++// A bypassable VPN's rule leaves out sockets that selected a network explicitly. connect() marks a
++// socket with the physical default network's netId even when a bypassable VPN applies to the UID,
++// so the rule of a VPN that does not exclude local routes is placed before the implicit network
++// rules (see RULE_PRIORITY_BYPASSABLE_VPN_NO_LOCAL_EXCLUSION). A destination that the VPN's table
++// has no route to continues to those rules.
+ [[nodiscard]] static int modifyVpnUidRangeRule(uint32_t table, uid_t uidStart, uid_t uidEnd,
+                                                int32_t subPriority, bool secure, bool add,
+                                                bool excludeLocalRoutes) {
+diff --git a/server/RouteController.h b/server/RouteController.h
+index d8393e75b7b788bf1086943320148ead45231028..8635895b4c2b89f12c549df908d64512e21889a5 100644
+--- a/server/RouteController.h
++++ b/server/RouteController.h
+@@ -48,11 +48,18 @@ constexpr int32_t RULE_PRIORITY_EXPLICIT_NETWORK                  = 16000;
+ constexpr int32_t RULE_PRIORITY_OUTPUT_INTERFACE                  = 17000;
+ constexpr int32_t RULE_PRIORITY_LOCAL_NETWORK                     = 20000;
+ constexpr int32_t RULE_PRIORITY_TETHERING                         = 21000;
++// The UID range rule and the system permission rule of a bypassable VPN that does not exclude local
++// routes come before the implicit network rules below. The framework gives the default network an
++// implicit rule for every UID, and a socket that connect() marked with that network's netId would
++// match it before the VPN's rule and never enter the VPN. Explicitly selected and protected sockets
++// still skip the VPN (its UID range rule requires neither bit), and a destination that the VPN's
++// table has no route to continues to the network rules. A VPN has only sub-priority 0, so this
++// priority precedes every implicit network rule.
++constexpr int32_t RULE_PRIORITY_BYPASSABLE_VPN_NO_LOCAL_EXCLUSION = 21900;
+ // Implicit rules for sockets that connected on a given network because the network was the default
+ // network for the UID.
+ constexpr int32_t RULE_PRIORITY_UID_IMPLICIT_NETWORK              = 22000;
+ constexpr int32_t RULE_PRIORITY_IMPLICIT_NETWORK                  = 23000;
+-constexpr int32_t RULE_PRIORITY_BYPASSABLE_VPN_NO_LOCAL_EXCLUSION = 24000;
+ // Sets of rules used for excluding local routes from the VPN. Look up tables
+ // that contain directly-connected local routes taken from the default network.
+ // The first set is used for apps that have a per-UID default network. The rule
+@@ -61,6 +68,7 @@ constexpr int32_t RULE_PRIORITY_BYPASSABLE_VPN_NO_LOCAL_EXCLUSION = 24000;
+ // is the system default network network.
+ constexpr int32_t RULE_PRIORITY_UID_LOCAL_ROUTES                  = 25000;
+ constexpr int32_t RULE_PRIORITY_LOCAL_ROUTES                      = 26000;
++// A bypassable VPN that excludes local routes stays behind the local routes rules above.
+ constexpr int32_t RULE_PRIORITY_BYPASSABLE_VPN_LOCAL_EXCLUSION    = 27000;
+ constexpr int32_t RULE_PRIORITY_VPN_FALLTHROUGH                   = 28000;
+ constexpr int32_t RULE_PRIORITY_UID_DEFAULT_NETWORK               = 29000;
+@@ -83,6 +91,11 @@ constexpr int32_t RULE_PRIORITY_DEFAULT_NETWORK                   = 31000;
+ constexpr int32_t RULE_PRIORITY_UNREACHABLE                       = 32000;
+ // clang-format on
+ 
++static_assert(RULE_PRIORITY_TETHERING < RULE_PRIORITY_BYPASSABLE_VPN_NO_LOCAL_EXCLUSION &&
++                      RULE_PRIORITY_BYPASSABLE_VPN_NO_LOCAL_EXCLUSION <
++                              RULE_PRIORITY_UID_IMPLICIT_NETWORK,
++              "a bypassable VPN's rules must come before the implicit network rules");
++
+ class UidRanges;
+ 
+ class RouteController {
+diff --git a/tests/binder_test.cpp b/tests/binder_test.cpp
+index 00e6aadaf2fb54cc27854414339ec4e1da858edb..581bf62edddaa9f4dc7939239a0a010585e64199 100644
+--- a/tests/binder_test.cpp
++++ b/tests/binder_test.cpp
+@@ -4512,14 +4512,14 @@ TEST_P(VpnParameterizedTest, ImplicitlySelectNetwork) {
+ 
+     // uid is neither in app range, nor in VPN range. Traffic goes through system default network.
+     expectPacketSentOnNetId(AID_ROOT, SYSTEM_DEFAULT_NETID, systemDefaultFd, IMPLICITLY_SELECT);
+-    // uid is in VPN range, not in app range. Traffic goes through VPN.
+-    expectPacketSentOnNetId(TEST_UID3, (isSecureVPN ? SYSTEM_DEFAULT_NETID : VPN_NETID), vpnFd,
+-                            IMPLICITLY_SELECT);
++    // uid is in VPN range, not in app range. Traffic goes through VPN. A connecting socket carries
++    // the physical network's netId even when a bypassable VPN applies to the uid, so the VPN's rule
++    // has to come before the physical network's implicit rules.
++    expectPacketSentOnNetId(TEST_UID3, SYSTEM_DEFAULT_NETID, vpnFd, IMPLICITLY_SELECT);
+     // uid is in app range, not in VPN range. Traffic goes through per-app default network.
+     expectPacketSentOnNetId(TEST_UID1, APP_DEFAULT_NETID, appDefaultFd, IMPLICITLY_SELECT);
+     // uid is in both app and VPN range. Traffic goes through VPN.
+-    expectPacketSentOnNetId(TEST_UID2, (isSecureVPN ? APP_DEFAULT_NETID : VPN_NETID), vpnFd,
+-                            IMPLICITLY_SELECT);
++    expectPacketSentOnNetId(TEST_UID2, APP_DEFAULT_NETID, vpnFd, IMPLICITLY_SELECT);
+ }
+ 
+ class VpnAndSelectNetworkParameterizedTest
+@@ -5188,8 +5188,9 @@ TEST_F(NetdBinderTest, UidRangeSubPriority_ImplicitlySelectNetwork) {
+     int appDefault_1_Fd = sTun2.getFdForTesting();
+     int vpnFd = sTun3.getFdForTesting();
+     int appDefault_2_Fd = sTun4.getFdForTesting();
+-    // Verify routings.
+-    expectPacketSentOnNetId(TEST_UID1, VPN_NETID, vpnFd, IMPLICITLY_SELECT);
++    // Verify routings. The socket carries the netId of the per-app default network even though the
++    // bypassable VPN has the highest priority for TEST_UID1; the VPN's rule takes the traffic.
++    expectPacketSentOnNetId(TEST_UID1, APP_DEFAULT_1_NETID, vpnFd, IMPLICITLY_SELECT);
+     expectPacketSentOnNetId(TEST_UID2, APP_DEFAULT_1_NETID, appDefault_1_Fd, IMPLICITLY_SELECT);
+     expectPacketSentOnNetId(TEST_UID3, APP_DEFAULT_2_NETID, appDefault_2_Fd, IMPLICITLY_SELECT);
+     expectPacketSentOnNetId(TEST_UID4, APP_DEFAULT_2_NETID, appDefault_2_Fd, IMPLICITLY_SELECT);
+@@ -5206,6 +5207,50 @@ TEST_F(NetdBinderTest, UidRangeSubPriority_ImplicitlySelectNetwork) {
+     }
+ }
+ 
++// LineageOS's firewall gives the default network an allowlist: the UID ranges that its policy
++// allows, all UIDs unless some are denied, at the lowest sub-priority that still makes the network
++// the default of those UIDs. Its implicit network rule must not take the traffic of a UID that a
++// bypassable VPN applies to, although connect() marks the socket with the default network's netId.
++//
++// SYSTEM_DEFAULT_NETID uses sTun (default route), VPN_NETID uses sTun3 (route 2001:db8::/32 only).
++TEST_F(NetdBinderTest, BypassableVpnBeatsDefaultNetworkAllowlist) {
++    createVpnAndOtherPhysicalNetwork(SYSTEM_DEFAULT_NETID, APP_DEFAULT_NETID, VPN_NETID,
++                                     false /* secure */);
++    constexpr int ALL_UIDS_END = 2147483647;
++    EXPECT_TRUE(mNetd->networkAddUidRangesParcel(
++                            makeNativeUidRangeConfig(SYSTEM_DEFAULT_NETID,
++                                                     {makeUidRangeParcel(0, ALL_UIDS_END)},
++                                                     UidRanges::SUB_PRIORITY_LOWEST))
++                        .isOk());
++    EXPECT_TRUE(mNetd->networkAddUidRanges(VPN_NETID, {makeUidRangeParcel(TEST_UID1)}).isOk());
++
++    int systemDefaultFd = sTun.getFdForTesting();
++    int vpnFd = sTun3.getFdForTesting();
++
++    // The VPN applies to TEST_UID1: its connected and unconnected sockets go into the VPN.
++    expectPacketSentOnNetId(TEST_UID1, SYSTEM_DEFAULT_NETID, vpnFd, IMPLICITLY_SELECT);
++    expectPacketSentOnNetId(TEST_UID1, NETID_UNSET, vpnFd, UNCONNECTED_SOCKET);
++    // The VPN does not apply to TEST_UID2: it stays on the default network.
++    expectPacketSentOnNetId(TEST_UID2, SYSTEM_DEFAULT_NETID, systemDefaultFd, IMPLICITLY_SELECT);
++    expectPacketSentOnNetId(TEST_UID2, NETID_UNSET, systemDefaultFd, UNCONNECTED_SOCKET);
++
++    // A destination that the VPN has no route to continues to the default network.
++    const in6_addr outsideVpnAddr = {
++            {// 2607:f0d0:1002::4
++             .u6_addr8 = {0x26, 0x07, 0xf0, 0xd0, 0x10, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4}}};
++    Fwmark fwmark;
++    EXPECT_TRUE(sendIPv6PacketFromUid(TEST_UID1, outsideVpnAddr, &fwmark, systemDefaultFd));
++    EXPECT_EQ(SYSTEM_DEFAULT_NETID, static_cast<int>(fwmark.netId));
++
++    // A socket that selects the default network explicitly bypasses the VPN.
++    {
++        ScopedUidChange scopedUidChange(TEST_UID1);
++        EXPECT_EQ(0, setNetworkForProcess(SYSTEM_DEFAULT_NETID));
++        expectPacketSentOnNetId(TEST_UID1, SYSTEM_DEFAULT_NETID, systemDefaultFd,
++                                EXPLICITLY_SELECT);
++    }
++}
++
+ class PerAppNetworkPermissionsTest : public NetdBinderTest {
+   public:
+     int bindSocketToNetwork(int sock, int netId, bool explicitlySelected) {

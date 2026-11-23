@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 07:29:03 +0900
+Subject: [PATCH] u_threaded_context: upload an image directly if staging is
+ refused
+
+tc_texture_subdata() sends a large image recorded in a render pass
+through a staging buffer and a buffer-to-image copy, and used the buffer
+without checking that the driver made it. A driver that had no memory
+for it left a NULL that the next call dereferenced, which the host's
+process does not survive. The image now goes to the driver directly
+when there is no staging buffer, as it does when it is not staged.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/gallium/auxiliary/util/u_threaded_context.c | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/src/gallium/auxiliary/util/u_threaded_context.c b/src/gallium/auxiliary/util/u_threaded_context.c
+index ba3695800eb2a6e70396330b240237b1f499da95..ba1764b25b6df0bebfb3caebcfb65ef6115f3f8e 100644
+--- a/src/gallium/auxiliary/util/u_threaded_context.c
++++ b/src/gallium/auxiliary/util/u_threaded_context.c
+@@ -3340,14 +3340,20 @@ tc_texture_subdata(struct pipe_context *_pipe,
+                         tc->options.is_resource_busy &&
+                         !tc->options.is_resource_busy(tc->pipe->screen, tres->latest, usage | unsync_usage);
+ 
++      /* upload to staging buffer and then buf2img copy */
++      struct pipe_resource *pres = NULL;
+       if (!can_unsync && resource->usage != PIPE_USAGE_STAGING &&
+-          tc->options.parse_renderpass_info && tc->in_renderpass) {
+-         /* upload to staging buffer and then buf2img copy */
+-         struct pipe_resource *pres = pipe_buffer_create(pipe->screen, 0, PIPE_USAGE_STREAM, layer_stride * box->depth);
++          tc->options.parse_renderpass_info && tc->in_renderpass)
++         pres = pipe_buffer_create(pipe->screen, 0, PIPE_USAGE_STREAM, layer_stride * box->depth);
++
++      if (pres) {
+          tc->base.buffer_subdata(&tc->base, pres, 0, 0, size, data);
+          tc->base.image_copy_buffer(&tc->base, resource, pres, 0, stride, layer_stride, level, box);
+          pipe_resource_reference(&pres, NULL);
+       } else {
++         /* Either the upload is not staged, or the driver had no memory for
++          * the staging buffer: the driver uploads it directly.
++          */
+          if (can_unsync) {
+             usage |= unsync_usage;
+          } else {

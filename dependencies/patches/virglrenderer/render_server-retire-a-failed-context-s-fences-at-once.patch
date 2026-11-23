@@ -348,10 +348,10 @@ index bc7f8e16debdcdd603eb4596f48bc83cbbd12903..0e95dd4f287842ba70e5e99189ba5a67
  
  static void
 diff --git a/src/venus/vkr_context.c b/src/venus/vkr_context.c
-index 5fc6b43d9fc0dff013a1e6ab2f8f82ea2f0a3cd1..623486be6fe5b6ce9408afa532781cb0a9a07203 100644
+index 1328c0fbd2465191593c8e536c7cfea95ae92c96..a4a01492740738a1632d93b4e81f127b0efc59be 100644
 --- a/src/venus/vkr_context.c
 +++ b/src/venus/vkr_context.c
-@@ -577,6 +577,11 @@ vkr_context_on_ring_fatal(struct vkr_context *ctx)
+@@ -576,6 +576,11 @@ vkr_context_on_ring_fatal(struct vkr_context *ctx)
     mtx_lock(&ctx->wait_ring.mutex);
     cnd_signal(&ctx->wait_ring.cond);
     mtx_unlock(&ctx->wait_ring.mutex);

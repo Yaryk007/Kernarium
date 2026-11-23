@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 06:51:45 +0900
+Subject: [PATCH] vulkan/runtime: hash a shader stage that names no shader
+
+vk_pipeline_hash_shader_stage_blake3() hashes a stage by its module, by a
+VkShaderModuleCreateInfo chained to it, or by a module identifier, and
+asserted that the identifier was there when the first two were not.  A
+release build compiles the assert out, so a stage with a null module and
+nothing chained read the identifier through a null pointer, and an
+identifier that names a size but no bytes read through another.  The entry
+point name was measured with strlen() whether or not it was there.  The
+Venus renderer runs in the application's own process on Apple hosts, and its
+driver is handed whatever a guest sends, so each ended the process.
+
+Hash nothing of the shader for a stage that names none, and nothing of an
+absent name or identifier.  Building such a stage already fails in
+vk_pipeline_shader_stage_to_nir() with "No shader module provided"; give an
+absent entry point name the same refusal there.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/vulkan/runtime/vk_pipeline.c | 20 ++++++++++++++++----
+ 1 file changed, 16 insertions(+), 4 deletions(-)
+
+diff --git a/src/vulkan/runtime/vk_pipeline.c b/src/vulkan/runtime/vk_pipeline.c
+index 0a3eac7238e78bf15c711b979c98d6f5ba2774ce..f159e5d1875823eb1cf7989d6956cd6a8381c4ed 100644
+--- a/src/vulkan/runtime/vk_pipeline.c
++++ b/src/vulkan/runtime/vk_pipeline.c
+@@ -192,6 +192,11 @@ vk_pipeline_shader_stage_to_nir(struct vk_device *device,
+       return VK_SUCCESS;
+    }
+ 
++   if (unlikely(info->pName == NULL)) {
++      return vk_errorf(device, VK_ERROR_UNKNOWN,
++                       "No shader entry point name provided");
++   }
++
+    const uint32_t *spirv_data;
+    uint32_t spirv_size;
+    if (module != NULL) {
+@@ -284,18 +289,25 @@ vk_pipeline_hash_shader_stage_blake3(VkPipelineCreateFlags2KHR pipeline_flags,
+       blake3_hash module_hash;
+       vk_shader_module_hash(minfo, module_hash);
+       _mesa_blake3_update(&ctx, module_hash, sizeof(module_hash));
+-   } else {
++   } else if (iinfo != NULL) {
+       /* It is legal to pass in arbitrary identifiers as long as they don't exceed
+        * the limit. Shaders with bogus identifiers are more or less guaranteed to fail. */
+-      assert(iinfo);
+       assert(iinfo->identifierSize <= VK_MAX_SHADER_MODULE_IDENTIFIER_SIZE_EXT);
+-      _mesa_blake3_update(&ctx, iinfo->pIdentifier, iinfo->identifierSize);
++      if (iinfo->pIdentifier != NULL)
++         _mesa_blake3_update(&ctx, iinfo->pIdentifier, iinfo->identifierSize);
+    }
++   /* A stage with no module, no chained module and no identifier names no
++    * shader at all, which the specification does not allow.  Its hash holds
++    * nothing of a shader, and building it fails in
++    * vk_pipeline_shader_stage_to_nir.
++    */
+ 
+    if (rstate)
+       _mesa_blake3_update(&ctx, rstate, sizeof(*rstate));
+ 
+-   _mesa_blake3_update(&ctx, info->pName, strlen(info->pName));
++   /* An absent entry point name fails in vk_pipeline_shader_stage_to_nir. */
++   if (info->pName != NULL)
++      _mesa_blake3_update(&ctx, info->pName, strlen(info->pName));
+ 
+    if (info->pSpecializationInfo) {
+       _mesa_blake3_update(&ctx, info->pSpecializationInfo->pMapEntries,

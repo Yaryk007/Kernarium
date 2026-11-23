@@ -9,8 +9,13 @@
  * from retranslating its working set; every change that can leave a
  * translation wrong publishes a range covering exactly the pages it can, so a
  * reader that retires only those ranges runs no stale code. */
+#if DARWIN_UML_X86_64_GUEST
+#include "frame_accounting.hpp"
+#endif
 #include "uml_darwin_guest.h"
 #include "uml_darwin_static_mmu.h"
+#include "allocation_fault.hpp"
+#include "domain_registry_testing.hpp"
 #include "require.hpp"
 #include "scratch_backing.hpp"
 
@@ -483,6 +488,448 @@ void test_a_published_page_moves_its_stamp()
 	require(darwin_uml_static_vm_destroy(generation) == 0);
 }
 
+/* The kernel's immutable fact travels in bit 1 of `guest_code` and means
+ * something only for guest code (bit 0). A caller that passes 0 or 1 never
+ * sets it, and 3 does. The fact belongs to the mapping: changing it replaces
+ * the mapping, which a translator sees as a mapping change, but it changes
+ * neither the bytes nor the right to execute them, so it moves no stamp.
+ * Gaining the fact publishes no code change. Losing it does, for the page
+ * alone: what a consumer kept about the bytes on the strength of the fact
+ * (rewritten code bound to the page by a hash) holds no longer, since another
+ * mapping of the frame can change them with no word to this address space. A
+ * replay of the same fact changes nothing. */
+void test_the_immutable_fact_replaces_a_mapping_without_a_code_change()
+{
+	constexpr unsigned long generation = 509;
+	constexpr unsigned long base = 0x180'0000;
+	ScratchBacking backing{backing_name, 8 * page};
+	map(generation, base, backing, 0, 4, rwx, 1);
+	require(darwin_uml_static_vm_activate(generation) == 0);
+	Observer seen{generation};
+
+	void *handle = nullptr;
+	darwin_uml_static_code_page_stamp before{};
+	require(darwin_uml_static_vm_code_page(generation, base + page, &handle,
+		&before) == DARWIN_UML_STATIC_TRANSLATED);
+	const auto moved = [&] {
+		darwin_uml_static_code_page_stamp now{};
+		require(darwin_uml_static_vm_code_page_stamp(handle, &now) == 0);
+		return now.version != before.version || now.identity != before.identity;
+	};
+
+	/* The fact on for one page. */
+	map(generation, base + page, backing, page, 1, rwx, 3);
+	seen.consume();
+	require_code(seen, 0, 0);
+	require(!seen.mapping_untracked && seen.mapping.size() == 1 &&
+		seen.mapping[0].address == base + page &&
+		seen.mapping[0].length == page);
+	require(!moved());
+
+	/* Again: the same mapping, nothing to publish. */
+	map(generation, base + page, backing, page, 1, rwx, 3);
+	seen.consume();
+	require_code(seen, 0, 0);
+	require(seen.mapping.empty());
+
+	/* Bit 1 without bit 0 is guest code and never immutable; as it is the
+	 * same mapping as the unflagged one, it publishes nothing for the pages
+	 * that are not flagged. */
+	map(generation, base + 2 * page, backing, 2 * page, 1, rwx, 2);
+	seen.consume();
+	require_code(seen, 0, 0);
+	require(seen.mapping.empty());
+
+	/* The protection round trip of a flagged page changes nothing; a fact
+	 * that goes off replaces the mapping again and is published as a code
+	 * change of that page, with the stamp where it was. */
+	protect(base + page, 1, rx);
+	protect(base + page, 1, rwx);
+	seen.consume();
+	require_code(seen, 0, 0);
+	map(generation, base + page, backing, page, 1, rwx, 1);
+	seen.consume();
+	require_code(seen, base + page, 1);
+	require(!seen.mapping_untracked && !seen.mapping.empty());
+	require(!moved());
+	/* Off to off again is a replay, and the fact coming back is a gain. */
+	map(generation, base + page, backing, page, 1, rwx, 1);
+	seen.consume();
+	require_code(seen, 0, 0);
+	map(generation, base + page, backing, page, 1, rwx, 3);
+	seen.consume();
+	require_code(seen, 0, 0);
+	require(!moved());
+	/* Losing it on a page that cannot hold code publishes nothing. */
+	protect(base + page, 1, PROT_READ);
+	seen.consume();
+	map(generation, base + page, backing, page, 1, PROT_READ, 1);
+	seen.consume();
+	require_code(seen, 0, 0);
+
+	/* Not guest code, flagged or not: a page that is not code is not made
+	 * code by the fact. */
+	map(generation, base + 3 * page, backing, 3 * page, 1, rwx, 0);
+	seen.consume();
+	require_code(seen, base + 3 * page, 1);
+	void *plain = nullptr;
+	darwin_uml_static_code_page_stamp unused{};
+	require(darwin_uml_static_vm_code_page(generation, base + 3 * page,
+		&plain, &unused) != DARWIN_UML_STATIC_TRANSLATED);
+	require(darwin_uml_static_vm_destroy(generation) == 0);
+}
+
+/* Two mappings of one frame that disagree on the fact still name one
+ * physical-page record: the stamp and the code history are the frame's, the
+ * fact is the mapping's. */
+void test_mappings_of_one_frame_that_disagree_share_its_record()
+{
+	constexpr unsigned long generation = 510;
+	constexpr unsigned long base = 0x190'0000;
+	ScratchBacking backing{backing_name, 4 * page};
+	map(generation, base, backing, page, 1, rwx, 1);
+	map(generation, base + 4 * page, backing, page, 1, rwx, 3);
+	map(generation, base + 8 * page, backing, page, 1, rx, 3);
+	require(darwin_uml_static_vm_activate(generation) == 0);
+
+	std::array<void *, 3> handles{};
+	std::array<darwin_uml_static_code_page_stamp, 3> stamps{};
+	const std::array<unsigned long, 3> addresses{base, base + 4 * page,
+		base + 8 * page};
+	for (std::size_t index = 0; index < handles.size(); ++index)
+		require(darwin_uml_static_vm_code_page(generation, addresses[index],
+			&handles[index], &stamps[index]) == DARWIN_UML_STATIC_TRANSLATED);
+	for (std::size_t index = 1; index < handles.size(); ++index) {
+		require(handles[index] == handles[0]);
+		require(stamps[index].identity == stamps[0].identity &&
+			stamps[index].version == stamps[0].version);
+	}
+
+	/* One of them leaving does not take the frame's record from the others. */
+	unmap(generation, base + 4 * page, 1);
+	void *remaining = nullptr;
+	darwin_uml_static_code_page_stamp stamp{};
+	require(darwin_uml_static_vm_code_page(generation, base, &remaining,
+		&stamp) == DARWIN_UML_STATIC_TRANSLATED);
+	require(remaining == handles[0] && stamp.identity == stamps[0].identity);
+	require(darwin_uml_static_vm_code_page(generation, base + 8 * page,
+		&remaining, &stamp) == DARWIN_UML_STATIC_TRANSLATED);
+	require(remaining == handles[0] && stamp.identity == stamps[0].identity);
+	require(darwin_uml_static_vm_destroy(generation) == 0);
+}
+
+/* A page's stamp carries the fact of the mapping it was asked through, not
+ * of the frame. A stamp read by handle names the frame and so never carries
+ * the fact; the epoch moves at a publication and with it the version. */
+void test_a_stamp_carries_the_epoch_and_the_mapping_fact()
+{
+	constexpr unsigned long generation = 511;
+	constexpr unsigned long base = 0x1a0'0000;
+	ScratchBacking backing{backing_name, 4 * page};
+	map(generation, base, backing, 0, 1, rwx, 3);
+	map(generation, base + page, backing, 0, 1, rwx, 1);
+	map(generation, base + 2 * page, backing, page, 1, rx, 3);
+	require(darwin_uml_static_vm_activate(generation) == 0);
+
+	std::array<void *, 3> handles{};
+	std::array<darwin_uml_static_code_page_stamp, 3> stamps{};
+	for (std::size_t index = 0; index < handles.size(); ++index)
+		require(darwin_uml_static_vm_code_page(generation,
+			base + index * page, &handles[index], &stamps[index]) ==
+			DARWIN_UML_STATIC_TRANSLATED);
+	require((stamps[0].flags & DARWIN_UML_STATIC_STAMP_IMMUTABLE) != 0);
+	require((stamps[1].flags & DARWIN_UML_STATIC_STAMP_IMMUTABLE) == 0);
+	require((stamps[2].flags & DARWIN_UML_STATIC_STAMP_IMMUTABLE) != 0);
+	for (const auto &stamp : stamps)
+		require((stamp.flags & DARWIN_UML_STATIC_STAMP_NEVER_SHARE) == 0);
+	require(handles[0] == handles[1] && handles[0] != handles[2]);
+	require(stamps[0].epoch == stamps[1].epoch);
+
+	/* By handle: the frame's own fields, and not the mapping's fact. */
+	darwin_uml_static_code_page_stamp by_handle{};
+	require(darwin_uml_static_vm_code_page_stamp(handles[0], &by_handle) == 0);
+	require(by_handle.identity == stamps[0].identity &&
+		by_handle.version == stamps[0].version &&
+		by_handle.epoch == stamps[0].epoch && by_handle.flags == 0);
+
+	/* A publication through the handle moves the version and the epoch of
+	 * that frame only. */
+	darwin_uml_static_vm_invalidate_code_page(handles[0]);
+	require(darwin_uml_static_vm_code_page_stamp(handles[1], &by_handle) == 0);
+	require(by_handle.version == stamps[0].version + 1 &&
+		by_handle.epoch == stamps[0].epoch + 1);
+	require(darwin_uml_static_vm_code_page_stamp(handles[2], &by_handle) == 0);
+	require(by_handle.version == stamps[2].version &&
+		by_handle.epoch == stamps[2].epoch);
+
+	/* So does a copy into the page that publishes (a ptrace or
+	 * /proc/pid/mem store, here as the bridge spells it). */
+	const std::uint32_t word = 0xd503'201fU;
+	require(darwin_uml_static_vm_copy_from_buffer(base, &word, sizeof word) ==
+		0);
+	require(darwin_uml_static_vm_code_page_stamp(handles[0], &by_handle) == 0);
+	require(by_handle.version == stamps[0].version + 2 &&
+		by_handle.epoch == stamps[0].epoch + 2);
+
+	/* Flipping the fact on a mapping changes what a full query says. */
+	map(generation, base + page, backing, 0, 1, rwx, 3);
+	darwin_uml_static_code_page_stamp flipped{};
+	void *again = nullptr;
+	require(darwin_uml_static_vm_code_page(generation, base + page, &again,
+		&flipped) == DARWIN_UML_STATIC_TRANSLATED);
+	require(again == handles[0] &&
+		(flipped.flags & DARWIN_UML_STATIC_STAMP_IMMUTABLE) != 0);
+	require(darwin_uml_static_vm_destroy(generation) == 0);
+}
+
+/* A publication moves the stamp of the frame whatever view of it the
+ * publisher has. Another generation maps the frame writable and not as guest
+ * code, as a process that writes a file does, and its code synchronization
+ * (IC IVAU) and the kernel's write through its address space each move the
+ * epoch and the version of the frame an executable mapping holds: a verdict
+ * filed for the frame's bytes is answered only under the epoch it was filed
+ * under. A frame that nothing maps executable has no record to move, and
+ * publishing it leaves the stamp of every other frame where it was. */
+void test_a_publication_through_a_view_that_cannot_execute_moves_the_stamp()
+{
+	constexpr unsigned long reader = 513, writer = 514;
+	constexpr unsigned long base = 0x1c0'0000, view = 0x1d0'0000;
+	ScratchBacking backing{backing_name, 2 * page};
+	map(reader, base, backing, 0, 1, rx, 3);
+	map(writer, view, backing, 0, 2, rw, 0);
+	require(darwin_uml_static_vm_activate(reader) == 0);
+	void *handle = nullptr;
+	darwin_uml_static_code_page_stamp before{};
+	require(darwin_uml_static_vm_code_page(reader, base, &handle, &before) ==
+		DARWIN_UML_STATIC_TRANSLATED);
+
+	require(darwin_uml_static_vm_activate(writer) == 0);
+	require(darwin_uml_static_vm_synchronize_code(view) == 0);
+	darwin_uml_static_code_page_stamp after{};
+	require(darwin_uml_static_vm_code_page_stamp(handle, &after) == 0);
+	require(after.identity == before.identity &&
+		after.version == before.version + 1 &&
+		after.epoch == before.epoch + 1);
+
+	require(darwin_uml_static_vm_invalidate_code_generation(writer, view,
+		page) == 0);
+	require(darwin_uml_static_vm_code_page_stamp(handle, &after) == 0);
+	require(after.version == before.version + 2 &&
+		after.epoch == before.epoch + 2);
+
+	/* The second page is mapped by nobody as code: publishing it moves no
+	 * stamp, the first page's included, and makes no record for it (the
+	 * lookup of a view that cannot execute allocates nothing). */
+	uml::memory::testing::reset_allocation_attempt_counts();
+	require(darwin_uml_static_vm_activate(writer) == 0);
+	require(darwin_uml_static_vm_synchronize_code(view + page) == 0);
+	require(darwin_uml_static_vm_invalidate_code_generation(writer,
+		view + page, page) == 0);
+	require(uml::memory::testing::allocation_attempt_count(
+		uml::memory::testing::AllocationSite::records) == 0 &&
+		uml::memory::testing::allocation_attempt_count(
+		uml::memory::testing::AllocationSite::code_record) == 0,
+		"publishing a frame no executable mapping holds made a record");
+	require(darwin_uml_static_vm_code_page_stamp(handle, &after) == 0);
+	require(after.version == before.version + 2 &&
+		after.epoch == before.epoch + 2);
+	require(darwin_uml_static_vm_destroy(reader) == 0);
+	require(darwin_uml_static_vm_destroy(writer) == 0);
+}
+
+/* A kernel write whose target page its address space does not map (the
+ * software page table fills at faults) tells every generation but names no
+ * frame, so no record is stepped. The epoch of every page moves at once
+ * instead, and no version does: a verdict filed under any page's epoch is no
+ * longer answered. */
+void test_a_kernel_write_to_a_page_nobody_maps_moves_every_epoch()
+{
+	constexpr unsigned long reader = 515, writer = 516;
+	constexpr unsigned long base = 0x1e0'0000, view = 0x1f0'0000;
+	ScratchBacking backing{backing_name, 2 * page};
+	map(reader, base, backing, 0, 2, rx, 3);
+	map(writer, view, backing, 0, 1, rw, 0);
+	unmap(writer, view, 1);
+	require(darwin_uml_static_vm_activate(reader) == 0);
+	std::array<void *, 2> handles{};
+	std::array<darwin_uml_static_code_page_stamp, 2> before{}, after{};
+	for (std::size_t index = 0; index < handles.size(); ++index)
+		require(darwin_uml_static_vm_code_page(reader, base + index * page,
+			&handles[index], &before[index]) == DARWIN_UML_STATIC_TRANSLATED);
+	Observer seen{reader};
+
+	for (unsigned round = 1; round <= 2; ++round) {
+		require(darwin_uml_static_vm_invalidate_code_generation(writer, view,
+			page) == 0);
+		seen.consume();
+		require(seen.code_untracked || !seen.code.empty());
+		for (std::size_t index = 0; index < handles.size(); ++index) {
+			require(darwin_uml_static_vm_code_page_stamp(handles[index],
+				&after[index]) == 0);
+			require(after[index].identity == before[index].identity &&
+				after[index].version == before[index].version &&
+				after[index].epoch != before[index].epoch &&
+				(after[index].flags & DARWIN_UML_STATIC_STAMP_NEVER_SHARE) == 0,
+				"a publication that names no frame left a stamp where it was");
+			before[index] = after[index];
+		}
+	}
+	require(darwin_uml_static_vm_destroy(reader) == 0);
+	require(darwin_uml_static_vm_destroy(writer) == 0);
+}
+
+/* The kernel's write that names the frame it holds
+ * (darwin_uml_vm_invalidate_code_frame) moves that frame's stamp, version and
+ * epoch, as a write that names an address does: through the writer's view of
+ * the frame whether or not it can execute, and, where the writer maps another
+ * frame at the address by now, through the frame's record, which exists where
+ * some mapping executes the frame. A frame that nothing maps executable has
+ * no record to move, and the write makes none. A write that cannot name its
+ * frame (a negative descriptor) moves no record and every epoch. */
+void test_a_named_kernel_write_moves_the_stamp_of_its_frame()
+{
+	namespace testing = uml::memory::testing;
+	constexpr unsigned long reader = 521, writer = 522;
+	constexpr unsigned long base = 0x200'0000, view = 0x210'0000;
+	ScratchBacking backing{backing_name, 2 * page};
+	map(reader, base, backing, 0, 1, rx, 3);
+	map(writer, view, backing, 0, 2, rw, 0);
+	require(darwin_uml_static_vm_activate(reader) == 0);
+	void *handle = nullptr;
+	darwin_uml_static_code_page_stamp before{}, after{};
+	require(darwin_uml_static_vm_code_page(reader, base, &handle, &before) ==
+		DARWIN_UML_STATIC_TRANSLATED);
+
+	/* The writer's view of the frame cannot execute. */
+	require(darwin_uml_static_vm_invalidate_code_frame(writer, view, 4,
+		backing.descriptor(), 0) == 0);
+	require(darwin_uml_static_vm_code_page_stamp(handle, &after) == 0);
+	require(after.identity == before.identity &&
+		after.version == before.version + 1 &&
+		after.epoch == before.epoch + 1,
+		"a named write through a view that cannot execute left the stamp "
+		"of its frame where it was");
+
+	/* The writer maps the other frame at the address by now: the write
+	 * names the first, which the writer does not map. */
+	unmap(writer, view, 2);
+	map(writer, view, backing, page, 1, rw, 0);
+	require(darwin_uml_static_vm_invalidate_code_frame(writer, view, 4,
+		backing.descriptor(), 0) == 0);
+	require(darwin_uml_static_vm_code_page_stamp(handle, &after) == 0);
+	require(after.version == before.version + 2 &&
+		after.epoch == before.epoch + 2,
+		"a named write for a frame the writer no longer maps left its "
+		"epoch where it was");
+
+	/* The frame named is the second, which nothing maps as code: no stamp
+	 * moves and no record is made. */
+	testing::reset_allocation_attempt_counts();
+	require(darwin_uml_static_vm_invalidate_code_frame(writer, view, 4,
+		backing.descriptor(), page) == 0);
+	require(darwin_uml_static_vm_invalidate_code_frame(writer, view + page,
+		4, backing.descriptor(), page) == 0);
+	require(testing::allocation_attempt_count(
+		testing::AllocationSite::records) == 0 &&
+		testing::allocation_attempt_count(
+		testing::AllocationSite::code_record) == 0,
+		"a named write to a frame no executable mapping holds made a record");
+	require(darwin_uml_static_vm_code_page_stamp(handle, &after) == 0);
+	require(after.version == before.version + 2 &&
+		after.epoch == before.epoch + 2,
+		"a write to another frame moved the stamp of this one");
+
+	/* A frame Linux cannot name moves the epoch of every page and no
+	 * version. */
+	require(darwin_uml_static_vm_invalidate_code_frame(writer, view, 4, -1,
+		0) == 0);
+	require(darwin_uml_static_vm_code_page_stamp(handle, &after) == 0);
+	require(after.identity == before.identity &&
+		after.version == before.version + 2 &&
+		after.epoch != before.epoch + 2 &&
+		(after.flags & DARWIN_UML_STATIC_STAMP_NEVER_SHARE) == 0,
+		"a write that named no frame left the epochs where they were");
+	require(darwin_uml_static_vm_destroy(reader) == 0);
+	require(darwin_uml_static_vm_destroy(writer) == 0);
+}
+
+/* The count of publications that name no frame rides in the high bits of
+ * every reported epoch, in a field of its own. At its limit the field would
+ * wrap to the value it had before any such write, so a stamp reports
+ * never-share from the very load of the count that reached the limit (not
+ * from a flag set after it, which a reader can run ahead of), and the count
+ * stops there. The row sets the count near the limit through the test seam. */
+void test_the_count_of_unnamed_publications_fails_closed_at_its_limit()
+{
+	namespace testing = uml::memory::testing;
+	constexpr unsigned long reader = 517, writer = 518;
+	constexpr unsigned long base = 0x1c0'0000, view = 0x1d0'0000;
+	ScratchBacking backing{backing_name, page};
+	map(reader, base, backing, 0, 1, rx, 3);
+	map(writer, view, backing, 0, 1, rw, 0);
+	unmap(writer, view, 1);
+	require(darwin_uml_static_vm_activate(reader) == 0);
+	void *handle = nullptr;
+	darwin_uml_static_code_page_stamp stamp{};
+	require(darwin_uml_static_vm_code_page(reader, base, &handle, &stamp) ==
+		DARWIN_UML_STATIC_TRANSLATED);
+	const auto stamp_now = [&] {
+		darwin_uml_static_code_page_stamp now{};
+		require(darwin_uml_static_vm_code_page_stamp(handle, &now) == 0);
+		return now;
+	};
+	const auto never_share = [](const darwin_uml_static_code_page_stamp &now) {
+		return (now.flags & DARWIN_UML_STATIC_STAMP_NEVER_SHARE) != 0;
+	};
+	const auto unnamed_write = [&] {
+		require(darwin_uml_static_vm_invalidate_code_generation(writer, view,
+			page) == 0);
+	};
+
+	const auto saved = testing::unnamed_publication_count();
+	const auto limit = testing::unnamed_publication_limit();
+	testing::clear_sharing_latch();
+	testing::set_unnamed_publication_count(limit - 2);
+	const auto before = stamp_now();
+	require(!never_share(before));
+
+	/* One write short of the limit: the epoch moved, sharing stands. */
+	unnamed_write();
+	const auto below = stamp_now();
+	require(below.epoch != before.epoch && !never_share(below),
+		"a write below the limit of the count shared no verdict");
+	require(testing::unnamed_publication_count() == limit - 1);
+
+	/* The write that reaches it: never-share, with the latch cleared again,
+	 * so that the stamp says it from the count alone. */
+	unnamed_write();
+	testing::clear_sharing_latch();
+	require(never_share(stamp_now()),
+		"a stamp at the limit of the count did not report never-share");
+	require(testing::unnamed_publication_count() == limit);
+
+	/* The count is where a reader that ran ahead of the latch finds it: at
+	 * the limit, with the latch clear, whatever got it there. */
+	testing::set_unnamed_publication_count(limit);
+	testing::clear_sharing_latch();
+	require(never_share(stamp_now()),
+		"a stamp read between the count and the latch shared a verdict");
+
+	/* It stops at the limit and stays never-share. */
+	for (unsigned round = 0; round < 3; ++round) {
+		unnamed_write();
+		require(testing::unnamed_publication_count() == limit,
+			"the count went past its limit");
+		require(never_share(stamp_now()));
+	}
+
+	testing::set_unnamed_publication_count(saved);
+	testing::clear_sharing_latch();
+	require(!never_share(stamp_now()));
+	require(darwin_uml_static_vm_destroy(reader) == 0);
+	require(darwin_uml_static_vm_destroy(writer) == 0);
+}
+
 /* A kernel write into a guest-code page, the bytes a 4 KiB uaccess copies
  * back from the kernel's alias, lands either way. It publishes no code change
  * until code whose fetch is coherent with every store (x86) is about to run:
@@ -538,12 +985,42 @@ void test_a_kernel_write_publishes_once_x86_code_may_run()
 	darwin_uml_static_vm_require_coherent_kernel_code_writes();
 	darwin_uml_static_vm_require_coherent_kernel_code_writes();
 	const std::uint32_t third = 0xd65f'03c0U;
+#if DARWIN_UML_X86_64_GUEST
+	/* The kernel reaches the page through its alias of the backing, which
+	 * the host knows: the write names the page's own frame and publishes it
+	 * once. */
+	void *alias = mmap(nullptr, page, PROT_READ | PROT_WRITE, MAP_SHARED,
+		backing.descriptor(), 0);
+	require(alias != MAP_FAILED);
+	uml::memory::FrameAccounting::note_direct_map(
+		alias, page, backing.descriptor(), 0);
+	std::memcpy(static_cast<unsigned char *>(alias) + 8, &third, sizeof third);
+	require(darwin_uml_static_vm_copy_kernel_write(base + 8,
+		static_cast<unsigned char *>(alias) + 8, sizeof third) == 0);
+#else
 	require(darwin_uml_static_vm_copy_kernel_write(base + 8, &third,
 		sizeof third) == 0);
+#endif
 	require(holds(base + 8, third));
 	seen.consume();
 	require_code(seen, base, 1);
 	require(moved());
+
+#if DARWIN_UML_X86_64_GUEST
+	/* A buffer that is no alias the host knows names no frame, whether or
+	 * not the page's own word is present: every translation is read
+	 * again. */
+	const std::uint32_t fourth = 0xd503'201fU;
+	require(darwin_uml_static_vm_copy_kernel_write(base + 8, &fourth,
+		sizeof fourth) == 0);
+	seen.consume();
+	bool everything = seen.code_untracked;
+	for (const auto &range : seen.code)
+		everything = everything || range.length == 0;
+	require(everything, "a write through no alias did not publish everything");
+	uml::memory::FrameAccounting::note_direct_unmap(alias, page);
+	munmap(alias, page);
+#endif
 	require(darwin_uml_static_vm_destroy(generation) == 0);
 }
 
@@ -560,7 +1037,17 @@ int main()
 	test_a_flush_publishes_the_whole_address_space();
 	test_discarding_a_stale_page_publishes_it();
 	test_a_published_page_moves_its_stamp();
+	test_the_immutable_fact_replaces_a_mapping_without_a_code_change();
+	test_mappings_of_one_frame_that_disagree_share_its_record();
+	test_a_stamp_carries_the_epoch_and_the_mapping_fact();
+	test_a_publication_through_a_view_that_cannot_execute_moves_the_stamp();
+	test_a_kernel_write_to_a_page_nobody_maps_moves_every_epoch();
+	test_a_named_kernel_write_moves_the_stamp_of_its_frame();
+	test_the_count_of_unnamed_publications_fails_closed_at_its_limit();
 	test_a_kernel_write_publishes_once_x86_code_may_run();
+	/* Every generation of every row is gone: no record counts a mapping. */
+	require(uml::memory::testing::audit_executable_counts() == 0);
+	require(uml::memory::testing::count_anomalies() == 0);
 	std::puts("Static MMU code change tests passed");
 	return 0;
 }

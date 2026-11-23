@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 
 namespace uml::platform {
@@ -19,5 +20,18 @@ namespace uml::platform {
  * resident, and IOSurface memory never does. Zero when the kernel does not
  * report it. One task_info call. */
 [[nodiscard]] std::uint64_t hostGraphicsFootprintBytes() noexcept;
+
+/* Gives back the graphics footprint of Metal resources this process has freed.
+ * The pages of a heap made resident through a residency set stay in the
+ * footprint after the heap is freed, though the device counter has dropped,
+ * until the process next asks for an allocation to be made resident (an empty
+ * set or an empty command buffer does not do it). This makes that request for
+ * a small buffer of its own, and the footprint falls a few milliseconds later.
+ * With a `wait` it polls for that, returning once the footprint has fallen by a
+ * mebibyte or more or the time has passed; without, it returns at once. Any
+ * thread. Does nothing without a Metal device or a device that makes no
+ * residency sets, and does not wait while the footprint is under a mebibyte,
+ * which is all the iOS Simulator reports. */
+void retireFreedGpuMemory(std::chrono::milliseconds wait = {}) noexcept;
 
 } // namespace uml::platform

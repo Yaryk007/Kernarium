@@ -5,6 +5,7 @@
 #include "address_layout.hpp"
 #include "address_space_types.hpp"
 #include "allocation_fault.hpp"
+#include "domain_registry_testing.hpp"
 #include "require.hpp"
 #include "wait_until.hpp"
 #include "scratch_backing.hpp"
@@ -1212,6 +1213,9 @@ int main()
 	test_waiting_execution_context_cannot_enter_retired_generation();
 	test_an_entered_context_translates_as_its_generation_does();
 	test_an_entered_context_fill_follows_every_mapping_change();
+	/* Every generation of every row is gone: no record counts a mapping. */
+	require(uml::memory::testing::audit_executable_counts() == 0);
+	require(uml::memory::testing::count_anomalies() == 0);
 	std::puts("Static MMU batch tests passed");
 	return 0;
 }

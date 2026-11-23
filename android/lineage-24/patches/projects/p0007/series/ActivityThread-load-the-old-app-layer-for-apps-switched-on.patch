@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 08:44:03 +0000
+Subject: [PATCH] ActivityThread: load the old-app layer for apps switched on
+
+Games written for Dalvik, which kept direct object pointers, do not
+start on ART as a 32-bit application that targets below API 14: they
+read a Java byte[] through its object pointer and assume a heap below
+2 GiB. The product ships a library that gives such an application's
+native code those behaviours (device/kernarium/andarium/oldapp). It is
+a choice made per application and off by default. Load it into the
+process of an application that targets below API 14, runs 32-bit and
+that the person switched on (a non-empty persist.sys.kernarium.oldapp.
+<package>), in handleBindApplication next to the other legacy-
+application handling and before any code of the application can run,
+and into no other process. A system application, including an updated
+one, never gets it, and an application that is not eligible never
+reads the property. Packages that share a user ID share the process,
+so the layer is left out when the user ID has another package. A
+failed load is logged and the application starts as before.
+---
+ core/java/android/app/ActivityThread.java | 38 +++++++++++++++++++++++
+ 1 file changed, 38 insertions(+)
+
+diff --git a/core/java/android/app/ActivityThread.java b/core/java/android/app/ActivityThread.java
+index b7d9f653023e91bc8c9145f0f6bf3014f921503c..e3ee271609443be92e011d856f5cf8b070193515 100644
+--- a/core/java/android/app/ActivityThread.java
++++ b/core/java/android/app/ActivityThread.java
+@@ -7969,6 +7969,29 @@ public final class ActivityThread extends ClientTransactionHandler
+         return insInfo.nativeLibraryDir;
+     }
+ 
++    // Whether the person switched the old-application layer on for this application: its
++    // property of the store holds the turn-on time. The caller has tested the target level and
++    // the bitness; a system application never gets the layer, and only an application that could
++    // use it reads the property. Packages that share a user ID share the process, so the layer is
++    // left out when the user ID has another package.
++    private static boolean oldApplicationLayerWanted(ApplicationInfo info) {
++        if ((info.flags & (ApplicationInfo.FLAG_SYSTEM
++                | ApplicationInfo.FLAG_UPDATED_SYSTEM_APP)) != 0) {
++            return false;
++        }
++        try {
++            if (android.os.SystemProperties.get(
++                    "persist.sys.kernarium.oldapp." + info.packageName, "").isEmpty()) {
++                return false;
++            }
++            final String[] sharing = getPackageManager().getPackagesForUid(Process.myUid());
++            return sharing == null || sharing.length <= 1;
++        } catch (Throwable t) {
++            Slog.w(TAG, "kernarium: old-application layer not loaded", t);
++            return false;
++        }
++    }
++
+     @UnsupportedAppUsage
+     @RavenwoodThrow(comment = "See ActivityThread_ravenwood for initialization on Ravenwood")
+     private void handleBindApplication(AppBindData data) {
+@@ -8048,6 +8071,21 @@ public final class ActivityThread extends ClientTransactionHandler
+             AsyncTask.setDefaultExecutor(AsyncTask.THREAD_POOL_EXECUTOR);
+         }
+ 
++        // An application written for Dalvik (a 32-bit one that targets below API 14) reads a
++        // Java byte[] through its object pointer and assumes a heap below 2 GiB. This library gives
++        // its native code what Dalvik gave it. It is loaded only for an application the person
++        // switched it on for, before any code of the application can run; nothing else in the
++        // process changes, and no other application maps it.
++        if (data.appInfo.targetSdkVersion < Build.VERSION_CODES.ICE_CREAM_SANDWICH
++                && !Process.is64Bit()
++                && oldApplicationLayerWanted(data.appInfo)) {
++            try {
++                System.load("/system/lib/libkernarium_oldapp.so");
++            } catch (Throwable t) {
++                Slog.w(TAG, "kernarium: old-application layer not loaded", t);
++            }
++        }
++
+         // Let the util.*Array classes maintain "undefined" for apps targeting Pie or earlier.
+         UtilConfig.setThrowExceptionForUpperArrayOutOfBounds(
+                 data.appInfo.targetSdkVersion >= Build.VERSION_CODES.Q);

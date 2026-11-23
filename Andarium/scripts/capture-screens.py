@@ -12,7 +12,13 @@ Device > Rotate, or a UI driver) between runs, and the orientation is read
 from each image.
 
     capture-screens.py --out DIR --device <udid> [--device <udid> ...]
+    capture-screens.py --out DIR --device <udid> --language ja
     capture-screens.py --list
+
+`--language` runs the Preview in one of Andarium's languages (en, zh-Hans,
+zh-Hant, ja): the launch carries `-AppleLanguages` and `-AppleLocale`, the
+file names and the manifest name the language, and the Simulator's own
+language stays as it is. Without it the Simulator's language decides.
 
 One run at a time captures into a directory: the runs would share the
 screenshots' working files and read and write manifest.json. A second run into
@@ -28,15 +34,20 @@ launched process, on the shot's screen, and active, both before and after the
 screenshot, and the frame is neither blank nor black; a shot that fails is
 reported and not recorded.
 
-A shot with `-systemMicrophone YES` runs the Microphone switch against the
-Simulator's own permission: the script sets it first with `simctl privacy`
-(grant, revoke or reset), and the revoked-while-backgrounded shot takes the
-permission away while the app is in the background. The Simulator keeps the
-system's permission alert up, over whatever launches next, until SpringBoard is
-restarted, and a restart turns an iPad upright. A launch under such an alert
-leaves the app inactive, which the check above refuses, so the one shot that
-raises the alert runs last, and SpringBoard is restarted once after it: rotate
-the iPad again before the next run.
+A shot with `-systemMicrophone YES` (or `-systemLocation YES`) runs the
+Microphone (or Location) switch against the Simulator's own permission: the
+script sets it first with `simctl privacy` (grant, revoke or reset), and the
+revoked-while-backgrounded shot takes the permission away while the app is in
+the background. The Simulator keeps the system's permission alert up, over
+whatever launches next, until SpringBoard is restarted, and a restart turns an
+iPad upright. A launch under such an alert leaves the app inactive, which the
+check above refuses, so the shots that raise the alert run last, and
+SpringBoard is restarted after each: rotate the iPad again before the next
+run.
+
+The Info shots show Follow developer on X in a Preview built with
+`FOLLOW_X_HANDLE=example_handle` (and `FOLLOW_X_LOGO_SOURCE=local` for the real
+logo from `Config/Local/`); without it the row is absent from them.
 
 Light mode is captured for every screen; dark mode only for the screens flagged
 in the table, where the design adapts to it. Every Simulator command has a hard
@@ -68,6 +79,8 @@ SETTLED_FRACTION = 0.003
 # How long the Preview has, after a launch, to report that it is the app in front.
 FRONT_SECONDS = 10
 STATE_FILE = "capture-state.json"
+# The languages of the application and the locale each is shown with.
+LANGUAGES = {"en": "en_US", "zh-Hans": "zh_CN", "zh-Hant": "zh_TW", "ja": "ja_JP"}
 LOCK_FILE = ".capture.lock"
 
 
@@ -80,8 +93,10 @@ class Shot:
     args: tuple[str, ...] = ()
     dark: bool = False
     wait: float = 3.0
-    # The Simulator's microphone permission before the launch: "grant", "revoke" or "reset" (not asked).
+    # The Simulator's permission before the launch: "grant", "revoke" or "reset" (not asked).
     privacy: str | None = None
+    # Which permission `privacy` and `flow` set: the `simctl privacy` service.
+    service: str = "microphone"
     # Steps after the launch, for a state that needs the app in the background: "background", "grant", "revoke",
     # "foreground".
     flow: tuple[str, ...] = ()
@@ -89,8 +104,11 @@ class Shot:
     # SpringBoard is restarted after it.
     alert: bool = False
 
-    def launch_arguments(self) -> list[str]:
-        return ["-screen", self.screen, *self.args]
+    def launch_arguments(self, language: str | None = None) -> list[str]:
+        arguments = ["-screen", self.screen, *self.args]
+        if language is not None:
+            arguments += ["-AppleLanguages", f"({language})", "-AppleLocale", LANGUAGES[language]]
+        return arguments
 
 
 def s(id: str, group: str, screen: str, description: str, *args: str, dark: bool = False, wait: float = 3.0) -> Shot:
@@ -98,11 +116,30 @@ def s(id: str, group: str, screen: str, description: str, *args: str, dark: bool
 
 
 SYSTEM = ("-systemMicrophone", "YES")
+SYSTEM_LOCATION = ("-systemLocation", "YES")
+SYSTEM_CAMERA = ("-systemCamera", "YES")
 
 
 def system_mic(id: str, group: str, screen: str, description: str, privacy: str, *flow: str) -> Shot:
     """A shot with the Microphone switch on the Simulator's own permission, set to `privacy` first."""
     return Shot(id, group, screen, description, SYSTEM, privacy=privacy, flow=tuple(flow), alert=privacy == "reset")
+
+
+def system_location(id: str, group: str, screen: str, description: str, privacy: str, *flow: str, alert: bool | None = None) -> Shot:
+    """A shot with the Location switch on the Simulator's own permission, set to `privacy` first. `alert` says the
+    shot raises the system's question; a reset permission does when the screen turns the switch on."""
+    return Shot(
+        id, group, screen, description, SYSTEM_LOCATION, privacy=privacy, service="location", flow=tuple(flow),
+        alert=privacy == "reset" and screen == "home-location-ask" if alert is None else alert,
+    )
+
+
+def system_camera(id: str, group: str, screen: str, description: str) -> Shot:
+    """A shot with the Camera switch on the Simulator's own permission, reset first so that it has not been asked.
+    `simctl privacy` has no camera service to grant or revoke, so only the question can be raised this way; the
+    refused and restricted states are the preview's own (`home-camera-denied`, `home-camera-restricted`). The service
+    is `all` because a reset names no camera."""
+    return Shot(id, group, screen, description, SYSTEM_CAMERA, privacy="reset", service="all", alert=True)
 
 
 def boot_stages(prefix: str, screen: str, names: list[str], what: str, dark_step: int | None = None) -> list[Shot]:
@@ -122,28 +159,66 @@ def boot_stages(prefix: str, screen: str, names: list[str], what: str, dark_step
 
 SHOTS: list[Shot] = [
     # Home
-    s("home", "Home", "home", "Home with a configured guest: Guest system (two matched rows: CPU and memory with Edit, then Storage with its usage bar and Resize), Display, Capabilities, Backup, Recovery and erase, and the Start bar.", dark=True),
-    s("home-welcome", "Home", "welcome", "Home before any guest exists: the welcome and Set up guest. First screen of the initial setup."),
+    s("home", "Home", "home", "Home with a configured guest: Virtual machine (matched rows: CPU and memory with Edit, Resolution with Change, then Storage with its usage bar and Resize, and Snapshots), JIT (in the builds that have it), Capabilities, Backup, Erase virtual machine, and the Start bar.", dark=True),
+    s("home-welcome", "Home", "welcome", "Home before any guest exists: the welcome and Set up virtual machine. First screen of the initial setup."),
     s("home-first-start", "Home", "home-new", "A guest just created and not yet started: Home as it is before the first start."),
-    s("home-display", "Home", "home-display", "Home scrolled to Display: the Retina mode toggle.", dark=True),
-    s("home-capabilities", "Home", "home-capabilities", "Home scrolled to Capabilities: Microphone off and Gyroscope on (its default), no notes.", dark=True),
+    s("home-resolution", "Home", "home-resolution", "Home scrolled to Virtual machine: the Resolution row between CPU and memory and Storage, with the guest's pixels (nobody has chosen, and the device states no memory limit: 320 dpi) and, where the choice is an end, its name, and Change.", dark=True),
+    s("home-resolution-low-memory", "Home", "home-resolution", "The Resolution row of someone who never chose, on a device the system holds to 2,867 MiB of memory (an iPad mini 6's): 240 dpi, the pixels alone.", "-memoryLimitMiB", "2867"),
+    s("home-resolution-native-2", "Home", "home-resolution", "The Resolution row of someone who never chose, on a 744 x 1133 point screen of native scale 2.0 with no memory limit: 320 dpi is native there, so the line says Native.", "-displayNative", "2", "-displayPoints", "744x1133"),
+    s("home-resolution-native-2-low-memory", "Home", "home-resolution", "The same screen held to 2,867 MiB: 240 dpi, the pixels alone.", "-displayNative", "2", "-displayPoints", "744x1133", "-memoryLimitMiB", "2867"),
+    s("home-resolution-fastest", "Home", "home-resolution", "The Resolution row with the fastest choice (one guest pixel to a point): the line says Fastest.", "-displayScale", "1"),
+    s("home-resolution-middle", "Home", "home-resolution", "The Resolution row with a choice between the ends: the pixels alone.", "-displayScale", "1.5"),
+    s("home-resolution-one-choice", "Home", "home-resolution", "The Resolution row on a screen with one choice (native scale 1.0): the resolution without a name, and Change dimmed.", "-displayNative", "1"),
+    s("home-capabilities", "Home", "home-capabilities", "Home scrolled to Capabilities: Location off, Microphone off, Camera off and, on an iPhone, Haptics on (their defaults), no notes.", dark=True),
+    s("home-jit", "Home", "home-jit", "Home scrolled to Performance on a screen that shows 60 frames a second: JIT alone, the toggle on and a debugger attached, so the note says it is ready for the next start.", dark=True),
+    s("home-jit-no-debugger", "Home", "home-jit-no-debugger", "JIT on with no debugger attached: the note says to open Andarium from StikDebug."),
+    s("home-jit-fallback", "Home", "home-jit-fallback", "Home after a start that ran without the JIT it was asked for: the note says StikDebug was not connected."),
+    s("home-aot", "Home", "home-aot", "Home scrolled to Performance on a screen that shows 120 frames a second, in a build that carries the translated libraries: 120 Hz off, the AOT row below it with its switch on (the default) and its note, then JIT.", dark=True),
+    s("home-aot-off", "Home", "home-aot-off", "The AOT row with its switch off."),
+    s("home-aot-60hz", "Home", "home-aot-60hz", "Performance on a screen that shows 60 frames a second, in a build that carries the translated libraries: the AOT group and the JIT group only."),
+    s("home-aot-jit", "Home", "home-aot-jit", "The AOT row while the next start runs on JIT: the row is dimmed and the line under the title says it is not used."),
     s("home-capabilities-mic-on", "Home", "home-mic-on", "Capabilities with Microphone on, iOS having allowed it."),
     s("home-capabilities-mic-denied", "Home", "home-mic-denied", "Capabilities after iOS refused the microphone or its app permission was removed: the row is dimmed and says it is not allowed in Settings.", dark=True),
     s("home-capabilities-mic-alert", "Home", "home-mic-alert", "Turning Microphone on while iOS refuses it: the alert that offers Settings."),
-    s("home-capabilities-gyroscope-unavailable", "Home", "home-gyroscope-unavailable", "Capabilities on a device without a gyroscope or accelerometer: Gyroscope is disabled and the footnote says why."),
-    s("home-backup", "Home", "home-backup", "Home scrolled to Backup: the guest-data backup toggle and a one-line note."),
-    s("home-first-start-recovery", "Home", "home-new-recovery", "Home scrolled to Recovery and erase on a guest not yet started: Start in recovery is disabled until the first start.", dark=True),
-    s("home-recovery-erase", "Home", "home-recovery-erase", "Home scrolled to Recovery and erase: Start in recovery and Erase guest."),
-    s("home-storage-grow", "Home", "home-grow", "Guest system with a larger storage size chosen: the Storage row's bar outlines the new size and the note under it says the growth takes effect at the next start.", dark=True),
-    s("home-storage-max", "Home", "home-max", "Guest system with storage at its largest size (128 GiB, in 4 GiB steps): the note under the Storage bar says so and Resize is dimmed.", dark=True),
+    s("home-capabilities-haptics-off", "Home", "home-haptics-off", "Capabilities on an iPhone after Haptics was turned off; an iPad has no Haptics row.", dark=True),
+    s("home-root", "Home", "home-root", "Home with the Root section after Capabilities: Root access with its switch off, and the note that apps allowed in Magisk can run as root from the next start.", dark=True),
+    s("home-root-on", "Home", "home-root-on", "The Root section with the switch on.", dark=True),
+    s("home-root-warning", "Home", "home-root-warning", "The alert that asks before root is turned on: what apps allowed in Magisk can do, Turn On and Cancel."),
+    s("home-root-paused", "Home", "home-root-paused", "The Root section after a start with root failed: the switch is still on and the line under it says Paused after a failed start."),
+    s("home-root-notice-paused", "Home", "home-root-notice-paused", "Home's card after a start with root ended before Android booted: Root is paused, with Try with root again and Turn off root."),
+    s("home-root-notice-turned-off", "Home", "home-root-notice-turned-off", "Home's card after a start with root ended before Android booted and root was turned off with it (the alternative behaviour)."),
+    s("home-root-notice-stopped", "Home", "home-root-notice-stopped", "Home's card after the person stopped a start with root before Android booted: Start without root."),
+    s("home-root-app-alert", "Home", "home-root-app-alert", "The alert after a start with root could not put the official Magisk app in the virtual machine."),
+    s("boot-root", "Boot", "boot-root", "The boot screen of a start with root at its fifth step, Magisk app, which installs the official Magisk app before the screen ends.", wait=3.0),
+    s("home-capabilities-location-on", "Home", "home-location-on", "Capabilities with Location on, iOS having allowed it with the exact position."),
+    s("home-capabilities-location-approximate", "Home", "home-location-approximate", "Location on while iOS gives only an approximate location: the line under it says Approximate location, with an info mark that explains.", dark=True),
+    s("home-capabilities-location-approximate-alert", "Home", "home-location-approximate-alert", "The explanation behind Approximate location: Precise Location is off for Andarium, with Open Settings."),
+    s("home-capabilities-location-denied", "Home", "home-location-denied", "Capabilities after iOS refused the location or its app permission was removed: the row is dimmed and says it is not allowed in Settings.", dark=True),
+    s("home-capabilities-location-alert", "Home", "home-location-alert", "Turning Location on while iOS refuses it: the alert that offers Settings."),
+    s("home-capabilities-location-restricted", "Home", "home-location-restricted", "Capabilities on a device that restricts the location (Screen Time or a profile): the row is dimmed and says it is restricted."),
+    s("home-capabilities-location-restricted-alert", "Home", "home-location-restricted-alert", "Turning Location on while the device restricts it: the alert explains and has only OK."),
+    s("home-capabilities-location-services-off", "Home", "home-location-services-off", "Capabilities while Location Services are off for the whole device: the row is dimmed and says so."),
+    s("home-capabilities-location-services-off-alert", "Home", "home-location-services-off-alert", "Turning Location on while Location Services are off: the alert explains where to turn them on."),
+    s("home-capabilities-camera-on", "Home", "home-camera-on", "Capabilities with Camera on, iOS having allowed it.", dark=True),
+    s("home-capabilities-camera-denied", "Home", "home-camera-denied", "Capabilities after iOS refused the camera or its app permission was removed: the row is dimmed and says it is not allowed in Settings.", dark=True),
+    s("home-capabilities-camera-alert", "Home", "home-camera-alert", "Turning Camera on while iOS refuses it: the alert that offers Settings.", dark=True),
+    s("home-capabilities-camera-restricted", "Home", "home-camera-restricted", "Capabilities on a device that restricts the camera (Screen Time or a profile): the row is dimmed and says it is restricted.", dark=True),
+    s("home-capabilities-camera-restricted-alert", "Home", "home-camera-restricted-alert", "Turning Camera on while the device restricts it: the alert explains and has only OK.", dark=True),
+    s("home-capabilities-camera-unavailable", "Home", "home-camera-unavailable", "Capabilities on a device with no camera (the Simulator, say): Camera is disabled and the note says there is no camera to share.", dark=True),
+    s("home-backup", "Home", "home-backup", "Home scrolled to Backup: the Include in backups switch and the note under it."),
+    s("home-erase", "Home", "home-erase", "Home scrolled to the end: Erase virtual machine in a card of its own, with no heading.", dark=True),
+    s("home-storage-grow", "Home", "home-grow", "Virtual machine with a larger storage size chosen: the Storage row's bar outlines the new size and the note under it says the growth takes effect at the next start.", dark=True),
+    s("home-storage-max", "Home", "home-max", "Virtual machine with storage at its largest size (128 GiB, in 4 GiB steps): the note under the Storage bar says so and Resize is dimmed.", dark=True),
     s("home-update", "Home", "home-update", "A system update waiting: the card above the Start bar."),
     s("home-update-unfinished", "Home", "home-update-failed", "An update that did not finish: the card offers retry or restoring the saved data."),
     s("home-update-unfinished-restore-only", "Home", "home-update-failed-restore", "An unfinished update that can only be restored."),
     s("home-blocked", "Home", "home-blocked", "Start blocked because the guest is newer than the system in this app."),
     s("home-notice-closed", "Home", "home-closed", "The notice shown after iOS closed Andarium while it was paused."),
+    s("home-notice-network-cellular", "Home", "home-network-cellular", "The notice that iOS denies Andarium cellular data, with the way to Settings.", dark=True),
+    s("home-notice-network-wifi", "Home", "home-network-wifi", "The notice that iOS denies Andarium Wi-Fi, with the way to Settings.", dark=True),
     s("home-notice-ended", "Home", "home-ended", "The notice shown at the launch after Android's previous session ended badly, here in a kernel panic."),
     s("home-notice-low-space", "Home", "home-low-space", "The low free space notice on Home."),
-    s("home-notice-memory-high", "Home", "home-memory-warning", "A guest with more memory than a new one gets (the most the device offers): the notice above Guest system says iOS is likely to close Andarium and what is safer.", dark=True),
+    s("home-notice-memory-high", "Home", "home-memory-warning", "A guest with more memory than a new one gets (the most the device offers): the notice above Virtual machine says iOS is likely to close Andarium and what is safer.", dark=True),
     s("busy-create", "Operations", "busy-create", "The overlay while the guest is created: title, detail and progress."),
     s("busy-erase", "Operations", "busy-erase", "The overlay while the guest is erased."),
     s("alert-error", "Alerts", "alert-error", "An error alert (an operation that failed with the system's message)."),
@@ -155,22 +230,64 @@ SHOTS: list[Shot] = [
     s("system-edit", "Sheets", "system-edit", "The System sheet, opened from Edit: vCPUs and memory with the device's limits, and beneath them the estimated VRAM (graphics memory) with the note that it is separate from the guest's RAM. A guest at the default memory shows no warning.", dark=True),
     s("system-edit-memory-high", "Sheets", "system-memory-warning", "The System sheet with memory above what a new guest gets (the most the device offers): the ticks past the default are orange, the line beneath the ruler says iOS is likely to close Andarium above it and the VRAM estimate is orange.", dark=True),
     s("system-edit-vram-warning", "Sheets", "system-edit", "The System sheet on a device whose default is held below the line where iOS is likely to close Andarium (an iPhone 18 Pro Max mock) with memory between the two: the ticks past the default are orange and beyond the closing size red, the line beneath says games may run out of graphics memory and the VRAM estimate is orange. Home shows no notice at this size.", "-device", "iphone-18-pro-max", "-memoryMiB", "3584", dark=True),
+    s("system-edit-camera-off", "Sheets", "system-edit", "The System sheet on an iPad mini 6 mock with Camera off: the VRAM estimate is the GPU's whole budget.", "-device", "ipad-mini-6"),
+    s("system-edit-camera-on", "Sheets", "system-edit-camera", "The System sheet on an iPad mini 6 mock with Camera on and allowed: the VRAM estimate is the budget less what the layout of the cameras holds (the runtime's figure for them, 171 MiB in this mock; the ceiling, 197 MiB, where the runtime cannot say).", "-device", "ipad-mini-6"),
+    s("system-edit-camera-off-phone", "Sheets", "system-edit", "The System sheet on an iPhone 18 Pro Max mock with Camera off: the VRAM estimate is the GPU's whole budget.", "-device", "iphone-18-pro-max"),
+    s("system-edit-camera-on-phone", "Sheets", "system-edit-camera", "The System sheet on an iPhone 18 Pro Max mock with Camera on and allowed: the VRAM estimate is the budget less what the layout of the cameras holds (197 MiB, the ceiling, in this mock).", "-device", "iphone-18-pro-max"),
     s("system-edit-ipad-mini", "Sheets", "system-edit", "The System sheet on an iPad mini 6 mock at its default memory (1.5 GiB): the two sizes coincide, so no graphics warning shows and the VRAM estimate is plain.", "-device", "ipad-mini-6"),
-    s("erase-alert", "Alerts", "erase", "Erase guest: the standard destructive confirmation over Home. Confirming returns to the first-launch screen (home-welcome).", dark=True),
+    s("system-edit-memory-mac-64", "Sheets", "system-edit", "The System sheet on a Mac mock with 64 GiB and a guest of 24 GiB: the memory ruler has about a thousand positions, so its labels thin out to round numbers of gibibytes that do not touch, and no short ticks are drawn.", "-device", "mac-64-gib", "-memoryMiB", "24576"),
+    s("resolution-sheet", "Sheets", "resolution-sheet", "The Resolution sheet, opened from Change: every choice with its pixels, and under them its density and, at the ends, Native and Fastest; the current choice is ticked (nobody has chosen, and the device states no memory limit: 320 dpi).", dark=True),
+    s("resolution-sheet-low-memory", "Sheets", "resolution-sheet", "The sheet of someone who never chose, on a device held to 2,867 MiB of memory: 240 dpi is ticked.", "-memoryLimitMiB", "2867"),
+    s("resolution-sheet-native-2", "Sheets", "resolution-sheet", "The sheet of someone who never chose, on a screen of native scale 2.0 with no memory limit: 1.0, 1.5 and native, with native (320 dpi) ticked.", "-displayNative", "2", "-displayPoints", "744x1133"),
+    s("resolution-sheet-native-2-low-memory", "Sheets", "resolution-sheet", "The same screen held to 2,867 MiB: 240 dpi is ticked.", "-displayNative", "2", "-displayPoints", "744x1133", "-memoryLimitMiB", "2867"),
+    s("resolution-sheet-middle", "Sheets", "resolution-sheet", "The Resolution sheet with a choice between the ends ticked.", "-displayScale", "2"),
+    s("resolution-sheet-native-2-3", "Sheets", "resolution-sheet", "The sheet on a screen whose native scale is 2.3: 1.0, 1.5, 2.0 and 2.3, with 2.0 ticked.", "-displayNative", "2.3"),
+    s("resolution-sheet-native-2-61", "Sheets", "resolution-sheet", "The sheet on a screen whose native scale is 2.61: 2.5 is left out for being near native, so 1.0, 1.5, 2.0 and 2.61, with 2.0 ticked.", "-displayNative", "2.61"),
+    s("erase-alert", "Alerts", "erase", "Erase virtual machine: the standard destructive confirmation over Home. Confirming returns to the first-launch screen (home-welcome).", dark=True),
     s("info", "Info", "info", "Info: the app and version, System info (Build, Android version, Security patch, Kernel, Architecture, Supported architectures), Project on GitHub and Acknowledgements.", dark=True),
     s("info-acknowledgements", "Info", "info-acknowledgements", "Acknowledgements: projects by group; the names and marks line is at the bottom.", dark=True),
     s("info-license", "Info", "info-license", "A project's page: copyright holders, the license name and the license text (Mesa, MIT).", dark=True),
     s("info-license-long", "Info", "info-license-gpl", "A page with a long license text (Linux: syscall exception and GPL v2)."),
+    s("info-acknowledgements-root", "Info", "info-acknowledgements-root", "Acknowledgements in a copy whose release carries root: Magisk and BusyBox are listed with the system projects.", dark=True),
+    s("info-license-magisk", "Info", "info-license-magisk", "Magisk's page: the contributors, GNU GPL v3 or later, where its source is available, and the full license text."),
+    # Snapshots and What's New (more of each are in the Preview: see SnapshotPreview and WhatsNewPreview)
+    s("snapshots", "Snapshots", "snapshots", "The Snapshots sheet over Home with mock snapshots: the list newest first, the space they use and Take snapshot at the foot.", dark=True),
+    s("snapshots-detail", "Snapshots", "snapshots-detail", "One snapshot's page: its name, when it was taken, what deleting frees, Restore and Delete."),
+    s("whatsnew-open", "What's New", "whatsnew-open", "The notes of the update, opened from the ribbon above Start."),
+    s("whatsnew-open-unsupported", "What's New", "whatsnew-unsupported-open", "The notes of the update on a 60 Hz screen with iOS 26: the Add to Home Screen entry, which that device does not show, is left out; the 120 Hz entry stays."),
+    # The update notice of a sideloaded build (Preview/UpdatePreview.swift: a made-up version file read by the real rules)
+    s("update-card", "Update notice", "update-card", "Home with the update card first among the notices: Update available, one line with the installed and the new version, Get Update and the close button.", dark=True),
+    s("update-card-closed", "Update notice", "update-card-closed", "Home after the card was put away: no card, Home as always.", dark=True),
+    s("update-detail", "Update notice", "update-detail", "The detail the card's button opens, with AltStore and SideStore installed: the version, its day, size, the iOS it needs and the installed version, then Update with AltStore, Update with SideStore, Download App File, Open Release Page, and Skip This Version.", dark=True),
+    s("update-detail-altstore", "Update notice", "update-detail-altstore", "The detail with only AltStore installed: one tool row.", dark=True),
+    s("update-detail-steps", "Update notice", "update-detail-steps", "The detail with neither sideloading app installed: the steps in words in place of the tool rows, then the app file and the release page.", dark=True),
+    s("update-detail-mac", "Update notice", "update-detail-mac", "The detail of an iPad app on a Mac or Vision Pro: no tool rows, the steps in words, the app file and the release page.", dark=True),
+    s("update-info", "Update notice", "update-info", "Info with its Updates section while a newer version exists: Update Available with the version, the Check for Updates switch on, and the sentence under it.", dark=True),
+    s("update-info-current", "Update notice", "update-info-current", "Info's Updates section with nothing newer: the Check for Updates switch alone and its sentence.", dark=True),
+    s("update-info-off", "Update notice", "update-info-off", "Info's Updates section with the switch off: no update row.", dark=True),
     # Boot
     *boot_stages("boot", "boot", ["System image", "Linux kernel", "Storage", "Startup"], "Normal boot over the dimmed guest display, no progress bar"),
     s("boot-single-vcpu", "Boot", "boot-single-vcpu", "Normal boot of a guest with a single vCPU: the Linux kernel line says \"1 vCPU\"."),
-    s("boot-first-start", "Boot", "boot-first", "First start: Storage prepares the disk and Startup sets up for the first time."),
+    s("boot-first-start", "Boot", "boot-first", "First start: Storage prepares the disk and Startup sets up for the first time; the panel last in the column, below the note, says Android has no Google apps, on purpose."),
     s("boot-update", "Boot", "boot-upgrade", "The first start after an update: Startup updates the apps."),
     s("boot-restart", "Boot", "boot-restart", "The guest restarting."),
+    s("boot-slow", "Boot", "boot-slow", "A start that has run 3 minutes 17 seconds, still at Startup: the notice above the steps says it is taking longer than usual, that it can be waited out or stopped, and that stopping needs Andarium closed in the App Switcher and opened again to start again; a red Stop. The steps stay in view below it.", dark=True),
+    s("boot-slow-clock-early", "Boot", "boot-slow-live", "The notice over a start that began 3 minutes 17 seconds ago, the clock running, 3 seconds after the launch: the status line and the notice show one time.", wait=3.0),
+    s("boot-slow-clock-later", "Boot", "boot-slow-live", "The same launch 9 seconds after it: the status line and the notice have both moved on by the same seconds.", wait=9.0),
+    s("boot-slow-first-start", "Boot", "boot-slow-first", "A first start 8 minutes 17 seconds in: the notice comes at eight minutes and its title does not say the start is slower than usual; the first-start note stays under the steps."),
+    s("boot-slow-update", "Boot", "boot-slow-upgrade", "The first start after an update, 8 minutes 11 seconds in: the same later notice and plain title, with the update note under the steps."),
+    s("boot-slow-recovery", "Boot", "boot-slow-recovery", "A Recovery start 3 minutes 17 seconds in: the notice over Recovery's opaque screen, with the ordinary title.", dark=True),
+    s("boot-slow-stop-dialog", "Boot", "boot-slow-stop", "Stop chosen on the notice: the dialog asks Stop the virtual machine?, says that Andarium has to be closed in the App Switcher and opened again to start it, and offers Stop (red) and Cancel. The alert is dark, as the screen under it is, whatever the system's appearance is.", dark=True),
+    s("boot-slow-recovery-stop-dialog", "Boot", "boot-slow-recovery-stop", "Stop chosen on a Recovery start's notice: the same dialog over Recovery's own screen, which follows the system's appearance, and so does the dialog.", dark=True),
+    s("boot-slow-storage", "Boot", "boot-slow-storage", "The notice over an earlier step (Storage under way): the step and the time name where the start is.", "-bootStage", "2"),
+    s("boot-slow-stopping", "Boot", "boot-slow-stopping", "Stop confirmed: the status line says Stopping\u2026, Stop's label says it too (with a spinner where the buttons are side by side) and is disabled until the run ends, and the buttons keep their size."),
+    s("boot-jit", "Boot", "boot-jit", "The debugger preparing the JIT: the System image step says Preparing JIT."),
+    s("boot-jit-fallback", "Boot", "boot-jit-fallback", "A boot that ran without the JIT it was asked for: a note under the steps says why."),
     *boot_stages("boot-recovery", "boot-recovery", ["System image", "Linux kernel", "Storage", "Recovery"], "Recovery boot (opaque, own stage list, no progress bar)", dark_step=3),
     # Running guest
     s("session", "Guest", "session", "The running guest with the side keys closed."),
-    s("session-tip", "Guest", "session-tip", "The side-keys tip over the running guest.", "-resetTips", "YES"),
+    s("session-tip", "Guest", "session-tip", "The side-keys tip over the running guest: the keys line and the line that says Settings holds Install APK.", "-resetTips", "YES"),
+    s("session-tip-left", "Guest", "session-tip-left", "The side-keys tip beside the keys on the left edge: the popover opens to the right of them.", "-resetTips", "YES"),
     s("session-side-keys", "Guest", "session-open", "The side keys open: Power, volume, Back, Home and Settings."),
     s("session-left-edge", "Guest", "session-left", "The side keys on the left edge."),
     s("session-volume", "Guest", "session-volume", "The volume panel after a volume key press."),
@@ -181,6 +298,13 @@ SHOTS: list[Shot] = [
     s("session-stats-vram-high", "Guest", "session-stats", "The readout with VRAM at 93% of its budget: its bar is orange.", "-statsReadings", "10", "-statsVramMiB", "498"),
     s("session-stats-short", "Guest", "session-stats", "The readout after three CPU readings: the bars fill from the right, the older slots stay dimmed floor bars.", "-statsReadings", "3"),
     s("session-graphics-notice", "Guest", "session-graphics-notice", "The notice over the running guest that Android ran out of graphics memory."),
+    s("session-thermal-notice", "Guest", "session-thermal-notice", "The notice over the running guest that the frame rate is lowered while the device is hot: its words end in a chevron and open the alert, and Dismiss only dismisses."),
+    s("session-thermal-alert", "Guest", "session-thermal-alert", "The alert the thermal notice's words open: Turn off the frame rate limit?, what it costs and where to turn it back on, with Turn Off (red) and Cancel."),
+    s("session-thermal-off", "Guest", "session-thermal-off", "The session after Turn Off: the frame rate limit is off and no notice shows, whatever the heat."),
+    s("session-network-cellular", "Guest", "session-network-cellular", "The notice over the running guest that iOS denies Andarium cellular data, with the way to Settings.", dark=True),
+    s("session-network-wifi", "Guest", "session-network-wifi", "The notice over the running guest that iOS denies Andarium Wi-Fi, with the way to Settings.", dark=True),
+    s("session-camera-notice", "Guest", "session-camera-notice", "The notice over the running guest that the camera is paused while other apps share the screen (iPad Split View or Slide Over).", dark=True),
+    s("session-camera-off-notice", "Guest", "session-camera-off-notice", "The notice over the running guest that Camera is off after an app in the guest opened a camera, with how to turn it on (shut down, then Capabilities).", dark=True),
     s("session-setup", "Guest", "session-setup", "The guest's own first-run setup screen."),
     s("session-off", "Guest", "session-off", "The guest's screen after it powered off."),
     s("space-pause", "Guest", "space-pause", "The running guest paused because the device is nearly out of space: the screen over it with Resume and Shut down.", dark=True),
@@ -191,26 +315,86 @@ SHOTS: list[Shot] = [
     s("recovery", "Guest", "recovery", "Recovery running."),
     s("recovery-side-keys", "Guest", "recovery-open", "Recovery with the side keys open."),
     # Settings during a session
-    s("settings", "Settings", "settings", "Settings at full height: Stats, Apps, Developer and Diagnostics.", dark=True),
+    s("settings", "Settings", "settings", "Settings at full height: Apps (Install APK) and File browser first, then Stats, Developer and Diagnostics.", dark=True),
+    s("settings-medium", "Settings", "settings-medium", "Settings as the side keys open it, at the medium detent: Apps (Install APK) and File browser at the top of the first screenful.", dark=True),
     s("settings-stats", "Settings", "settings-stats", "Settings scrolled to Stats: CPU, Memory and VRAM with bars of their share, and Frame rate.", dark=True),
     s("settings-stats-short", "Settings", "settings-stats", "Settings scrolled to Stats after three CPU readings: the bars fill from the right.", "-statsReadings", "3"),
+    s("settings-performance", "Settings", "settings-performance", "Settings' Performance section after Stats, with the limit on: When hot reads Limit frame rate, and the footnote says what the limit does.", dark=True),
+    s("settings-performance-menu", "Settings", "settings-performance-menu", "The When hot menu open: Limit frame rate (checked, Lets this device cool down) and Full frame rate (Hotter, and the battery drains faster)."),
+    s("settings-performance-off", "Settings", "settings-performance-off", "Performance with the limit off: When hot reads Full frame rate, and the footnote warns what it costs."),
+    s("settings-performance-hot", "Settings", "settings-performance-hot", "Performance while the device is held hot and the limit is on: an orange tile, a thermometer line that the frame rate is limited until it cools, and Frame rate at 30 fps."),
+    s("settings-performance-hot-off", "Settings", "settings-performance-hot-off", "Performance while the device is held hot and the limit is off: the thermometer line says the frame rate is not limited, with the warning under it."),
+    s("settings-performance-120", "Settings", "settings-performance-120", "Settings' Performance on a screen that shows 120 frames a second: When hot alone, with no 120 Hz switch (it is on Home)."),
+    s("home-performance", "Home", "home-performance", "Home on a screen that shows 120 frames a second: Performance holds the 120 Hz switch (off), with its short footnote, above JIT, whose note is beneath the panel."),
+    s("home-performance-on", "Home", "home-performance-on", "The 120 Hz switch on."),
     system_mic("home-mic-system-prompt", "Capabilities", "home-mic-alert", "The system's own question when Microphone is turned on for the first time (the Simulator's alert).", "reset"),
     system_mic("home-mic-system-allowed", "Capabilities", "home-mic-on", "Microphone on after iOS allowed it.", "grant"),
     system_mic("home-mic-system-refused", "Capabilities", "home-capabilities", "Microphone after iOS refused it: the row is dimmed and says it is not allowed in Settings.", "revoke"),
     system_mic("home-mic-system-settings-prompt", "Capabilities", "home-mic-alert", "Turning Microphone on after a refusal: Andarium explains and offers Settings.", "revoke"),
     system_mic("home-mic-system-revoked", "Capabilities", "home-mic-on", "Microphone on, access taken away in Settings while Andarium was in the background, Andarium active again: the switch is off and dimmed.", "grant", "background", "revoke", "foreground"),
+    system_location("home-location-system-prompt", "Capabilities", "home-location-ask", "The system's own question when Location is turned on for the first time (the Simulator's alert).", "reset"),
+    system_location("home-location-system-allowed", "Capabilities", "home-location-on", "Location on after iOS allowed it.", "grant"),
+    system_location("home-location-system-refused", "Capabilities", "home-capabilities", "Location after iOS refused it: the row is dimmed and says it is not allowed in Settings.", "revoke"),
+    system_location("home-location-system-settings-prompt", "Capabilities", "home-location-alert", "Turning Location on after a refusal: Andarium explains and offers Settings.", "revoke"),
+    system_location("home-location-system-revoked", "Capabilities", "home-location-on", "Location on, access taken away in Settings while Andarium was in the background, Andarium active again: the switch is off and dimmed.", "grant", "background", "revoke", "foreground"),
+    system_camera("home-camera-system-prompt", "Capabilities", "home-camera-ask", "The system's own question when Camera is turned on for the first time (the Simulator's alert), if the Simulator raises one without a camera."),
     s("settings-adb", "Settings", "settings-adb", "Developer: ADB over network on, the address a computer connects to."),
     s("settings-adb-no-address", "Settings", "settings-adb-no-address", "Developer: ADB over network on with no network address."),
     s("settings-adb-off", "Settings", "settings-adb-off", "Developer: ADB over network unavailable because USB debugging is off."),
+    s("settings-old-apps", "Settings", "settings-old-apps", "Settings as the side keys open it: Apps has Install APK and the Old app compatibility row, saying On because one app has it.", dark=True),
+    s("old-apps-page", "Old apps", "settings-old-apps-page", "Old app compatibility: Built for Android before 4.0, two made-up apps with their package names and a switch each (one on), and the footer.", dark=True, wait=4.0),
+    s("old-apps-turn-on", "Old apps", "settings-old-apps-turn-on", "The alert that asks before the switch is turned on for an app that is not open.", wait=4.0),
+    s("old-apps-turn-on-open", "Old apps", "settings-old-apps-turn-on-open", "The same alert for an app that is open: it adds that the app closes now.", wait=4.0),
+    s("old-apps-turn-off", "Old apps", "settings-old-apps-turn-off", "The alert that asks before the switch is turned off for an app that is open.", wait=4.0),
+    s("old-apps-refused", "Old apps", "settings-old-apps-refused", "The alert when the virtual machine did not take the change.", wait=4.0),
+    s("old-apps-empty", "Old apps", "settings-old-apps-empty", "The page when no app built for Android before 4.0 is installed.", wait=4.0),
+    s("old-apps-failed", "Old apps", "settings-old-apps-failed", "The page when the virtual machine did not answer the listing: the message and Try again.", wait=4.0),
+    s("old-apps-loading", "Old apps", "settings-old-apps-loading", "The page while the virtual machine is asked which apps it can apply to.", wait=3.0),
     # Operations on the guest
     s("overlay-bug-report", "Operations", "bug-report", "The full-screen progress while a bug report is made.", wait=2.0),
     s("overlay-install-apk", "Operations", "install-apk", "The full-screen progress while an app installs from Files.", wait=2.0),
+    s("alert-install-legacy", "Operations", "install-legacy", "The question over the install overlay when Android refused an app built for a much older version: Cancel and Install anyway.", wait=2.0),
+    s("overlay-install-legacy-hint", "Operations", "install-legacy-hint", "The install overlay at its end after Install anyway of an app built for an Android before 4.0 that Old app compatibility lists: the card says where its switch is.", dark=True),
+    s("overlay-install-legacy-hint-data", "Operations", "install-legacy-hint-data", "The same hint on the warning card of an app whose data files were not all copied."),
     s("overlay-install-done", "Operations", "install-done", "The install overlay at its end: App installed with Done. It stays until closed."),
     s("overlay-install-failed", "Operations", "install-failed", "The install overlay at its end: App not installed, the guest's reason and OK."),
     s("overlay-install-not-apk", "Operations", "install-not-apk", "A file that is not an app, refused at once on the overlay."),
-    s("overlay-install-bundle", "Operations", "install-bundle", "An app in several files, refused at once on the overlay."),
+    s("overlay-install-parts", "Operations", "install-parts", "The full-screen progress while an app that comes in parts (.apks, .xapk, .apkm) is sent, part by part.", wait=2.0),
+    s("overlay-install-app-bundle", "Operations", "install-app-bundle", "A file named .apks, .xapk or .apkm that holds an app bundle for publishing apps, refused once it is read."),
+    s("overlay-install-data", "Operations", "install-data", "The install overlay while an app's data files are copied, after the app is in: Cancel is back and the line counts the file.", wait=2.0),
+    s("overlay-install-done-without-data", "Operations", "install-done-without-data", "The install overlay at its end when the copy of the data files was stopped or failed: a warning (the caution symbol in orange, the title App installed, some data missing), not the plain success; the app is in, and installing the file again copies them.", dark=True),
+    s("overlay-install-done-data-not-placed", "Operations", "install-done-data-not-placed", "The install overlay at its end when some of the file's data is of a kind that is not copied, or a pack that is delivered later is left out: the same warning card, without the line about installing again."),
+    s("overlay-install-done-container", "Operations", "install-done-container", "The install overlay at its end for an app in parts that installed whole: the plain success (the check, the title App installed), to set beside the warning."),
+    s("overlay-install-encrypted", "Operations", "install-encrypted", "A file whose entries are encrypted, refused once it is read."),
+    s("overlay-install-damaged-or-encrypted", "Operations", "install-damaged-or-encrypted", "An .apkm that is not a ZIP, which may be damaged or the encrypted kind, refused once it is read."),
+    s("overlay-install-no-app", "Operations", "install-no-app", "An archive that holds no app, refused once it is read."),
+    s("overlay-install-damaged", "Operations", "install-damaged", "A file that is damaged, cut short, or whose parts do not fit together, refused once it is read."),
+    s("overlay-install-missing-split", "Operations", "install-missing-split", "The package manager's refusal of an app that lacks parts it requires."),
+    s("overlay-install-part-too-large", "Operations", "install-part-too-large", "An app with a part of 4 GiB or more, which Android cannot install, refused once the file is read."),
+    s("add-home-row", "Add to Home Screen", "add-home-row", "Settings as the side keys open it while Android runs and lists apps: the Apps section has the Add to Home Screen row, Shortcuts on its right.", dark=True),
+    s("add-home-page", "Add to Home Screen", "add-home-page", "The chooser: the apps Android lists with their icons, installed ones first and the ones built into Android after, each leading to the guide.", dark=True, wait=4.0),
+    s("add-home-page-search", "Add to Home Screen", "add-home-page-search", "The chooser with a short list, so that its last section is in view: the switch for Search, on, and the sentence under it that the apps stay available in Shortcuts and Siri when it is off.", dark=True, wait=4.0),
+    s("add-home-page-refreshing", "Add to Home Screen", "add-home-page-refreshing", "The chooser while Android is asked for a fresher list: the remembered list under a line that says so.", wait=4.0),
+    s("add-home-page-loading", "Add to Home Screen", "add-home-page-loading", "The chooser with no list yet and none remembered: only the note that the list is being read from Android.", wait=4.0),
+    s("add-home-page-failed", "Add to Home Screen", "add-home-page-failed", "The chooser when Android did not answer: the last list it gave, dated, with Try again.", wait=4.0),
+    s("add-home-page-failed-empty", "Add to Home Screen", "add-home-page-failed-empty", "The chooser when Android did not answer and no list is remembered: its own title, that the apps could not be read, and Try again.", wait=4.0),
+    s("add-home-page-empty", "Add to Home Screen", "add-home-page-empty", "The chooser when Android lists no app with an icon.", wait=4.0),
+    s("add-home-page-search-none", "Add to Home Screen", "add-home-page-search-none", "A search of the chooser that finds nothing: No Results for the typed words.", wait=4.0),
+    s("add-home-page-search-off", "Add to Home Screen", "add-home-page-search-off", "The chooser with the switch for Search off.", wait=4.0),
+    s("add-home-guide", "Add to Home Screen", "add-home-guide", "The guide of one app: the four steps of Apple's Shortcuts as they look, the note about what a tap on the icon does, and Apple's Shortcuts button at the foot.", dark=True, wait=4.0),
+    s("add-home-boot", "Add to Home Screen", "add-home-boot", "The boot screen while Android starts for a tap on an icon: the card with the app, when it opens and Don't open, above the steps.", dark=True),
+    s("add-home-wait-update", "Add to Home Screen", "add-home-wait-update", "Home with an unfinished update and a request waiting for the answer: the card above the update's notice.", dark=True),
+    s("add-home-wait-space", "Add to Home Screen", "add-home-wait-space", "Home with too little free space and a request waiting: the card says to free up space, then tap Start."),
+    s("add-home-pill", "Add to Home Screen", "add-home-pill", "The capsule over Android while the app is being opened.", dark=True),
+    s("add-home-banner-gone", "Add to Home Screen", "add-home-banner-gone", "The banner when the app is not in Android: no Try again."),
+    s("add-home-banner-slow", "Add to Home Screen", "add-home-banner-slow", "The banner when Android took too long: Try again and the close mark.", dark=True),
+    s("add-home-banner-recovery", "Add to Home Screen", "add-home-banner-recovery", "The banner when Android is in recovery mode."),
+    s("add-home-banner-setup", "Add to Home Screen", "add-home-banner-setup", "The banner when Android's first-run setup is not finished: it names the app and offers Try again."),
+    s("add-home-banner-tool", "Add to Home Screen", "add-home-banner-tool", "The banner when the installed Android has no tool that opens apps: a short title with the app, the text that says to update Andarium, and no Try again."),
+    s("add-home-alert-no-android", "Add to Home Screen", "add-home-alert-no-android", "An icon used when there is no virtual machine (erased, or never set up): the alert that the app is not in Android and the icon works again once it is installed in a new virtual machine."),
     # End: a clean power-off returns to Home; only a failed run keeps an end screen
     s("end-failed", "End", "failed", "The screen after the guest stopped unexpectedly."),
+    s("end-stopped", "End", "stopped", "The screen after Stop on the slow-start notice: it says the person stopped the virtual machine and that Andarium must be closed in the App Switcher and opened again to start it; no fault mark, the report block starts Virtual machine ended.", dark=True),
 ]
 
 
@@ -347,7 +531,7 @@ def settled_screenshot(udid: str, shot_id: str, out: Path) -> tuple[Path | None,
     return temporary, settled
 
 
-def play_flow(udid: str, shot: Shot, pid: int) -> int | None:
+def play_flow(udid: str, shot: Shot, pid: int, language: str | None = None) -> int | None:
     """The steps that follow the launch of a shot whose state needs the app in the background; the process that
     ends them, or None. The Simulator ends an app whose permission changes, as iOS does, so the last step is a
     relaunch there; an app still running just comes forward, which is the activation."""
@@ -355,9 +539,9 @@ def play_flow(udid: str, shot: Shot, pid: int) -> int | None:
         if step == "background":
             result = simctl("launch", udid, "com.apple.Preferences")
         elif step in ("grant", "revoke"):
-            result = simctl("privacy", udid, step, "microphone", BUNDLE)
+            result = simctl("privacy", udid, step, shot.service, BUNDLE)
         elif step == "foreground":
-            result = simctl("launch", udid, BUNDLE, *shot.launch_arguments())
+            result = simctl("launch", udid, BUNDLE, *shot.launch_arguments(language))
             if result.returncode == 0:
                 again = launched_pid(result)
                 print(f"  {shot.id}: {'the app was still running' if again == pid else 'the permission change ended the app'}")
@@ -386,24 +570,27 @@ def clear_system_alert(udid: str) -> None:
     time.sleep(15.0)
 
 
-def capture(udid: str, name: str, shot: Shot, appearance: str, out: Path, wait: float, orientation: str | None) -> dict | None:
+def capture(
+    udid: str, name: str, shot: Shot, appearance: str, out: Path, wait: float, orientation: str | None,
+    language: str | None = None,
+) -> dict | None:
     """One shot, or None (with the reason on stderr) when the picture cannot be Andarium's: the app is not the
     launched process on the shot's screen in front, the frame is empty, or the device turned since the run began
     (`orientation`)."""
     simctl("terminate", udid, BUNDLE)
     if shot.privacy is not None:
-        privacy = simctl("privacy", udid, shot.privacy, "microphone", BUNDLE)
+        privacy = simctl("privacy", udid, shot.privacy, shot.service, BUNDLE)
         if privacy.returncode != 0:
             print(f"  {shot.id}: privacy {shot.privacy} failed: {privacy.stderr.strip()}", file=sys.stderr)
             return None
-    launched = simctl("launch", udid, BUNDLE, *shot.launch_arguments())
+    launched = simctl("launch", udid, BUNDLE, *shot.launch_arguments(language))
     pid = launched_pid(launched)
     if launched.returncode != 0 or pid is None:
         print(f"  {shot.id}: launch failed: {launched.stderr.strip()}", file=sys.stderr)
         return None
     time.sleep(max(wait, shot.wait))
     if shot.flow:
-        pid = play_flow(udid, shot, pid)
+        pid = play_flow(udid, shot, pid, language)
         if pid is None:
             return None
     reason = wait_in_front(udid, pid, shot)
@@ -426,7 +613,7 @@ def capture(udid: str, name: str, shot: Shot, appearance: str, out: Path, wait: 
     if not settled:
         print(f"  {shot.id}: the screen kept changing; kept the last look", file=sys.stderr)
     idiom = "iPad" if "iPad" in name else "iPhone"
-    file = f"{idiom.lower()}-{now}-{appearance}-{shot.id}.png"
+    file = f"{idiom.lower()}-{now}-{appearance}-{shot.id}{'' if language is None else f'-{language}'}.png"
     temporary.replace(out / file)
     return {
         "file": file,
@@ -437,21 +624,22 @@ def capture(udid: str, name: str, shot: Shot, appearance: str, out: Path, wait: 
         "group": shot.group,
         "id": shot.id,
         "screen": shot.screen,
-        "launch_arguments": " ".join(shot.launch_arguments()),
+        "launch_arguments": " ".join(shot.launch_arguments(language)),
+        "language": language,
         "pixels": [width, height],
         "settled": settled,
         "description": shot.description,
     }
 
 
-def preflight(udid: str, name: str, out: Path) -> str | None:
+def preflight(udid: str, name: str, out: Path, language: str | None = None) -> str | None:
     """Before the first shot: the Preview must come to the front on a plain screen. A permission alert left up by
     an earlier use of the Simulator is cleared (which turns an iPad upright, as is said). The result is the
     orientation the run keeps, or None when the Preview cannot be brought to the front."""
     probe = Shot("preflight", "", "home", "")
     for attempt in range(2):
         simctl("terminate", udid, BUNDLE)
-        launched = simctl("launch", udid, BUNDLE, *probe.launch_arguments())
+        launched = simctl("launch", udid, BUNDLE, *probe.launch_arguments(language))
         pid = launched_pid(launched)
         if pid is not None and wait_in_front(udid, pid, probe) is None:
             temporary = out / ".preflight.png"
@@ -503,6 +691,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--only", metavar="REGEX", help="capture only shots whose id matches")
     parser.add_argument("--appearance", choices=("light", "dark"), help="capture only this appearance")
     parser.add_argument("--wait", type=float, default=0.0, help="minimum seconds after each launch")
+    parser.add_argument("--language", choices=sorted(LANGUAGES), help="show the Preview in this language (default: the Simulator's)")
     parser.add_argument("--list", action="store_true", help="list the shots and exit")
     args = parser.parse_args(argv)
     if args.list:
@@ -543,23 +732,29 @@ def capture_all(args: argparse.Namespace) -> int:
             "status_bar", udid, "override", "--time", "9:41", "--batteryState", "charged", "--batteryLevel", "100",
             "--cellularMode", "active", "--cellularBars", "4", "--wifiBars", "3", "--dataNetwork", "wifi",
         )
-        orientation = preflight(udid, name, args.out)
+        orientation = preflight(udid, name, args.out, args.language)
         if orientation is None:
             print(f"capture-screens.py: {name} ({udid}): the Preview does not come to the front; nothing captured", file=sys.stderr)
             status = 1
             continue
+        wanted = selected
         # The shot of the system's own alert runs last: the alert outlives its shot and covers whatever launches next.
-        plain = [shot for shot in selected if not shot.alert]
+        plain = [shot for shot in wanted if not shot.alert]
         passes = [("light", plain), ("dark", [shot for shot in plain if shot.dark]),
-                  ("light", [shot for shot in selected if shot.alert])]
+                  ("light", [shot for shot in wanted if shot.alert])]
         passes = [(appearance, shots) for appearance, shots in passes if args.appearance in (None, appearance)]
         asked = False
         for appearance, shots in passes:
             simctl("ui", udid, "appearance", appearance)
             for shot in shots:
-                entry = capture(udid, name, shot, appearance, args.out, args.wait, orientation)
+                if shot.alert and asked:
+                    # The alert an earlier shot raised is still up over whatever launches. Clearing it turns an iPad
+                    # upright, so the orientation of the start no longer holds.
+                    clear_system_alert(udid)
+                    orientation = None
+                entry = capture(udid, name, shot, appearance, args.out, args.wait, orientation, args.language)
                 if entry is None:
-                    entry = capture(udid, name, shot, appearance, args.out, args.wait, orientation)
+                    entry = capture(udid, name, shot, appearance, args.out, args.wait, orientation, args.language)
                 asked = asked or shot.alert
                 if entry is None:
                     status = 1

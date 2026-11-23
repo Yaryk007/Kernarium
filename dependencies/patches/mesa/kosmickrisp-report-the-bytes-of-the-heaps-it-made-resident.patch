@@ -14,25 +14,32 @@ scale.
 
 kk_resident_heap_bytes() reports the heaps both figures hold, so the
 host can add the two and subtract it once. A pooled device makes each
-heap resident when it makes it, and the heap enters the count only
-after the residency request has returned, when the ledger holds it, and
-leaves it before Metal drops it. A heap whose residency could not be
-requested, which waits for the next submission, stays out of the
-count, so it can only be counted twice, never not at all.
+heap resident when it makes it. The heap enters the count as the
+residency request is made, while the reservation that covers it is
+still held, and leaves it before Metal drops it. The ledger climbs
+while the pages become resident, so a heap that entered the count only
+after the request returned was counted by Metal, by its reservation and
+by the pages that had arrived, up to twice its size over for as long as
+the request took (about 100 ms for 128 MiB); the pages that arrive are
+now subtracted as they come, and the heap is over-counted by at most
+its size, never under-counted. A heap whose residency could not be
+requested leaves the count again and waits for the next submission, so
+it can only be counted twice, never not at all.
 mtl_heap_make_resident() now says whether it made the request.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
 ---
- src/kosmickrisp/bridge/mtl_heap.h             |  3 ++-
- src/kosmickrisp/bridge/mtl_heap.m             |  9 ++++++---
- src/kosmickrisp/bridge/stubs/mtl_heap.c       |  3 ++-
- src/kosmickrisp/vulkan/kk_bo.c                | 12 +++++++++--
- src/kosmickrisp/vulkan/kk_bo.h                |  2 ++
- src/kosmickrisp/vulkan/kk_device.h            |  5 +++++
- .../vulkan/kk_device_memory_pool.c            | 20 +++++++++++++++++++
- .../vulkan/kk_device_memory_pool.h            | 11 ++++++++++
- .../vulkan/tests/test_device_memory_pool.c    |  5 +++++
- 9 files changed, 63 insertions(+), 7 deletions(-)
+ src/kosmickrisp/bridge/mtl_heap.h             |  3 +-
+ src/kosmickrisp/bridge/mtl_heap.m             |  9 +-
+ src/kosmickrisp/bridge/stubs/mtl_heap.c       |  3 +-
+ src/kosmickrisp/vulkan/kk_bo.c                | 25 ++++-
+ src/kosmickrisp/vulkan/kk_bo.h                |  2 +
+ src/kosmickrisp/vulkan/kk_device.h            |  5 +
+ .../vulkan/kk_device_memory_pool.c            | 20 ++++
+ .../vulkan/kk_device_memory_pool.h            | 14 +++
+ .../vulkan/tests/test_device_memory_pool.c    | 98 +++++++++++++++++++
+ 9 files changed, 171 insertions(+), 8 deletions(-)
 
 diff --git a/src/kosmickrisp/bridge/mtl_heap.h b/src/kosmickrisp/bridge/mtl_heap.h
 index 345d0514435dd516aafd7849f4fe6233897f17b5..21eeca1bc60326869ea1f24c4c5e670f32a20ef9 100644
@@ -104,24 +111,37 @@ index 53cf2e58e0a529823d846a0a34d94848991571b0..1083ddc511ed40bb8a39db2b60287ff9
  
  /* Allocation from heap */
 diff --git a/src/kosmickrisp/vulkan/kk_bo.c b/src/kosmickrisp/vulkan/kk_bo.c
-index a62d01c717055e5766f0f332592d20c3f809e13d..b0859ddd1e25d9107285efdac0af3a52b17b2b8f 100644
+index a62d01c717055e5766f0f332592d20c3f809e13d..ce94cffe6556619815e08fd41200ea98b08cb3b3 100644
 --- a/src/kosmickrisp/vulkan/kk_bo.c
 +++ b/src/kosmickrisp/vulkan/kk_bo.c
-@@ -81,8 +81,11 @@ kk_alloc_bo_internal(struct kk_device *dev, struct vk_object_base *log_obj,
+@@ -80,9 +80,23 @@ kk_alloc_bo_internal(struct kk_device *dev, struct vk_object_base *log_obj,
+     * between them could together pass its limit. A pooled device makes every
      * heap resident here, before its reservation ends, so both readings count
      * it from then on; its next submission would have made it resident
-     * anyway. */
+-    * anyway. */
 -   if (kk_device_pooled(dev))
 -      mtl_heap_make_resident(dev->mtl_handle, handle);
-+   if (kk_device_pooled(dev) &&
-+       mtl_heap_make_resident(dev->mtl_handle, handle)) {
-+      bo->resident_B = mtl_heap_get_size(handle);
-+      kk_resident_heap_add(bo->resident_B);
++    * anyway.
++    *
++    * The footprint climbs while the pages become resident, and a pool that
++    * subtracts the resident heaps from it, to count a heap once, would count
++    * the pages that have arrived a second time until the heap is in the
++    * tally. The heap goes into the tally first, while its reservation still
++    * covers it, so that the climb is subtracted as it comes: the pool counts
++    * the heap through the reservation and the count of Metal, and the climb
++    * adds to that only once it passes the ledger's other holdings. */
++   if (kk_device_pooled(dev)) {
++      const uint64_t resident_B = mtl_heap_get_size(handle);
++      kk_resident_heap_add(resident_B);
++      if (mtl_heap_make_resident(dev->mtl_handle, handle))
++         bo->resident_B = resident_B;
++      else
++         kk_resident_heap_sub(resident_B);
 +   }
  
     *bo_out = bo;
     if (reserved)
-@@ -125,6 +128,11 @@ kk_destroy_bo(struct kk_device *dev, struct kk_bo *bo)
+@@ -125,6 +139,11 @@ kk_destroy_bo(struct kk_device *dev, struct kk_bo *bo)
  
     mtl_release(bo->map);
  
@@ -194,10 +214,10 @@ index cbaf99b46a8b2b65852dc8c9c2d837a0b3121849..d96dc6f253f694ef4dcf9b84d33e035f
  kk_wait_for_pool_headroom(uint32_t timeout_ms)
  {
 diff --git a/src/kosmickrisp/vulkan/kk_device_memory_pool.h b/src/kosmickrisp/vulkan/kk_device_memory_pool.h
-index 5536479de76e63079f455f294f330af95783d07e..3050ebacfdfb8db012fa9c288ba30c2615c4562c 100644
+index 5536479de76e63079f455f294f330af95783d07e..f21696bb1fc2c433c702fb1c1b6adc3500b3554b 100644
 --- a/src/kosmickrisp/vulkan/kk_device_memory_pool.h
 +++ b/src/kosmickrisp/vulkan/kk_device_memory_pool.h
-@@ -104,6 +104,17 @@ uint64_t kk_imported_host_memory_bytes(void);
+@@ -104,6 +104,20 @@ uint64_t kk_imported_host_memory_bytes(void);
   * learn whether the release freed anything. Exported by the driver library. */
  uint64_t kk_freed_memory_bytes(void);
  
@@ -206,20 +226,75 @@ index 5536479de76e63079f455f294f330af95783d07e..3050ebacfdfb8db012fa9c288ba30c26
 + * graphics ledger both count these, and each counts memory the other does
 + * not (the IOSurfaces of presentation, the driver's command storage), so a
 + * host that wants both counted adds the two and subtracts this once. A heap
-+ * enters the count only after its pages are resident, when the ledger already
-+ * holds it, and leaves before Metal drops it, so the subtraction never takes
-+ * away a heap that one of the two does not hold. Exported by the driver
-+ * library. */
++ * enters the count when its pages are made resident, while the reservation
++ * that covers it is still held, and the ledger holds it once the allocation
++ * returns; it leaves before Metal drops it. A reader that counts the
++ * reservations in flight as well as the two readings therefore never counts
++ * a heap fewer times than it exists, and counts the pages that arrive in the
++ * ledger only once they pass what the ledger holds beyond the resident heaps.
++ * Exported by the driver library. */
 +uint64_t kk_resident_heap_bytes(void);
 +
  /* Waits until the pool has the room for the request it last refused the
   * calling thread, or for timeout_ms; the refusal is forgotten either way. Memory a device frees counts in Metal's
   * allocation at once but in the graphics ledger a short while later, and the
 diff --git a/src/kosmickrisp/vulkan/tests/test_device_memory_pool.c b/src/kosmickrisp/vulkan/tests/test_device_memory_pool.c
-index 679e608c78d767ba4cb6d715e8d910a88099c950..1dffc4a35a84fcdfee320b9deaa60a9ff370082c 100644
+index 679e608c78d767ba4cb6d715e8d910a88099c950..04cf1f3b88424cf83728095064cf23a06475a84e 100644
 --- a/src/kosmickrisp/vulkan/tests/test_device_memory_pool.c
 +++ b/src/kosmickrisp/vulkan/tests/test_device_memory_pool.c
-@@ -205,11 +205,14 @@ main(void)
+@@ -184,6 +184,51 @@ wait_without_refusal(void *arg)
+    return NULL;
+ }
+ 
++/* Samples what a pool that counts the ledger beyond the resident heaps, and
++ * the reservations in flight, holds besides Metal's count of the heaps, as
++ * often as it can until told to stop, and keeps the largest.  Metal counts a
++ * heap from its creation and the reservation covers it until it returns, so
++ * what the sample holds above its value once the allocation is done is what
++ * the heap is counted too many times. */
++struct sampler {
++   struct pool *pool;
++   atomic_bool stop;
++   int64_t peak_B;
++   /* The samples, and how many held more than `above_B`. */
++   int64_t above_B;
++   unsigned samples, above;
++};
++
++static int64_t
++beyond_metal_B(const struct pool *pool)
++{
++   const int64_t ledger_B = graphics_footprint_B();
++   const int64_t resident_B = (int64_t)kk_resident_heap_bytes();
++   const int64_t ledger_only_B = ledger_B > resident_B ? ledger_B - resident_B : 0;
++   return (int64_t)__atomic_load_n(&pool->reserved_B, __ATOMIC_RELAXED) +
++          ledger_only_B;
++}
++
++static void *
++sample(void *arg)
++{
++   struct sampler *sampler = arg;
++   int64_t peak_B = 0;
++   unsigned samples = 0, above = 0;
++   while (!atomic_load(&sampler->stop)) {
++      const int64_t now_B = beyond_metal_B(sampler->pool);
++      if (now_B > peak_B)
++         peak_B = now_B;
++      samples++;
++      if (now_B > sampler->above_B)
++         above++;
++   }
++   sampler->peak_B = peak_B;
++   sampler->samples = samples;
++   sampler->above = above;
++   return NULL;
++}
++
+ int
+ main(void)
+ {
+@@ -205,11 +250,14 @@ main(void)
      * footprint counts the heap as well as Metal: no work has been submitted
      * that would make the heaps resident. */
     VkDeviceMemory memory[3] = {0}, extra = VK_NULL_HANDLE;
@@ -234,7 +309,7 @@ index 679e608c78d767ba4cb6d715e8d910a88099c950..1dffc4a35a84fcdfee320b9deaa60a9f
     process.check_footprint = false;
     CHECK(process.live_B == MIB(96));
     CHECK(process.reserved_B == 0u);
-@@ -279,6 +282,8 @@ main(void)
+@@ -279,6 +327,8 @@ main(void)
     for (unsigned i = 1; i < 3; i++)
        release(&t, MIB(32), memory[i], &process);
     CHECK(process.live_B == 0u && process.reserved_B == 0u);
@@ -243,3 +318,58 @@ index 679e608c78d767ba4cb6d715e8d910a88099c950..1dffc4a35a84fcdfee320b9deaa60a9f
     CHECK(process.reserves == process.releases + process.refusals);
  
     /* Clearing the pool frees every device of its bound; a pool with a
+@@ -303,6 +353,54 @@ main(void)
+          VK_ERROR_OUT_OF_DEVICE_MEMORY);
+    CHECK(allocate(&t, device_type, MIB(32), &large, &process) == VK_SUCCESS);
+    release(&t, MIB(32), large, &process);
++
++   /* The pages of a heap reach the footprint while the heap is made
++    * resident, and Metal and the reservation both count it meanwhile.  The
++    * heap is in the count of resident heaps by then, so a pool that
++    * subtracts the count from the footprint does not take the pages that
++    * have arrived for a second count: what it holds beyond Metal's count
++    * peaks at the heap's size above what it holds when the allocation is
++    * done, not at twice that. */
++   process.limit_B = MIB(512);
++   kk_set_device_memory_pool(&info);
++   /* Once the ledger has caught up with the heaps the test freed. */
++   int64_t settled_B = beyond_metal_B(&process);
++   for (unsigned i = 0; i < 60; i++) {
++      const struct timespec wait = {.tv_nsec = 50000000L};
++      nanosleep(&wait, NULL);
++      const int64_t again_B = beyond_metal_B(&process);
++      const bool steady = again_B >= settled_B - (int64_t)MIB(1) &&
++                          again_B <= settled_B + (int64_t)MIB(1);
++      settled_B = again_B;
++      if (steady)
++         break;
++   }
++   struct sampler sampler = {.pool = &process,
++                             .above_B = settled_B + (int64_t)MIB(64 + 8)};
++   atomic_init(&sampler.stop, false);
++   pthread_t sampling;
++   CHECK(pthread_create(&sampling, NULL, sample, &sampler) == 0);
++   CHECK(allocate(&t, device_type, MIB(128), &large, &process) == VK_SUCCESS);
++   atomic_store(&sampler.stop, true);
++   CHECK(pthread_join(sampling, NULL) == 0);
++   const struct timespec pause = {.tv_nsec = 300000000L};
++   nanosleep(&pause, NULL);
++   const int64_t done_B = beyond_metal_B(&process);
++   /* Against the larger of what it held before and after: the ledger lets
++    * go of memory the test freed earlier only while the heap is made. */
++   const int64_t over_B =
++      sampler.peak_B - (settled_B > done_B ? settled_B : done_B);
++   printf("the pool counted the heap %.1f MiB too often at most, and more "
++          "than 64 MiB too often in %u of %u samples (%.1f MiB beyond "
++          "Metal's count before, %.1f MiB at the peak, %.1f MiB after)\n",
++          (double)over_B / MIB(1), sampler.above, sampler.samples,
++          (double)settled_B / MIB(1), (double)sampler.peak_B / MIB(1),
++          (double)done_B / MIB(1));
++   CHECK(over_B <= (int64_t)MIB(128 + 16));
++   release(&t, MIB(128), large, &process);
++   process.limit_B = MIB(48);
++   kk_set_device_memory_pool(&info);
++
+    kk_test_destroy_device(&t);
+ 
+    /* A device that names a pool itself charges that one, and the process's

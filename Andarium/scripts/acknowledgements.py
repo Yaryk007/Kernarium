@@ -11,9 +11,30 @@ network. Do not edit the resource by hand.
 
     acknowledgements.py             rewrite the resource from the sources
     acknowledgements.py --verify    fail if the resource differs from them
+        both take the AOT artifact (--aot-artifact), whose notices fill
+        "Translated system libraries"; without the option they read the
+        accepted artifact installed below .build/android/aot
     acknowledgements.py --coverage  fail if the application carries a
                                     framework or prefix library the resource
                                     does not acknowledge (needs no sources)
+
+Translated system libraries: the application carries machine code translated
+from the libraries of the Android image (UmlArm64Aot.framework). The notices
+of those libraries are the artifact's own `licences.json` (tools/aot), whose
+digest `artifact.json` records, so the generator verifies the artifact, takes
+each distinct notice once and lists them as the texts of one project that is
+shown only on the page of Android Open Source Project and only when the
+application embeds the framework (`parent`, `requires_framework`). The
+paragraph above the row is the application's own text.
+
+Magisk and BusyBox: the Android release may carry Magisk's files (root) and,
+with them, BusyBox. Their projects are shown only where the release carries
+root (`requires_root`, which the application answers from the release it
+carries). Magisk's license text is the GPL-3.0 and is taken from two upstream
+projects' own copies, which must agree byte for byte after line-ending
+normalisation (GPL3_COPIES); BusyBox's is the GPL-2.0 text shared with the
+kernel. Each page says where the source of both is available: the Magisk
+project, at the tag of the version the release carries (MAGISK_VERSION).
 
 Coverage is measured against what the application embeds: the frameworks in
 Andarium/Andarium.xcodeproj and the components of the iOS device prefixes'
@@ -36,6 +57,9 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "tools/aot"))
+import release_artifact  # noqa: E402
+
 RESOURCE = ROOT / "Andarium/Andarium/Shared/Acknowledgements.json"
 PROJECT_FILE = ROOT / "Andarium/Andarium.xcodeproj/project.xcproj"
 PLATFORMS = ROOT / "dependencies/platforms"
@@ -46,6 +70,11 @@ DEVICE_CONTRACTS = (
     "ios-device-compression-arm64.tsv",
 )
 SCHEMA = 1
+AOT_FRAMEWORK = "UmlArm64Aot"
+TRANSLATED_ID = "aot-libraries"
+ACCEPTED_RELEASE = "android/lineage-24/metadata/accepted-release.env"
+INSTALLED_AOT = ".build/android/aot"
+TITLE_LENGTH = 80
 
 GROUPS = [
     {"id": "system", "title": "Operating system"},
@@ -57,6 +86,8 @@ GROUPS = [
 # under --source-root named as in dependencies/manifest.tsv, or "linux" for the
 # kernel source.
 SOURCES = {
+    "gawk": "gawk",
+    "libiconv": "libiconv",
     "vulkan-headers": "vulkan-headers",
     "mesa": "mesa",
     "libepoxy": "libepoxy",
@@ -69,6 +100,21 @@ SOURCES = {
     "proxy-libintl": "proxy-libintl",
     "zstd": "zstd",
 }
+
+# The version of Magisk that the Android release's root files carry, and the
+# public place where the source of Magisk and of the BusyBox it includes is
+# available at that version's tag.
+MAGISK_VERSION = "v31.1"
+MAGISK_SOURCE = "https://github.com/topjohnwu/Magisk"
+MAGISK_SOURCE_NOTICE = (
+    f"The source code of Magisk and of the BusyBox it includes, in the version Andarium carries "
+    f"({MAGISK_VERSION}), is available from the Magisk project at {MAGISK_SOURCE}, at the tag "
+    f"{MAGISK_VERSION}."
+)
+
+# Two upstream projects' own copies of the GPL-3.0 text: (source, path). They
+# must agree byte for byte after line-ending normalisation.
+GPL3_COPIES = (("gawk", "COPYING"), ("libiconv", "COPYING"))
 
 MESA_HOLDERS = (
     "Intel Corporation, Google LLC, LunarG, Inc., Collabora Ltd., Valve Corporation, "
@@ -101,6 +147,18 @@ class Texts:
         if not path.is_file():
             raise Problem(f"{path} is missing; run dependencies/prepare.sh or pass --source-root")
         return path
+
+    def agreeing(self, copies: tuple[tuple[str, str], ...]) -> str:
+        """The text of copies that must be one: every copy equal to the first
+        once line endings are normalised."""
+        found = []
+        for source, relative in copies:
+            raw = self.path(source, relative).read_bytes()
+            found.append(raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n"))
+        if any(copy != found[0] for copy in found[1:]):
+            names = ", ".join(f"{source}/{relative}" for source, relative in copies)
+            raise Problem(f"the copies of one license text differ: {names}")
+        return self.read(*copies[0])
 
     def read(
         self,
@@ -177,6 +235,61 @@ def mit_template(texts: Texts, holders: str) -> str:
     return reflow(filled)
 
 
+# --- translated system libraries ---------------------------------------------
+
+
+def aot_artifact_directory(root: Path, named: Path | None) -> Path:
+    """The artifact whose notices the resource carries: the one named, else the
+    accepted one installed below .build/android/aot."""
+    if named is not None:
+        return named
+    descriptor = root / release_artifact.ACCEPTED_DESCRIPTOR
+    release = root / ACCEPTED_RELEASE
+    if descriptor.is_file() and release.is_file():
+        for line in release.read_text(encoding="utf-8").splitlines():
+            match = re.fullmatch(r"LINEAGE24_ACCEPTED_DIRECTORY_NAME='([^']+)'", line)
+            if match:
+                installed = root / INSTALLED_AOT / match.group(1)
+                if installed.is_dir():
+                    return installed
+                raise Problem(f"the accepted AOT artifact is not installed at {installed}; pass --aot-artifact")
+    raise Problem("no AOT artifact is accepted or installed; pass --aot-artifact")
+
+
+def notice_title(text: str) -> str:
+    """The first line that says something, to head one notice among thirty."""
+    for line in text.split("\n"):
+        words = " ".join(line.split())
+        if re.search(r"[A-Za-z0-9]", words):
+            return words if len(words) <= TITLE_LENGTH else words[: TITLE_LENGTH - 1].rstrip() + "\u2026"
+    raise Problem("a translated library's notice has no text")
+
+
+def translated_notices(artifact: Path) -> list[dict[str, str]]:
+    """The distinct notices the artifact's libraries state, each once, in a
+    fixed order. A notice appears under the identifier the image's NOTICE
+    gives it; where one identifier has texts that differ only in white space
+    (a partition's NOTICE and an APEX's), the first in sorted order stands."""
+    try:
+        release_artifact.verify(artifact, repo=ROOT, generator=False)
+        licences = json.loads((artifact / "licences.json").read_text(encoding="utf-8"))
+    except (release_artifact.ArtifactError, OSError, ValueError) as error:
+        raise Problem(f"{artifact} is not an AOT artifact: {error}") from error
+    texts: dict[str, set[str]] = {}
+    for library in licences["libraries"]:
+        for notice in library["notices"]:
+            texts.setdefault(notice["id"], set()).add(notice["text"])
+    if not texts:
+        raise Problem(f"{artifact}/licences.json states no notice")
+    notices = []
+    for identifier, variants in texts.items():
+        original = sorted(variants)[0]
+        text = original.replace("\r\n", "\n").replace("\r", "\n").expandtabs(8).strip("\n")
+        notices.append({"title": notice_title(text), "text": clean(text, text), "id": identifier})
+    notices.sort(key=lambda notice: (notice["title"].lower(), notice["id"]))
+    return [{"title": notice["title"], "text": notice["text"]} for notice in notices]
+
+
 # --- the table --------------------------------------------------------------
 
 
@@ -200,6 +313,10 @@ def shared_licenses(texts: Texts) -> dict[str, dict[str, str]]:
             "LICENSES/exceptions/Linux-syscall-note",
             after="License-Text:",
         ),
+        "gpl-3.0": {
+            "title": "GNU General Public License, Version 3",
+            "text": clean(texts.agreeing(GPL3_COPIES)),
+        },
         "lgpl-2.1": license(
             "GNU Lesser General Public License, Version 2.1",
             "glib-ios",
@@ -208,7 +325,7 @@ def shared_licenses(texts: Texts) -> dict[str, dict[str, str]]:
     }
 
 
-def projects(texts: Texts) -> list[dict]:
+def projects(texts: Texts, notices: list[dict[str, str]]) -> list[dict]:
     def own(title: str | None, source: str, relative: str, **options) -> dict[str, str]:
         text = clean(texts.read(source, relative, **options))
         return {"title": title, "text": text} if title else {"text": text}
@@ -226,7 +343,19 @@ def projects(texts: Texts) -> list[dict]:
             copyright="The Android Open Source Project",
             license="Apache License 2.0",
             spdx="Apache-2.0",
+            frameworks=["UmlArm64Aot"],
             licenses=["apache-2.0"],
+        ),
+        entry(
+            id=TRANSLATED_ID,
+            group="system",
+            parent="android",
+            requires_framework=AOT_FRAMEWORK,
+            name="Translated system libraries",
+            copyright="The Android Open Source Project and the authors of the libraries it includes",
+            license="Apache License 2.0, BSD, MIT, zlib and other licenses",
+            spdx="NOASSERTION",
+            texts=notices,
         ),
         entry(
             id="lineageos",
@@ -246,6 +375,28 @@ def projects(texts: Texts) -> list[dict]:
             spdx="GPL-2.0-only WITH Linux-syscall-note",
             frameworks=["KRuntime_Android_6_18_4K"],
             licenses=["linux-syscall-note", "gpl-2.0"],
+        ),
+        entry(
+            id="magisk",
+            group="system",
+            name="Magisk",
+            copyright="The Magisk contributors",
+            license="GNU GPL v3 or later",
+            spdx="GPL-3.0-or-later",
+            requires_root=True,
+            licenses=["gpl-3.0"],
+            texts=[{"title": "Source code", "text": MAGISK_SOURCE_NOTICE}],
+        ),
+        entry(
+            id="busybox",
+            group="system",
+            name="BusyBox",
+            copyright="The BusyBox contributors",
+            license="GNU GPL v2",
+            spdx="GPL-2.0-only",
+            requires_root=True,
+            licenses=["gpl-2.0"],
+            texts=[{"title": "Source code", "text": MAGISK_SOURCE_NOTICE}],
         ),
         entry(
             id="mesa",
@@ -391,9 +542,9 @@ def projects(texts: Texts) -> list[dict]:
     ]
 
 
-def build(texts: Texts) -> dict:
+def build(texts: Texts, notices: list[dict[str, str]]) -> dict:
     shared = shared_licenses(texts)
-    table = projects(texts)
+    table = projects(texts, notices)
     used = {name for project in table for name in project["licenses"]}
     if used != set(shared):
         raise Problem(f"shared licenses {sorted(set(shared) ^ used)} are unused or missing")
@@ -442,6 +593,8 @@ def check_document(document: dict, frameworks: set[str], components: set[str]) -
         for field in ("name", "copyright", "license", "spdx", "group"):
             if not str(project.get(field) or "").strip():
                 problems.append(f"{name}: no {field}")
+        if "requires_root" in project and project["requires_root"] is not True:
+            problems.append(f"{name}: requires_root is {project['requires_root']!r}, expected true")
         if project.get("group") not in groups:
             problems.append(f"{name}: unknown group {project.get('group')!r}")
         body = [t for t in project.get("texts", []) if str(t.get("text", "")).strip()]
@@ -454,6 +607,17 @@ def check_document(document: dict, frameworks: set[str], components: set[str]) -
                 problems.append(f"{name}: license text {ref!r} is missing")
         covered_frameworks.update(project.get("frameworks", []))
         covered_components.update(project.get("components", []))
+    identifiers = {project.get("id") for project in document.get("projects", [])}
+    for project in document.get("projects", []):
+        name = project.get("id", "?")
+        parent = project.get("parent")
+        if parent is not None and parent not in identifiers:
+            problems.append(f"{name}: parent {parent!r} is not a project")
+        required = project.get("requires_framework")
+        if required is not None and required not in frameworks:
+            problems.append(f"{name}: requires framework {required} that the application does not embed")
+        if required is not None and required not in covered_frameworks:
+            problems.append(f"{name}: requires framework {required} that no project acknowledges")
     for ref in sorted(set(licenses) - referenced):
         problems.append(f"license text {ref!r} is not used by any project")
     for framework in sorted(frameworks - covered_frameworks):
@@ -494,6 +658,11 @@ def main(argv: list[str] | None = None) -> int:
         help="prepared dependency sources (default: external/sources)",
     )
     parser.add_argument("--kernel-source", type=Path, help="Linux source (default: the configured replay)")
+    parser.add_argument(
+        "--aot-artifact",
+        type=Path,
+        help="the AOT artifact whose notices fill Translated system libraries (default: the accepted one installed)",
+    )
     parser.add_argument("--resource", type=Path, default=RESOURCE, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     try:
@@ -504,7 +673,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"acknowledgements.py: {problem}", file=sys.stderr)
             return 1 if problems else 0
         texts = Texts(args.source_root, args.kernel_source or kernel_source_from(ROOT))
-        document = build(texts)
+        document = build(texts, translated_notices(aot_artifact_directory(ROOT, args.aot_artifact)))
         problems = check_document(document, embedded_frameworks(), device_components())
         if problems:
             for problem in problems:

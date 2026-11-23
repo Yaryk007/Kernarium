@@ -119,4 +119,51 @@ struct BugReportArchiveTests {
         let (_, listing) = try run("/usr/bin/unzip", ["-l", archive.path], in: directory)
         #expect(listing.contains("andarium/session-current.txt") && listing.contains("andarium/metrickit/metrics-3.json"))
     }
+
+    @Test func theBugReportCarriesThePreviousProcessAndTheLastEarlierRunThroughoutTheProcess() throws {
+        let directory = try scratch()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let container = directory.path
+        let current = directory.appendingPathComponent(BugReportAttachments.sessionRecord)
+        // The launch kept the end of the process before, a guest panic.
+        try "state ended\nend guest-panic\npid 10\n".write(
+            to: directory.appendingPathComponent(BugReportAttachments.previousSessionRecord),
+            atomically: true, encoding: .utf8)
+        let run = RunRecord(in: directory)
+        // Three runs: each is retired as the next is asked for.
+        for pid in [11, 12] {
+            try "state ended\nend powered-off\npid \(pid)\nNot locking \(container)/data.img\n".write(
+                to: current, atomically: true, encoding: .utf8)
+            run.retire()
+        }
+        try "state running\nend running\npid 13\n".write(to: current, atomically: true, encoding: .utf8)
+        let entries = BugReportAttachments.entries(from: directory, containers: [container], includingEarlierRun: true)
+        #expect(entries.map(\.name) == [
+            "andarium/session-previous.txt", "andarium/session-earlier-run.txt", "andarium/session-current.txt",
+        ])
+        let text = entries.map { String(decoding: $0.data, as: UTF8.self) }
+        #expect(text[0].contains("end guest-panic") && text[0].contains("pid 10"))
+        // The last earlier run, redacted as every record is.
+        #expect(text[1].contains("pid 12") && !text[1].contains("pid 11"))
+        #expect(text[1].contains("Not locking <container>/data.img") && !text[1].contains(container))
+        #expect(text[2].contains("pid 13"))
+    }
+
+
+    @Test func anEarlierRunThatThisProcessDidNotRetireIsNotCarried() throws {
+        let directory = try scratch()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try "state ended\nend powered-off\npid 12\n".write(
+            to: directory.appendingPathComponent(BugReportAttachments.earlierRunRecord), atomically: true, encoding: .utf8)
+        try "state running\nend running\npid 13\n".write(
+            to: directory.appendingPathComponent(BugReportAttachments.sessionRecord), atomically: true, encoding: .utf8)
+        // A file a launch could not file or drop is an older process's.
+        #expect(BugReportAttachments.entries(from: directory, containers: []).map(\.name) == [
+            "andarium/session-current.txt",
+        ])
+        #expect(BugReportAttachments.entries(from: directory, containers: [], includingEarlierRun: true).map(\.name) == [
+            "andarium/session-earlier-run.txt", "andarium/session-current.txt",
+        ])
+    }
+
 }

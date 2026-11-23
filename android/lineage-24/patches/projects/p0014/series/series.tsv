@@ -12,3 +12,4 @@ patch	tell-the-host-how-an-emulated-YUV-buffer-is-laid-out.patch
 patch	emulate-P010-over-an-R8-resource.patch
 patch	leave-a-decoder-s-output-as-the-decoder-wrote-it.patch
 patch	strip-scanout-from-a-P010-buffer-the-host-cannot-scan-out.patch
+patch	leave-a-camera-s-output-as-the-camera-wrote-it.patch

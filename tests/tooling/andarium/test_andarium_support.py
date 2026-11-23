@@ -44,7 +44,30 @@ class SettingsTests(unittest.TestCase):
             "KERNARIUM_EXECUTION_ENGINE": "gadgets",
             "KERNARIUM_HOST_FORWARD": "tcp:127.0.0.1:21100-5555",
             "KERNARIUM_ANDROID_ADB_AUTH": "0",
+            # An automated run keeps the phone silent.
+            "ANDARIUM_HAPTICS": "0",
         })
+
+    def test_a_run_that_tests_haptics_states_no_haptics_setting(self) -> None:
+        # The application's own switch then decides, as for a person's launch.
+        self.assertNotIn("ANDARIUM_HAPTICS", settings(haptics=True))
+        self.assertEqual(
+            {name: value for name, value in settings().items()
+             if name != "ANDARIUM_HAPTICS"},
+            settings(haptics=True))
+        self.assertEqual(andarium.HAPTICS_SETTING, "ANDARIUM_HAPTICS")
+
+    def test_the_haptics_setting_belongs_to_the_runner_s_own_option(
+        self
+    ) -> None:
+        for haptics in (False, True):
+            for value in ("0", "1"):
+                with self.subTest(haptics=haptics, value=value):
+                    with self.assertRaisesRegex(
+                        andarium.AndariumError, "ANDARIUM_HAPTICS"
+                    ):
+                        settings(haptics=haptics,
+                                 extra={"ANDARIUM_HAPTICS": value})
 
     def test_the_optional_knobs_are_set_only_when_asked_for(self) -> None:
         asked = settings(
@@ -135,6 +158,7 @@ class ApplicationTests(unittest.TestCase):
         self.assertNotIn("DEVICECTL_CHILD_ANDARIUM_ERASE", environment)
         self.assertEqual(environment["DEVICECTL_CHILD_ANDARIUM_START"],
                          "normal")
+        self.assertEqual(environment["DEVICECTL_CHILD_ANDARIUM_HAPTICS"], "0")
         self.assertEqual(environment["DEVICECTL_CHILD_UML_GPU_FRAME_STATS"],
                          "1")
         # Kernarium still clears only its own family.
@@ -142,6 +166,14 @@ class ApplicationTests(unittest.TestCase):
                          kernarium_environment)
         self.assertEqual(
             kernarium_environment["DEVICECTL_CHILD_ANDARIUM_ERASE"], "1")
+
+    def test_a_haptics_run_does_not_inherit_a_silenced_launch(self) -> None:
+        # An inherited setting would silence the run that tests haptics.
+        inherited = {"DEVICECTL_CHILD_ANDARIUM_HAPTICS": "0"}
+        with mock.patch.dict(ios_device.os.environ, inherited):
+            environment = ios_device.device_launch_environment(
+                andarium.APPLICATION, settings(haptics=True))
+        self.assertNotIn("DEVICECTL_CHILD_ANDARIUM_HAPTICS", environment)
 
     def test_the_focus_is_what_the_console_said_last(self) -> None:
         self.assertTrue(andarium.application_is_active(""))

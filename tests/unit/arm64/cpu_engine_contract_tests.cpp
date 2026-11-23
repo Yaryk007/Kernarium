@@ -270,6 +270,21 @@ struct AllocationBoundary final {
 	std::size_t blocks{};
 };
 
+/* An instruction fetch registers the generation as a holder of the frame it
+ * reads, and the holder table's leaf for the frame is an ordinary allocation
+ * made at the first registration: a failure injected for a later allocation
+ * would take it. A test that injects one makes the leaf of the frame it means
+ * to reach first. */
+void make_holder_leaf(uml::memory::StaticGuestMemory &memory,
+	std::uint64_t address)
+{
+	memory.set_code_holder_registration(true);
+	std::array<std::byte, sizeof(std::uint32_t)> word{};
+	require(memory.fetch(address, word),
+		"a frame of the allocation-failure test could not be fetched");
+	memory.set_code_holder_registration(false);
+}
+
 [[nodiscard]] bool fail_next_block_allocation(
 	uml::cpu::arm64::CpuState &, void *opaque) noexcept
 {
@@ -670,6 +685,7 @@ void test_production_translated_exception_contract()
 		std::memcpy(cpu.vectors[1].bytes.data(), &one, sizeof(one));
 		std::memcpy(cpu.vectors[2].bytes.data(), &one, sizeof(one));
 		const auto caller_fpcr = native_fpcr();
+		make_holder_leaf(memory, target);
 		AllocationBoundary boundary;
 		uml::cpu::ExecutionRequest request{
 			.cpu = cpu,
@@ -755,6 +771,7 @@ void test_gadget_post_execution_failure_preserves_prefix_and_reuse()
 	 * already retired and advanced the architectural PC. */
 	cpu.pc = base;
 	cpu.registers[0] = second_target;
+	make_holder_leaf(memory, second_target);
 	uml::testing::fail_next_allocation();
 	const auto failed = engine->run(request);
 	require(failed.reason == uml::cpu::ExitReason::fatal &&

@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Abdulmajeed Almarzoqi <abdulmjad01@gmail.com>
+Date: Fri, 13 Nov 2026 20:24:06 +0300
+Subject: [PATCH] Take libsonic from a given checkout instead of fetching it
+
+The Android build fetches libsonic with CMake's FetchContent. A build given
+-PsonicSourceDir=PATH now takes the checkout there and fetches nothing, so
+it can run offline from sources prepared beforehand; without the property
+it fetches as before.
+---
+ android/build.gradle | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/android/build.gradle b/android/build.gradle
+index 1b246cfd1509c2ca1bca37b67b6c163dfdc44a01..104cbc05945f1a692cc2e29369499b847542c635 100644
+--- a/android/build.gradle
++++ b/android/build.gradle
+@@ -48,6 +48,14 @@ android {
+         externalNativeBuild {
+             cmake {
+                 arguments.addAll(["-DUSE_ASYNC:BOOL=OFF", "-DUSE_MBROLA:BOOL=OFF", "-DUSE_LIBSONIC:BOOL=ON"])
++                // A build given a libsonic checkout (-PsonicSourceDir=PATH)
++                // takes it from there and fetches nothing.
++                if (project.hasProperty("sonicSourceDir")) {
++                    arguments.addAll([
++                        "-DFETCHCONTENT_SOURCE_DIR_SONIC-GIT=" + project.property("sonicSourceDir"),
++                        "-DFETCHCONTENT_FULLY_DISCONNECTED:BOOL=ON",
++                    ])
++                }
+                 targets.addAll(["ttsespeak", "espeak-data"])
+             }
+         }

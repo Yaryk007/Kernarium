@@ -1,0 +1,61 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# What the AOT rewriter translates from an Android release (tools/aot/README.md).
+# `library` names one absolute guest path; `boot` names a pattern for the
+# boot image's compiled Java, every OAT file of the release that holds code.
+# darwin/cpu/CMakeLists.txt and release_artifact.py read this file, and an
+# artifact records its digest.
+
+library /apex/com.android.runtime/lib64/bionic/libc.so
+library /apex/com.android.runtime/bin/linker64
+library /apex/com.android.art/lib64/libart.so
+library /system/lib64/libhwui.so
+library /vendor/lib64/venus_gallium_dri.so
+library /system/bin/surfaceflinger
+library /system/lib64/libcrypto.so
+library /system/lib64/libpcre2.so
+library /system/lib64/libbinder.so
+library /system/lib64/libz.so
+library /system/bin/toybox
+library /system/lib64/libselinux.so
+library /system/lib64/libtracing_perfetto.so
+library /apex/com.android.art/lib64/libartpalette.so
+library /system/lib64/libutils.so
+library /system/lib64/libcutils.so
+library /apex/com.android.art/lib64/libdexfile.so
+library /system/lib64/libbinder_ndk.so
+library /system/lib64/bootstrap/libc.so
+library /apex/com.android.art/lib64/libc++.so
+library /system/lib64/libandroidfw.so
+library /apex/com.android.art/lib64/libartbase.so
+library /apex/com.android.runtime/lib64/bionic/libm.so
+library /system/lib64/libgui.so
+library /system/lib64/libui.so
+library /apex/com.android.art/lib64/libjavacore.so
+library /system/bin/bootstrap/linker64
+library /system/lib64/liblog.so
+library /system/lib64/android.hardware.graphics.composer3-V5-ndk.so
+library /vendor/lib64/libutils.so
+library /system/lib64/libminikin.so
+library /system/lib64/libandroid_runtime.so
+library /system/lib64/libsqlite.so
+library /system/lib64/libft2.so
+# One path per distinct file: a unit binds by the content of its pages, so
+# it serves every identical copy another APEX ships too.
+library /apex/com.android.media.swcodec/lib64/libcodec2_soft_av1dec_gav1.so
+library /apex/com.android.conscrypt/lib64/libcrypto.so
+library /apex/com.android.media.swcodec/lib64/libFraunhoferAAC.so
+library /apex/com.android.art/bin/dex2oat64
+library /vendor/lib64/hw/vulkan.virtio.so
+library /apex/com.android.media.swcodec/lib64/libcodec2_soft_av1dec_dav1d.so
+library /apex/com.android.media.swcodec/lib64/libopus.so
+library /apex/com.android.conscrypt/lib64/libssl.so
+library /apex/com.android.art/lib64/liblzma.so
+library /system/lib64/liblzma.so
+library /apex/com.android.conscrypt/lib64/libjavacrypto.so
+library /apex/com.android.art/lib64/liblz4.so
+library /system/lib64/liblz4.so
+library /apex/com.android.media.swcodec/lib64/libvpx.so
+library /apex/com.android.media.swcodec/lib64/libcodec2_soft_avcdec.so
+
+boot /system/framework/arm64/boot*.oat

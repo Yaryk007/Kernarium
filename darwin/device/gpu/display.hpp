@@ -3,11 +3,15 @@
 
 #include "context_memory_ledger.hpp"
 #include "protocol.hpp"
+#include "reclaim_wait.hpp"
 #include "../input/vnc/vnc_input.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -93,6 +97,12 @@ struct DisplayStatistics {
     /* Guest frames that could not use direct presentation and took the CPU
      * readback path instead. */
     std::uint64_t cpuFallbackFrames {};
+    /* Guest updates the display accepted, each once, however it is shown: a
+     * direct Metal texture, a 2-D resource's CPU update or a readback. The
+     * counters above are not that count (guestFrames counts direct attempts
+     * the display refused, and neither of the others counts a 2-D update), so
+     * it is what the 120 Hz display link paces by. */
+    std::uint64_t offeredFrames {};
 };
 
 class Display {
@@ -104,6 +114,26 @@ public:
 
     [[nodiscard]] virtual std::uint32_t width() const noexcept = 0;
     [[nodiscard]] virtual std::uint32_t height() const noexcept = 0;
+    /* The refresh rate, in hertz, that the host grants the display's one mode
+     * for this run: 60, or 120 on a display that was asked for the 120 Hz
+     * mode, whose screen and size the host checked once, before the guest
+     * booted, and that paces its presents from a display link at the rate the
+     * guest renders at (present_pacer.hpp). Any other value is the 60 Hz mode.
+     * It is the highest rate the mode can have and does not change while the
+     * display lives. The mode the guest is shown at a moment has the rate its
+     * size's EDID timing states (statedRefreshRate in edid_timing.hpp): a size
+     * whose 120 Hz clock the EDID cannot state is a 60 Hz mode while that size
+     * lasts, and one whose 60 Hz clock it cannot state has the rate of the
+     * largest clock. */
+    [[nodiscard]] virtual std::uint32_t refreshRate() const noexcept
+    {
+        return 60;
+    }
+    /* The device tells the display the rate of the mode it just stated to the
+     * guest (the EDID of the size the display has now: 120, 60, or the rate of
+     * the largest clock for a size beyond it), so that a display that paces by
+     * the mode follows it across a resize. */
+    virtual void noteModeRefreshRate(std::uint32_t) noexcept {}
     /* Native AppKit/UIKit surfaces publish resize readiness from the UI
      * thread. The transport drains and applies it on its GPU owner thread. */
     [[nodiscard]] virtual int resizeEventDescriptor() const noexcept
@@ -149,7 +179,46 @@ public:
     }
     void setGuestScanoutActive(bool active) noexcept
     {
+        if (!active)
+            guestScanoutMode_.store(0, std::memory_order_release);
         guestScanoutActive_.store(active, std::memory_order_release);
+    }
+    /* The size in pixels of the guest's primary scanout, which is the area a
+     * pointer position is relative to: the device sets it whenever the guest
+     * binds a resource to the scanout, and it is gone with the scanout
+     * (setGuestScanoutActive(false)). Read from any thread. */
+    struct GuestScanoutMode {
+        std::uint32_t width {};
+        std::uint32_t height {};
+    };
+    void setGuestScanoutMode(
+        std::uint32_t width, std::uint32_t height) noexcept
+    {
+        guestScanoutMode_.store(
+            static_cast<std::uint64_t>(width) << 32U | height,
+            std::memory_order_release);
+    }
+    [[nodiscard]] std::optional<GuestScanoutMode> guestScanoutMode()
+        const noexcept
+    {
+        const auto mode = guestScanoutMode_.load(std::memory_order_acquire);
+        if (mode == 0)
+            return std::nullopt;
+        return GuestScanoutMode {
+            .width = static_cast<std::uint32_t>(mode >> 32U),
+            .height = static_cast<std::uint32_t>(mode),
+        };
+    }
+    /* Told how many clients the display has whenever that changes, on the
+     * thread that serves them: a VNC display counts its connected clients,
+     * and a display with no clients never reports. A null observer clears
+     * it. The observer must return promptly and must not call back into the
+     * display; once this returns no call to the old one is running. */
+    using ClientObserver = std::function<void(std::uint32_t clients)>;
+    void setClientObserver(ClientObserver observer)
+    {
+        std::lock_guard lock(observerMutex_);
+        clientObserver_ = std::move(observer);
     }
     virtual void update(
         std::span<const std::uint8_t> source,
@@ -204,6 +273,20 @@ public:
     {
         return memoryRefusals_.load(std::memory_order_relaxed);
     }
+    /* A refused allocation waits for the guest's reclaimer (ReclaimWait).
+     * The guest is told of it as of a refusal, at once, so its reclaimer
+     * acts; the application's count, memoryRefusals(), holds only the
+     * refusals the guest was answered with. */
+    void recordMemoryWait() noexcept
+    {
+        memoryWaits_.fetch_add(1, std::memory_order_relaxed);
+        graphicsLedger_.notify();
+    }
+    [[nodiscard]] std::uint64_t memoryWaits() const noexcept
+    {
+        return memoryWaits_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] ReclaimWait& reclaimWait() noexcept { return reclaimWait_; }
     /* What the guest's contexts hold of the host GPU's memory, by process.
      * The device keeps it for as long as its guest runs, and clears it when
      * that guest is gone; it lives here because the display outlives the
@@ -230,15 +313,49 @@ public:
     {
         return guestReclaims_.load(std::memory_order_relaxed);
     }
+    /* The least a process holds, and how long it has been quiet, for the
+     * guest's reclaimer to end it: the terms of the guest's last query. */
+    void setGuestReclaimTerms(
+        std::uint64_t minimumBytes, std::uint32_t minimumIdleMs) noexcept
+    {
+        reclaimMinimumBytes_.store(minimumBytes, std::memory_order_relaxed);
+        reclaimMinimumIdleMs_.store(minimumIdleMs, std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint64_t guestReclaimMinimumBytes() const noexcept
+    {
+        return reclaimMinimumBytes_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::chrono::milliseconds guestReclaimMinimumIdle()
+        const noexcept
+    {
+        return std::chrono::milliseconds {
+            reclaimMinimumIdleMs_.load(std::memory_order_relaxed)};
+    }
 
 protected:
     Display() = default;
 
+    /* For a display whose clients come and go. */
+    void reportClients(std::uint32_t clients) noexcept
+    {
+        std::lock_guard lock(observerMutex_);
+        if (clientObserver_)
+            clientObserver_(clients);
+    }
+
 private:
     std::atomic_bool guestScanoutActive_ {};
+    /* Width in the high word and height in the low one; zero when none. */
+    std::atomic<std::uint64_t> guestScanoutMode_ {};
+    std::mutex observerMutex_;
+    ClientObserver clientObserver_;
     std::atomic_bool guestReclaims_ {};
+    std::atomic<std::uint64_t> reclaimMinimumBytes_ {};
+    std::atomic<std::uint32_t> reclaimMinimumIdleMs_ {};
     std::atomic<std::uint64_t> memoryRefusals_ {};
+    std::atomic<std::uint64_t> memoryWaits_ {};
     ContextMemoryLedger graphicsLedger_;
+    ReclaimWait reclaimWait_;
 };
 
 [[nodiscard]] std::unique_ptr<Display> makeDisplay(
@@ -254,6 +371,7 @@ private:
         uml::input::vnc::PointerMode::mouse,
     std::uint32_t maximumDimension = protocol::maximumDisplayDimension,
     bool autoResizeGuest = true,
-    OffscreenDisplayOptions offscreen = {});
+    OffscreenDisplayOptions offscreen = {},
+    std::uint32_t refreshRate = 60);
 
 } // namespace uml::gpu

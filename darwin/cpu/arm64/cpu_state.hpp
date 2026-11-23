@@ -121,8 +121,8 @@ struct CpuState final {
 	 * link sweep releases records. A stale or mismatched record can only
 	 * fall back to the ordinary miss path. */
 	struct ReturnRecord final {
-		/* An unaligned sentinel: no return PC can ever match an empty
-		 * record, so an empty ring never follows its null link. */
+		/* An unaligned sentinel no return address matches. A guest can
+		 * still branch there, so a pop checks for a link first. */
 		std::uint64_t pc{~std::uint64_t{0}};
 		const void *link{};
 	};

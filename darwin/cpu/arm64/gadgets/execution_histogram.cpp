@@ -91,11 +91,7 @@ class Histogram final {
 public:
 	Histogram()
 	{
-#ifdef UML_APP_STORE_RUNTIME
-		const char *path = nullptr;
-#else
 		const auto *path = std::getenv("DARWIN_UML_GADGET_EXECUTION_HISTOGRAM");
-#endif
 		if (path == nullptr || *path == '\0')
 			return;
 		path_ = path;

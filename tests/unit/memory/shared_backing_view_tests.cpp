@@ -421,6 +421,14 @@ void test_hand_back_keeps_permanent_text(std::size_t page_size)
 	require(uml::memory::host_range_kept(text, page_size) &&
 		!uml::memory::host_range_kept(text, page_size * 2) &&
 		!uml::memory::host_range_kept(root, page_size));
+	/* A span with a kept range in it, whatever else it holds, is not for
+	 * unmapping as a whole. */
+	require(uml::memory::host_range_kept_within(root, window_size) &&
+		uml::memory::host_range_kept_within(root, page_size * 2) &&
+		uml::memory::host_range_kept_within(text + page_size - 1, 2) &&
+		!uml::memory::host_range_kept_within(root, page_size) &&
+		!uml::memory::host_range_kept_within(text + page_size, page_size) &&
+		!uml::memory::host_range_kept_within(text, 0));
 	require(uml::memory::hand_back_anonymous_guest_ram(
 		window, window_size) == 0);
 	require(!uml::memory::anonymous_shared_backing_registered());

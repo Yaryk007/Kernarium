@@ -189,8 +189,7 @@ gadget vector_scalar_i\integer_width\()_f\element\()_rm
 	effective_address
 	ldr x26, [_stream], #8
 	mov x25, x7
-	page_cross_check (\integer_width / 8), Lx86_vector_integer_to_scalar_cross\@
-	translate 0, UML_X86_64_TLB_READ_PAGE, (\integer_width / 8)
+	translate 0, UML_X86_64_TLB_READ_PAGE, (\integer_width / 8), cross=Lx86_vector_integer_to_scalar_cross\@
 	.if \integer_width == 32
 	ldr w24, [x7]
 	.else
@@ -257,8 +256,7 @@ gadget vector_pi_f\element\()_rm
 	effective_address
 	ldr x26, [_stream], #8
 	mov x25, x7
-	page_cross_check 8, Lx86_vector_pi_cross\@
-	translate 0, UML_X86_64_TLB_READ_PAGE, 8
+	translate 0, UML_X86_64_TLB_READ_PAGE, 8, cross=Lx86_vector_pi_cross\@
 	ldr d1, [x7]
 	b Lx86_vector_pi_loaded\@
 Lx86_vector_pi_cross\@:
@@ -303,8 +301,7 @@ gadget vector_scalar_f\element\()_i\width\()_\truncate\()_rr
 gadget vector_scalar_f\element\()_i\width\()_\truncate\()_rm
 	effective_address
 	mov x25, x7
-	page_cross_check (\element / 8), Lx86_vector_fp_to_gpr_cross\@
-	translate 0, UML_X86_64_TLB_READ_PAGE, (\element / 8)
+	translate 0, UML_X86_64_TLB_READ_PAGE, (\element / 8), cross=Lx86_vector_fp_to_gpr_cross\@
 	.if \element == 32
 	ldr s1, [x7]
 	.else

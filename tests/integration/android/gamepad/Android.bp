@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: Apache-2.0
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+// Foreground game controller client for the candidate image's gamepad checks.
+android_app {
+    name: "AndariumGamepadProbe",
+    manifest: "app/AndroidManifest.xml",
+    srcs: ["app/src/**/*.java"],
+    sdk_version: "current",
+    optimize: { enabled: false },
+}

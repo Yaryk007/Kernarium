@@ -1,0 +1,64 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 12:14:33 +0900
+Subject: [PATCH] Launcher add new items from the first screen
+
+An item the launcher adds by itself (a newly installed application, a
+pinned shortcut or a pinned widget) skipped the first screen and went
+to the second screen or a new one. This product's first screen holds
+nothing, so exclude no screen from the search: it begins at the first
+screen, which the space finder counts even while it is empty, and goes
+on through the later screens in order. A new screen is added when no
+candidate screen can accommodate the item's span. Items already on the
+second screen stay put.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .../android/launcher3/model/tasks/AddWorkspaceItemsTask.java | 5 +++--
+ .../launcher3/model/tasks/AddWorkspaceItemsTaskTest.kt       | 3 +--
+ 2 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/src/com/android/launcher3/model/tasks/AddWorkspaceItemsTask.java b/src/com/android/launcher3/model/tasks/AddWorkspaceItemsTask.java
+index 1d511852d1e3e11f68c2bbd5a1a2ac2b1ba1c616..733a9082f311c748d9289932b13e820fa8d82f56 100644
+--- a/src/com/android/launcher3/model/tasks/AddWorkspaceItemsTask.java
++++ b/src/com/android/launcher3/model/tasks/AddWorkspaceItemsTask.java
+@@ -16,7 +16,6 @@
+ package com.android.launcher3.model.tasks;
+ 
+ import static com.android.launcher3.LauncherSettings.Favorites.ITEM_TYPE_APPLICATION;
+-import static com.android.launcher3.WorkspaceLayoutManager.FIRST_SCREEN_ID;
+ import static com.android.launcher3.WorkspaceLayoutManager.TAG;
+ 
+ import android.content.Context;
+@@ -78,7 +77,9 @@ public class AddWorkspaceItemsTask implements ModelUpdateTask {
+         }
+ 
+         final ArrayList<ItemInfo> addedItemsFinal = new ArrayList<>();
+-        final IntSet excludedScreens = IntSet.wrap(FIRST_SCREEN_ID);
++        // No screen is excluded: the search starts at the first screen, which is always part of
++        // it, even while it holds nothing, and goes on through the later screens in order.
++        final IntSet excludedScreens = new IntSet();
+         final Context context = taskController.getContext();
+ 
+         synchronized (dataModel) {
+diff --git a/tests/multivalentTests/src/com/android/launcher3/model/tasks/AddWorkspaceItemsTaskTest.kt b/tests/multivalentTests/src/com/android/launcher3/model/tasks/AddWorkspaceItemsTaskTest.kt
+index af17a2dfc87c9d82787c27c112ddd7c627622c06..c24b0b52d142df6b6b60a77459451393beb90c17 100644
+--- a/tests/multivalentTests/src/com/android/launcher3/model/tasks/AddWorkspaceItemsTaskTest.kt
++++ b/tests/multivalentTests/src/com/android/launcher3/model/tasks/AddWorkspaceItemsTaskTest.kt
+@@ -22,7 +22,6 @@ import android.platform.test.flag.junit.SetFlagsRule
+ import androidx.test.ext.junit.runners.AndroidJUnit4
+ import androidx.test.filters.SmallTest
+ import com.android.launcher3.Flags
+-import com.android.launcher3.WorkspaceLayoutManager.FIRST_SCREEN_ID
+ import com.android.launcher3.model.TestableModelState
+ import com.android.launcher3.model.WorkspaceItemSpaceFinder
+ import com.android.launcher3.model.data.AppInfo
+@@ -178,7 +177,7 @@ class AddWorkspaceItemsTaskTest {
+      */
+     private fun verifyItemSpaceFinderCall(numberOfExpectedCall: Int, items: List<ItemInfo>) {
+         verify(workspaceItemSpaceFinder, times(numberOfExpectedCall))
+-            .findSpaceForItem(eq(ArrayList(items)), eq(1), eq(1), eq(IntSet.wrap(FIRST_SCREEN_ID)))
++            .findSpaceForItem(eq(ArrayList(items)), eq(1), eq(1), eq(IntSet()))
+     }
+ 
+     /**

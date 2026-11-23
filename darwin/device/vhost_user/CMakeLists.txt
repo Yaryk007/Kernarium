@@ -74,3 +74,20 @@ if(UML_BUILD_UNIT_TESTS AND UML_BUILD_GPU)
     target_link_libraries(uml_gpu_transport_slow_stop_test_variant PRIVATE
         objc)
 endif()
+
+if(UML_BUILD_UNIT_TESTS)
+    # The transport with a clock a test sets, so that the bound of a backend
+    # wait is tested by moving the clock instead of waiting for it.
+    add_library(uml_vhost_user_wait_test_variant STATIC
+        shared_memory_regions.cpp
+        vhost_user_server.cpp)
+    uml_configure_vhost_user_component(uml_vhost_user_wait_test_variant)
+    target_compile_definitions(uml_vhost_user_wait_test_variant PRIVATE
+        UML_VHOST_USER_WAIT_TESTING=1)
+    target_link_libraries(uml_vhost_user_wait_test_variant PUBLIC
+        UML::MemorySharedBacking
+        uml_vhost_user_wire)
+    target_link_libraries(uml_vhost_user_wait_test_variant PRIVATE
+        UML::GuestTimerMask
+        objc)
+endif()

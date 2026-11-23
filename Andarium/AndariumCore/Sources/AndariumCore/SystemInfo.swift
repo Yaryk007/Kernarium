@@ -2,9 +2,8 @@
 
 import Foundation
 
-/// The system Andarium carries, as the Info screen and the boot screens name
-/// it. The live app reads it from the release manifest the packaging step
-/// stages beside the system image.
+/// The installed system, as the Info screen and boot screens name it. The
+/// live app reads it from the release manifest beside the system image.
 public struct SystemInfo: Equatable, Sendable {
     /// The system's version number as the screens say it ("17").
     public var version: String
@@ -40,15 +39,28 @@ public struct SystemInfo: Equatable, Sendable {
         self.appVersion = appVersion
     }
 
-    /// "2026-10-01" as "1 October 2026"; nil for anything else.
-    static func patchLevel(_ text: String) -> String? {
+    /// "arm64, 4 KiB pages": the CPU architecture and the page size the guest kernel runs with.
+    public static func architecture(pageKiB: Int) -> String {
+        String(
+            localized: "arm64, \(pageKiB) KiB pages", bundle: .module,
+            comment: "The architecture row of the Info sheet: the CPU architecture, then the size of a memory page, as in arm64, 4 KiB pages.")
+    }
+
+    /// "2026-10-01" as the system writes the day in `locale` ("1 October 2026"
+    /// in British English, "2026年10月1日" in Japanese); nil for anything else.
+    public static func patchLevel(_ text: String, locale: Locale = .current) -> String? {
         let parts = text.split(separator: "-", omittingEmptySubsequences: false).map { Int($0) }
-        guard parts.count == 3, let year = parts[0], let month = parts[1], let day = parts[2],
-              (1...12).contains(month), (1...31).contains(day), year >= 2000
+        guard parts.count == 3, let year = parts[0], let month = parts[1], let day = parts[2], year >= 2000
         else { return nil }
-        let names = ["January", "February", "March", "April", "May", "June", "July", "August", "September",
-                     "October", "November", "December"]
-        return "\(day) \(names[month - 1]) \(year)"
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "UTC") ?? .gmt
+        let components = DateComponents(year: year, month: month, day: day)
+        // A day the month does not have rolls over in a calendar; it is no date here.
+        guard let date = calendar.date(from: components),
+              calendar.dateComponents([.year, .month, .day], from: date) == components
+        else { return nil }
+        let style = Date.FormatStyle(date: .long, time: .omitted, locale: locale, calendar: calendar, timeZone: calendar.timeZone)
+        return date.formatted(style)
     }
 
     public enum ManifestError: Error, Equatable {
@@ -57,7 +69,7 @@ public struct SystemInfo: Equatable, Sendable {
     }
 
     /// Reads a `release-manifest.json`.
-    public init(manifest: Data, appVersion: String) throws {
+    public init(manifest: Data, appVersion: String, locale: Locale = .current) throws {
         guard let root = try? JSONSerialization.jsonObject(with: manifest) as? [String: Any] else {
             throw ManifestError.malformed
         }
@@ -75,9 +87,12 @@ public struct SystemInfo: Equatable, Sendable {
             throw ManifestError.missing("kernel.page_size")
         }
 
-        // The family "lineage-24-mainline-6.18-4k" is the one release line the app carries.
         let parts = family.split(separator: "-")
-        guard parts.count >= 2, parts[0] == "lineage", Int(parts[1]) != nil else {
+        let isLineage = parts.count >= 2 && parts[0] == "lineage" && Int(parts[1]) != nil
+        let isCustom = ["xos", "hyperos", "coloros", "one-ui"].contains {
+            family == $0 || family.hasPrefix($0 + "-")
+        }
+        guard isLineage || isCustom else {
             throw ManifestError.missing("product_family")
         }
         // "6.18.54-g4bcc3653b86a" is Linux 6.18.54.
@@ -86,8 +101,8 @@ public struct SystemInfo: Equatable, Sendable {
         self.init(
             version: String(major), release: release,
             buildID: android?["build_id"] as? String,
-            securityPatch: (android?["security_patch"] as? String).flatMap(Self.patchLevel),
-            kernel: "Linux \(version)", architecture: "arm64, \(pageSize / 1024) KiB pages",
+            securityPatch: (android?["security_patch"] as? String).flatMap { Self.patchLevel($0, locale: locale) },
+            kernel: "Linux \(version)", architecture: Self.architecture(pageKiB: pageSize / 1024),
             abis: (android?["abi_list"] as? [Any])?.compactMap { $0 as? String }.filter { !$0.isEmpty } ?? [],
             appVersion: appVersion
         )

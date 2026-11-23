@@ -29,6 +29,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <string>
@@ -282,6 +283,16 @@ struct Fixture final {
     {
         pollfd descriptor {device.eventDescriptor(), POLLIN, 0};
         return ::poll(&descriptor, 1, milliseconds) == 1 && (descriptor.revents & POLLIN);
+    }
+    /* The event queue's next buffer. The device answers it with the event it
+     * has for the guest; with none it leaves the buffer in the guest's ring
+     * (retry) and holds nothing. */
+    std::optional<virtio_video_event> takeEvent(std::source_location where = std::source_location::current())
+    {
+        const auto result = device.processQueue(1, 0xe0000, {}, sizeof(virtio_video_event));
+        if (result.action == VhostUserQueueAction::retry) return std::nullopt;
+        require(result.action == VhostUserQueueAction::complete, "an event buffer was held by the device", where);
+        return load<virtio_video_event>(result.response);
     }
     void wake(std::source_location where = std::source_location::current())
     {
@@ -879,8 +890,7 @@ void encodeRoundTrip()
         return bytes;
     };
     prepare(f);
-    require(f.device.processQueue(1, 900, {}, sizeof(virtio_video_event)).action == VhostUserQueueAction::defer,
-            "an event buffer did not wait");
+    require(!f.takeEvent(), "an event buffer was held with no event to give");
 
     // A frame with no coded buffer waiting: the input completes, the coded frame waits in the device.
     const auto first = f.queueRaw(1, 1, 1000);
@@ -941,8 +951,8 @@ void encodeRoundTrip()
     coded = f.queueCoded(1, 0);
     require(f.completions().empty(), "re-queued coded buffer completed without output");
 
-    // The event queue held its buffer all along: nothing went wrong.
-    require(!Fixture::completed(f.completions(), 900), "an event completed without an event");
+    // Nothing went wrong, so the event queue has nothing to say.
+    require(!f.takeEvent(), "an event was raised with nothing wrong");
 }
 
 void crop()
@@ -1111,12 +1121,12 @@ void backpressure()
     h.queueRaw(1, 1, 1);
     require(Fixture::completionOf(h.completions(), h0).buffer().timestamp == 1, "first frame");
     require(h.encoder().inFlight == 0, "the first frame was not taken");
-    require(h.device.processQueue(1, 900, {}, sizeof(virtio_video_event)).action == VhostUserQueueAction::defer, "event buffer");
     h.encoder().pool = 0;
     const auto h1 = h.queueRaw(1, 2, 2);
     done = h.completions();
+    const auto failure = h.takeEvent();
     require(Fixture::completionOf(done, h1).buffer().flags == VIRTIO_VIDEO_DEQUEUE_FLAG_ERR &&
-            load<virtio_video_event>(Fixture::completionOf(done, 900).response).event_type == VIRTIO_VIDEO_EVENT_ERROR,
+            failure && failure->event_type == VIRTIO_VIDEO_EVENT_ERROR,
             "a platform with no frames and none in flight must fail the stream");
 
     // Coded frames wait in the device only up to a bound; the rest stay in the platform until buffers come.
@@ -1329,18 +1339,19 @@ void failures()
         // A session the platform refuses fails the stream: the frame, the event and later frames.
         Fixture f([](SyntheticEncoder& encoder) { encoder.configureStatus = VideoEncodeStatus::unsupported; });
         prepare(f);
-        require(f.device.processQueue(1, 900, {}, sizeof(virtio_video_event)).action == VhostUserQueueAction::defer, "event buffer");
-        require(f.device.processQueue(1, 902, {}, sizeof(virtio_video_event)).action == VhostUserQueueAction::defer, "event buffer");
+        require(!f.takeEvent(), "an event was raised before anything failed");
         const auto r1 = f.queueRaw(1, 1, 10);
         auto done = f.completions();
         require(Fixture::completionOf(done, r1).buffer().flags == VIRTIO_VIDEO_DEQUEUE_FLAG_ERR, "the frame of a failed session");
-        const auto event = load<virtio_video_event>(Fixture::completionOf(done, 900).response);
-        require(event.event_type == VIRTIO_VIDEO_EVENT_ERROR && event.stream_id == 1 && !Fixture::completed(done, 902),
-                "the failed session was not reported to the first waiting buffer");
+        const auto event = f.takeEvent();
+        require(event && event->event_type == VIRTIO_VIDEO_EVENT_ERROR && event->stream_id == 1,
+                "the failed session was not reported to the guest");
+        require(!f.takeEvent(), "the failed session was reported twice");
         const auto r2 = f.queueRaw(1, 2, 20);
         done = f.completions();
         require(Fixture::completionOf(done, r2).buffer().flags == VIRTIO_VIDEO_DEQUEUE_FLAG_ERR && f.encoder().configures == 1 &&
                 done.size() == 1, "a failed stream retried by itself, or reported twice");
+        require(!f.takeEvent(), "a failed stream was reported again");
         // The guest recovers by clearing, which lets the next frame try again.
         f.encoder().configureStatus = VideoEncodeStatus::ok;
         f.ok(virtio_video_queue_clear {{VIRTIO_VIDEO_CMD_QUEUE_CLEAR, 1}, input, {}});
@@ -1348,27 +1359,29 @@ void failures()
         f.queueRaw(1, 3, 30);
         done = f.completions();
         require(f.encoder().configures == 2 && Fixture::completionOf(done, c0).buffer().timestamp == 30, "recovery after a failed session");
-        // The next failure goes to the next waiting buffer, and one with no buffer waiting is kept for the next one.
+        // Failures with no buffer offered are kept for the buffers that come, one event each, in order.
         f.encoder().configureStatus = VideoEncodeStatus::exhausted;
         f.ok(virtio_video_queue_clear {{VIRTIO_VIDEO_CMD_QUEUE_CLEAR, 1}, input, {}});
         f.queueRaw(1, 1, 40);
-        done = f.completions();
-        require(Fixture::completed(done, 902), "the second failure did not reach the second buffer");
+        f.completions();
         f.ok(virtio_video_queue_clear {{VIRTIO_VIDEO_CMD_QUEUE_CLEAR, 1}, input, {}});
         f.queueRaw(1, 1, 50);
         f.completions();
-        const auto late = f.device.processQueue(1, 903, {}, sizeof(virtio_video_event));
-        require(late.action == VhostUserQueueAction::complete && load<virtio_video_event>(late.response).event_type == VIRTIO_VIDEO_EVENT_ERROR,
-                "an event with no waiting buffer was lost");
+        for (unsigned failure = 0; failure < 2; ++failure) {
+            const auto late = f.takeEvent();
+            require(late && late->event_type == VIRTIO_VIDEO_EVENT_ERROR && late->stream_id == 1,
+                    "an event with no buffer offered was lost");
+        }
+        require(!f.takeEvent(), "an event was delivered twice");
     }
     {
-        // Events: a buffer too small is dropped, and the queue pushes back when full.
+        // Events: a buffer too small is dropped, and any number of buffers can wait in the guest's ring.
         Fixture f;
         require(f.device.processQueue(1, 1, {}, 4).response.empty(), "an event buffer too small");
         for (unsigned i = 0; i < 256; ++i)
-            require(f.device.processQueue(1, 2000 + i, {}, sizeof(virtio_video_event)).action == VhostUserQueueAction::defer, "event buffer");
-        require(f.device.processQueue(1, 3000, {}, sizeof(virtio_video_event)).action == VhostUserQueueAction::retry,
-                "a full event queue did not push back");
+            require(f.device.processQueue(1, 2000 + i, {}, sizeof(virtio_video_event)).action == VhostUserQueueAction::retry,
+                    "the device held an event buffer with no event to give");
+        require(f.completions().empty(), "an event buffer produced a completion");
     }
     {
         // Guest memory the device cannot map is refused at attach, and a bad resource id.
@@ -1654,11 +1667,53 @@ void severalStreams()
     require(Fixture::completionOf(done, c).buffer().timestamp == 333, "the surviving stream stopped");
 }
 
+/* A guest suspends by disabling its rings, and a codec stream outlives it: the
+ * device asks the transport to leave it alone at a ring's disable and to keep
+ * the request buffers a ring is given meanwhile (vhost_user_device.hpp). */
+void streamsOutliveASuspend()
+{
+    Fixture f;
+    require(f.device.keepsDeferredRequestsWhileDisabled(),
+            "a ring disable resets the encoder, which drops the stream a suspend must keep");
+    require(f.device.keepsRequestsOnDisabledRing(),
+            "a request posted as the guest suspends is dropped by the encoder's transport");
+}
+
+/* The event queue never holds a buffer of the guest's. With no event waiting a
+ * buffer offered stays in the guest's ring, and the device does not wake the
+ * transport; an event raised later does, and the next buffer takes it. An
+ * event nobody took is dropped by a reset. */
+void eventsWaitForABuffer()
+{
+    Fixture f([](SyntheticEncoder& encoder) { encoder.configureStatus = VideoEncodeStatus::unsupported; });
+    const auto input = VIRTIO_VIDEO_QUEUE_TYPE_INPUT;
+    prepare(f);
+    if (f.readable(0)) f.device.drainEventSource();
+    for (unsigned i = 0; i < 256; ++i)
+        require(f.device.processQueue(1, 100 + i, {}, sizeof(virtio_video_event)).action == VhostUserQueueAction::retry,
+                "the device held an event buffer with no event to give");
+    require(!f.readable(0), "the device woke the transport with no event");
+
+    // A session the platform refuses is the guest's to hear of.
+    f.queueRaw(1, 1, 10);
+    f.completions();
+    f.wake();
+    const auto event = f.takeEvent();
+    require(event && event->event_type == VIRTIO_VIDEO_EVENT_ERROR && event->stream_id == 1, "the event did not reach the buffer");
+    require(!f.takeEvent(), "the event was delivered twice");
+
+    // An event nobody took is dropped by a reset.
+    f.ok(virtio_video_queue_clear {{VIRTIO_VIDEO_CMD_QUEUE_CLEAR, 1}, input, {}});
+    f.queueRaw(1, 1, 20);
+    f.completions();
+    f.device.reset();
+    require(!f.takeEvent(), "an event survived the reset");
+}
+
 void resetAndDestroy()
 {
     Fixture f([](SyntheticEncoder& encoder) { encoder.hold = true; });
     prepare(f);
-    require(f.device.processQueue(1, 900, {}, sizeof(virtio_video_event)).action == VhostUserQueueAction::defer, "event buffer");
     f.queueRaw(1, 1, 5);
     f.completions();
     const auto c0 = f.queueCoded(1, 0);
@@ -1676,10 +1731,7 @@ void resetAndDestroy()
     require(f.completions().empty(), "reset kept completions");
     f.refused(virtio_video_get_params {{VIRTIO_VIDEO_CMD_GET_PARAMS, 2}, input, {}}, VIRTIO_VIDEO_RESP_ERR_INVALID_STREAM_ID,
               "a stream survived a device reset");
-    // The event buffer was dropped with the reset: a new one waits again.
-    for (unsigned i = 0; i < 256; ++i)
-        require(f.device.processQueue(1, 5000 + i, {}, sizeof(virtio_video_event)).action == VhostUserQueueAction::defer,
-                "event buffers survived the reset");
+    require(!f.takeEvent(), "an event survived the reset");
     // The device works again after a reset.
     prepare(f, 3);
     const auto c = f.queueCoded(3, 0);
@@ -2249,6 +2301,7 @@ int main()
 {
     try {
         identity();
+        streamsOutliveASuspend();
         queries();
         streams();
         parameters();
@@ -2268,6 +2321,7 @@ int main()
         rawColorspace();
         jpeg();
         severalStreams();
+        eventsWaitForABuffer();
         resetAndDestroy();
         activityLog();
         sharedMemoryBuffers();

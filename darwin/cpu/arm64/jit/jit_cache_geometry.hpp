@@ -22,10 +22,17 @@ class JitExecutor;
  * (G135), so retained JIT memory stays bounded however many guest CPUs run.
  *
  * The budget is a whole-process figure. Each expected executor, one per guest
- * CPU, receives a bounded private working-set cache and the process-global
- * shared translation cache receives the remainder. The whole budget defaults
- * to half of guest memory, which the emulator reads from the guest's own
- * `mem=` argument. `--jit-cache-budget=` overrides the whole budget and
+ * CPU, receives a bounded private working-set cache of min(cap, budget /
+ * executors), and the process-global shared translation cache receives what
+ * is left when that is at least `minimum_shared_translation_tier_bytes`.
+ * Below that floor, or with a single executor, there is no shared tier: no
+ * executor looks up, publishes to or takes a lock of one. What it would have
+ * held is the private caches' while they are below their cap (budget /
+ * executors is their figure), and is not allocated while they are at it.
+ * The rule depends on the budget and the executor count alone, so every
+ * platform splits the same way. The whole budget defaults to half of guest
+ * memory, which the emulator reads from the guest's own `mem=` argument.
+ * `--jit-cache-budget=` overrides the whole budget and
  * `--jit-executor-cache-budget=` may lower the private per-executor cap.
  */
 struct JitCacheGeometry final {
@@ -39,6 +46,12 @@ struct JitCacheGeometry final {
 		default;
 	[[nodiscard]] bool valid() const noexcept;
 	[[nodiscard]] std::size_t total_bytes() const noexcept;
+	/* The executable memory one executor of this geometry keeps: its code,
+	 * tracked-store and single-instruction arenas, each in whole 16 KiB
+	 * granules. A region that must hold every executor's arenas is this
+	 * times the executor count; total_bytes() already charges the same
+	 * mappings to the budget. */
+	[[nodiscard]] std::size_t executable_bytes() const noexcept;
 };
 
 inline constexpr unsigned maximum_jit_cache_executors = 64;
@@ -64,6 +77,16 @@ inline constexpr std::size_t maximum_jit_cache_budget_per_executor =
 inline constexpr std::size_t minimum_shared_translation_cache_bytes =
 	64U * 1024U;
 
+/* The least the shared translation tier may hold. A tier smaller than this
+ * serves too little of the translations that executors repeat to repay the
+ * lookups, publications, locks and reclaim sweeps it costs, so it is not
+ * created at all.
+ */
+inline constexpr std::size_t minimum_shared_translation_tier_bytes =
+	768U * 1024U * 1024U;
+static_assert(minimum_shared_translation_tier_bytes >=
+	minimum_shared_translation_cache_bytes);
+
 /* Publishes one indivisible whole-process budget and executor-count pair.
  * Called during startup, before any executor exists. The first valid pair wins,
  * an identical repeat succeeds, and a different later pair fails so a new run
@@ -76,6 +99,14 @@ inline constexpr std::size_t minimum_shared_translation_cache_bytes =
 	std::size_t per_executor_bytes =
 		default_jit_cache_budget_per_executor) noexcept;
 
+/* Whether a whole-process pair can still be published: none has been, or the
+ * published one is this one. The test set_jit_cache_budget applies, without
+ * publishing. */
+[[nodiscard]] bool jit_cache_budget_publishable(std::size_t total_bytes,
+	unsigned executors,
+	std::size_t per_executor_bytes =
+		default_jit_cache_budget_per_executor) noexcept;
+
 /* Pure geometry derivation used by the published process configuration and by
  * budget-accounting tests. total_bytes is the whole-process JIT budget.
  */
@@ -84,8 +115,10 @@ inline constexpr std::size_t minimum_shared_translation_cache_bytes =
 	std::size_t per_executor_bytes =
 		default_jit_cache_budget_per_executor) noexcept;
 
-/* Process-global share retained after all per-executor minimums have been
- * funded. Zero means the whole-process pair is invalid.
+/* Process-global share retained after every executor's private cache has been
+ * funded: the budget less that of the executors' geometries, when at least
+ * minimum_shared_translation_tier_bytes and with two or more executors.
+ * Zero means the tier is off, or the whole-process pair is invalid.
  */
 [[nodiscard]] std::size_t derive_shared_translation_cache_budget(
 	std::size_t total_bytes, unsigned executors,
@@ -99,14 +132,15 @@ inline constexpr std::size_t minimum_shared_translation_cache_bytes =
 [[nodiscard]] std::size_t
 minimum_jit_cache_budget_per_executor() noexcept;
 
-/* Exact minimum whole-process budget, including the shared-cache base. */
+/* Exact minimum whole-process budget: every executor's minimum, and no tier. */
 [[nodiscard]] std::size_t
 minimum_jit_cache_budget(unsigned executors) noexcept;
 
 /* The per-executor geometry derived from the published budget. */
 [[nodiscard]] JitCacheGeometry jit_cache_geometry() noexcept;
 
-/* Shared-cache share belonging to the published process configuration. */
+/* Shared-cache share belonging to the published process configuration, zero
+ * when the tier is off. */
 [[nodiscard]] std::size_t jit_shared_translation_cache_budget() noexcept;
 
 /* An executor lease is acquired before any cache or arena allocation. At
@@ -132,6 +166,12 @@ public:
 	{
 		return geometry_;
 	}
+	/* Whether the published budget funds a shared translation tier. An
+	 * executor of a lease without one never touches the tier. */
+	[[nodiscard]] bool shared_translations() const noexcept
+	{
+		return shared_translations_;
+	}
 
 private:
 	friend class JitExecutor;
@@ -143,6 +183,7 @@ private:
 
 	JitCacheGeometry geometry_{};
 	bool admitted_{};
+	bool shared_translations_{};
 };
 
 /* Emulator runs take a process-wide session before entering a JIT-capable
@@ -173,10 +214,5 @@ using JitCacheRunSessionReservedHook = void (*)(void *) noexcept;
 [[nodiscard]] bool acquire_jit_cache_run_session_after_reservation_for_test(
 	JitCacheRunSessionReservedHook hook, void *context) noexcept;
 #endif
-
-/* Parses a byte count with an optional K/M/G suffix, as used by
- * `--jit-cache-budget=`. Returns zero if unparsable.
- */
-[[nodiscard]] std::size_t parse_byte_quantity(const char *text) noexcept;
 
 } // namespace uml::cpu::arm64

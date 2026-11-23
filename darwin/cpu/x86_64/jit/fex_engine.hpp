@@ -100,12 +100,47 @@ public:
 	FexEngine(const FexEngine &) = delete;
 	FexEngine &operator=(const FexEngine &) = delete;
 
+	/* The types the runtime's hand-over names through the engine, so that
+	 * header includes no engine (x86_jit_sync.hpp). */
+	using Changes = AddressSpaceChanges;
+	using Range = GuestRange;
+
 	/* The sequences this engine last consumed for `generation`, so the
 	 * runtime can ask the address space only for what is new. Returns false
 	 * when the engine holds nothing for it yet. */
 	[[nodiscard]] bool consumed_sequences(unsigned long generation,
 		ExecutionMode mode, std::uint64_t &mapping_sequence,
 		std::uint64_t &code_sequence) const noexcept;
+
+	/* Before the hand-over of the address space's changes, whatever they
+	 * are: drops the code of `generation` and `mode` that was compiled
+	 * while a vCPU stayed inside the engine for longer than a registration
+	 * waits for it, until that vCPU has left. A store it translated before
+	 * may land after the compile read its bytes and publish nothing, so a
+	 * vCPU that has seen the store compiles that code again at each
+	 * hand-over. Costs one load when nothing is stuck. */
+	void settle_stuck_participants(unsigned long generation, ExecutionMode mode) noexcept;
+
+	/* What the engine has done that a check reads, like the gadget cache's
+	 * diagnostics: always compiled in, moving on cold paths only. */
+	struct Diagnostics final {
+		/* Pages dropped at a hand-over because a participant a registration
+		 * waited out had not left the engine since. */
+		std::uint64_t escalation_invalidations{};
+		/* Frame registrations made, for pages a query asked for that the
+		 * space did not already hold. */
+		std::uint64_t frame_registrations{};
+		/* Registrations that failed or were refused, each answered with a
+		 * fetch fault the kernel resolves; the longest run of them in a
+		 * row, in any space, since a registration last succeeded; and the
+		 * spaces that reached the limit and take the failed-space outcome. */
+		std::uint64_t registration_failures{};
+		std::uint64_t consecutive_registration_failures{};
+		std::uint64_t failed_spaces{};
+	};
+	/* Failed or refused registrations in a row after which a space gives up. */
+	static constexpr std::uint64_t registration_failure_limit = 64;
+	[[nodiscard]] Diagnostics diagnostics() const noexcept;
 
 	/* Retires the software-TLB entries the mapping changes cover and the
 	 * translations the code changes cover, and makes the space's context on

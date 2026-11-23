@@ -32,18 +32,31 @@
  *     eth0 whichever network the framework makes the default;
  *  3. stacks a private macvlan with a MAC of its own on eth0 and a virt_wifi
  *     device named wlan0 on that, so the framework sees a Wi-Fi station whose
- *     DHCP lease is another address of the same network (10.0.2.16).
+ *     DHCP lease is another address of the same network (10.0.2.16). The MAC
+ *     is derived from eth0's (kernarium_wifi_mac.h): the host gives every
+ *     installation its own eth0 address, so installations differ in both
+ *     without a kernel argument that every application could read.
  *
  * init has set arp_ignore and arp_announce already, so eth0 and the macvlan
  * answer ARP for their own addresses only.
  *
+ * The lower devices carry no IPv6: the tool turns it off on eth0 first and on
+ * the macvlan before that comes up, because a link-local address built from
+ * a MAC would hand the installation's MACs to every application that lists
+ * its interface addresses. The guest's IPv6 is wlan0's, which the framework
+ * enables once Wi-Fi is up, with an address that is not built from the MAC; a
+ * later change that gives the guest more IPv6 puts it on wlan0.
+ *
  * The tool fails closed: without the lease or the source rule wlan0 would
  * either take over the address adb is reached on or send adb's replies out
- * of the wrong device, so it creates no Wi-Fi device in either case.
+ * of the wrong device, so it creates no Wi-Fi device in either case. A
+ * failure to turn IPv6 off is fatal in the same way: the error is logged and
+ * the tool exits with 1 before it makes the next device.
  */
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <linux/fib_rules.h>
 #include <linux/if_arp.h>
 #include <linux/if_link.h>
@@ -54,6 +67,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -71,10 +85,11 @@
 #include "common/libs/net/netlink_request.h"
 #include "common/libs/net/network_interface.h"
 #include "common/libs/net/network_interface_manager.h"
+#include "kernarium_wifi_mac.h"
 
 namespace {
 
-using Mac = std::array<unsigned char, 6>;
+using kernarium_net::Mac;
 
 constexpr char kLowerName[] = "eth0";
 constexpr char kMacvlanName[] = "buried_eth0";
@@ -92,11 +107,6 @@ constexpr int kPrefixLength = 24;
 // 1000 plus the interface index and 97 to 99, and the kernel's are 253 to
 // 255.
 constexpr uint32_t kRouteTable = 5555;
-
-// The MAC of the macvlan, and so of wlan0. It is locally administered and
-// differs from eth0's in the first octets, so the host's DHCP server assigns
-// it the next free address.
-constexpr Mac kWifiMac = {0x02, 0x15, 0xb2, 0x00, 0x00, 0x00};
 
 constexpr int kInterfaceWaitMs = 15000;
 constexpr int kLeaseAttempts = 5;
@@ -325,13 +335,17 @@ bool AddLinkRoute(cuttlefish::NetlinkClient& netlink, uint32_t lower_index) {
 // The creation requests leave ifi_change at 0. A flag mask would replace the new link's flags with
 // ifi_flags, and with none given that clears IFF_MULTICAST, which ether_setup() sets. BringUp sets
 // IFF_UP.
-bool AddMacvlan(cuttlefish::NetlinkClient& netlink, uint32_t lower_index) {
+// |wifi_mac| is the MAC of the macvlan, and so of wlan0: locally administered
+// and never eth0's own, so the host's DHCP server assigns it the next free
+// address.
+bool AddMacvlan(cuttlefish::NetlinkClient& netlink, uint32_t lower_index,
+                const Mac& wifi_mac) {
   cuttlefish::NetlinkRequest request(RTM_NEWLINK, NLM_F_CREATE | NLM_F_EXCL);
   ifinfomsg info = {};
   request.Append(info);
   request.AddString(IFLA_IFNAME, kMacvlanName);
   request.AddInt<uint32_t>(IFLA_LINK, lower_index);
-  request.AddMacAddress(kWifiMac);
+  request.AddMacAddress(wifi_mac);
   request.PushList(IFLA_LINKINFO);
   request.AddString(IFLA_INFO_KIND, "macvlan");
   request.PushList(IFLA_INFO_DATA);
@@ -355,6 +369,23 @@ bool AddVirtWifi(cuttlefish::NetlinkClient& netlink, uint32_t lower_index) {
   return netlink.Send(request);
 }
 
+// Writes 1 to the interface's disable_ipv6: the kernel drops the addresses the interface
+// has, link-local included, and generates none while it is set.
+bool DisableIpv6(const char* name) {
+  char path[64];
+  snprintf(path, sizeof(path), "/proc/sys/net/ipv6/conf/%s/disable_ipv6", name);
+  android::base::unique_fd fd(open(path, O_WRONLY | O_CLOEXEC));
+  if (fd.get() < 0) {
+    PLOG(ERROR) << "cannot open " << path;
+    return false;
+  }
+  if (write(fd.get(), "1", 1) != 1) {
+    PLOG(ERROR) << "cannot write " << path;
+    return false;
+  }
+  return true;
+}
+
 bool BringUp(cuttlefish::NetlinkClient& netlink, uint32_t index) {
   cuttlefish::NetlinkRequest request(RTM_SETLINK, 0);
   request.AddIfInfo(static_cast<int32_t>(index), true);
@@ -363,6 +394,10 @@ bool BringUp(cuttlefish::NetlinkClient& netlink, uint32_t index) {
 
 int Run() {
   if (!WaitForInterface(kLowerName)) return 1;
+  if (!DisableIpv6(kLowerName)) {
+    LOG(ERROR) << "cannot turn IPv6 off on " << kLowerName;
+    return 1;
+  }
   Mac lower_mac;
   if (!ReadHardwareAddress(kLowerName, &lower_mac)) return 1;
 
@@ -385,13 +420,18 @@ int Run() {
     LOG(ERROR) << "cannot add the link route in table " << kRouteTable;
     return 1;
   }
-  if (!AddMacvlan(*netlink, lower_index)) {
+  // Not logged: the guest's log carries no hardware address.
+  if (!AddMacvlan(*netlink, lower_index, kernarium_net::DeriveWifiMac(lower_mac))) {
     LOG(ERROR) << "cannot add " << kMacvlanName;
     return 1;
   }
   const uint32_t macvlan_index = if_nametoindex(kMacvlanName);
   if (macvlan_index == 0) {
     LOG(ERROR) << kMacvlanName << " is missing after it was added";
+    return 1;
+  }
+  if (!DisableIpv6(kMacvlanName)) {
+    LOG(ERROR) << "cannot turn IPv6 off on " << kMacvlanName;
     return 1;
   }
   if (!AddVirtWifi(*netlink, macvlan_index)) {

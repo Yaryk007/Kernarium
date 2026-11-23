@@ -19,19 +19,29 @@ states, and so does pipe_screen::release_cached_memory, which a host
 calls before it refuses an allocation. The next batch to take a state
 allocates its storage again.
 
+A context hands the states of its completed batches to the screen when
+it takes its next state, and the next submission of any context resets
+them and makes them free. The states handed over after the last
+submission wait for one that does not come once the client is gone, and
+the release did not reach them: with the submission thread and the
+client's thread racing, a destroyed heavy context kept the storage of
+up to all of its batches, 300 MiB in the host GL test, in about one run
+in ten under load. The release resets those states first.
+
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
 ---
- src/gallium/drivers/zink/zink_batch.c   | 23 +++++++++++++++++++++++
+ src/gallium/drivers/zink/zink_batch.c   | 28 +++++++++++++++++++++++++
  src/gallium/drivers/zink/zink_batch.h   |  3 +++
  src/gallium/drivers/zink/zink_context.c |  2 ++
  src/gallium/drivers/zink/zink_screen.c  |  5 ++++-
- 4 files changed, 32 insertions(+), 1 deletion(-)
+ 4 files changed, 37 insertions(+), 1 deletion(-)
 
 diff --git a/src/gallium/drivers/zink/zink_batch.c b/src/gallium/drivers/zink/zink_batch.c
-index 226d29a183b8dd795009515c1198c163c1bc34d4..4285bae83e310511426833e8334af69899110d98 100644
+index 226d29a183b8dd795009515c1198c163c1bc34d4..b8748cca43826eac02ad0ba689db5542ea9f6c5d 100644
 --- a/src/gallium/drivers/zink/zink_batch.c
 +++ b/src/gallium/drivers/zink/zink_batch.c
-@@ -474,6 +474,29 @@ reset_active_batch_states(struct zink_screen *screen)
+@@ -474,6 +474,34 @@ reset_active_batch_states(struct zink_screen *screen)
     simple_mtx_unlock(&screen->active_batch_states_lock);
  }
  
@@ -40,12 +50,17 @@ index 226d29a183b8dd795009515c1198c163c1bc34d4..4285bae83e310511426833e8334af698
 + * behind its command buffers at their largest size.  The screen keeps every
 + * state any context has needed and hands them to whichever context asks next,
 + * so the storage of contexts that are gone stays allocated for as long as the
-+ * screen lives.  Give it back; the next batch to take a state allocates what
-+ * it needs again.  Returns the number of states released. */
++ * screen lives.  The states a context handed to the screen after the last
++ * submission are not free yet: they wait for the next submission to reset
++ * them, which does not come while every context is quiet or gone, and they
++ * hold the storage of the batches that were just finished.  Reset them first.
++ * Give it back; the next batch to take a state allocates what it needs
++ * again.  Returns the number of states released. */
 +unsigned
 +zink_screen_release_batch_storage(struct zink_screen *screen)
 +{
 +   unsigned released = 0;
++   reset_active_batch_states(screen);
 +   simple_mtx_lock(&screen->free_batch_states_lock);
 +   for (struct zink_batch_state *bs = screen->free_batch_states; bs; bs = bs->next) {
 +      VKSCR(ResetCommandPool)(screen->dev, bs->cmdpool,

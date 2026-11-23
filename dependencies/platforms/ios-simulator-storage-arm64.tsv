@@ -3,7 +3,7 @@ field	value
 format	1
 platform	ios-simulator
 architecture	arm64
-deployment_target	27.0
+deployment_target	26.0
 linkage	static
 components	gptfdisk-core
 source_manifest	dependencies/manifest.tsv

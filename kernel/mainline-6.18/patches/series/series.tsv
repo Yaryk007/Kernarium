@@ -14,3 +14,4 @@ patch	fuse-add-support-for-d_canonical_path.patch
 patch	netfilter-xt_IDLETIMER-add-send_nl_msg-support.patch
 patch	netfilter-xt_quota2-add-the-quota2-match.patch
 patch	fs-add-the-Incremental-file-system.patch
+patch	fuse-let-Android-s-MediaProvider-use-passthrough.patch

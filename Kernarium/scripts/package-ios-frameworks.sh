@@ -28,29 +28,26 @@
 # conflicts with it). The output directory is shared: Kernarium needs the
 # default full set, so package that again before building Kernarium.
 #
-# --app-store packages the App Store Android runtime, built from the
-# kernarium-ios-device-android-app-store preset, for the device alone and for
-# Andarium's App Store configuration: it reads no environment variable that
-# tunes, observes or drives a run, and the packaging fails if the runtime
-# carries the name of one. It conflicts with both automation options, with the
-# Simulator and with --runtimes all.
-#
-# --stikdebug-jit packages the experimental development Android runtime built
-# from kernarium-ios-device-android-stikdebug-jit. It is device-only, Android-
-# only, and conflicts with App Store and automation packaging.
-#
 # No packaged framework keeps the linker's debug map: it names the object files
 # of the build host (N_OSO stabs, absolute paths of the checkout and the
 # dependency trees) and would ship in the application. Each framework's dSYM,
 # made from the unstripped binary, keeps the symbols, and `strip -S` keeps the
-# binary's UUID that the two share. An App Store packaging also checks that no
-# framework still has it.
+# binary's UUID that the two share.
 #
 # Every embedded framework carries a PrivacyInfo.xcprivacy
 # (Kernarium/PrivacyManifests) in each slice, and the device slices are checked
 # with scripts/check-privacy-manifests.py, which fails a binary that uses a
 # required-reason API the manifest does not declare, and a framework
 # Info.plist with an empty version or no MinimumOSVersion.
+#
+# UmlArm64Aot.xcframework carries the ahead-of-time code the Android runtime
+# links (darwin/cpu/arm64/aot): a slice for each packaged SDK whose Android
+# runtime links it and none for one whose runtime does not, so the framework
+# is in the application exactly when its runtime needs it. Which runtime links
+# it is the runtime tree's own configuration (UML_AOT_MODE, UML_AOT_ARTIFACT);
+# the Linux runtime never does. An archive of Andarium's Release configuration
+# embeds it only while the accepted AOT descriptor allows it
+# (scripts/check-embedded-artifacts.py --aot).
 #
 # KernariumTests also links HostBattery.xcframework: the Apple battery
 # provider's archive, as the Android runtime links it, with its header. The
@@ -71,11 +68,9 @@ fail()
 
 AUTOMATION=0
 ANDROID_AUTOMATION=0
-APP_STORE=0
-STIKDEBUG_JIT=0
 RUNTIMES=all
 SDKS=
-USAGE="usage: package-ios-frameworks.sh [--sdk device|simulator]... [--automation] [--android-automation] [--app-store] [--stikdebug-jit] [--runtimes all|android]"
+USAGE="usage: package-ios-frameworks.sh [--sdk device|simulator]... [--automation] [--android-automation] [--runtimes all|android]"
 while [ "$#" -gt 0 ]; do
 	case "$1" in
 	--sdk)
@@ -92,8 +87,6 @@ while [ "$#" -gt 0 ]; do
 		;;
 	--automation) AUTOMATION=1 ;;
 	--android-automation) ANDROID_AUTOMATION=1 ;;
-	--app-store) APP_STORE=1 ;;
-	--stikdebug-jit) STIKDEBUG_JIT=1 ;;
 	--runtimes)
 		[ "$#" -ge 2 ] || fail "$USAGE"
 		RUNTIMES=$2
@@ -111,25 +104,6 @@ android)
 	;;
 *) fail "--runtimes takes all or android: $RUNTIMES" ;;
 esac
-if [ "$APP_STORE" -eq 1 ]; then
-	[ "$RUNTIMES" = android ] ||
-		fail "--app-store packages the Android runtime alone; add --runtimes android"
-	[ "$AUTOMATION" -eq 0 ] && [ "$ANDROID_AUTOMATION" -eq 0 ] ||
-		fail "--app-store conflicts with the automation options"
-	case " $SDKS " in
-	*" simulator "*) fail "--app-store packages the device alone" ;;
-	esac
-fi
-if [ "$STIKDEBUG_JIT" -eq 1 ]; then
-	[ "$RUNTIMES" = android ] ||
-		fail "--stikdebug-jit packages the Android runtime alone; add --runtimes android"
-	[ "$APP_STORE" -eq 0 ] && [ "$AUTOMATION" -eq 0 ] &&
-		[ "$ANDROID_AUTOMATION" -eq 0 ] ||
-		fail "--stikdebug-jit conflicts with App Store and automation packaging"
-	case " $SDKS " in
-	*" simulator "*) fail "--stikdebug-jit packages the device alone" ;;
-	esac
-fi
 
 find_tool()
 {
@@ -160,6 +134,7 @@ find_tool OTOOL otool
 find_tool NM nm
 find_tool STRIP strip
 find_tool PYTHON python3
+find_tool DSYMUTIL dsymutil
 
 RUNTIME_4K="KRuntime_6_18_4K"
 
@@ -173,10 +148,6 @@ RUNTIME_TREE=kernarium-runtime-ios-device
 ANDROID_TREE=kernarium-runtime-ios-device-android-4k
 [ "$ANDROID_AUTOMATION" -eq 0 ] ||
 	ANDROID_TREE=kernarium-runtime-ios-device-android-4k-automation
-[ "$APP_STORE" -eq 0 ] ||
-	ANDROID_TREE=kernarium-runtime-ios-device-android-4k-app-store
-[ "$STIKDEBUG_JIT" -eq 0 ] ||
-	ANDROID_TREE=kernarium-runtime-ios-device-android-4k-stikdebug-jit
 DEVICE_RUNTIME_4K="$ROOT_DIR/.build/$RUNTIME_TREE/Kernarium/Runtime/$RUNTIME_4K.framework"
 DEVICE_RUNTIME_ANDROID="$ROOT_DIR/.build/$ANDROID_TREE/Kernarium/Runtime/$RUNTIME_ANDROID_4K.framework"
 # KERNARIUM_DEVICE_GPU_PREFIX and KERNARIUM_SIMULATOR_GPU_PREFIX name a GPU
@@ -205,6 +176,10 @@ HOST_VIDEO_ENCODER_HEADERS="$ROOT_DIR/darwin/platform/video_encoder.hpp $ROOT_DI
 SIMULATOR_HOST_BATTERY="$ROOT_DIR/.build/$SIMULATOR_ANDROID_TREE/darwin/platform/libuml_host_battery.a"
 SIMULATOR_ANDROID_RUNTIME_TREE="$ROOT_DIR/.build/$SIMULATOR_ANDROID_TREE"
 SIMULATOR_HOST_VIDEO_ENCODER="$SIMULATOR_ANDROID_RUNTIME_TREE/darwin/platform/libuml_video_encoder.a"
+# The ahead-of-time framework of each Android runtime tree.
+AOT_FRAMEWORK=UmlArm64Aot
+DEVICE_AOT="$ANDROID_RUNTIME_TREE/lib/$AOT_FRAMEWORK.framework"
+SIMULATOR_AOT="$SIMULATOR_ANDROID_RUNTIME_TREE/lib/$AOT_FRAMEWORK.framework"
 
 # Mesa supplies the host GL provider as MesaEGL and MesaGallium. The device
 # stack also has the Vulkan driver they render on, KosmicKrisp; the Simulator's
@@ -262,6 +237,36 @@ if has_sdk simulator; then
 		fail "could not build the host video encoder archive"
 	[ -f "$SIMULATOR_HOST_VIDEO_ENCODER" ] ||
 		fail "missing host video encoder archive: $SIMULATOR_HOST_VIDEO_ENCODER"
+fi
+
+# links_aot BINARY: whether a runtime binary loads the ahead-of-time framework.
+links_aot()
+{
+	"$OTOOL" -L "$1" | LC_ALL=C grep -q "@rpath/$AOT_FRAMEWORK.framework/$AOT_FRAMEWORK"
+}
+AOT_DEVICE=0
+AOT_SIMULATOR=0
+if has_sdk device; then
+	if links_aot "$DEVICE_RUNTIME_ANDROID/$RUNTIME_ANDROID_4K"; then
+		AOT_DEVICE=1
+		[ -d "$DEVICE_AOT" ] || fail "missing framework slice: $DEVICE_AOT"
+	fi
+	if [ "$RUNTIMES" = all ] && links_aot "$DEVICE_RUNTIME_4K/$RUNTIME_4K"; then
+		fail "$RUNTIME_4K links the ahead-of-time framework, which only the Android runtime may"
+	fi
+fi
+if has_sdk simulator; then
+	if links_aot "$SIMULATOR_RUNTIME_ANDROID/$RUNTIME_ANDROID_4K"; then
+		AOT_SIMULATOR=1
+		[ -d "$SIMULATOR_AOT" ] || fail "missing framework slice: $SIMULATOR_AOT"
+	fi
+	if [ "$RUNTIMES" = all ] && links_aot "$SIMULATOR_RUNTIME_4K/$RUNTIME_4K"; then
+		fail "$RUNTIME_4K links the ahead-of-time framework, which only the Android runtime may"
+	fi
+fi
+AOT_FRAMEWORKS=
+if [ "$AOT_DEVICE" -eq 1 ] || [ "$AOT_SIMULATOR" -eq 1 ]; then
+	AOT_FRAMEWORKS=$AOT_FRAMEWORK
 fi
 
 OUTPUT_PARENT=$(dirname -- "$OUTPUT")
@@ -332,6 +337,24 @@ create_xcframework "$RUNTIME_ANDROID_4K" \
 	"$(device_slice "$DEVICE_RUNTIME_ANDROID")" \
 	"$(simulator_slice "$SIMULATOR_RUNTIME_ANDROID")" \
 	"$DEVICE_RUNTIME_ANDROID.dSYM" "$SIMULATOR_RUNTIME_ANDROID.dSYM"
+if [ -n "$AOT_FRAMEWORKS" ]; then
+	# The framework holds no debug information, so its dSYM is the binary's
+	# identity alone, which an archive's symbol collection expects.
+	aot_device=
+	aot_simulator=
+	if [ "$AOT_DEVICE" -eq 1 ]; then
+		aot_device=$DEVICE_AOT
+		"$DSYMUTIL" "$DEVICE_AOT/$AOT_FRAMEWORK" -o "$DEVICE_AOT.dSYM" 2>/dev/null ||
+			fail "could not make the dSYM of $DEVICE_AOT"
+	fi
+	if [ "$AOT_SIMULATOR" -eq 1 ]; then
+		aot_simulator=$SIMULATOR_AOT
+		"$DSYMUTIL" "$SIMULATOR_AOT/$AOT_FRAMEWORK" -o "$SIMULATOR_AOT.dSYM" 2>/dev/null ||
+			fail "could not make the dSYM of $SIMULATOR_AOT"
+	fi
+	create_xcframework "$AOT_FRAMEWORK" "$aot_device" "$aot_simulator" \
+		"$DEVICE_AOT.dSYM" "$SIMULATOR_AOT.dSYM"
+fi
 for framework in $GL_FRAMEWORKS; do
 	create_xcframework "$framework" \
 		"$(device_slice "$DEVICE_GPU/$framework.framework")" \
@@ -369,7 +392,7 @@ strip_debug_maps()
 		done
 	done
 }
-strip_debug_maps $RUNTIME_FRAMEWORKS $GL_FRAMEWORKS
+strip_debug_maps $RUNTIME_FRAMEWORKS $GL_FRAMEWORKS $AOT_FRAMEWORKS
 if has_sdk device; then
 	strip_debug_maps KosmicKrisp
 fi
@@ -391,6 +414,9 @@ for slice_platform in $PACKAGED_SLICES; do
 done
 for framework in $RUNTIME_FRAMEWORKS; do
 	install_privacy_manifest "$framework" KRuntime
+done
+for framework in $AOT_FRAMEWORKS; do
+	install_privacy_manifest "$framework" "$framework"
 done
 for framework in $GPU_FRAMEWORKS; do
 	[ ! -d "$STAGE/$framework.xcframework" ] ||
@@ -438,8 +464,14 @@ packaged_frameworks()
 {
 	slice=$1
 	case "$slice" in
-	ios-arm64) printf '%s ' $RUNTIME_FRAMEWORKS $GPU_FRAMEWORKS ;;
-	*) printf '%s ' $RUNTIME_FRAMEWORKS $GL_FRAMEWORKS ;;
+	ios-arm64)
+		printf '%s ' $RUNTIME_FRAMEWORKS $GPU_FRAMEWORKS
+		[ "$AOT_DEVICE" -eq 0 ] || printf '%s ' "$AOT_FRAMEWORK"
+		;;
+	*)
+		printf '%s ' $RUNTIME_FRAMEWORKS $GL_FRAMEWORKS
+		[ "$AOT_SIMULATOR" -eq 0 ] || printf '%s ' "$AOT_FRAMEWORK"
+		;;
 	esac
 }
 for slice_platform in $PACKAGED_SLICES; do
@@ -560,19 +592,6 @@ for slice_platform in $PACKAGED_SLICES; do
 	fi
 done
 
-# An App Store runtime carries the name of no environment knob, and no framework
-# of it keeps a trace of the host that built it.
-if [ "$APP_STORE" -eq 1 ]; then
-	"$PYTHON" -B "$ROOT_DIR/Andarium/scripts/check-app-store-bundle.py" --runtime \
-		"$STAGE/$RUNTIME_ANDROID_4K.xcframework/ios-arm64/$RUNTIME_ANDROID_4K.framework" ||
-		fail "$RUNTIME_ANDROID_4K carries an environment knob or a trace of its build host; build the kernarium-ios-device-android-app-store preset"
-	for framework in $GPU_FRAMEWORKS; do
-		"$PYTHON" -B "$ROOT_DIR/Andarium/scripts/check-app-store-bundle.py" --host-traces \
-			"$STAGE/$framework.xcframework/ios-arm64/$framework.framework" ||
-			fail "$framework keeps a trace of its build host"
-	done
-fi
-
 # The storage and compression cores carry no Metal dependency, so their
 # XCFrameworks keep both published slices.
 for platform in ios-arm64 ios-arm64-simulator; do
@@ -585,7 +604,7 @@ done
 # The device slices are what an upload carries: each must declare the
 # required-reason APIs its binary uses and carry a complete Info.plist.
 if has_sdk device; then
-	for framework in $RUNTIME_FRAMEWORKS $GPU_FRAMEWORKS; do
+	for framework in $RUNTIME_FRAMEWORKS $GPU_FRAMEWORKS $([ "$AOT_DEVICE" -eq 0 ] || printf '%s' "$AOT_FRAMEWORK"); do
 		"$PYTHON" -B "$ROOT_DIR/scripts/check-privacy-manifests.py" \
 			"$STAGE/$framework.xcframework/ios-arm64/$framework.framework" ||
 			fail "the device slice of $framework fails the privacy manifest check"
@@ -595,6 +614,10 @@ fi
 # The x86-64 JIT and the FEXCore it embeds are macOS-only.
 "$PYTHON" -B "$ROOT_DIR/scripts/check-no-fexcore.py" "$STAGE" ||
 	fail "a packaged iOS framework carries FEXCore"
+
+# The AOT runtime's diagnostics build is for tests only.
+"$PYTHON" -B "$ROOT_DIR/scripts/check-no-aot-diagnostics.py" "$STAGE" ||
+	fail "a packaged iOS framework carries the AOT diagnostics build"
 
 # Publish with one atomic rename, so the XCFrameworks are never absent and a
 # concurrent run is never moved below another's tree: the first publish is an
@@ -618,9 +641,7 @@ case $publish in
 	;;
 *) fail "could not publish the XCFrameworks: $OUTPUT" ;;
 esac
-if [ "$APP_STORE" -eq 1 ]; then
-	printf '%s\n' "published App Store Android runtime XCFrameworks: $OUTPUT"
-elif [ "$RUNTIMES" = android ]; then
+if [ "$RUNTIMES" = android ]; then
 	printf '%s\n' "published Android runtime XCFrameworks: $OUTPUT"
 elif [ "$AUTOMATION" -eq 1 ] || [ "$ANDROID_AUTOMATION" -eq 1 ]; then
 	printf '%s\n' "published Kernarium automation XCFrameworks: $OUTPUT"

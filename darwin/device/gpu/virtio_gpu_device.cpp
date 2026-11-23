@@ -3,6 +3,8 @@
 #include "virtio_gpu_device.hpp"
 
 #include "display_activity_log.hpp"
+#include "edid_timing.hpp"
+#include "platform/frame_figures.hpp"
 #include "virtio_gpu_uml.h"
 
 #if UML_GPU_DEVICE_TESTING
@@ -20,8 +22,12 @@
 #include <new>
 #include <optional>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <variant>
+
+#include <sys/stat.h>
+#include <unistd.h>
 
 namespace uml::gpu {
 namespace {
@@ -331,7 +337,8 @@ void writeMonitorDescriptor(
 std::array<std::uint8_t, protocol::baseEdidSize> makeEdid(
     std::uint32_t width,
     std::uint32_t height,
-    std::uint32_t dotsPerInch)
+    std::uint32_t dotsPerInch,
+    std::uint32_t requestedRefreshRate)
 {
     std::array<std::uint8_t, protocol::baseEdidSize> edid {};
     constexpr std::array<std::uint8_t, 8> header {
@@ -365,25 +372,24 @@ std::array<std::uint8_t, protocol::baseEdidSize> makeEdid(
         edid.begin() + 25U);
     std::fill(edid.begin() + 38U, edid.begin() + 54U, 0x01);
 
-    const auto horizontalBlank = std::min<std::uint32_t>(
-        protocol::maximumEdidDimension,
-        std::max<std::uint32_t>(160U, width / 5U));
-    const auto verticalBlank = std::min<std::uint32_t>(
-        protocol::maximumEdidDimension,
-        std::max<std::uint32_t>(30U, height / 20U));
+    const auto blanking = edidBlanking(width, height);
+    const auto horizontalBlank = blanking.horizontal;
+    const auto verticalBlank = blanking.vertical;
     const auto horizontalSyncOffset = std::min<std::uint32_t>(
         1023U, std::max<std::uint32_t>(8U, horizontalBlank / 3U));
     const auto horizontalSyncPulse = std::min<std::uint32_t>(
         1023U, std::max<std::uint32_t>(8U, horizontalBlank / 3U));
     constexpr std::uint32_t verticalSyncOffset = 3;
     constexpr std::uint32_t verticalSyncPulse = 5;
+    /* The one mode is 60 Hz, or 120 Hz when the display was granted it and
+     * the clock states it. A size whose 120 Hz clock does not fit is the 60 Hz
+     * mode, not a clamped clock that no longer says the rate. */
+    const std::uint64_t refreshRate =
+        modeRefreshRate(width, height, requestedRefreshRate);
     const auto clock = std::clamp<std::uint64_t>(
-        ((static_cast<std::uint64_t>(width) + horizontalBlank) *
-             (static_cast<std::uint64_t>(height) + verticalBlank) * 60U +
-            5000U) /
-            10000U,
+        detailedTimingClock(width, height, blanking, refreshRate),
         1U,
-        65535U);
+        maximumDetailedTimingClock);
 
     constexpr std::size_t timing = 54;
     edid[timing] = static_cast<std::uint8_t>(clock);
@@ -420,6 +426,91 @@ std::array<std::uint8_t, protocol::baseEdidSize> makeEdid(
     edid[127] = static_cast<std::uint8_t>(0U - checksum);
     return edid;
 }
+
+#if !UML_GPU_DEVICE_TESTING
+/* What a refused Venus allocation's wait reads and tells: the display's
+ * ledger and the terms of the guest's reclaimer, and the renderer's pool. */
+class DisplayReclaimHost final : public ReclaimWait::Host {
+public:
+    explicit DisplayReclaimHost(Display& display) noexcept
+        : display_(display)
+    {
+    }
+
+    [[nodiscard]] ReclaimWait::Clock::time_point now() const noexcept override
+    {
+        return ReclaimWait::Clock::now();
+    }
+    void sleep(ReclaimWait::Clock::duration duration) noexcept override
+    {
+        std::this_thread::sleep_for(duration);
+    }
+    [[nodiscard]] bool reclaimerArmed() const noexcept override
+    {
+        return display_.guestReclaims();
+    }
+    [[nodiscard]] std::optional<std::uint64_t> shortfall(
+        std::uint64_t bytes) const noexcept override
+    {
+        const auto memory = VirglRenderer::deviceMemory();
+        if (!memory)
+            return std::nullopt;
+        /* The pool charges whole host pages. */
+        const auto page = static_cast<std::uint64_t>(getpagesize());
+        const std::uint64_t padding = (page - bytes % page) % page;
+        const std::uint64_t charged =
+            bytes > std::numeric_limits<std::uint64_t>::max() - padding
+            ? std::numeric_limits<std::uint64_t>::max()
+            : bytes + padding;
+        const std::uint64_t ceiling = memory->ceilingBytes != 0
+            ? memory->ceilingBytes
+            : memory->budgetBytes;
+        if (charged > ceiling)
+            return std::numeric_limits<std::uint64_t>::max();
+        const std::uint64_t room = ceiling - charged;
+        return memory->usageBytes > room ? memory->usageBytes - room : 0;
+    }
+    [[nodiscard]] std::uint32_t processOf(
+        std::uint32_t contextId) const noexcept override
+    {
+        return display_.graphicsLedger().processOf(contextId);
+    }
+    [[nodiscard]] std::vector<ReclaimWait::Holder> candidates() const override
+    {
+        const auto snapshot = display_.graphicsLedger().snapshot(now(),
+            std::numeric_limits<std::size_t>::max(),
+            display_.guestReclaimMinimumIdle(),
+            display_.guestReclaimMinimumBytes());
+        std::vector<ReclaimWait::Holder> holders;
+        holders.reserve(snapshot.holders.size());
+        for (const auto& holder : snapshot.holders) {
+            if (holder.pid != 0)
+                holders.push_back({.pid = holder.pid, .bytes = holder.bytes});
+        }
+        return holders;
+    }
+    [[nodiscard]] bool holds(std::uint32_t pid) const noexcept override
+    {
+        return display_.graphicsLedger().hasProcess(pid);
+    }
+    void announce() noexcept override { display_.recordMemoryWait(); }
+    void finished(bool admitted, ReclaimWait::Clock::duration waited,
+        std::uint64_t bytes) noexcept override
+    {
+        std::fprintf(stderr,
+            "uml: a refused GPU allocation of %llu bytes waited %lld ms for "
+            "the guest to free memory, and was %s\n",
+            static_cast<unsigned long long>(bytes),
+            static_cast<long long>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(waited)
+                    .count()),
+            admitted ? "made" : "refused");
+    }
+
+private:
+    Display& display_;
+};
+#endif
 
 } // namespace
 
@@ -468,6 +559,26 @@ VirtioGpuDevice::VirtioGpuDevice(
                 contextId, delta);
         },
         &display_.graphicsLedger());
+    /* And a Venus allocation the pool refused waits there, on the thread
+     * that runs it, for the guest's reclaimer to make room. */
+    VirglRenderer::setMemoryWaitObserver(
+        [](void* display, std::uint32_t contextId, std::uint64_t bytes,
+            std::uint32_t attempt) noexcept {
+            auto& target = *static_cast<Display*>(display);
+            DisplayReclaimHost host(target);
+            try {
+                return target.reclaimWait().wait(
+                    host, contextId, bytes, attempt);
+            } catch (...) {
+                return false;
+            }
+        },
+        [](void* display, bool admitted) noexcept {
+            auto& target = *static_cast<Display*>(display);
+            DisplayReclaimHost host(target);
+            target.reclaimWait().waited(host, admitted);
+        },
+        &display_);
 }
 #endif
 
@@ -641,12 +752,11 @@ std::function<void()> VirtioGpuDevice::memoryObserver()
 {
     if (!memoryWake_)
         return {};
-    /* A refusal reaches the ledger's observer as a change does. The ledger
-     * calls its observer one call at a time. */
-    wokenRefusals_.store(
-        UML_GPU_DISPLAY.memoryRefusals(), std::memory_order_relaxed);
+    /* A refusal, or an allocation that waits, reaches the ledger's observer
+     * as a change does. The ledger calls its observer one call at a time. */
+    wokenRefusals_.store(guestMemoryRefusals(), std::memory_order_relaxed);
     return [this, wake = memoryWake_] {
-        const std::uint64_t refusals = UML_GPU_DISPLAY.memoryRefusals();
+        const std::uint64_t refusals = guestMemoryRefusals();
         const bool refused =
             wokenRefusals_.exchange(refusals, std::memory_order_relaxed) !=
             refusals;
@@ -654,10 +764,17 @@ std::function<void()> VirtioGpuDevice::memoryObserver()
     };
 }
 
+std::uint64_t VirtioGpuDevice::guestMemoryRefusals() const noexcept
+{
+    /* An allocation that waits for the guest's reclaimer is told to the guest
+     * as a refusal, so the reclaimer acts at once. */
+    return UML_GPU_DISPLAY.memoryRefusals() + UML_GPU_DISPLAY.memoryWaits();
+}
+
 MemoryPressure::Reading VirtioGpuDevice::memoryReading() const noexcept
 {
     MemoryPressure::Reading reading {
-        .refusals = UML_GPU_DISPLAY.memoryRefusals(),
+        .refusals = guestMemoryRefusals(),
     };
     if (const auto figures = UML_GPU_DEVICE_MEMORY) {
         reading.budgetBytes = figures->budgetBytes;
@@ -722,6 +839,7 @@ std::vector<std::uint8_t> VirtioGpuDevice::memoryReport(
     }
     UML_GPU_DISPLAY.setGuestReclaims(
         (query.flags & VIRTIO_GPU_UML_MEMORY_GUEST_RECLAIMS) != 0);
+    UML_GPU_DISPLAY.setGuestReclaimTerms(query.min_bytes, query.min_idle_ms);
     const auto state = memoryPressure_.query(now, reading);
 
     /* Only a process the host can name is a holder to the guest. */
@@ -923,7 +1041,11 @@ std::vector<std::uint8_t> VirtioGpuDevice::edid(
     information.header.flags &=
         protocol::gpuFlagFence | protocol::gpuFlagInfoRingIndex;
     information.size = protocol::baseEdidSize;
-    const auto base = makeEdid(width, height, dotsPerInch_);
+    const auto granted = UML_GPU_DISPLAY.refreshRate();
+    const auto base = makeEdid(width, height, dotsPerInch_, granted);
+    /* The display paces by the rate the mode states. */
+    UML_GPU_DISPLAY.noteModeRefreshRate(
+        statedRefreshRate(width, height, granted));
     std::copy(base.begin(), base.end(), information.edid.begin());
     std::vector<std::uint8_t> bytes(sizeof(information));
     std::memcpy(bytes.data(), &information, sizeof(information));
@@ -1394,6 +1516,8 @@ std::vector<std::uint8_t> VirtioGpuDevice::processInternal(
             if (virglResources_.contains(contextResource->resourceId) ||
                 blobResources_.contains(contextResource->resourceId)) {
                 bool credited = false;
+                UML_GPU_LEDGER.contextActive(
+                    header->contextId, ContextMemoryLedger::Clock::now());
                 try {
                     credited = UML_GPU_LEDGER.resourceAttached(
                         header->contextId, contextResource->resourceId);
@@ -1515,6 +1639,10 @@ std::vector<std::uint8_t> VirtioGpuDevice::processInternal(
             .flags = create->flags,
         };
         auto success = response(*header, protocol::GpuResponse::okNoData);
+        /* A resource made for a context is the context's activity once it
+         * holds the bytes. */
+        UML_GPU_LEDGER.contextActive(
+            header->contextId, ContextMemoryLedger::Clock::now());
         try {
             UML_GPU_LEDGER.reserveResource(create->resourceId);
             virglResources_.emplace(
@@ -1604,6 +1732,8 @@ std::vector<std::uint8_t> VirtioGpuDevice::processInternal(
                 *header, protocol::GpuResponse::errorInvalidParameter);
         }
 
+        UML_GPU_LEDGER.contextActive(
+            header->contextId, ContextMemoryLedger::Clock::now());
         try {
             auto success = response(*header, protocol::GpuResponse::okNoData);
             LedgerReservation reservation(UML_GPU_LEDGER, create->resourceId);
@@ -1701,6 +1831,21 @@ std::vector<std::uint8_t> VirtioGpuDevice::processInternal(
             descriptorType != VirglRenderer::sharedMemoryBlobDescriptor) {
             return response(
                 *header, protocol::GpuResponse::errorUnspecified);
+        }
+        /* The guest is given chargedSize bytes of this file, and the host maps
+         * the same range; an access past the file's end ends the host process.
+         * The renderer bounds a blob where it is created, and the transport
+         * checks the range again before it hands the guest a descriptor. This
+         * answers a request that the descriptor cannot back, whatever the
+         * renderer made of it, before anything is queued: the descriptor is
+         * closed here and the guest keeps its device. */
+        struct stat descriptorStatus {};
+        if (::fstat(descriptor, &descriptorStatus) != 0 ||
+            descriptorStatus.st_size < 0 ||
+            static_cast<std::uint64_t>(descriptorStatus.st_size) <
+                resource.chargedSize) {
+            return response(
+                *header, protocol::GpuResponse::errorInvalidParameter);
         }
         std::uint32_t mapInfo = 0;
         if (UML_GPU_RENDERER.resourceMapInfo(
@@ -2146,6 +2291,8 @@ std::vector<std::uint8_t> VirtioGpuDevice::processInternal(
         releaseBlobScanout();
         scanoutResource_ = scanout->resourceId;
         scanoutRectangle_ = scanout->rectangle;
+        UML_GPU_DISPLAY.setGuestScanoutMode(
+            scanout->rectangle.width, scanout->rectangle.height);
         UML_GPU_DISPLAY.setGuestScanoutActive(true);
         displayActivityLog().record(
             "scanout set kind=%s resource=%u source=%ux%u rect=%ux%u+%u+%u",
@@ -2280,6 +2427,8 @@ std::vector<std::uint8_t> VirtioGpuDevice::processInternal(
         scanoutOffset_ = scanout->offsets[0];
         scanoutTexture_ = texture;
         scanoutVirglBlob_ = readback;
+        UML_GPU_DISPLAY.setGuestScanoutMode(
+            scanout->rectangle.width, scanout->rectangle.height);
         UML_GPU_DISPLAY.setGuestScanoutActive(true);
         return success;
     }
@@ -2289,6 +2438,11 @@ std::vector<std::uint8_t> VirtioGpuDevice::processInternal(
             readStructure<protocol::GpuResourceFlush>(request);
         if (flush == nullptr)
             return response(*header, protocol::GpuResponse::errorInvalidParameter);
+        /* The session record's frame count and longest gap
+         * (platform/frame_figures.hpp): the flush of the guest's scanout,
+         * whichever way it is shown. */
+        if (flush->resourceId == scanoutResource_)
+            uml::platform::noteScanoutFlush();
         if (const auto iterator = resources_.find(flush->resourceId);
             iterator != resources_.end()) {
             const auto& resource = iterator->second;

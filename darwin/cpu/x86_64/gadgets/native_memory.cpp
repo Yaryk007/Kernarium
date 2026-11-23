@@ -60,12 +60,74 @@ void publish_code_page(NativeExecutionContext &context,
 	context.write_code = write_code_published;
 }
 
-void publish_code_write(NativeExecutionContext &context,
+/* Whether the frame the page maps has a holder other than the page itself:
+ * an executor of this or another generation translated it at some other
+ * address, so a store here owes its publication there too. */
+[[nodiscard]] bool frame_has_other_holder(NativeExecutionContext &context,
+	std::uint64_t address) noexcept
+{
+#if DARWIN_UML_X86_64_GUEST
+	::uml::memory::FrameFill fill;
+	return context.memory->frame_fill(address, context.execution_context,
+		fill) && fill.other_holder;
+#else
+	(void)context;
+	(void)address;
+	return false;
+#endif
+}
+
+/* Publishes the store of `count` bytes at `address` at every holder of its
+ * frame, in each holder's own generation, when the frame has a holder other
+ * than the page itself, and cools this executor's own blocks at the holders'
+ * addresses in its generation. `overlaps` is set if one of those addresses
+ * lies in the block that is running: the store wrote into it through an
+ * alias, and the run must leave. False when the frame has no other holder or
+ * the publication did not take it (the caller publishes as it always did). */
+[[nodiscard]] bool publish_frame_holders(NativeExecutionContext &context,
+	std::uint64_t address, std::size_t count, bool &overlaps) noexcept
+{
+#if DARWIN_UML_X86_64_GUEST
+	if (!frame_has_other_holder(context, address))
+		return false;
+	std::array<std::uint64_t, 32> own;
+	::uml::memory::FramePublication done;
+	if (!context.memory->publish_frame_store(address, count,
+		    context.execution_context, own.data(), own.size(), done))
+		return false;
+	if (done.overflow) {
+		/* More holders in this generation than the buffer names: every
+		 * cached block cools, and the run leaves. */
+		invalidate_cached_code(context, 0, std::uint64_t{1} << 47);
+		overlaps = true;
+	}
+	for (std::size_t index = 0; index < done.own_count; ++index) {
+		invalidate_cached_code(context, own[index], count);
+		if (own[index] < context.program_end &&
+		    own[index] + count > context.program_begin)
+			overlaps = true;
+	}
+	context.code_publications += done.own_records;
+	context.write_code = write_code_published;
+	return true;
+#else
+	(void)context;
+	(void)address;
+	(void)count;
+	(void)overlaps;
+	return false;
+#endif
+}
+
+/* Returns whether a holder of the store's frame, in this generation, lies in
+ * the block that is running. */
+bool publish_code_write(NativeExecutionContext &context,
 	std::uint64_t address, std::size_t size) noexcept
 {
 	if (context.memory == nullptr || size == 0)
-		return;
+		return false;
 	bool cooled = false;
+	bool overlaps = false;
 	std::size_t completed = 0;
 	while (completed < size) {
 		const auto current = address + completed;
@@ -74,6 +136,10 @@ void publish_code_write(NativeExecutionContext &context,
 			static_cast<std::size_t>(4096) - in_page);
 		/* The slow paths protect the same cached translations the fast
 		 * path does, so they publish on the same list. */
+		if (publish_frame_holders(context, current, count, overlaps)) {
+			completed += count;
+			continue;
+		}
 		if (context.memory->is_executable(current) &&
 		    (context.code_pages == nullptr ||
 			    context.code_pages->holds(current))) {
@@ -85,6 +151,12 @@ void publish_code_write(NativeExecutionContext &context,
 		}
 		completed += count;
 	}
+	if (overlaps) {
+		context.write_reached = 1;
+		context.write_reached_address = address;
+		context.write_reached_size = size;
+	}
+	return overlaps;
 }
 
 } // namespace
@@ -133,8 +205,23 @@ extern "C" std::byte *uml_x86_64_gadget_tlb_miss(
 	bool writes_code = executable;
 	for (;;) {
 		const auto changes = registry == nullptr ? 0 : registry->changes();
-		writes_code = executable &&
-			(registry == nullptr || registry->holds(address));
+		/* A frame that some executor translated at another address owes
+		 * this store a publication too, whatever this page holds: the tag
+		 * is settled against the frame's holders as against the registry
+		 * (the fill, then a re-read of what it read). */
+		bool other_holder = false;
+#if DARWIN_UML_X86_64_GUEST
+		::uml::memory::FrameFill frame;
+		const bool framed = context->memory->frame_fill(
+			address, context->execution_context, frame);
+		other_holder = framed && frame.other_holder;
+#endif
+		/* An executor with no registry cannot be retired from a holder's
+		 * registration (register_frame finds no registry for its
+		 * generation), so every one of its write fills is tagged: an
+		 * untagged entry filled before a holder existed would outlive it. */
+		writes_code = registry == nullptr ||
+			(executable && registry->holds(address)) || other_holder;
 		const bool caches_code = writes_code && executor != nullptr &&
 			executor->page_holds_cached_code(address);
 		std::atomic_ref<std::uintptr_t>{entry.write_data_minus_address}
@@ -144,7 +231,12 @@ extern "C" std::byte *uml_x86_64_gadget_tlb_miss(
 				(caches_code ? write_cached_code_tag : 0),
 			std::memory_order_relaxed);
 		std::atomic_thread_fence(std::memory_order_seq_cst);
-		if (registry == nullptr || registry->changes() == changes)
+		bool settled = registry == nullptr || registry->changes() == changes;
+#if DARWIN_UML_X86_64_GUEST
+		settled = settled &&
+			(!framed || context->memory->frame_fill_unchanged(frame));
+#endif
+		if (settled)
 			break;
 	}
 	if (writes_code)
@@ -187,30 +279,58 @@ extern "C" std::uint32_t uml_x86_64_gadget_cross_page_store(
 	return 0;
 }
 
-extern "C" void uml_x86_64_gadget_publish_code_write(
+extern "C" std::uint32_t uml_x86_64_gadget_publish_code_write(
 	NativeExecutionContext *context, std::uint64_t address,
 	std::uint32_t size) noexcept
 {
 	/* The write TLB tagged this page executable while resolving it, and the
 	 * translation left `write_code` pending exactly when this store's page
-	 * holds cached code, so the store owes a record. Mapping mutation is
-	 * excluded by the execution gate until this block returns. Every
-	 * executable store selectively cools overlapping cached blocks.
+	 * holds cached code or its frame has a holder elsewhere, so the store
+	 * owes a record. Mapping mutation is excluded by the execution gate until
+	 * this block returns. Every executable store selectively cools
+	 * overlapping cached blocks.
 	 *
 	 * A store whose range reaches a second page -- a masked store whose
 	 * base is on one page and whose selected elements are on the next --
 	 * may owe that page the record, so it asks each page, as the
 	 * cross-page helpers do.
+	 *
+	 * The result is 1 when the store wrote, through another address of its
+	 * frame, into the block that is running, which then leaves as it does for
+	 * a store at its own address.
 	 */
 	if (context == nullptr || context->memory == nullptr || size == 0)
-		return;
+		return 0;
+	/* A helper that stored and published itself -- a bulk store, a store
+	 * across a page, the segment model's -- found the store in the block
+	 * that is running and left that to the instruction's epilogue, which is
+	 * this call: the publication is not owed twice, the exit is. The reach
+	 * is taken here, once, by the store it stands for; a later store of the
+	 * instruction (ENTER's next push, the next element of a repeated string
+	 * store) publishes for itself. A reach that no store of this range
+	 * answered for, because its epilogue never ran, is still owed as an
+	 * exit. */
+	bool owed = false;
+	if (context->write_reached != 0) {
+		const auto begin = context->write_reached_address;
+		const auto end = begin + context->write_reached_size;
+		context->write_reached = 0;
+		if (address < end && address + size > begin)
+			return 1;
+		owed = true;
+	}
 	if (((address ^ (address + size - 1U)) & page_mask) != 0) {
-		publish_code_write(*context, address, size);
-		return;
+		const bool reached = publish_code_write(*context, address, size);
+		/* This call is the epilogue: it answered for the store itself. */
+		context->write_reached = 0;
+		return reached || owed ? 1U : 0U;
 	}
 	invalidate_cached_code(*context, address, size);
-	if (context->write_code != write_code_published)
+	bool overlaps = false;
+	if (context->write_code != write_code_published &&
+	    !publish_frame_holders(*context, address, size, overlaps))
 		publish_code_page(*context, address);
+	return overlaps || owed ? 1U : 0U;
 }
 
 extern "C" std::uint64_t uml_x86_64_gadget_random_value() noexcept
@@ -301,7 +421,9 @@ extern "C" std::uint32_t uml_x86_64_gadget_run_segment_instruction(
 		decoded.instruction);
 	switch (result.outcome) {
 	case SegmentOutcome::retired:
-		if (!decoded.instruction.terminal())
+		/* A store the instruction made reached the block that is running:
+		 * the block leaves with RIP at the next instruction. */
+		if (!decoded.instruction.terminal() && context->write_reached == 0)
 			return UML_X86_64_SEGMENT_NEXT;
 		[[fallthrough]];
 	case SegmentOutcome::retired_changed:

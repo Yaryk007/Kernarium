@@ -112,7 +112,7 @@ index 0f5e0e951f2e242b1c614ee994a20f5f8360a551..b98aaf7a98bd46580f61c6a863e02811
  #endif
  
 diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
-index 0c841a82dc050cd57d1420d1633aed9c18dc5b73..99f48550e72fca7e63fd20d891dbfa1a814b33b5 100644
+index 5d756fc0e84f604bda6ab044d13bcc72eea0ab06..061892d99fae54dd1ec01e1d46b625c3e2749fa1 100644
 --- a/src/vrend/vrend_renderer.c
 +++ b/src/vrend/vrend_renderer.c
 @@ -31,6 +31,7 @@
@@ -158,7 +158,7 @@ index 0c841a82dc050cd57d1420d1633aed9c18dc5b73..99f48550e72fca7e63fd20d891dbfa1a
  static void vrend_pause_render_condition(struct vrend_context *ctx, bool pause);
  static void vrend_update_viewport_state(struct vrend_sub_context *sub_ctx);
  static void vrend_update_scissor_state(struct vrend_sub_context *sub_ctx);
-@@ -8250,6 +8265,8 @@ int vrend_renderer_init(const struct vrend_if_cbs *cbs, uint32_t flags)
+@@ -8274,6 +8289,8 @@ int vrend_renderer_init(const struct vrend_if_cbs *cbs, uint32_t flags)
     list_inithead(&vrend_state.fence_list);
     list_inithead(&vrend_state.fence_wait_list);
     list_inithead(&vrend_state.waiting_query_list);
@@ -167,7 +167,7 @@ index 0c841a82dc050cd57d1420d1633aed9c18dc5b73..99f48550e72fca7e63fd20d891dbfa1a
     atomic_store(&vrend_state.has_waiting_queries, false);
  
     /* create 0 context */
-@@ -8568,6 +8585,9 @@ void vrend_destroy_context(struct vrend_context *ctx)
+@@ -8592,6 +8609,9 @@ void vrend_destroy_context(struct vrend_context *ctx)
  {
     bool switch_0 = (ctx == vrend_state.current_ctx);
     struct vrend_context *cur = vrend_state.current_ctx;
@@ -177,7 +177,7 @@ index 0c841a82dc050cd57d1420d1633aed9c18dc5b73..99f48550e72fca7e63fd20d891dbfa1a
     if (switch_0) {
        vrend_state.current_ctx = NULL;
        vrend_state.current_hw_ctx = NULL;
-@@ -8641,6 +8661,7 @@ struct vrend_context *vrend_create_context(int id, uint32_t nlen, const char *de
+@@ -8665,6 +8685,7 @@ struct vrend_context *vrend_create_context(int id, uint32_t nlen, const char *de
  
     grctx->ctx_id = id;
  
@@ -185,7 +185,7 @@ index 0c841a82dc050cd57d1420d1633aed9c18dc5b73..99f48550e72fca7e63fd20d891dbfa1a
     list_inithead(&grctx->sub_ctxs);
     list_inithead(&grctx->vrend_resources);
  
-@@ -8681,6 +8702,7 @@ struct vrend_context *vrend_create_context(int id, uint32_t nlen, const char *de
+@@ -8705,6 +8726,7 @@ struct vrend_context *vrend_create_context(int id, uint32_t nlen, const char *de
        return NULL;
     }
     vrend_renderer_set_sub_ctx(grctx, 0);
@@ -193,8 +193,8 @@ index 0c841a82dc050cd57d1420d1633aed9c18dc5b73..99f48550e72fca7e63fd20d891dbfa1a
  
     int glver = get_glsl_version();
     if (glver < 0) {
-@@ -9697,10 +9719,10 @@ static void vrend_resource_zero_texture(struct vrend_resource *gr)
-    }
+@@ -9890,10 +9912,10 @@ static bool vrend_resource_zero_texture(struct vrend_resource *gr)
+    return true;
  }
  
 -struct pipe_resource *
@@ -208,7 +208,7 @@ index 0c841a82dc050cd57d1420d1633aed9c18dc5b73..99f48550e72fca7e63fd20d891dbfa1a
  {
     struct vrend_resource *gr;
     int ret;
-@@ -9757,6 +9779,39 @@ vrend_renderer_resource_create(const struct vrend_renderer_resource_create_args
+@@ -9957,6 +9979,39 @@ vrend_renderer_resource_create(const struct vrend_renderer_resource_create_args
     return &gr->base;
  }
  
@@ -248,7 +248,7 @@ index 0c841a82dc050cd57d1420d1633aed9c18dc5b73..99f48550e72fca7e63fd20d891dbfa1a
  /* The R8 texture of a planes-only packed YUV image is the 1x1 texture that
   * gives the image a name; the planes hold its pixels. */
  static int vrend_packed_yuv_alloc_name(struct vrend_resource *gr)
-@@ -10179,6 +10234,7 @@ void vrend_resource_sync_shm_import(struct vrend_resource *res)
+@@ -10379,6 +10434,7 @@ void vrend_resource_sync_shm_import(struct vrend_resource *res)
  
  void vrend_renderer_resource_destroy(struct vrend_resource *res)
  {
@@ -256,7 +256,7 @@ index 0c841a82dc050cd57d1420d1633aed9c18dc5b73..99f48550e72fca7e63fd20d891dbfa1a
     if (res->packed_yuv) {
        for (unsigned i = 0; i < ARRAY_SIZE(res->packed_yuv->plane); i++)
           vrend_resource_reference(&res->packed_yuv->plane[i], NULL);
-@@ -13331,6 +13387,109 @@ void vrend_renderer_host_context_trim(void)
+@@ -13531,6 +13587,109 @@ void vrend_renderer_host_context_trim(void)
     vrend_renderer_context_trim(vrend_state.ctx0);
  }
  
@@ -367,7 +367,7 @@ index 0c841a82dc050cd57d1420d1633aed9c18dc5b73..99f48550e72fca7e63fd20d891dbfa1a
  {
     if (ctx->ctx_switch_pending == false)
 diff --git a/src/vrend/vrend_renderer.h b/src/vrend/vrend_renderer.h
-index b3b7ee7501169b405c1add95d915d8a644d6ae6d..133569a3b0c733d625226afc6f803c89a5a4daa5 100644
+index dc17fef860c4ac21f693d705785ad7c58e206ad3..b10bb514297b1b86fc4fc471649837e759794e15 100644
 --- a/src/vrend/vrend_renderer.h
 +++ b/src/vrend/vrend_renderer.h
 @@ -254,6 +254,15 @@ struct vrend_if_cbs {

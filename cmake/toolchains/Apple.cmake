@@ -5,15 +5,18 @@ set(UML_APPLE_PLATFORM "macos" CACHE STRING "Apple target platform")
 list(APPEND CMAKE_TRY_COMPILE_PLATFORM_VARIABLES UML_APPLE_PLATFORM)
 set(CMAKE_OSX_ARCHITECTURES arm64 CACHE STRING "Apple architectures" FORCE)
 
-# Each platform's SDK and CMake system name. Every Apple product builds at one
-# deployment target, which its dependency prefixes record as well.
-set(_uml_apple_deployment_target 27.0)
+# Each platform's SDK, CMake system name and deployment floor, which its
+# dependency prefixes record as well. macOS builds at 27.0; iOS and the iOS
+# Simulator build at 26.0 and guard the newer APIs they use.
 if(UML_APPLE_PLATFORM STREQUAL "macos")
     set(_uml_apple_platform macosx Darwin)
+    set(_uml_apple_deployment_target 27.0)
 elseif(UML_APPLE_PLATFORM STREQUAL "ios")
     set(_uml_apple_platform iphoneos iOS)
+    set(_uml_apple_deployment_target 26.0)
 elseif(UML_APPLE_PLATFORM STREQUAL "ios-simulator")
     set(_uml_apple_platform iphonesimulator iOS)
+    set(_uml_apple_deployment_target 26.0)
 else()
     message(FATAL_ERROR "Unknown UML_APPLE_PLATFORM=${UML_APPLE_PLATFORM}")
 endif()
@@ -24,17 +27,18 @@ execute_process(
     OUTPUT_STRIP_TRAILING_WHITESPACE
     COMMAND_ERROR_IS_FATAL ANY)
 set(CMAKE_OSX_SYSROOT "${_uml_apple_sdk_path}" CACHE PATH "Apple SDK" FORCE)
-# The floor is the only target. A tree configured at an older floor keeps that
-# target in its cache, and a preset does not reset it, so any other value is
-# refused instead of building at it. An unset or empty target takes the floor.
+# The platform's floor is its only target. A tree configured at another floor
+# keeps that target in its cache, and a preset does not reset it, so any other
+# value is refused instead of building at it. An unset or empty target takes
+# the floor.
 if(DEFINED CMAKE_OSX_DEPLOYMENT_TARGET AND
         NOT "${CMAKE_OSX_DEPLOYMENT_TARGET}" STREQUAL "" AND
         NOT "${CMAKE_OSX_DEPLOYMENT_TARGET}" STREQUAL
             "${_uml_apple_deployment_target}")
     message(FATAL_ERROR
         "CMAKE_OSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET} is cached "
-        "or was passed, but every Apple product builds at the deployment "
-        "floor ${_uml_apple_deployment_target}. Do not pass "
+        "or was passed, but UML_APPLE_PLATFORM=${UML_APPLE_PLATFORM} builds at "
+        "the deployment floor ${_uml_apple_deployment_target}. Do not pass "
         "-DCMAKE_OSX_DEPLOYMENT_TARGET. Configure with --fresh, or in a new "
         "binary directory, to drop the cached value.")
 endif()

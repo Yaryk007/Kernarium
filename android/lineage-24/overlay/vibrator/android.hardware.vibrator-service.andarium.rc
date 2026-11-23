@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+# The vibrator HAL exists only on a device with haptics: the host passes
+# androidboot.product.hardware.sku=haptics for it, the ODM manifest of that SKU
+# declares the HAL, and nothing else declares or starts one. Without the SKU no
+# process runs and Android sees no vibrator.
+service vendor.vibrator-andarium /vendor/bin/hw/android.hardware.vibrator-service.andarium
+    interface aidl android.hardware.vibrator.IVibrator/default
+    class hal
+    user nobody
+    group nobody
+    disabled
+
+on boot && property:ro.boot.product.hardware.sku=haptics
+    enable vendor.vibrator-andarium
+    start vendor.vibrator-andarium

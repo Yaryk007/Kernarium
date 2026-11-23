@@ -2,10 +2,38 @@
 # adbd's report that an adb host is connected; product init turns it into a wakelock.
 sys.kernarium.adb.host_connected    u:object_r:kernarium_adb_host_prop:s0 exact bool
 
-# Set once the product has saved its virtual Wi-Fi network, so a network the user
-# forgets stays forgotten.
-persist.sys.kernarium.virtwifi_saved    u:object_r:kernarium_wifi_network_prop:s0 exact bool
+# The adb public key the host authorizes for the boot, which no application may
+# read: the other ro.boot.* properties are readable by every application.
+ro.boot.kernarium.adb_key    u:object_r:kernarium_adb_key_prop:s0 exact string
+
+# 1 once the product has saved its virtual Wi-Fi network, so a network the user
+# forgets stays forgotten; 2 once the station has joined it.
+persist.sys.kernarium.virtwifi_saved    u:object_r:kernarium_wifi_network_prop:s0 exact enum 1 2
 
 # The time zone the product applied last from the host's, so a zone the user
 # chose in the guest is told from it and never replaced.
 persist.sys.kernarium.timezone_applied    u:object_r:kernarium_time_zone_prop:s0 exact string
+
+# Set once the product has looked at a guest's on-screen keyboard setting, so a person who
+# turns it on afterwards keeps it on.
+persist.sys.kernarium.keyboard_default    u:object_r:kernarium_keyboard_default_prop:s0 exact bool
+
+# One property per package, `persist.sys.kernarium.oldapp.<package>`: the time
+# (epoch seconds) the person turned Old app compatibility on for that
+# application; empty or unset means off. Every application domain reads it, the
+# shell domain sets it (kernarium_oldapp_prop.te).
+persist.sys.kernarium.oldapp.    u:object_r:kernarium_oldapp_prop:s0
+
+# Starts the script that starts the text message service. Its holder sets it, and init, which owns the property
+# service, and no other domain (kernarium_sms_listener.te).
+ctl.start$kernarium_sms_wake    u:object_r:ctl_kernarium_sms_wake_prop:s0 exact
+
+# Every other way to control the holder and the waker is init's alone. init checks ctl.<service> before
+# ctl.<action>$<service>, and the first falls to ctl_default_prop, which system_app may set; the platform labels the
+# qualified start, stop, restart and sigstop keys for init alone, and leaves oneshot_on and oneshot_off to the default.
+ctl.kernarium_sms_wake                  u:object_r:ctl_kernarium_sms_locked_prop:s0 exact
+ctl.kernarium_sms_listener              u:object_r:ctl_kernarium_sms_locked_prop:s0 exact
+ctl.oneshot_on$kernarium_sms_wake       u:object_r:ctl_kernarium_sms_locked_prop:s0 exact
+ctl.oneshot_off$kernarium_sms_wake      u:object_r:ctl_kernarium_sms_locked_prop:s0 exact
+ctl.oneshot_on$kernarium_sms_listener   u:object_r:ctl_kernarium_sms_locked_prop:s0 exact
+ctl.oneshot_off$kernarium_sms_listener  u:object_r:ctl_kernarium_sms_locked_prop:s0 exact

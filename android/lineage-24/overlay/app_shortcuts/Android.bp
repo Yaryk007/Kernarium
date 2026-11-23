@@ -1,0 +1,39 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 The Android Open Source Project
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+// The shell-user command that lists the launcher applications with their labels
+// and icons and starts one, for Andarium's Add to Home Screen. Like
+// kernarium_oldapp it is a Java tool started through app_process, as the
+// platform's own `content` is, so it is installed on system_ext with its wrapper
+// script, runs only as the adb shell user, holds no permission of its own and
+// writes nothing: no file, no property, no setting. It draws no icon: it names
+// each application's files to the icon renderer (KernariumIcons, app_icons) and
+// checks the PNG that comes back, so no application file is opened or decoded in
+// this process. IconProtocol, shared with that app, is the request vocabulary.
+java_binary {
+    name: "kernarium_apps",
+    wrapper: "kernarium_apps",
+    srcs: [
+        "src/**/*.java",
+        ":kernarium_icon_protocol",
+    ],
+    platform_apis: true,
+    system_ext_specific: true,
+}

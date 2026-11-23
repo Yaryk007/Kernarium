@@ -34,14 +34,16 @@ set(_uml_x86_64_baked_generator
     ${CMAKE_CURRENT_SOURCE_DIR}/engine/generate_baked.py)
 add_custom_command(
     OUTPUT ${_uml_x86_64_baked_dir}/baked_scalar.inc
+        ${_uml_x86_64_baked_dir}/baked_tail.inc
     COMMAND ${CMAKE_COMMAND} -E make_directory ${_uml_x86_64_baked_dir}
     COMMAND ${Python3_EXECUTABLE} -B ${_uml_x86_64_baked_generator}
         --output ${_uml_x86_64_baked_dir}/baked_scalar.inc
+        --tail-output ${_uml_x86_64_baked_dir}/baked_tail.inc
     DEPENDS ${_uml_x86_64_baked_generator}
     COMMENT "Generating the x86-64 register-baked gadget bank"
     VERBATIM)
 set_source_files_properties(engine.S PROPERTIES
-    OBJECT_DEPENDS ${_uml_x86_64_baked_dir}/baked_scalar.inc
+    OBJECT_DEPENDS "${_uml_x86_64_baked_dir}/baked_scalar.inc;${_uml_x86_64_baked_dir}/baked_tail.inc"
     COMPILE_OPTIONS "-Wall;-Wextra;-Werror")
 target_include_directories(uml_x86_64_gadgets PRIVATE
     ${_uml_x86_64_baked_dir})

@@ -30,7 +30,6 @@ __import__("sys").dont_write_bytecode = True
 
 import argparse
 import importlib.util
-import json
 import pathlib
 import subprocess
 import sys
@@ -49,9 +48,8 @@ def load(name: str, path: pathlib.Path):
 
 
 def records_of(builder, pack: pathlib.Path):
-    corpus, tokens = builder.decode_pack(pack.read_bytes())
-    items = [json.loads(line) for line in builder.dump_corpus(corpus, tokens)]
-    return corpus.meta, [item for item in items if "record" in item]
+    corpus, _tokens = builder.decode_pack(pack.read_bytes())
+    return corpus.meta, list(builder.dump_records(corpus))
 
 
 def check_features(ie) -> list[str]:

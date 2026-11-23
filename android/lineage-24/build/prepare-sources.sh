@@ -8,6 +8,8 @@ ROOT_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/../../.." && pwd)
 AOSP_METADATA="$ROOT_DIR/android/lineage-24/metadata/lineage.env"
 MESA_VENUS_METADATA="$ROOT_DIR/android/lineage-24/third_party/mesa-venus/metadata.env"
 MESA_VENUS_VERIFIER="$ROOT_DIR/android/lineage-24/tools/verify-mesa-venus-source.py"
+ACCESSIBILITY_METADATA="$ROOT_DIR/android/lineage-24/third_party/accessibility/metadata.env"
+ACCESSIBILITY_VERIFIER="$ROOT_DIR/android/lineage-24/tools/verify-accessibility-source.py"
 
 AOSP_SOURCE=
 JOBS=
@@ -28,7 +30,9 @@ source. The Repo workspace must already exist and be clean. It is synchronized
 to the exact commits of the checked base manifest, and needs Git LFS for its
 WebView prebuilts. The Venus Vulkan HAL's
 Mesa source is materialized at its pinned external commit plus generated local
-patch series. No endpoint or transport option is accepted.
+patch series. TalkBack, eSpeak NG and libsonic, which the image builds, are
+materialized the same way at their own pinned commits plus the series of the
+first two. No endpoint or transport option is accepted.
 EOF
 }
 
@@ -49,7 +53,8 @@ pinned_git()
 #     [SERIES_DIR FINAL_TREE]...
 # Fetch one pinned commit beside DESTINATION, detached when BRANCH is empty,
 # replay each series in order, publish it, and verify the result. An existing
-# destination is verified and reused.
+# destination is verified and reused. VERIFIER is a command that verifies
+# this source's checkout and takes no argument.
 materialize_pinned()
 {
 	label=$1
@@ -61,8 +66,7 @@ materialize_pinned()
 	branch=$7
 	shift 7
 	if [ -e "$destination" ] || [ -L "$destination" ]; then
-		"$verifier" --android-root "$ROOT_DIR/android/lineage-24" \
-			--aosp-source "$AOSP_SOURCE"
+		"$verifier"
 		printf '%s\n' "reusing pinned $label checkout: $destination"
 		return
 	fi
@@ -91,8 +95,29 @@ materialize_pinned()
 	done
 	mv -- "$STAGING" "$destination"
 	STAGING=
-	"$verifier" --android-root "$ROOT_DIR/android/lineage-24" \
+	"$verifier"
+}
+
+verify_mesa_venus()
+{
+	"$MESA_VENUS_VERIFIER" --android-root "$ROOT_DIR/android/lineage-24" \
 		--aosp-source "$AOSP_SOURCE"
+}
+
+# verify_accessibility NAME: one of talkback, espeak-ng and sonic.
+verify_accessibility()
+{
+	"$ACCESSIBILITY_VERIFIER" --android-root "$ROOT_DIR/android/lineage-24" \
+		--aosp-source "$AOSP_SOURCE" --only "$1"
+}
+verify_talkback() { verify_accessibility talkback; }
+verify_espeak_ng() { verify_accessibility espeak-ng; }
+verify_sonic() { verify_accessibility sonic; }
+
+# series_tree DIRECTORY: the tree a series, relative to the repository, records.
+series_tree()
+{
+	awk -F '\t' '$1 == "tree" { print $2 }' "$ROOT_DIR/$1/series.tsv"
 }
 
 while [ "$#" -gt 0 ]; do
@@ -132,12 +157,19 @@ esac
 	fail "missing Mesa Venus metadata: $MESA_VENUS_METADATA"
 [ -x "$MESA_VENUS_VERIFIER" ] ||
 	fail "missing Mesa Venus source verifier: $MESA_VENUS_VERIFIER"
+[ -f "$ACCESSIBILITY_METADATA" ] ||
+	fail "missing accessibility source metadata: $ACCESSIBILITY_METADATA"
+[ -x "$ACCESSIBILITY_VERIFIER" ] ||
+	fail "missing accessibility source verifier: $ACCESSIBILITY_VERIFIER"
 # shellcheck disable=SC1090
 . "$AOSP_METADATA"
 # shellcheck disable=SC1090
 . "$MESA_VENUS_METADATA"
+# shellcheck disable=SC1090
+. "$ACCESSIBILITY_METADATA"
 
 "$MESA_VENUS_VERIFIER" --android-root "$ROOT_DIR/android/lineage-24"
+"$ACCESSIBILITY_VERIFIER" --android-root "$ROOT_DIR/android/lineage-24"
 
 command -v repo >/dev/null 2>&1 || fail "repo is not available on PATH"
 command -v git >/dev/null 2>&1 || fail "git is not available on PATH"
@@ -168,11 +200,28 @@ fi
 )
 
 materialize_pinned "Mesa Venus" "$AOSP_SOURCE/$MESA_VENUS_DESTINATION" \
-	"$MESA_VENUS_VERIFIER" "$MESA_VENUS_UPSTREAM_REPOSITORY" \
+	verify_mesa_venus "$MESA_VENUS_UPSTREAM_REPOSITORY" \
 	"$MESA_VENUS_UPSTREAM_COMMIT" "$MESA_VENUS_UPSTREAM_TREE" \
 	"$MESA_VENUS_PATCH_BRANCH" \
 	"$MESA_VENUS_GUEST_SERIES" "$MESA_VENUS_GUEST_TREE" \
 	android/lineage-24/third_party/mesa-venus/series "$MESA_VENUS_FINAL_TREE"
+
+# TalkBack and eSpeak NG carry the Soong build of the image in their series;
+# libsonic, which eSpeak NG's build takes from its own sonic directory, is
+# pinned as it is and materialized inside the eSpeak NG checkout after it.
+materialize_pinned "TalkBack" "$AOSP_SOURCE/$TALKBACK_DESTINATION" \
+	verify_talkback "$TALKBACK_UPSTREAM_REPOSITORY" \
+	"$TALKBACK_UPSTREAM_COMMIT" "$TALKBACK_UPSTREAM_TREE" \
+	"$TALKBACK_PATCH_BRANCH" \
+	"$TALKBACK_SERIES" "$(series_tree "$TALKBACK_SERIES")"
+materialize_pinned "eSpeak NG" "$AOSP_SOURCE/$ESPEAK_NG_DESTINATION" \
+	verify_espeak_ng "$ESPEAK_NG_UPSTREAM_REPOSITORY" \
+	"$ESPEAK_NG_UPSTREAM_COMMIT" "$ESPEAK_NG_UPSTREAM_TREE" \
+	"$ESPEAK_NG_PATCH_BRANCH" \
+	"$ESPEAK_NG_SERIES" "$(series_tree "$ESPEAK_NG_SERIES")"
+materialize_pinned "libsonic" "$AOSP_SOURCE/$SONIC_DESTINATION" \
+	verify_sonic "$SONIC_UPSTREAM_REPOSITORY" \
+	"$SONIC_UPSTREAM_COMMIT" "$SONIC_UPSTREAM_TREE" ""
 
 "$SCRIPT_DIR/preflight.sh" \
 	--aosp-source "$AOSP_SOURCE" \

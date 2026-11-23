@@ -59,8 +59,7 @@ Lx86_vector_gather_loop\@:
 	tbz x23, #52, Lx86_vector_gather_address_ready\@
 	mov w7, w7
 Lx86_vector_gather_address_ready\@:
-	page_cross_check (\data), Lx86_vector_gather_cross\@
-	translate_plain 0, UML_X86_64_TLB_READ_PAGE, \data, Lx86_vector_gather_fault\@
+	translate_plain 0, UML_X86_64_TLB_READ_PAGE, \data, Lx86_vector_gather_fault\@, cross=Lx86_vector_gather_cross\@
 	.if \data == 4
 	ldr w14, [x7]
 	str w14, [x19, x26, lsl #2]

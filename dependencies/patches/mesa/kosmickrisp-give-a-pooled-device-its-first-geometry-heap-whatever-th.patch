@@ -28,10 +28,10 @@ Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
  3 files changed, 61 insertions(+), 18 deletions(-)
 
 diff --git a/src/kosmickrisp/vulkan/kk_cmd_draw.c b/src/kosmickrisp/vulkan/kk_cmd_draw.c
-index 586ee352b48e24b83f2817d673ff9ad5eba5e053..4964ac330cb5bf5a7e53a43d69d69e07a9ad2d64 100644
+index e14b47c2e4b62c70ce59cf1219554bf0eacdb14c..1c63484c0a6afa45029f22761e7571c371094962 100644
 --- a/src/kosmickrisp/vulkan/kk_cmd_draw.c
 +++ b/src/kosmickrisp/vulkan/kk_cmd_draw.c
-@@ -1168,14 +1168,17 @@ kk_flush_pipeline(struct kk_cmd_buffer *cmd)
+@@ -1241,14 +1241,17 @@ kk_flush_pipeline(struct kk_cmd_buffer *cmd)
   * heap to it: it reserves a heap's size before creating the heap and never
   * creates one the pool refuses, so the heap never takes the pool past its
   * limit. A heap takes at most half of what the pool can still hold, except
@@ -53,7 +53,7 @@ index 586ee352b48e24b83f2817d673ff9ad5eba5e053..4964ac330cb5bf5a7e53a43d69d69e07
   * them, a pooled device frees a heap that grew past the starting size once
   * the pool's headroom has fallen below half its size, and the next draw that
   * needs a heap creates one at what it then needs and the pool leaves it.
-@@ -1183,9 +1186,9 @@ kk_flush_pipeline(struct kk_cmd_buffer *cmd)
+@@ -1256,9 +1259,9 @@ kk_flush_pipeline(struct kk_cmd_buffer *cmd)
   * them is, with or without a pool. */
  #define KK_HEAP_START_MIB   16u
  #define KK_HEAP_MIN_CAP_MIB 128u
@@ -66,7 +66,7 @@ index 586ee352b48e24b83f2817d673ff9ad5eba5e053..4964ac330cb5bf5a7e53a43d69d69e07
  #define KK_HEAP_POOL_FLOOR_B (1ull << 20)
  /* Heaps sized to what the pool leaves are rounded down to this. */
  #define KK_HEAP_POOL_ALIGN_B (64ull << 10)
-@@ -1223,16 +1226,23 @@ kk_heap_pool_share_B(const struct kk_device *dev)
+@@ -1296,16 +1299,23 @@ kk_heap_pool_share_B(const struct kk_device *dev)
  
  /* Creates a heap of size_B, charged to the device's pool when it has one.
   * Returns NULL, with *pool_refused set, when the pool cannot hold it, and
@@ -95,7 +95,7 @@ index 586ee352b48e24b83f2817d673ff9ad5eba5e053..4964ac330cb5bf5a7e53a43d69d69e07
     }
  
     struct kk_geometry_heap *heap = calloc(1, sizeof(*heap));
-@@ -1242,7 +1252,7 @@ kk_geometry_heap_create(struct kk_device *dev, uint64_t size_B,
+@@ -1315,7 +1325,7 @@ kk_geometry_heap_create(struct kk_device *dev, uint64_t size_B,
        heap = NULL;
     }
     /* Metal counts the heap now, or it was refused. */
@@ -104,7 +104,7 @@ index 586ee352b48e24b83f2817d673ff9ad5eba5e053..4964ac330cb5bf5a7e53a43d69d69e07
        kk_device_pool_release(dev, size_B);
     if (heap == NULL)
        return NULL;
-@@ -1375,9 +1385,17 @@ kk_heap_create_first_locked(struct kk_device *dev, uint64_t bound_B)
+@@ -1448,9 +1458,17 @@ kk_heap_create_first_locked(struct kk_device *dev, uint64_t bound_B)
        MIN2(kk_heap_size_for(dev, start_B, bound_B),
             MAX2(kk_heap_pool_share_B(dev), KK_HEAP_POOL_FLOOR_B));
     bool pool_refused;
@@ -124,7 +124,7 @@ index 586ee352b48e24b83f2817d673ff9ad5eba5e053..4964ac330cb5bf5a7e53a43d69d69e07
     /* Metal's refusal is final; the pool's lasts until the pool has room. */
     dev->heap_attempted = dev->heap != NULL || !pool_refused;
  }
-@@ -1407,7 +1425,7 @@ kk_heap_grow_locked(struct kk_device *dev, uint64_t bound_B)
+@@ -1480,7 +1498,7 @@ kk_heap_grow_locked(struct kk_device *dev, uint64_t bound_B)
  
     bool pool_refused;
     struct kk_geometry_heap *heap =

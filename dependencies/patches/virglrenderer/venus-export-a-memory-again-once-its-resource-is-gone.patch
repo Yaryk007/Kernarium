@@ -24,10 +24,10 @@ reference to the storage and is unaffected.
  4 files changed, 50 insertions(+), 14 deletions(-)
 
 diff --git a/src/venus/vkr_context.c b/src/venus/vkr_context.c
-index e5bd69651d45c66c3e30c237c068ba953973b3ff..5fc6b43d9fc0dff013a1e6ab2f8f82ea2f0a3cd1 100644
+index 479199d9d10120eeef9868b3934763beab1a7785..1328c0fbd2465191593c8e536c7cfea95ae92c96 100644
 --- a/src/venus/vkr_context.c
 +++ b/src/venus/vkr_context.c
-@@ -266,6 +266,7 @@ vkr_context_import_resource_internal(struct vkr_context *ctx,
+@@ -265,6 +265,7 @@ vkr_context_import_resource_internal(struct vkr_context *ctx,
     res->native_handle_type = native_handle_type;
     res->native_handle = native_handle;
     res->shm_mapping = NULL;
@@ -35,7 +35,7 @@ index e5bd69651d45c66c3e30c237c068ba953973b3ff..5fc6b43d9fc0dff013a1e6ab2f8f82ea
  
     /* fd and mmap_ptr cannot be valid at the same time, but allowed to be -1 and NULL */
     assert(fd < 0 || !mmap_ptr);
-@@ -401,13 +402,10 @@ vkr_context_create_resource_from_device_memory(struct vkr_context *ctx,
+@@ -400,13 +401,10 @@ vkr_context_create_resource_from_device_memory(struct vkr_context *ctx,
        if (!vkr_context_import_resource_from_shm(ctx, res_id, blob_size,
                                                  blob.u.fd, native_resource_id,
                                                  native_handle_type,
@@ -52,7 +52,7 @@ index e5bd69651d45c66c3e30c237c068ba953973b3ff..5fc6b43d9fc0dff013a1e6ab2f8f82ea
     }
  
     /* If memory might get exported, store a dup'ed fd in vkr_resource for:
-@@ -417,10 +415,8 @@ vkr_context_create_resource_from_device_memory(struct vkr_context *ctx,
+@@ -416,10 +414,8 @@ vkr_context_create_resource_from_device_memory(struct vkr_context *ctx,
     int res_fd = -1;
     if (mem->might_export) {
        res_fd = os_dupfd_cloexec(blob.u.fd);
@@ -65,7 +65,7 @@ index e5bd69651d45c66c3e30c237c068ba953973b3ff..5fc6b43d9fc0dff013a1e6ab2f8f82ea
     }
  
     if (!vkr_context_import_resource_internal(
-@@ -428,13 +424,21 @@ vkr_context_create_resource_from_device_memory(struct vkr_context *ctx,
+@@ -427,13 +423,21 @@ vkr_context_create_resource_from_device_memory(struct vkr_context *ctx,
            VIRGL_RESOURCE_NATIVE_HANDLE_NONE, NULL)) {
        if (res_fd >= 0)
           close(res_fd);
@@ -89,7 +89,7 @@ index e5bd69651d45c66c3e30c237c068ba953973b3ff..5fc6b43d9fc0dff013a1e6ab2f8f82ea
  }
  
  bool
-@@ -485,6 +489,28 @@ vkr_context_import_resource(struct vkr_context *ctx,
+@@ -484,6 +488,28 @@ vkr_context_import_resource(struct vkr_context *ctx,
        VIRGL_RESOURCE_NATIVE_HANDLE_NONE, NULL);
  }
  
@@ -118,7 +118,7 @@ index e5bd69651d45c66c3e30c237c068ba953973b3ff..5fc6b43d9fc0dff013a1e6ab2f8f82ea
  void
  vkr_context_destroy_resource(struct vkr_context *ctx, uint32_t res_id)
  {
-@@ -511,6 +537,9 @@ vkr_context_destroy_resource(struct vkr_context *ctx, uint32_t res_id)
+@@ -510,6 +536,9 @@ vkr_context_destroy_resource(struct vkr_context *ctx, uint32_t res_id)
     }
     mtx_unlock(&ctx->ring_mutex);
  
@@ -143,7 +143,7 @@ index 74482ee0a0461c273e1d1badd1ad08c31909e5b5..e38f98895fdb531df18fb0752d035697
  
  enum vkr_context_validate_level {
 diff --git a/src/venus/vkr_device_memory.c b/src/venus/vkr_device_memory.c
-index 4b6f407f9aee49907648c125b0c354d0a174a6dd..65b58fca5172571b4fceb86606aa104e9a15ea8e 100644
+index 33226d30225c9c22242ea39499bc394d7449db97..6b0035c49b6f77262f8a74d0a236f80ea94e67c7 100644
 --- a/src/venus/vkr_device_memory.c
 +++ b/src/venus/vkr_device_memory.c
 @@ -788,8 +788,8 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,

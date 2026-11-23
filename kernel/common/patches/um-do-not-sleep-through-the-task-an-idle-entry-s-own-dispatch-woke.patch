@@ -1,0 +1,161 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:58:04 +0900
+Subject: [PATCH] um: do not sleep through the task an idle entry's own
+ dispatch woke
+
+CPU0's idle wait dispatches the host's descriptor events before it
+sleeps, for the edges that arrived after the previous wait ended and
+before this one began. A handler of such an edge can make a task
+runnable on this CPU, as a virtio queue's callback does when it queues
+its worker. That sets the idle task's need-resched flag, and the
+dispatch ends without a preempt check, which leaves the switch to the
+idle loop. The wait went on to sleep until its clock deadline, up to a
+second away, because the loop reads the flag only when the wait returns.
+CPU0 had taken the edge itself, so the notification thread had nothing
+left to signal, and the worker, or the task it was to wake on another
+CPU, waited for the next timer.
+
+An idle guest that echoed a message through the vsock device every
+20 ms showed it: every traced echo that took more than 150 ms had its
+edge taken by a dispatch that no wake preceded, followed by the wait
+that slept until the next clock deadline. Five of the 52 late echoes
+of the first data set were not traced.
+
+darwin_irq_dispatch() now says whether its poll collected an event, as
+DARWIN_IRQ_HANDLED: a handler may then have run, not that one did or
+that a task became runnable. The idle wait polls instead of sleeping
+when it says so, so the idle loop sees the flag at once. The next entry
+finds nothing and sleeps when no fresh edge, pending IPI or delayed
+notification remains.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ arch/um/os-Darwin/irq.c  | 27 +++++++++++++++++++++++----
+ arch/um/os-Darwin/irq.h  |  3 +++
+ arch/um/os-Darwin/time.c | 14 ++++++++++----
+ 3 files changed, 36 insertions(+), 8 deletions(-)
+
+diff --git a/arch/um/os-Darwin/irq.c b/arch/um/os-Darwin/irq.c
+index 59be405bd11441ef261e43c60ce2763e6a62bd3d..4b5b71ba5844764bd62f952da75e16856981d56a 100644
+--- a/arch/um/os-Darwin/irq.c
++++ b/arch/um/os-Darwin/irq.c
+@@ -90,6 +90,11 @@ static int notification_parked;
+ static int dispatch_owner = -1;
+ static int dispatch_missed;
+ static unsigned long long last_dispatch_ns;
++/*
++ * Set by the poll of the dispatch queue when it returns an edge, and read and
++ * cleared by the holder of the token around its own handlers.
++ */
++static int dispatch_collected;
+ 
+ static void wake_signal_handler(int signal)
+ {
+@@ -113,14 +118,23 @@ static int take_token(int cpu, int *owner)
+ /*
+  * Dispatch the host's descriptor events if this CPU may: CPU0 always, any other
+  * CPU only when no dispatch has begun for DARWIN_IRQ_TAKEOVER_NS, and only
+- * while no other CPU holds the token.  Returns whether it dispatched.  It is
+- * called where an interrupt could arrive on this CPU, with the logical IRQs
+- * as the caller's tick has them, and may run any handler and softirq.
++ * while no other CPU holds the token.  Returns 0 if it did not dispatch, 1 if
++ * it dispatched and no edge was waiting, and DARWIN_IRQ_HANDLED if it ran the
++ * handlers of an edge.  It is called where an interrupt could arrive on this
++ * CPU, with the logical IRQs as the caller's tick has them, and may run any
++ * handler and softirq.
++ *
++ * A handler can make a task runnable on this CPU, which sets the idle task's
++ * need-resched flag and leaves the switch to the idle loop; the dispatch ends
++ * without a preempt check (see sigio_handler()).  A caller that is about to
++ * sleep must therefore not sleep when the result is DARWIN_IRQ_HANDLED, but
++ * return to the idle loop, which looks at the flag.
+  */
+ int darwin_irq_dispatch(int cpu, unsigned long long now,
+ 			struct uml_pt_regs *registers)
+ {
+ 	int owner;
++	int handled = 0;
+ 
+ 	if (cpu != 0 &&
+ 	    (long long)(now - __atomic_load_n(&last_dispatch_ns,
+@@ -142,12 +156,15 @@ int darwin_irq_dispatch(int cpu, unsigned long long now,
+ 	if ((long long)(now - last_dispatch_ns) > 0)
+ 		__atomic_store_n(&last_dispatch_ns, now, __ATOMIC_RELAXED);
+ 	do {
++		__atomic_store_n(&dispatch_collected, 0, __ATOMIC_RELAXED);
+ 		sigio_handler(SIGIO, NULL, registers, NULL);
++		if (__atomic_load_n(&dispatch_collected, __ATOMIC_RELAXED))
++			handled = 1;
+ 		__atomic_store_n(&dispatch_owner, -1, __ATOMIC_SEQ_CST);
+ 	} while (__atomic_load_n(&dispatch_missed, __ATOMIC_SEQ_CST) &&
+ 		 __atomic_exchange_n(&dispatch_missed, 0, __ATOMIC_SEQ_CST) &&
+ 		 take_token(cpu, &owner));
+-	return 1;
++	return handled ? DARWIN_IRQ_HANDLED : 1;
+ }
+ 
+ static struct timespec relative_time(unsigned long long target,
+@@ -689,6 +706,8 @@ int os_waiting_for_events_epoll(void)
+ 		       DARWIN_MAX_EVENTS, &immediate);
+ 	if (count < 0)
+ 		return errno == EINTR ? 0 : -errno;
++	if (count > 0)
++		__atomic_store_n(&dispatch_collected, 1, __ATOMIC_RELAXED);
+ 	for (index = 0; index < count; index++) {
+ 		triggered[index] = (struct watched_fd) {
+ 			.fd = (int)events[index].ident,
+diff --git a/arch/um/os-Darwin/irq.h b/arch/um/os-Darwin/irq.h
+index dfa75a438de4ef8cab92e617dd0fdc5c3f66ab7a..ef46033e02219a7e0fd4904757a3307c8d7d1fc0 100644
+--- a/arch/um/os-Darwin/irq.h
++++ b/arch/um/os-Darwin/irq.h
+@@ -12,6 +12,9 @@ struct uml_pt_regs;
+ #define DARWIN_IRQ_TAKEOVER_NS 20000000ULL
+ #define DARWIN_IRQ_TAKEOVER_CHECK_NS 2000000ULL
+ 
++/* What darwin_irq_dispatch() returns when it ran the handlers of an edge. */
++#define DARWIN_IRQ_HANDLED 2
++
+ int darwin_irq_idle_begin(void);
+ void darwin_irq_idle_end(void);
+ int darwin_irq_dispatch(int cpu, unsigned long long now,
+diff --git a/arch/um/os-Darwin/time.c b/arch/um/os-Darwin/time.c
+index 8ca0eb169c4de544f081206b0a79fa912511adb5..368166312a42b6fe01982a06108e215ae6e98bcc 100644
+--- a/arch/um/os-Darwin/time.c
++++ b/arch/um/os-Darwin/time.c
+@@ -265,6 +265,7 @@ void os_idle_sleep(void)
+ 		int wake_fd;
+ 		int fire_timer = 0;
+ 		int edge_left = 0;
++		int handled = 0;
+ 		int pipe_empty;
+ 		int ready;
+ 
+@@ -280,8 +281,10 @@ void os_idle_sleep(void)
+ 		 */
+ 		memset(&registers, 0, sizeof(registers));
+ 		if (cpu == 0)
+-			darwin_irq_dispatch(0, (unsigned long long)os_nsecs(),
+-					    &registers);
++			handled = darwin_irq_dispatch(0,
++						      (unsigned long long)os_nsecs(),
++						      &registers) ==
++				  DARWIN_IRQ_HANDLED;
+ 		if (state->active) {
+ 			now = (unsigned long long)os_nsecs();
+ 			remaining = state->deadline_ns > now ?
+@@ -313,9 +316,12 @@ void os_idle_sleep(void)
+ 		/* A vector pending here has no wake edge of its own; see
+ 		 * darwin_ipi_idle_pending().  Drain it below rather than sleep on it.
+ 		 * Nor has an edge which the notification thread left for this idle
+-		 * entry (darwin_irq_idle_begin()).
++		 * entry (darwin_irq_idle_begin()).  Nor has a task which a handler of
++		 * the dispatch above made runnable here: it set this idle task's
++		 * need-resched flag, which the idle loop reads only when this
++		 * function returns, so the wait is skipped for it to switch.
+ 		 */
+-		if (darwin_ipi_idle_pending() || edge_left) {
++		if (darwin_ipi_idle_pending() || edge_left || handled) {
+ 			timeout.tv_sec = 0;
+ 			timeout.tv_nsec = 0;
+ 			timeout_pointer = &timeout;

@@ -16,10 +16,12 @@ if(PLATFORM STREQUAL "macos")
     set(_platform_contract macos-gpu-vulkan-arm64.tsv)
     set(_mach_platform 1)
     set(_minimum_os_key LSMinimumSystemVersion)
+    set(_deployment_target 27.0)
 elseif(PLATFORM STREQUAL "ios")
     set(_platform_contract ios-device-gpu-vulkan-arm64.tsv)
     set(_mach_platform 2)
     set(_minimum_os_key MinimumOSVersion)
+    set(_deployment_target 26.0)
 elseif(PLATFORM STREQUAL "ios-simulator")
     # KosmicKrisp is a Metal 4 driver and the iOS Simulator exposes no Metal 4
     # device, so the Simulator prefix is the software variant: Mesa's llvmpipe
@@ -27,10 +29,10 @@ elseif(PLATFORM STREQUAL "ios-simulator")
     set(_platform_contract ios-simulator-gpu-software-arm64.tsv)
     set(_mach_platform 7)
     set(_minimum_os_key MinimumOSVersion)
+    set(_deployment_target 26.0)
 else()
     message(FATAL_ERROR "Unsupported Apple GPU platform: ${PLATFORM}")
 endif()
-set(_deployment_target 27.0)
 if(PLATFORM STREQUAL "ios-simulator")
     set(_software TRUE)
 else()
@@ -378,7 +380,7 @@ function(_verify_framework _name)
         list(FIND _arg_DEPENDENCIES "${_dependency}" _allowed)
         if(_dependency STREQUAL "@rpath/${_name}.framework/${_name}" OR
            NOT _allowed EQUAL -1 OR
-           _dependency MATCHES "^/usr/lib/(libc\\+\\+\\.1|libSystem\\.B|libobjc\\.A|libz\\.1)\\.dylib$" OR
+           _dependency MATCHES "^/usr/lib/(libc\\+\\+\\.1|libSystem\\.B|libobjc\\.A|libz\\.1|libcompression)\\.dylib$" OR
            _dependency MATCHES "^/System/Library/Frameworks/(${_arg_SYSTEM})\\.framework/")
             continue()
         endif()

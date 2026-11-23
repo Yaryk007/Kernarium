@@ -50,10 +50,12 @@ private:
 const TargetLinkTable &vacant_target_links() noexcept
 {
 	static const UnlinkedBlockLink vacant{
-		0, ~std::uint64_t{}, ~std::uint64_t{},
+		0, 0, ~std::uint64_t{}, ~std::uint64_t{},
 		reinterpret_cast<std::uintptr_t>(
 			native::uml_x86_64_gadget_link_exit),
-		{&vacant.fallback_stream, 0, ~std::uint64_t{}},
+		{reinterpret_cast<std::uintptr_t>(
+			 native::uml_x86_64_gadget_link_exit),
+			&vacant.fallback_stream + 1, ~std::uint64_t{}},
 	};
 	static const TargetLinkTable table = [] {
 		TargetLinkTable initial{};
@@ -431,8 +433,11 @@ Body *Space::publish(const Program &program, std::uint8_t instruction_limit,
 		free_bodies(never);
 		return adopted;
 	}
+	/* The builder holds each of these pages, and held them settled, or it
+	 * would not have stored the body: this count adds to the builder's, so
+	 * the call never gains a page and has nothing to wait for. */
 	for (std::size_t index = 0; index < gained.count; ++index)
-		registry_->add(gained.pages[index], self);
+		(void)registry_->add(gained.pages[index], self);
 	return body;
 }
 
@@ -792,8 +797,13 @@ void Space::observe(std::uint64_t changes, ProgramCacheCodeChangeReader reader,
 				const auto address = ranges[index].address;
 				const auto length =
 					static_cast<std::size_t>(ranges[index].length);
-				if (length == 0)
-					continue;
+				/* A range of length 0 is the whole space (the memory
+				 * layer publishes one for a write that named no frame):
+				 * what the ring cannot describe is reset whole. */
+				if (length == 0) {
+					described = false;
+					break;
+				}
 				const auto first = address & page_mask;
 				const auto last = (address + length - 1U) & page_mask;
 				for (auto page = first;;

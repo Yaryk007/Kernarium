@@ -1,0 +1,188 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 06:15:04 +0900
+Subject: [PATCH] um: end a host suspend that a wake overtook
+
+The host's suspend and wake are two console requests. A wake is
+answered in the interrupt at once and marks the suspend under way; a
+suspend needs a process, so it runs after the requests ahead of it, one
+at a time and newest first. When one of them is stuck, a file system
+sync that waits for a held disk write, say, the host gives its suspend
+up at its deadline, wakes the guest and asks again, and the second
+suspend queues behind the stuck one. The wake finds no suspend under
+way and marks nothing, so the queued suspend begins when the stuck
+request ends, discards the wakeup, and puts the guest to sleep while the
+application believes it runs.
+
+Count the wakes the console answers, stamp every request that needs a
+process with the count when the interrupt queues it, and let a suspend
+whose stamp differs when it begins fail with -EBUSY, as a woken suspend
+does, without calling pm_suspend(). A wake sent before the request does
+not end it. The order the queued requests run in does not matter, since
+the stamp decides, not the position. The suspend claims suspend_request
+before it reads the count and the wake counts before it reads
+suspend_request, so one of them sees the other.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ arch/um/drivers/mconsole.h      |  3 ++
+ arch/um/drivers/mconsole_kern.c | 78 +++++++++++++++++++++++++++------
+ arch/um/drivers/mconsole_kern.h |  3 ++
+ 3 files changed, 71 insertions(+), 13 deletions(-)
+
+diff --git a/arch/um/drivers/mconsole.h b/arch/um/drivers/mconsole.h
+index e536d3afedf1cb73b2cb97186f87775e5cb0b479..bbaaffc484eb218acefffdffbc15cd7e5976d807 100644
+--- a/arch/um/drivers/mconsole.h
++++ b/arch/um/drivers/mconsole.h
+@@ -64,6 +64,9 @@ struct mc_request
+ 	struct mconsole_request request;
+ 	struct mconsole_command *cmd;
+ 	struct uml_pt_regs regs;
++
++	/* The wake requests the console had answered when this one arrived. */
++	int wakes;
+ };
+ 
+ extern char mconsole_socket_name[];
+diff --git a/arch/um/drivers/mconsole_kern.c b/arch/um/drivers/mconsole_kern.c
+index 0e5ab13e62997431059c989692bb4de116b2976c..57979cb49b0f642beb61e01f6f5ce4722a8dd036 100644
+--- a/arch/um/drivers/mconsole_kern.c
++++ b/arch/um/drivers/mconsole_kern.c
+@@ -101,6 +101,7 @@ static irqreturn_t mconsole_interrupt(int irq, void *dev_id)
+ 			else {
+ 				new->request = req;
+ 				new->request.regs = get_irq_regs()->regs;
++				mconsole_stamp_request(&new->request);
+ 				spin_lock_irqsave(&mc_requests_lock, flags);
+ 				list_add(&new->list, &mc_requests);
+ 				spin_unlock_irqrestore(&mc_requests_lock,
+@@ -262,6 +263,39 @@ void mconsole_go(struct mc_request *req)
+ static struct mc_request *suspend_request;
+ /* A wake arrived while the host's suspend request was in progress. */
+ static bool suspend_woken;
++/* The wake requests answered so far; only a change between two reads counts. */
++static atomic_t mconsole_wakes = ATOMIC_INIT(0);
++
++/*
++ * Called in the interrupt for each request that needs a process.  Such
++ * requests run one after the other, so a suspend can wait behind another
++ * (a sync that is stuck, a trim) while the host's wake arrives; the stamp is
++ * how mconsole_suspend() tells that wake from one sent before the request.
++ */
++void mconsole_stamp_request(struct mc_request *req)
++{
++	req->wakes = atomic_read(&mconsole_wakes);
++}
++
++/*
++ * Record a wake in the count and then in the suspend under way, if any.
++ * mconsole_suspend() claims suspend_request and then reads the count, so a
++ * wake that misses the claim is seen in the count, and one that misses the
++ * count finds the claim.
++ */
++static void mconsole_note_wake(void)
++{
++	atomic_inc(&mconsole_wakes);
++	smp_mb__after_atomic();
++	if (READ_ONCE(suspend_request) != NULL)
++		WRITE_ONCE(suspend_woken, true);
++}
++
++/* Whether the host woke the guest after it sent this request. */
++static bool mconsole_overtaken(const struct mc_request *req)
++{
++	return atomic_read(&mconsole_wakes) != req->wakes;
++}
+ 
+ void um_suspend_notify_entered(void)
+ {
+@@ -291,7 +325,9 @@ int um_suspend_host_requested(void)
+  * fired while the suspend was being entered.  The host still wants the guest
+  * suspended, and a new suspend discards the wakeups signaled before it
+  * began, so the request enters it again, a few times at most.  The host's
+- * own wake ends the request instead, and so does any other failure.
++ * own wake ends the request instead, and so does any other failure.  A wake
++ * the host sent after the request arrived ends it as well, even if it has not
++ * begun: it fails as a woken suspend does, without suspending the guest.
+  */
+ #define MCONSOLE_SUSPEND_RETRIES 3
+ #define MCONSOLE_SUSPEND_RETRY_MS 50
+@@ -301,19 +337,30 @@ void mconsole_suspend(struct mc_request *req)
+ 	struct mc_request *pending;
+ 	char response[64];
+ 	int retries = 0;
+-	int error;
++	int error = -EBUSY;
+ 
+ 	if (cmpxchg(&suspend_request, NULL, req) != NULL) {
+ 		mconsole_reply(req, "Suspend already in progress", 1, 0);
+ 		return;
+ 	}
+-	error = pm_suspend(PM_SUSPEND_MEM);
+-	while (error == -EBUSY && retries++ < MCONSOLE_SUSPEND_RETRIES &&
+-	       !READ_ONCE(suspend_woken) && READ_ONCE(suspend_request) != NULL) {
+-		msleep(MCONSOLE_SUSPEND_RETRY_MS);
+-		if (READ_ONCE(suspend_woken))
+-			break;
++	/*
++	 * A suspend that waited behind another request is stale when the host
++	 * has woken the guest since it asked: the wake could mark only the
++	 * suspend under way, and the host has since given this one up, so it
++	 * must not put the guest to sleep when its turn comes.  The wake and
++	 * the claim of suspend_request above each come first for the other, so
++	 * one of them sees it, in whichever order the requests run.
++	 */
++	if (!mconsole_overtaken(req)) {
+ 		error = pm_suspend(PM_SUSPEND_MEM);
++		while (error == -EBUSY && retries++ < MCONSOLE_SUSPEND_RETRIES &&
++		       !READ_ONCE(suspend_woken) &&
++		       READ_ONCE(suspend_request) != NULL) {
++			msleep(MCONSOLE_SUSPEND_RETRY_MS);
++			if (READ_ONCE(suspend_woken))
++				break;
++			error = pm_suspend(PM_SUSPEND_MEM);
++		}
+ 	}
+ 	pending = xchg(&suspend_request, NULL);
+ 	WRITE_ONCE(suspend_woken, false);
+@@ -331,16 +378,21 @@ void mconsole_wake(struct mc_request *req)
+ 	 * suspend anyway, whether the host or the guest started it: as a
+ 	 * wakeup, it aborts a suspend at the PM core's next check from the
+ 	 * moment that suspend began, file system sync included.  A suspend the
+-	 * host asked for might not have begun yet, so it also does not sleep
+-	 * after a wake that arrived since the request.  A guest that is not
+-	 * suspending only answers: its next suspend discards the wakeup.
++	 * host asked for might not have begun yet, or wait behind a request
++	 * that is stuck, so it also does not sleep after a wake that arrived
++	 * since the request: the count of wakes tells mconsole_suspend().  A
++	 * guest that is not suspending only answers: its next suspend discards
++	 * the wakeup.
+ 	 */
+-	if (READ_ONCE(suspend_request) != NULL)
+-		WRITE_ONCE(suspend_woken, true);
++	mconsole_note_wake();
+ 	pm_system_wakeup();
+ 	mconsole_reply(req, "running", 0, 0);
+ }
+ #else
++void mconsole_stamp_request(struct mc_request *req)
++{
++}
++
+ void um_suspend_notify_entered(void)
+ {
+ }
+diff --git a/arch/um/drivers/mconsole_kern.h b/arch/um/drivers/mconsole_kern.h
+index 56d8d6a3ff76f6407f01872a5dbdb56bb78dff86..b7c3698282e54d1462124a77b6882d59e2c49826 100644
+--- a/arch/um/drivers/mconsole_kern.h
++++ b/arch/um/drivers/mconsole_kern.h
+@@ -14,6 +14,9 @@ struct mconsole_entry {
+ 	struct mc_request request;
+ };
+ 
++/* Record, in the interrupt, how many wakes the console has answered. */
++void mconsole_stamp_request(struct mc_request *req);
++
+ /* All these methods are called in process context. */
+ struct mc_device {
+ 	struct list_head list;

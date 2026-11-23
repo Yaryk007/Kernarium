@@ -140,7 +140,7 @@ class SourceTests(unittest.TestCase):
     def test_the_sources_compile_for_the_ios_sdk(self) -> None:
         done = subprocess.run(
             ["xcrun", "--sdk", "iphonesimulator", "swiftc", "-typecheck", "-swift-version", "5",
-             "-target", "arm64-apple-ios27.0-simulator",
+             "-target", "arm64-apple-ios26.0-simulator",
              "-enable-upcoming-feature", "MemberImportVisibility",
              "-enable-upcoming-feature", "NonisolatedNonsendingByDefault",
              "-enable-upcoming-feature", "InferIsolatedConformances",
@@ -169,7 +169,7 @@ class ProjectTests(unittest.TestCase):
         self.assertNotIn("DEVELOPMENT_TEAM", project)
         identifiers = set(re.findall(r"PRODUCT_BUNDLE_IDENTIFIER = (.*?);", project))
         self.assertEqual(identifiers, {'"$(KERNARIUM_BUNDLE_IDENTIFIER)AudioInterrupter"'})
-        self.assertIn("IPHONEOS_DEPLOYMENT_TARGET = 27.0;", project)
+        self.assertIn("IPHONEOS_DEPLOYMENT_TARGET = 26.0;", project)
 
     def test_the_scheme_builds_the_application(self) -> None:
         scheme = (PROJECT / "AudioInterrupter.xcodeproj/xcshareddata/xcschemes/AudioInterrupter.xcscheme").read_text()

@@ -142,7 +142,8 @@ void ContextMemoryLedger::contextCreated(
     context.name = std::string(debugName);
     context.owner = parseContextOwner(debugName);
     context.venus = venus;
-    context.lastActive = now;
+    context.allocatedAt = now;
+    context.commandAt = now;
     Change change(*this);
     destroyLocked(contextId);
     contexts_.emplace(contextId, std::move(context));
@@ -175,8 +176,10 @@ void ContextMemoryLedger::contextActive(
 {
     std::lock_guard lock(mutex_);
     const auto found = contexts_.find(contextId);
-    if (found != contexts_.end())
-        found->second.lastActive = std::max(found->second.lastActive, now);
+    if (found == contexts_.end())
+        return;
+    found->second.commandAt = std::max(found->second.commandAt, now);
+    found->second.commandWithdrawn = false;
 }
 
 void ContextMemoryLedger::rebaseLocked(
@@ -191,6 +194,10 @@ void ContextMemoryLedger::rebaseLocked(
             context != contexts_.end()) {
             auto& held = context->second.resourceBytes;
             held = held - std::min(held, previousBytes) + bytes;
+            if (bytes > previousBytes)
+                context->second.allocated();
+            else if (bytes < previousBytes)
+                context->second.released();
         }
     };
     rebase(resource.firstHolder);
@@ -238,6 +245,7 @@ void ContextMemoryLedger::blobMade(
     resource->second.add(contextId);
     heldResourceBytes_ += resource->second.bytes;
     context->second.resourceBytes += resource->second.bytes;
+    context->second.allocated();
 }
 
 bool ContextMemoryLedger::resourceAttached(
@@ -254,6 +262,7 @@ bool ContextMemoryLedger::resourceAttached(
     if (resource->second.otherHolders.empty())
         heldResourceBytes_ += resource->second.bytes;
     context->second.resourceBytes += resource->second.bytes;
+    context->second.allocated();
     return true;
 }
 
@@ -272,6 +281,8 @@ void ContextMemoryLedger::resourceDetached(
         context != contexts_.end()) {
         context->second.resourceBytes -=
             std::min(context->second.resourceBytes, resource->second.bytes);
+        if (resource->second.bytes != 0)
+            context->second.released();
     }
 }
 
@@ -287,6 +298,8 @@ void ContextMemoryLedger::resourceReleased(std::uint32_t resourceId) noexcept
             context != contexts_.end()) {
             context->second.resourceBytes -=
                 std::min(context->second.resourceBytes, resource.bytes);
+            if (resource.bytes != 0)
+                context->second.released();
         }
     };
     if (resource.held()) {
@@ -310,12 +323,16 @@ void ContextMemoryLedger::venusMemory(
         const auto grown = static_cast<std::uint64_t>(delta);
         held += grown;
         venusTotal_ += grown;
+        if (grown != 0)
+            found->second.allocated();
     } else {
         /* Unsigned negation, which is exact for every negative delta. */
         const auto shrunk = std::min(
             held, std::uint64_t {0} - static_cast<std::uint64_t>(delta));
         held -= shrunk;
         venusTotal_ -= std::min(venusTotal_, shrunk);
+        if (shrunk != 0)
+            found->second.released();
     }
 }
 
@@ -332,6 +349,25 @@ std::uint64_t ContextMemoryLedger::totalBytes() const noexcept
 {
     std::lock_guard lock(mutex_);
     return heldResourceBytes_ + venusTotal_;
+}
+
+std::uint32_t ContextMemoryLedger::processOf(
+    std::uint32_t contextId) const noexcept
+{
+    std::lock_guard lock(mutex_);
+    const auto found = contexts_.find(contextId);
+    return found != contexts_.end() && found->second.owner
+        ? found->second.owner->pid
+        : 0;
+}
+
+bool ContextMemoryLedger::hasProcess(std::uint32_t pid) const noexcept
+{
+    std::lock_guard lock(mutex_);
+    return std::any_of(contexts_.begin(), contexts_.end(),
+        [pid](const auto& entry) {
+            return entry.second.owner && entry.second.owner->pid == pid;
+        });
 }
 
 ContextMemoryLedger::Counts ContextMemoryLedger::counts() const noexcept
@@ -367,10 +403,10 @@ ContextMemoryLedger::Snapshot ContextMemoryLedger::snapshot(
                 group.holder.pid = context.owner ? context.owner->pid : 0;
                 group.holder.name =
                     context.owner ? context.owner->comm : context.name;
-                group.lastActive = context.lastActive;
+                group.lastActive = context.activeAt();
             } else {
                 group.lastActive =
-                    std::max(group.lastActive, context.lastActive);
+                    std::max(group.lastActive, context.activeAt());
             }
             ++group.holder.contexts;
             group.holder.bytes += bytes;

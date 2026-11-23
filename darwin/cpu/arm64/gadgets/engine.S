@@ -28,6 +28,10 @@
  * veneer at the end of its own, and its code reaches the base part's veneers
  * for the helpers the base parts already call. It holds no SVE or SME
  * instruction, and so runs outside streaming mode only.
+ * The run part comes last: the run heads branch into the bank and call no
+ * helper, and the same-base entries call only helpers the bank already calls,
+ * through its veneers, so where the part sits moves no entry of any other
+ * part.
  * The names are the arm64 engine's own, so the x86-64 engine's sections never
  * interleave with them in an image that carries both. */
 #define GADGET_SECTION_BANK __TEXT,__a64_bank,regular,pure_instructions
@@ -40,6 +44,7 @@
 #define GADGET_SECTION_A32_BANK __TEXT,__a32_bank,regular,pure_instructions
 #define GADGET_SECTION_A32_COLD __TEXT,__a32_cold,regular,pure_instructions
 #define GADGET_SECTION_A32_VENEER __TEXT,__a32_veneer,regular,pure_instructions
+#define GADGET_SECTION_RUNS __TEXT,__a64_runs,regular,pure_instructions
 
 /* Unreachable bytes ahead of each part's first entry, which set the part's
  * 64-byte phase. The bank's phase is the one the iPad measured fastest with
@@ -57,6 +62,7 @@
 #define GADGET_PHASE_A32_BANK 0
 #define GADGET_PHASE_A32_COLD 0
 #define GADGET_PHASE_A32_VENEER 0
+#define GADGET_PHASE_RUNS 0
 
 /* Zero-size bounds of each part, for the guest sampler's PC test. CSYM() is
  * not defined until core_integer.inc. */
@@ -134,6 +140,12 @@ _uml_arm64_gadget_region_\part:
 	.endif
 	gadget_bank_bound uml_arm64_gadget_a32_veneer_section_\edge
 	.popsection
+	.pushsection GADGET_SECTION_RUNS
+	.ifc \edge,begin
+	gadget_region_start runs, 6, GADGET_PHASE_RUNS
+	.endif
+	gadget_bank_bound uml_arm64_gadget_runs_section_\edge
+	.popsection
 .endm
 
 /* Nonzero while engine/sme.inc assembles the GPR memory families a second
@@ -185,9 +197,14 @@ Lveneer_\symbol:
 /* RET through X30 appends its entry after them: neither the bank nor the cold
  * part moves for it. */
 #include "engine/return_x30.inc"
+/* Only into the run part, after every other part. */
+#include "engine/run_heads.inc"
 /* Only into the SME part, after every base part's code. */
 #include "engine/sme.inc"
 /* Only into the AArch32 part's sections, after every part before it. */
 #include "engine/a32.inc"
+/* Only into the run part, behind the run heads, so no established gadget
+ * moves. */
+#include "engine/same_base.inc"
 	afp_twin_table_end
 	gadget_bank_bounds end

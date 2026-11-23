@@ -47,6 +47,8 @@ import android_launch_suite as launch_suite  # noqa: E402
 import android_provision  # noqa: E402
 import andarium  # noqa: E402
 import ios_device  # noqa: E402
+import ios_device_reports  # noqa: E402
+import ios_jit_debugger  # noqa: E402
 
 DEFAULT_ARTIFACT_ROOT = REPOSITORY / ".build" / "ios-device-android"
 DEFAULT_APPS_MANIFEST = Path(__file__).resolve().parent / (
@@ -89,9 +91,28 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cpus", type=int, default=2)
     parser.add_argument("--memory-mib", type=int, default=1536)
     parser.add_argument("--engine", choices=("gadgets", "jit"),
-                        default="gadgets")
+                        default="gadgets",
+                        help="jit turns on Andarium's JIT setting; the guest "
+                        "runs on the JIT only where a debugger prepares its "
+                        "memory (--jit-debugger), on gadgets otherwise")
+    parser.add_argument(
+        "--jit-debugger", choices=("stand-in", "none"),
+        help="stand-in launches the application stopped and serves its "
+        "request for executable memory with lldb "
+        "(tests/integration/support/ios_jit_debugger.py); none attaches "
+        "nothing, which with --engine jit shows the fall back to gadgets. "
+        "The default is stand-in with --engine jit and none otherwise; "
+        "stand-in with --engine gadgets shows the application letting an "
+        "attached debugger go when the JIT is off",
+    )
     parser.add_argument("--disk-size-gib", type=int,
                         help="the guest storage capacity")
+    parser.add_argument(
+        "--haptics", action="store_true",
+        help="this run tests haptics: the launch states no haptics setting, "
+        "so the application's own Haptics switch decides. Without it the "
+        "launch states ANDARIUM_HAPTICS=0 and the phone stays silent",
+    )
     parser.add_argument(
         "--setting", action="append", default=[], metavar="NAME=VALUE",
         help="another KERNARIUM_* or ANDARIUM_* launch setting",
@@ -147,7 +168,10 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--poll-interval", type=float, default=2.0)
     parser.add_argument("--artifact-root", type=Path,
                         default=DEFAULT_ARTIFACT_ROOT)
+    ios_device_reports.add_arguments(parser)
     options = parser.parse_args(argv)
+    if options.jit_debugger is None:
+        options.jit_debugger = "stand-in" if options.engine == "jit" else "none"
     if min(options.timeout, options.boot_timeout, options.launch_timeout,
            options.script_timeout, options.push_timeout,
            options.poweroff_timeout, options.install_timeout) < 1 or options.poll_interval <= 0:
@@ -322,6 +346,30 @@ class Adb:
     def disconnect(self) -> None:
         """Drop this guest's transport; the shared server stays up."""
         self.run("disconnect", self.serial, timeout=20, device=False)
+
+
+JIT_READY_LINE = "Andarium: JIT ready"
+JIT_FALLBACK_LINE = re.compile(r"Andarium: (Started without JIT: [^\n]*)")
+JIT_PREPARED = re.compile(
+    r"prepared 0x[0-9a-f]+\+0x([0-9a-f]+): ([0-9]+) pages in ([0-9.]+) s")
+
+
+def jit_record(transcript: str, debugger_log: Path) -> dict:
+    """What the application said about the JIT and what the debugger did: the
+    JIT ran, or the sentence it fell back to gadgets with, and the region the
+    debugger prepared with how long it took."""
+    record: dict = {"ran": JIT_READY_LINE in transcript, "fallback": None}
+    fallback = JIT_FALLBACK_LINE.search(transcript)
+    if fallback is not None:
+        record["fallback"] = fallback.group(1)
+    if debugger_log.exists():
+        prepared = JIT_PREPARED.search(
+            debugger_log.read_text(errors="replace"))
+        if prepared is not None:
+            record["region_bytes"] = int(prepared.group(1), 16)
+            record["region_pages"] = int(prepared.group(2))
+            record["bless_seconds"] = float(prepared.group(3))
+    return record
 
 
 def last_line(transcript: str) -> str:
@@ -587,6 +635,10 @@ class Run:
     summary: dict
     problems: list[str] = field(default_factory=list)
 
+    @property
+    def serves_jit(self) -> bool:
+        return self.options.jit_debugger == "stand-in"
+
     def check_unlocked(self) -> None:
         if ios_device.device_lock_state(self.options.device) == "locked":
             raise andarium.AndariumError(
@@ -597,6 +649,7 @@ class Run:
         """Install, boot, drive, power off; fills the summary."""
         options, plan = self.options, self.plan
         self.check_unlocked()
+        ios_device_reports.preflight(options, [andarium.APPLICATION])
         if options.app is not None:
             app = options.app.resolve()
             andarium.require_automation_app(app)
@@ -608,25 +661,51 @@ class Run:
         log = self.artifact / "console.log"
         self.summary["console"] = log.name
         started = time.monotonic()
+        debugger: subprocess.Popen[bytes] | None = None
         try:
+            # What the device lists before the launch is not the launch's
+            # process.
+            before = (
+                ios_jit_debugger.application_pids(options.device, "Andarium")
+                if self.serves_jit else set())
             with ios_device.Console(
-                options.device, andarium.APPLICATION, self.settings, log
+                options.device, andarium.APPLICATION, self.settings, log,
+                start_stopped=self.serves_jit,
             ) as console:
                 try:
+                    if self.serves_jit:
+                        debugger = ios_jit_debugger.start_serving(
+                            options.device,
+                            ios_jit_debugger.launched_pid(
+                                options.device, "Andarium", before,
+                                ios_jit_debugger.PID_TIMEOUT),
+                            self.artifact / "jit-debugger.log",
+                            output=self.artifact / "lldb.log")
                     with Iproxy(self.iproxy_program, options.device,
                                 self.host_port,
                                 self.artifact / "iproxy.log"):
                         self.drive(adb, console, started)
-                except (ios_device.DeviceError, subprocess.SubprocessError,
-                        OSError) as error:
+                except (ios_device.DeviceError, ios_jit_debugger.DebuggerError,
+                        subprocess.SubprocessError, OSError) as error:
                     self.problems.append(str(error))
+        except ios_jit_debugger.DebuggerError as error:
+            self.problems.append(str(error))
         finally:
             self.summary["seconds"] = round(time.monotonic() - started, 1)
+            if debugger is not None and debugger.poll() is None:
+                debugger.terminate()
+                try:
+                    debugger.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    debugger.kill()
             adb.disconnect()
             transcript = (
                 log.read_text(errors="replace") if log.exists() else ""
             )
             self.summary["thermal"] = andarium.thermal_record(transcript)
+            if self.options.engine == "jit" or self.serves_jit:
+                self.summary["jit"] = jit_record(
+                    transcript, self.artifact / "jit-debugger.log")
             if "boot_seconds" in self.summary and not (
                 self.summary["thermal"]["complete"]
             ):
@@ -699,6 +778,8 @@ def main(argv: list[str] | None = None) -> int:
             "engine": options.engine,
             "page_size": 4096,
         },
+        # Whether the phone's own haptics were left on for the run.
+        "haptics": options.haptics,
         "runtime_result": None,
         "workload": None,
     }
@@ -721,6 +802,7 @@ def main(argv: list[str] | None = None) -> int:
             engine=options.engine,
             host_port=host_port,
             disk_size_gib=options.disk_size_gib,
+            haptics=options.haptics,
             extra=parse_settings(options.setting),
         )
         artifact.mkdir(parents=True, exist_ok=False)

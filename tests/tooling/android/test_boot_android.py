@@ -120,6 +120,54 @@ class BootAndroidTests(unittest.TestCase):
         self.assertFalse(options.build)
         self.assertTrue(boot_android.parse_arguments(["--build"]).build)
 
+    def command_for(self, *arguments: str) -> list[str]:
+        options = boot_android.parse_arguments(list(arguments))
+        return boot_android.emulator_command(
+            options,
+            Path("/tmp/release"),
+            Path("/tmp/instance/data.img"),
+            Path("/tmp/uml-darwin-android17"),
+        )
+
+    def test_an_installation_has_an_identity_file_beside_its_data_disk(self) -> None:
+        command = self.command_for()
+        self.assertIn("--android-identity=/tmp/instance/identity.json", command)
+        # The command names the file and never a value of the installation.
+        self.assertFalse(any(
+            value.startswith(("--android-serialno", "--net-mac")) for value in command
+        ))
+
+    def test_values_a_run_states_replace_the_identity_file(self) -> None:
+        both = self.command_for("--serialno", "TESTSERIAL01", "--eth-mac", "02:AA:bb:cc:dd:ee")
+        self.assertIn("--android-serialno=TESTSERIAL01", both)
+        self.assertIn("--net-mac=02:aa:bb:cc:dd:ee", both)
+        self.assertFalse(any(value.startswith("--android-identity") for value in both))
+        # One value alone: the file is still not used, and the other value stays
+        # what the guest has without one.
+        serial = self.command_for("--serialno", "TESTSERIAL01")
+        self.assertIn("--android-serialno=TESTSERIAL01", serial)
+        self.assertFalse(any(value.startswith(("--net-mac", "--android-identity")) for value in serial))
+        mac = self.command_for("--eth-mac", "06:11:22:33:44:55")
+        self.assertIn("--net-mac=06:11:22:33:44:55", mac)
+        self.assertFalse(any(value.startswith(("--android-serialno", "--android-identity")) for value in mac))
+
+    def test_a_serial_and_an_address_that_cannot_be_the_guests_are_refused(self) -> None:
+        for arguments in (
+            ["--serialno", "abc"],
+            ["--serialno", "unknown"],
+            ["--serialno", "UNKNOWN"],
+            ["--serialno", "a" * 21],
+            ["--serialno", "abc def1"],
+            ["--eth-mac", "02:aa:bb:cc:dd"],
+            ["--eth-mac", "02-aa-bb-cc-dd-ee"],
+            ["--eth-mac", "03:aa:bb:cc:dd:ee"],
+            ["--eth-mac", "00:00:00:00:00:00"],
+            ["--eth-mac", "zz:aa:bb:cc:dd:ee"],
+        ):
+            with self.subTest(arguments=arguments), mock.patch("sys.stderr"):
+                with self.assertRaises(SystemExit):
+                    boot_android.parse_arguments(arguments)
+
     def test_vnc_display_names_its_port(self) -> None:
         options = boot_android.parse_arguments(
             ["--display", "vnc", "--vnc-port", "5931"]
@@ -233,6 +281,28 @@ class BootAndroidTests(unittest.TestCase):
             )
             self.assertIn(f"--android-boot-mode={mode}", command)
 
+    def test_root_asks_for_the_releases_root_ramdisk_and_is_off_by_default(self) -> None:
+        plain = boot_android.parse_arguments([])
+        self.assertFalse(plain.root)
+        self.assertNotIn(
+            "--android-root",
+            boot_android.emulator_command(plain, Path("/r"), Path("/i"), Path("/e")),
+        )
+        # Options a runner builds by hand, which have no root member, boot as before.
+        by_hand = argparse.Namespace(**{k: v for k, v in vars(plain).items() if k != "root"})
+        self.assertNotIn(
+            "--android-root",
+            boot_android.emulator_command(by_hand, Path("/r"), Path("/i"), Path("/e")),
+        )
+        options = boot_android.parse_arguments(["--root"])
+        command = boot_android.emulator_command(options, Path("/r"), Path("/i"), Path("/e"))
+        self.assertTrue(options.root)
+        self.assertEqual(command.count("--android-root"), 1)
+        # It rides beside the boot mode and never names a file: the ramdisk is the release's.
+        self.assertFalse(any(argument.startswith("--android-root=") for argument in command))
+        with self.assertRaises(SystemExit):
+            boot_android.parse_arguments(["--root=/some/boot.img"])
+
     def test_recovery_flag_selects_recovery_boot(self) -> None:
         options = boot_android.parse_arguments(["--recovery"])
         command = boot_android.emulator_command(
@@ -286,6 +356,53 @@ class BootAndroidTests(unittest.TestCase):
             with self.subTest(arguments=arguments):
                 with self.assertRaises(SystemExit):
                     boot_android.parse_arguments(arguments)
+
+    def test_memory_without_a_unit_is_refused_with_the_units_named(self) -> None:
+        # The kernel reads mem=4096 as 4096 bytes.
+        for value in ("4096", "512", "8192", "0", "67108863", "bogus", "16M", "1KB"):
+            with self.subTest(memory=value):
+                with mock.patch("sys.stderr") as stderr, self.assertRaises(SystemExit):
+                    boot_android.parse_arguments(["--memory", value])
+                message = "".join(call.args[0] for call in stderr.write.call_args_list)
+                self.assertIn(f"--memory {value}", message)
+        with mock.patch("sys.stderr") as stderr, self.assertRaises(SystemExit):
+            boot_android.parse_arguments(["--memory", "4096"])
+        message = "".join(call.args[0] for call in stderr.write.call_args_list)
+        self.assertIn("4096 bytes", message)
+        self.assertIn("K, M or G", message)
+        self.assertIn("4096M", message)
+
+    def test_memory_every_caller_passes_is_accepted(self) -> None:
+        # The launchers' defaults, the tests' sizes, and the other spellings
+        # the kernel reads as 64 MiB or more.
+        for value in (
+            "8G", "4G", "6G", "2G", "1G", "1536M", "4096M", "512M", "64M",
+            "4g", "0x40000000", "010000000000", "67108864", "8589934592", "1Gignored",
+        ):
+            with self.subTest(memory=value):
+                options = boot_android.parse_arguments(["--memory", value])
+                self.assertEqual(options.memory, value)
+                command = boot_android.emulator_command(
+                    options, Path("/r"), Path("/i"), Path("/e")
+                )
+                self.assertIn(f"mem={value}", command)
+        self.assertEqual(boot_android.parse_arguments([]).memory, "8G")
+
+    def test_memory_is_read_as_the_kernel_reads_it(self) -> None:
+        for text, size, has_unit in (
+            ("4096", 4096, False),
+            ("4096M", 4096 << 20, True),
+            ("4g", 4 << 30, True),
+            ("0x10", 16, False),
+            ("010", 8, False),
+            ("1Gignored", 1 << 30, True),
+            ("09G", 0, False),
+            ("bogus", 0, False),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    boot_android.kernel_memory_size(text), (size, has_unit)
+                )
 
     def test_default_instance_is_the_stable_directory(self) -> None:
         instance = boot_android.instance_path(None)
@@ -695,6 +812,39 @@ class BootAndroidTests(unittest.TestCase):
             self.assertEqual(state["release_id"], "rel-a")
             self.assertFalse((instance / "data.img").exists())
 
+    def test_a_release_number_updates_data_of_the_old_counter_and_not_back(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="android-launcher-") as temporary:
+            root = Path(temporary)
+            releases = root / "releases"
+            old = self.installed_release(releases, "rel-a", build=2026110817)
+            numbered = self.installed_release(releases, "rel-b", build=26)
+            instance = root / "instance"
+            self.run_main(root, old, instance)
+            (instance / "data.img").write_bytes(b"guest data")
+
+            result, _guest, popen = self.run_main(root, numbered, instance, booted=False)
+            self.assertEqual(result, 0)
+            popen.assert_called_once()
+            state = json.loads((instance / "instance.json").read_text())
+            self.assertEqual(state["release_id"], "rel-b")
+            self.assertEqual(state["build_incremental"], "26")
+            self.assertEqual(state["pending_update"]["to_release_id"], "rel-b")
+            self.assertEqual(state["pending_update"]["from"]["build_incremental"], "2026110817")
+            self.assertEqual((instance / "data.img.pre-rel-b").read_bytes(), b"guest data")
+
+            # A start that reaches boot_completed finishes the update.
+            self.run_main(root, numbered, instance, ["--retry"])
+            state = json.loads((instance / "instance.json").read_text())
+            self.assertIsNone(state["pending_update"])
+            self.assertFalse((instance / "data.img.pre-rel-b").exists())
+
+            # The old counter is older than the release number, so there is no way back.
+            before = (instance / "instance.json").read_bytes()
+            result, _guest, popen = self.run_main(root, old, instance)
+            self.assertEqual(result, 1)
+            popen.assert_not_called()
+            self.assertEqual((instance / "instance.json").read_bytes(), before)
+
     def test_dry_run_changes_nothing(self) -> None:
         with tempfile.TemporaryDirectory(prefix="android-launcher-") as temporary:
             root = Path(temporary)
@@ -706,6 +856,25 @@ class BootAndroidTests(unittest.TestCase):
                 "--dry-run", "--adb", str(adb),
             ])
             self.assertEqual(result, 0)
+            self.assertFalse(instance.exists())
+
+    def test_the_identity_file_is_the_emulators_to_make_and_the_start_leaves_it(self) -> None:
+        # The launcher passes the file's name; the instance's files do not gain one
+        # from the start, and a dry run prints the name and no value.
+        with tempfile.TemporaryDirectory(prefix="android-launcher-") as temporary:
+            root = Path(temporary)
+            release = self.installed_release(root / "releases")
+            _emulator, adb = self.fake_tools(root)
+            instance = root / "instance"
+            with mock.patch("builtins.print") as printed:
+                result = boot_android.main([
+                    "--release", str(release), "--instance", str(instance),
+                    "--dry-run", "--adb", str(adb),
+                ])
+            self.assertEqual(result, 0)
+            lines = [str(call.args[0]) for call in printed.call_args_list if call.args]
+            self.assertTrue(any(f"--android-identity={instance.resolve()}/identity.json" in line for line in lines))
+            self.assertFalse(any("--android-serialno" in line or "--net-mac" in line for line in lines))
             self.assertFalse(instance.exists())
 
     def test_the_emulator_leads_its_own_process_group(self) -> None:

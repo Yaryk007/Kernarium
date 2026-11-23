@@ -25,6 +25,14 @@ public:
 
     [[nodiscard]] virtual std::uint32_t width() const noexcept = 0;
     [[nodiscard]] virtual std::uint32_t height() const noexcept = 0;
+    /* The display's refresh rate (Display::refreshRate). */
+    [[nodiscard]] virtual std::uint32_t refreshRate() const noexcept
+    {
+        return 60;
+    }
+    /* The rate of the mode the device stated
+     * (Display::noteModeRefreshRate). */
+    virtual void noteModeRefreshRate(std::uint32_t) noexcept {}
     [[nodiscard]] virtual bool guestScanoutChanged(
         std::uint32_t width,
         std::uint32_t height) noexcept = 0;
@@ -32,6 +40,8 @@ public:
     virtual void clear() noexcept = 0;
     /* A display keeps the flag itself; a fake that records it overrides this. */
     virtual void setGuestScanoutActive(bool) noexcept {}
+    /* Likewise the guest scanout's size (Display::setGuestScanoutMode). */
+    virtual void setGuestScanoutMode(std::uint32_t, std::uint32_t) noexcept {}
     /* A display counts the refusals itself; a fake that records them
      * overrides this. */
     virtual void recordMemoryRefusal() noexcept {}
@@ -41,6 +51,13 @@ public:
     {
         return 0;
     }
+    /* The allocations that waited for the guest's reclaimer
+     * (Display::memoryWaits). */
+    [[nodiscard]] virtual std::uint64_t memoryWaits() const noexcept
+    {
+        return 0;
+    }
+    void setGuestReclaimTerms(std::uint64_t, std::uint32_t) noexcept {}
     /* A display keeps whether a guest reclaimer acts on the memory reports
      * (Display::guestReclaims); the device's test double keeps it here. */
     void setGuestReclaims(bool reclaims) noexcept { guestReclaims_ = reclaims; }

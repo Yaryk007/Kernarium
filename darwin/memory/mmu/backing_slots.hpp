@@ -17,20 +17,22 @@ namespace uml::memory {
 /* The backings and descriptors a generation's fill-index words name.
  *
  * A word has six bits for them, so a generation numbers its distinct
- * (backing, descriptor) pairs 0 to 62 and each slot counts the pages that
- * lie in it. A guest process maps one or two (the guest RAM file, mostly), so
- * the table is tiny and a page pays six bits instead of a reference to
- * its backing. A slot is released when its count reaches 0.
+ * (backing, descriptor, immutable) triples 0 to 62 and each slot counts the
+ * pages that lie in it. The kernel's immutable fact rides in the key because
+ * a word has no spare bit for it. A guest process maps one or two (the guest
+ * RAM file, mostly), so the table is tiny and a page pays six bits instead of
+ * a reference to its backing. A slot is released when its count reaches 0.
  *
  * A process can map more: many GPU blobs, one per descriptor. Slot 63 sends a
- * reader to an overflow table that records the pair per page, which costs what
- * a page cost before slots and keeps the index exact whatever the guest maps.
+ * reader to an overflow table that records the triple per page, which costs
+ * what a page cost before slots and keeps the index exact whatever the guest
+ * maps.
  *
  * Writers hold the generation's mapping lock exclusive and readers hold it
  * shared; nothing here is read without it. A change is made in steps so that
  * the step that can fail comes first:
  *
- *   claim()            finds or takes the slot of a pair; no allocation;
+ *   claim()            finds or takes the slot of a triple; no allocation;
  *   reserve_overflow() makes room for a page in the overflow table, the only
  *                      step that allocates;
  *   add(), remove()    count the page in or out; no allocation;
@@ -46,6 +48,7 @@ public:
 	struct Entry final {
 		MappedBacking *backing;
 		int fd;
+		bool immutable;
 	};
 
 	/* What the word of `page`, which names `slot`, maps into. A null backing
@@ -53,27 +56,44 @@ public:
 	[[nodiscard]] Entry entry(unsigned slot, std::uint64_t page) const noexcept
 	{
 		if (slot < slot_count)
-			return {slots_[slot].backing.get(), slots_[slot].fd};
+			return {slots_[slot].backing.get(), slots_[slot].fd,
+				slots_[slot].immutable};
 		const auto found = overflow_.find(page);
-		return found == overflow_.end() ? Entry{nullptr, -1} :
-			Entry{found->second.backing.get(), found->second.fd};
+		return found == overflow_.end() ? Entry{nullptr, -1, false} :
+			Entry{found->second.backing.get(), found->second.fd,
+				found->second.immutable};
 	}
 
-	/* The slot of the pair, taking a free one with no pages yet if it has
-	 * none; `overflow` when all are taken. */
+	/* The owner of the backing the word of `page`, which names `slot`, maps
+	 * into: for a caller that needs it beyond an overwrite of the entry. */
+	[[nodiscard]] std::shared_ptr<MappedBacking> owner(
+		unsigned slot, std::uint64_t page) const
+	{
+		if (slot < slot_count)
+			return slots_[slot].backing;
+		const auto found = overflow_.find(page);
+		return found == overflow_.end() ? nullptr : found->second.backing;
+	}
+
+	/* The slot of the (backing, descriptor, immutable) triple, taking a free
+	 * one with no pages yet if it has none; `overflow` when all are taken.
+	 * The immutable fact is part of the key because a word has no bit for
+	 * it: two mappings of one frame that disagree sit in different slots. */
 	[[nodiscard]] unsigned claim(
-		const std::shared_ptr<MappedBacking> &backing, int fd) noexcept
+		const std::shared_ptr<MappedBacking> &backing, int fd,
+		bool immutable) noexcept
 	{
 		unsigned free_slot = overflow;
 		for (unsigned slot = 0; slot < slot_count; ++slot) {
 			const auto &held = slots_[slot];
-			if (held.backing == backing && held.fd == fd)
+			if (held.backing == backing && held.fd == fd &&
+			    held.immutable == immutable)
 				return slot;
 			if (!held.backing && free_slot == overflow)
 				free_slot = slot;
 		}
 		if (free_slot != overflow) {
-			slots_[free_slot] = {backing, fd, 0};
+			slots_[free_slot] = {backing, fd, immutable, 0};
 			touched_ |= std::uint64_t{1} << free_slot;
 		}
 		return free_slot;
@@ -86,10 +106,11 @@ public:
 			++unfilled_;
 	}
 
-	/* Counts `page` into `slot`, or records its pair in the overflow table,
+	/* Counts `page` into `slot`, or records its triple in the overflow table,
 	 * where reserve_overflow() made room. */
 	void add(unsigned slot, std::uint64_t page,
-		const std::shared_ptr<MappedBacking> &backing, int fd) noexcept
+		const std::shared_ptr<MappedBacking> &backing, int fd,
+		bool immutable) noexcept
 	{
 		if (slot < slot_count) {
 			++slots_[slot].pages;
@@ -100,7 +121,7 @@ public:
 			return;
 		if (!found->second.backing)
 			--unfilled_;
-		found->second = {backing, fd};
+		found->second = {backing, fd, immutable};
 	}
 
 	/* Counts `page` out of `slot`, or drops it from the overflow table. */
@@ -165,11 +186,13 @@ private:
 	struct Slot final {
 		std::shared_ptr<MappedBacking> backing;
 		int fd{-1};
+		bool immutable{};
 		std::uint64_t pages{};
 	};
 	struct OverflowPage final {
 		std::shared_ptr<MappedBacking> backing;
 		int fd{-1};
+		bool immutable{};
 	};
 
 	std::array<Slot, slot_count> slots_{};

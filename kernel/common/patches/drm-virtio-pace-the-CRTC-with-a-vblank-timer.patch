@@ -20,6 +20,33 @@ something holds a vblank reference, so an idle display costs nothing. A
 client that flips faster than the refresh rate is now held to it, since
 the next commit waits for the previous flip event.
 
+The helpers started a timer that had stopped for want of a reference
+one period after the enable, and the count and timestamp that the
+enable stored were the time of the enable. Every restart after an idle
+gap moved the grid of ticks, so a compositor that predicts its next
+vblank from the last timestamp was off by up to a period after each
+gap. Keep the grid across the gap instead:
+
+ - a timer that starts again with the frame duration it last ran at
+   expires first at its old expiry plus the fewest whole frames that
+   put it in the future, whether that expiry fired or was cancelled
+   pending;
+ - the first start of a CRTC, a change of the frame duration, and a
+   modeset or resume start a new grid. The last two pass through
+   drm_crtc_vblank_off() and drm_crtc_vblank_on(), which store the
+   present as the last vblank, so a count continuing the old grid would
+   run backwards;
+ - while the timer is armed, its timestamp for the vblank counter is
+   the grid point before the next expiry, also in the enable that arms
+   it. The core, which derives the count of a driver without a hardware
+   counter from the timestamps, then adds the whole frames of the gap
+   and stores a timestamp on the grid. A timer that is not armed stands
+   for the present.
+
+A vblank wait or a flip event after an idle gap thus reports a count
+that advanced by the frames that elapsed and a timestamp on the grid it
+had before, as a display that kept refreshing would.
+
 The commit tail waits for the commit's own flip event rather than
 counting a vblank, as the default tail does. The default wait warns when
 it sees no vblank within 100 ms, which a loaded host can cause by
@@ -33,9 +60,135 @@ that a client queues next is refused with -EBUSY for up to a tick.
 
 Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
 ---
- drivers/gpu/drm/virtio/virtgpu_display.c | 54 ++++++++++++++++++++++++
- 1 file changed, 54 insertions(+)
+ drivers/gpu/drm/drm_vblank.c             | 60 +++++++++++++++++++++---
+ drivers/gpu/drm/virtio/virtgpu_display.c | 54 +++++++++++++++++++++
+ include/drm/drm_vblank.h                 |  7 +++
+ 3 files changed, 114 insertions(+), 7 deletions(-)
 
+diff --git a/drivers/gpu/drm/drm_vblank.c b/drivers/gpu/drm/drm_vblank.c
+index 451ec96202266e7c345219d35b1c5983660f68aa..b4a172dee4431e1536f8fd07aaf0646dcc541489 100644
+--- a/drivers/gpu/drm/drm_vblank.c
++++ b/drivers/gpu/drm/drm_vblank.c
+@@ -247,6 +247,7 @@ static u32 __get_vblank_counter(struct drm_device *dev, unsigned int pipe)
+  */
+ static void drm_reset_vblank_timestamp(struct drm_device *dev, unsigned int pipe)
+ {
++	struct drm_vblank_crtc *vblank = drm_vblank_crtc(dev, pipe);
+ 	u32 cur_vblank;
+ 	bool rc;
+ 	ktime_t t_vblank;
+@@ -254,6 +255,12 @@ static void drm_reset_vblank_timestamp(struct drm_device *dev, unsigned int pipe
+ 
+ 	spin_lock(&dev->vblank_time_lock);
+ 
++	/*
++	 * The stored timestamp restarts here, at the present, so a vblank
++	 * timer that ran before no longer has a grid the count continues on.
++	 */
++	vblank->vblank_timer.grid_interval = 0;
++
+ 	/*
+ 	 * sample the current counter to avoid random jumps
+ 	 * when drm_vblank_enable() applies the diff
+@@ -2216,8 +2223,18 @@ static enum hrtimer_restart drm_vblank_timer_function(struct hrtimer *timer)
+  * @crtc: the CRTC
+  *
+  * Drivers should call this function from their CRTC's enable_vblank
+- * function to start a vblank timer. The timer will fire after the duration
+- * of a full frame. drm_crtc_vblank_cancel_timer() disables a running timer.
++ * function to start a vblank timer. drm_crtc_vblank_cancel_timer() disables a
++ * running timer.
++ *
++ * The first timer of a CRTC, and the first one after the CRTC's vblank was
++ * turned off and on again with drm_crtc_vblank_off() and drm_crtc_vblank_on()
++ * or after the frame duration changed, fires after the duration of a full
++ * frame. One that is started again after a cancellation with the same frame
++ * duration keeps the grid it ran on: it fires at the first of the instants it
++ * would have fired at had it never stopped that lies in the future, so the
++ * vblanks that follow are on the same grid as the ones before the stop, and
++ * the vblank counter, which the core derives from the timestamps for a driver
++ * without a hardware counter, advances by the whole frames that elapsed.
+  *
+  * Returns:
+  * 0 on success, or a negative errno code otherwise.
+@@ -2227,6 +2244,9 @@ int drm_crtc_vblank_start_timer(struct drm_crtc *crtc)
+ 	struct drm_vblank_crtc *vblank = drm_crtc_vblank_crtc(crtc);
+ 	struct drm_vblank_crtc_timer *vtimer = &vblank->vblank_timer;
+ 	unsigned long flags;
++	ktime_t interval;
++
++	assert_spin_locked(&crtc->dev->vblank_time_lock);
+ 
+ 	if (!vtimer->crtc) {
+ 		/*
+@@ -2246,12 +2266,24 @@ int drm_crtc_vblank_start_timer(struct drm_crtc *crtc)
+ 	}
+ 
+ 	drm_calc_timestamping_constants(crtc, &crtc->mode);
++	interval = ns_to_ktime(vblank->framedur_ns);
+ 
+ 	spin_lock_irqsave(&vtimer->interval_lock, flags);
+-	vtimer->interval = ns_to_ktime(vblank->framedur_ns);
++	vtimer->interval = interval;
+ 	spin_unlock_irqrestore(&vtimer->interval_lock, flags);
+ 
+-	hrtimer_start(&vtimer->timer, vtimer->interval, HRTIMER_MODE_REL);
++	if (vtimer->grid_interval && vtimer->grid_interval == interval) {
++		/*
++		 * The expiry the timer last had lies on its grid, whether it
++		 * fired or was cancelled while pending. Move it on by whole
++		 * frames to the first one after now.
++		 */
++		hrtimer_forward_now(&vtimer->timer, interval);
++		hrtimer_start_expires(&vtimer->timer, HRTIMER_MODE_ABS);
++	} else {
++		hrtimer_start(&vtimer->timer, interval, HRTIMER_MODE_REL);
++	}
++	vtimer->grid_interval = interval;
+ 
+ 	return 0;
+ }
+@@ -2292,7 +2324,8 @@ EXPORT_SYMBOL(drm_crtc_vblank_cancel_timer);
+  *
+  * The helper drm_crtc_vblank_get_vblank_timeout() returns the next vblank
+  * timestamp of the CRTC's vblank timer according to the timer's expiry
+- * time.
++ * time. A timer that is not running has no vblank to report and stands for
++ * the present.
+  */
+ void drm_crtc_vblank_get_vblank_timeout(struct drm_crtc *crtc, ktime_t *vblank_time)
+ {
+@@ -2300,8 +2333,21 @@ void drm_crtc_vblank_get_vblank_timeout(struct drm_crtc *crtc, ktime_t *vblank_t
+ 	struct drm_vblank_crtc_timer *vtimer = &vblank->vblank_timer;
+ 	u64 cur_count;
+ 	ktime_t cur_time;
++	ktime_t interval;
++	unsigned long flags;
+ 
+-	if (!READ_ONCE(vblank->enabled)) {
++	/*
++	 * The timer is armed before the core marks the vblank enabled and
++	 * counts the vblanks that passed while it was off. The vblank to count
++	 * then is the one before the timer's first expiry, which is on the
++	 * timer's grid, not the present: a count and a timestamp that stand
++	 * for an instant in between would not continue the grid.
++	 */
++	spin_lock_irqsave(&vtimer->interval_lock, flags);
++	interval = vtimer->interval;
++	spin_unlock_irqrestore(&vtimer->interval_lock, flags);
++
++	if (!interval) {
+ 		*vblank_time = ktime_get();
+ 		return;
+ 	}
+@@ -2327,6 +2373,6 @@ void drm_crtc_vblank_get_vblank_timeout(struct drm_crtc *crtc, ktime_t *vblank_t
+ 	 * and what the vblank core expects. Therefore we need to always
+ 	 * correct the timestamp by one frame.
+ 	 */
+-	*vblank_time = ktime_sub(*vblank_time, vtimer->interval);
++	*vblank_time = ktime_sub(*vblank_time, interval);
+ }
+ EXPORT_SYMBOL(drm_crtc_vblank_get_vblank_timeout);
 diff --git a/drivers/gpu/drm/virtio/virtgpu_display.c b/drivers/gpu/drm/virtio/virtgpu_display.c
 index e265a06f2c06ab2b9c79384346cfcf8278bffe3b..7c31ff32787d99f2b4df14bdbe3e9a199ba6f6f3 100644
 --- a/drivers/gpu/drm/virtio/virtgpu_display.c
@@ -145,3 +298,21 @@ index e265a06f2c06ab2b9c79384346cfcf8278bffe3b..7c31ff32787d99f2b4df14bdbe3e9a19
  
  	/* modes will be validated against the framebuffer size */
  	vgdev->ddev->mode_config.min_width = XRES_MIN;
+diff --git a/include/drm/drm_vblank.h b/include/drm/drm_vblank.h
+index ffa564d79638494c5c51561422786763086d67ba..d643e5251a8ddffda9f0643a8752f9915d213a79 100644
+--- a/include/drm/drm_vblank.h
++++ b/include/drm/drm_vblank.h
+@@ -120,6 +120,13 @@ struct drm_vblank_crtc_timer {
+ 	 * @interval: Duration between two vblanks
+ 	 */
+ 	ktime_t interval;
++	/**
++	 * @grid_interval: Duration between two vblanks of the grid that the
++	 * timer's last expiry lies on, or zero when there is no such grid. A
++	 * timer that starts again with the same duration keeps the grid.
++	 * Protected by &drm_device.vblank_time_lock.
++	 */
++	ktime_t grid_interval;
+ 	/**
+ 	 * @crtc: The timer's CRTC
+ 	 */

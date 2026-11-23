@@ -44,6 +44,12 @@
 #define UML_GADGET_CPU_RETURN_MASK (UML_GADGET_RETURN_STACK_ENTRIES - 1)
 #define UML_GADGET_CPU_TARGET_TIER 1184
 #define UML_GADGET_TARGET_TIER_BITS 10
+/* A gadget BlockLink (gadgets/program.hpp): the pair {first entry, stream}
+ * at UML_GADGET_LINK_PAIR, and, as offsets from the stream a pair names, the
+ * linked block's guest PC and its one-byte instruction count. */
+#define UML_GADGET_LINK_PAIR 16
+#define UML_GADGET_LINK_HEADER_PC (-24)
+#define UML_GADGET_LINK_HEADER_COUNT (-10)
 
 /* SME state (cpu/arm64/sme_profile.hpp), for both engines. The register file
  * lies behind UML_ARM64_CPU_SME_REGISTERS and is sized for the SVL in

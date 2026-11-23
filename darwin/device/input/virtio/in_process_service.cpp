@@ -6,11 +6,34 @@
 
 namespace uml::input::virtio {
 
+namespace {
+
+const char* threadName(DeviceKind kind) noexcept
+{
+    switch (kind) {
+    case DeviceKind::touchscreen:
+        return "uml-touch";
+    case DeviceKind::keyboard:
+        return "uml-keyboard";
+    case DeviceKind::hardwareKeyboard:
+        return "uml-hwkeyboard";
+    case DeviceKind::mouse:
+        return "uml-mouse";
+    case DeviceKind::pointer:
+        return "uml-pointer";
+    }
+    return "uml-input";
+}
+
+} // namespace
+
 InProcessInputService::InProcessInputService(DeviceKind kind)
-    : events_(std::make_shared<EventQueue>())
+    : events_(std::make_shared<EventQueue>(
+          pluggable(kind) ? EventQueue::Attachment::pluggable :
+                            EventQueue::Attachment::fixed))
     , service_(std::make_unique<uml::gpu::InProcessVhostUserService>(
           "virtio-input",
-          kind == DeviceKind::touchscreen ? "uml-touch" : "uml-keyboard",
+          threadName(kind),
           [kind, events = events_] {
               return std::make_unique<VirtioInputDevice>(kind, events);
           }))

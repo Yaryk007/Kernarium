@@ -231,8 +231,7 @@ unary_width 64, ldr, str, x, x
 gadget \operation\()_\width\()_rm
 	effective_address
 	mov x25, x7
-	page_cross_check (\width / 8), Lx86_arithmetic_rm_cross\@
-	translate 0, UML_X86_64_TLB_READ_PAGE, (\width / 8)
+	translate 0, UML_X86_64_TLB_READ_PAGE, (\width / 8), cross=Lx86_arithmetic_rm_cross\@
 	\load \host_register\()12, [x7]
 Lx86_arithmetic_rm_loaded\@:
 	and x8, x23, #0xffff
@@ -290,8 +289,7 @@ Lx86_arithmetic_msource_exclusive\@:
 Lx86_arithmetic_msource_split\@:
 	split_operand (\width / 8), Lx86_arithmetic_msource_exclusive\@
 	.endif
-	page_cross_check (\width / 8), Lx86_arithmetic_msource_read_cross\@
-	translate 0, UML_X86_64_TLB_READ_PAGE, (\width / 8)
+	translate 0, UML_X86_64_TLB_READ_PAGE, (\width / 8), cross=Lx86_arithmetic_msource_read_cross\@
 	\load \host_register\()24, [x7]
 Lx86_arithmetic_msource_read\@:
 	\instruction \host_register\()27, \host_register\()24, \host_register\()26
@@ -305,8 +303,7 @@ Lx86_arithmetic_msource_read\@:
 	.endif
 	.if \writes
 	mov x7, x25
-	page_cross_check (\width / 8), Lx86_arithmetic_msource_write_cross\@
-	translate 1, UML_X86_64_TLB_WRITE_PAGE, (\width / 8)
+	translate 1, UML_X86_64_TLB_WRITE_PAGE, (\width / 8), cross=Lx86_arithmetic_msource_write_cross\@
 	\store \host_register\()27, [x7]
 Lx86_arithmetic_msource_written\@:
 	.if \locked
@@ -406,8 +403,7 @@ Lx86_carry_msource_split\@:
 	\instruction \host_register\()27, \host_register\()27, \host_register\()19
 	normalize_result \width, \host_register\()27
 	mov x7, x25
-	page_cross_check (\width / 8), Lx86_carry_msource_write_cross\@
-	translate 1, UML_X86_64_TLB_WRITE_PAGE, (\width / 8)
+	translate 1, UML_X86_64_TLB_WRITE_PAGE, (\width / 8), cross=Lx86_carry_msource_write_cross\@
 	\store \host_register\()27, [x7]
 	b Lx86_carry_msource_written\@
 Lx86_carry_msource_write_cross\@:
@@ -468,8 +464,7 @@ Lx86_exchange_split\@:
 	split_operand (\width / 8), Lx86_exchange_exclusive\@
 	read_operand (\width / 8), \load, \host_register, 24
 	mov x7, x25
-	page_cross_check (\width / 8), Lx86_exchange_write_cross\@
-	translate 1, UML_X86_64_TLB_WRITE_PAGE, (\width / 8)
+	translate 1, UML_X86_64_TLB_WRITE_PAGE, (\width / 8), cross=Lx86_exchange_write_cross\@
 	\store \host_register\()26, [x7]
 	b Lx86_exchange_written\@
 Lx86_exchange_write_cross\@:
@@ -557,8 +552,7 @@ Lx86_unary_split\@:
 	memory_unary_compute \instruction, \host_register
 	normalize_result \width, \host_register\()27
 	mov x7, x25
-	page_cross_check (\width / 8), Lx86_unary_write_cross\@
-	translate 1, UML_X86_64_TLB_WRITE_PAGE, (\width / 8)
+	translate 1, UML_X86_64_TLB_WRITE_PAGE, (\width / 8), cross=Lx86_unary_write_cross\@
 	\store \host_register\()27, [x7]
 	b Lx86_unary_written\@
 Lx86_unary_write_cross\@:

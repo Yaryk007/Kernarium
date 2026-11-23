@@ -24,7 +24,8 @@ nonisolated struct SpaceHarness: Sendable {
     let enabled: Bool
     let directory: URL
 
-    /// The device's free space, or what the harness says it is.
+    /// The space a write can use on the device (`HostStorage`), or what the
+    /// harness says it is.
     @Sendable
     func freeSpace() -> UInt64 {
         guard enabled,

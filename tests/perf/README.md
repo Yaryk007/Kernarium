@@ -25,8 +25,10 @@ its script own its options and its output.
   host, never write into the application container, and never pass
   `--remove-existing-content`. Hold exclusive use of the device for the whole
   run and settle about 45 s between runs, because iOS releases the previous
-  guest's wired window asynchronously. Attached Instruments or other sampling
-  turns a run into a diagnostic capture.
+  guest's wired window asynchronously. Every device runner first guarantees
+  free diagnostic-report slots on the device ([testing](../../docs/testing.md)).
+  Attached Instruments or other sampling turns a run into a diagnostic
+  capture.
 - Summarize an accepted or rejected trial in
   [`../../docs/optimization-history.md`](../../docs/optimization-history.md).
   Do not add raw profiles, temporary paths, or a separate investigation
@@ -138,14 +140,22 @@ not measurements. `check-unit-census` checks such a build
 
 ## Focused assembly probes
 
-[`probes.tsv`](probes.tsv) is the complete inventory of freestanding A64 probe
-sources, with each one's mechanism, required guest feature, runner and
-retained purpose. [`CMakeLists.txt`](CMakeLists.txt) builds every row, so a
+[`probes.tsv`](probes.tsv) is the complete inventory of freestanding A64 and
+x86-64 probe sources, with each one's mechanism, required guest feature, runner
+and retained purpose. [`CMakeLists.txt`](CMakeLists.txt) builds every row, so a
 row without its source fails the build; keep one row per `guest_*.S` file.
 Build all probes with the `performance-probe-binaries` target and run one
 through the runner `probes.tsv` names. Probes are self-checking and succeed
 only when the measured guest command finishes, the guest shuts down, and the
 emulator exits zero. They are not CTest registrations.
+
+A row whose required feature is `x86-64` is a `guest_x86_64_*.S` probe on
+[`x86_64_probe_harness.inc`](x86_64_probe_harness.inc). It runs in an x86-64
+guest: the `macos-x86_64` emulator with an x86-64 image as `--rootfs`. Its
+setup jumps to the measured loop, the loop's back edge is followed by a jump to
+the result check, and the data the loop reads is assembled rather than filled
+at run time, so the engine translates the loop in blocks of its own with only
+the setup's blocks in front of them.
 
 The `guest_tagged_*_loop.S` probes reach memory through a pointer tagged in its
 top byte, as a process with heap pointer tagging does; the emulator ignores

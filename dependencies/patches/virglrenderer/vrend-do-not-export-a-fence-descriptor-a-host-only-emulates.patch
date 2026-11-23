@@ -25,7 +25,7 @@ into an open-ended wait on a GPU timeline.
  1 file changed, 13 insertions(+)
 
 diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
-index b495975eda721276b039b9d60a9d77cc5c377d63..15aa830d39dcff2d6c71e7cdb22509e4ae5602a2 100644
+index 6cd3264a81b71c70dd7f3861bb2c55b860146f65..700c3ac9d63eed9568f0607c3a1b1e83b45856be 100644
 --- a/src/vrend/vrend_renderer.c
 +++ b/src/vrend/vrend_renderer.c
 @@ -7798,7 +7798,20 @@ int vrend_renderer_init(const struct vrend_if_cbs *cbs, uint32_t flags)

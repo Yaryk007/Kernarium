@@ -11,12 +11,15 @@ DISK_TOOL="$ANDROID_ROOT/tools/ubd-disk.py"
 BOOT_IMAGE_TOOL="$ANDROID_ROOT/tools/boot-image.py"
 INITRAMFS_VERIFIER="$ANDROID_ROOT/tools/verify-initramfs.py"
 RECOVERY_VERIFIER="$ANDROID_ROOT/tools/verify-lineage-recovery.py"
+MAGISK_BOOT_TOOL="$ANDROID_ROOT/tools/magisk-boot.py"
+MAGISK_VERIFIER="$ANDROID_ROOT/tools/verify-magisk-boot.py"
 
 TARGET_FILES=
 SIGNED_OPTION=
 KERNEL_ARTIFACT=
 MKBOOTFS=
 MKBOOTIMG=
+MAGISK_APK=
 OUTPUT_DIR=
 WORK_DIR=
 
@@ -31,10 +34,17 @@ Usage: android/lineage-24/build/assemble-image.sh \
        --kernel-artifact ABSOLUTE_PATH \
        --mkbootfs ABSOLUTE_PATH \
        --mkbootimg ABSOLUTE_PATH \
-       --output-dir ABSOLUTE_PATH [--signed]
+       --output-dir ABSOLUTE_PATH [--signed] [--magisk-apk ABSOLUTE_PATH]
 
 --signed marks the target files as the signed archive of a release, which the
 verifier then requires to trust the release certificate alone.
+
+--magisk-apk is the official APK of the Magisk release that
+metadata/magisk.env pins. With it, the assembled disk's own init_boot is also
+patched by Magisk's patcher (tools/magisk-boot.py), verified against the stock
+image, and the output directory receives root/ beside the two files: the patched
+init_boot-magisk.img and the unmodified APK, which a release carries as its root
+files.
 
 Run locally on the x86_64 Linux builder after build-aosp.sh. The target-files
 staging directory must remain beside its .zip archive. The generic and UML
@@ -47,8 +57,8 @@ files, expanded here) are packed, each exactly its raw image rounded up to
 partition-layout.json beside it, with a SHA-256 for every partition and the
 data disk template the host turns into each guest's writable disk. Neither the
 seed userdata and metadata images nor a misc partition are assembled: the app
-creates the writable disk. The output directory receives the two files; an
-existing file is never replaced.
+creates the writable disk. The output directory receives the two files (and
+root/ with --magisk-apk); an existing file is never replaced.
 EOF
 }
 
@@ -91,6 +101,11 @@ while [[ $# -gt 0 ]]; do
 		OUTPUT_DIR=$2
 		shift 2
 		;;
+	--magisk-apk)
+		[[ $# -ge 2 ]] || fail "--magisk-apk requires a path"
+		MAGISK_APK=$2
+		shift 2
+		;;
 	-h|--help)
 		usage
 		exit 0
@@ -109,6 +124,13 @@ absolute_path "kernel artifact" "$KERNEL_ARTIFACT"
 absolute_path "mkbootfs" "$MKBOOTFS"
 absolute_path "mkbootimg" "$MKBOOTIMG"
 absolute_path "output directory" "$OUTPUT_DIR"
+if [[ -n "$MAGISK_APK" ]]; then
+	absolute_path "Magisk APK" "$MAGISK_APK"
+	[[ -x "$MAGISK_BOOT_TOOL" ]] || fail "Magisk boot patcher is missing"
+	[[ -x "$MAGISK_VERIFIER" ]] || fail "Magisk boot image verifier is missing"
+	[[ -f "$MAGISK_APK" && ! -L "$MAGISK_APK" ]] ||
+		fail "Magisk APK must be a regular non-symlink file"
+fi
 [[ "$(uname -s)" == Linux ]] || fail "builder host must be Linux"
 [[ "$(uname -m)" == x86_64 ]] || fail "builder host must be x86_64"
 [[ -x "$TARGET_FILES_VERIFIER" ]] || fail "target-files verifier is missing"
@@ -197,4 +219,11 @@ DISK="$OUTPUT_DIR/system.img"
 	--partition recovery
 "$RECOVERY_VERIFIER" --android-root "$ANDROID_ROOT" \
 	--layout "$LAYOUT" --disk "$DISK"
+if [[ -n "$MAGISK_APK" ]]; then
+	ROOT_DIR="$OUTPUT_DIR/root"
+	"$MAGISK_BOOT_TOOL" patch --magisk-apk "$MAGISK_APK" \
+		--disk "$DISK" --layout "$LAYOUT" --output-dir "$ROOT_DIR"
+	"$MAGISK_VERIFIER" --pin --image "$ROOT_DIR/init_boot-magisk.img" \
+		--apk "$MAGISK_APK" --disk "$DISK" --layout "$LAYOUT"
+fi
 printf '%s\n' "assembled the Android 17 system disk: $DISK"

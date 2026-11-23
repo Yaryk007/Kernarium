@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 00:50:59 +0000
+Subject: [PATCH] leave a camera's output as the camera wrote it
+
+A buffer the camera writes was taken for a buffer the host writes, so every CPU mapping of it for
+reading transferred the host copy over the guest pages. The camera device writes the guest pages of
+a frame, the way the video decoder does and for the same reason a decoder's output needed
+"leave a decoder's output as the decoder wrote it": the transfer replaces the picture with whatever
+the host copy held.
+
+The camera flag no longer makes a mapping transfer from the host. A buffer that is also rendered
+into still does.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ virtgpu_virgl.c | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/virtgpu_virgl.c b/virtgpu_virgl.c
+index cdb3c67b32be3b3b86cf66f94852b43b2f472077..bc759949efd1973cba48c49eca7db8e534dacd88 100644
+--- a/virtgpu_virgl.c
++++ b/virtgpu_virgl.c
+@@ -1340,8 +1340,10 @@ static int virgl_bo_invalidate(struct bo *bo, struct mapping *mapping)
+ 	// use the format to determine whether this buffer could be encoder/decoder output.
+ 	// A decoder writes the guest pages of its output buffer and never the host copy, so
+ 	// a transfer from the host would replace the decoded picture with stale contents,
+-	// and the decoder flag is not a host write.
+-	host_write_flags = BO_USE_RENDERING | BO_USE_CAMERA_WRITE | BO_USE_GPU_DATA_BUFFER;
++	// and the decoder flag is not a host write. The camera device does the same: it writes
++	// the guest pages of a frame, so a mapping for reading must not transfer the host copy
++	// over them, and the camera flag is not a host write either.
++	host_write_flags = BO_USE_RENDERING | BO_USE_GPU_DATA_BUFFER;
+ 	if (bo->meta.format == DRM_FORMAT_R8)
+ 		host_write_flags |= BO_USE_HW_VIDEO_ENCODER;
+ 

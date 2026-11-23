@@ -2,12 +2,19 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 """Prove guest TCP uploads through the SLiRP network reach the host promptly.
 
-The guest connects to a listener on the host's loopback through the SLiRP
-gateway alias 10.0.2.2 and sends bodies in the shapes applications produce: one
-bulk stream, a request body written in paced chunks, several concurrent
-streams, a stream whose host reader stops for a while, and many small
-request/response exchanges. The host checks every byte by SHA-256 and replies
-with its digest, so a report of success also proves the data arrived intact.
+The guest connects to the SLiRP gateway alias 10.0.2.2 and sends bodies in the
+shapes applications produce: one bulk stream, a request body written in paced
+chunks, several concurrent streams, a stream whose host reader stops for a
+while, and many small request/response exchanges. The host checks every byte
+by SHA-256 and replies with its digest, so a report of success also proves the
+data arrived intact.
+
+A guest reaches no listener on the host's loopback or addresses, so the host
+half listens on a Unix socket, which a guest forward of the user network
+carries the guest's connections to. Only the provider's test build offers that
+forward, so this runs the test launcher (``uml-darwin-network-test``), which
+reads it from UML_TEST_SLIRP_GUEST_FORWARD; the product launcher has no way
+to name one.
 
 Every shape has a latency bound far above the healthy result and far below a
 stall, which surfaces as retransmission timeouts, zero-window probes, or an
@@ -23,10 +30,13 @@ import contextlib
 import dataclasses
 import hashlib
 import json
+import os
 import pathlib
 import re
+import shutil
 import socket
 import sys
+import tempfile
 import threading
 import time
 
@@ -49,6 +59,9 @@ HOST_RECEIVE_BUFFER = 64 * 1024
 STALL_AFTER_BYTES = 256 * 1024
 STALL_SECONDS = 3.0
 RESULT_MARKER = "TRANSFER-RESULT "
+# The port of the gateway address that the guest forward answers on.
+GUEST_PORT = 45454
+FORWARD_VARIABLE = "UML_TEST_SLIRP_GUEST_FORWARD"
 
 # Bounds, in milliseconds. Healthy results are one to two orders of magnitude
 # lower; a stalled stream costs at least a retransmission timeout per loss and
@@ -115,7 +128,7 @@ class HostStream:
 
 
 class TransferServer:
-    """Loopback listener implementing the guest script's host half.
+    """Unix socket listener implementing the guest script's host half.
 
     A stream starts with ``NAME LENGTH\\n``. ``echo`` streams are echoed back
     until LENGTH bytes have arrived; every other stream is read to LENGTH and
@@ -128,18 +141,20 @@ class TransferServer:
         self.streams: list[HostStream] = []
         self.errors: list[str] = []
         self._lock = threading.Lock()
-        self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # A socket path must fit sun_path, which a long $TMPDIR does not.
+        self._directory = tempfile.mkdtemp(prefix="uml-transfer-", dir="/tmp")
+        self.path = os.path.join(self._directory, "host")
+        self._listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._listener.setsockopt(
             socket.SOL_SOCKET, socket.SO_RCVBUF, HOST_RECEIVE_BUFFER)
-        self._listener.bind(("127.0.0.1", 0))
+        self._listener.bind(self.path)
         self._listener.listen(16)
-        self.port = self._listener.getsockname()[1]
         self._thread = threading.Thread(target=self._accept, daemon=True)
         self._thread.start()
 
     def close(self) -> None:
         self._listener.close()
+        shutil.rmtree(self._directory, ignore_errors=True)
 
     def stream(self, name: str) -> HostStream | None:
         with self._lock:
@@ -282,12 +297,16 @@ def main() -> int:
                 GUEST_SCRIPT.replace("%MARKER%", RESULT_MARKER).encode()
             )
         },
+        environment={
+            **os.environ,
+            FORWARD_VARIABLE: f"10.0.2.2:{GUEST_PORT}={server.path}",
+        },
     ) as guest:
         guest.boot_to_shell(180)
         start_guest_dhcp_client(guest)
         verify_slirp_lease(*wait_for_slirp_lease(guest))
         before = interface_counters(guest)
-        output = guest.check_command(guest_command(server.port), 180)
+        output = guest.check_command(guest_command(GUEST_PORT), 180)
         after = interface_counters(guest)
         match = re.search(re.escape(RESULT_MARKER) + r"(\[.*\])", output)
         if match is None:

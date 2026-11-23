@@ -25,7 +25,7 @@ lost, in a build that was never going to act on it.
  1 file changed, 22 insertions(+)
 
 diff --git a/src/vrend/vrend_decode.c b/src/vrend/vrend_decode.c
-index 71cf1aff031ba8711616e288f718bc67dc3c11cb..eafbab0aa0ffec8b34d15482b6553e863ba733e5 100644
+index 5462b9d8ddaae84cdeace142f8b85ce0d63494f4..00b79bf515b228a33c0fa93b5af3b9dc4315a730 100644
 --- a/src/vrend/vrend_decode.c
 +++ b/src/vrend/vrend_decode.c
 @@ -21,6 +21,10 @@
@@ -39,7 +39,7 @@ index 71cf1aff031ba8711616e288f718bc67dc3c11cb..eafbab0aa0ffec8b34d15482b6553e86
  #include <stdint.h>
  #include <string.h>
  #include <stdio.h>
-@@ -2115,8 +2119,19 @@ static int vrend_decode_ctx_submit_cmd(struct virgl_context *ctx,
+@@ -2119,8 +2123,19 @@ static int vrend_decode_ctx_submit_cmd(struct virgl_context *ctx,
        TRACE_SCOPE_SLOW(vrend_get_comand_name(cmd));
  
        ret = decode_table[cmd](gdctx->grctx, buf, len);
@@ -59,7 +59,7 @@ index 71cf1aff031ba8711616e288f718bc67dc3c11cb..eafbab0aa0ffec8b34d15482b6553e86
        if (ret) {
           virgl_error("context %d failed to dispatch %s: %d\n",
                 gdctx->base.ctx_id, vrend_get_comand_name(cmd), ret);
-@@ -2136,6 +2151,13 @@ static int vrend_decode_ctx_submit_cmd(struct virgl_context *ctx,
+@@ -2140,6 +2155,13 @@ static int vrend_decode_ctx_submit_cmd(struct virgl_context *ctx,
      * guest the rest of its session.
      */
     vrend_clear_context_error(gdctx->grctx);

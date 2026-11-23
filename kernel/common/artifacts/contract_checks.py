@@ -7,6 +7,7 @@ from __future__ import annotations
 __import__("sys").dont_write_bytecode = True
 
 import hashlib
+import json
 import re
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
@@ -36,6 +37,45 @@ def parse_assignments(
             raise error(f"{path}:{line_number}: duplicate metadata key {key}")
         values[key] = quoted if quoted is not None else numeric
     return values
+
+
+class _DuplicateKey(ValueError):
+    pass
+
+
+def parse_json_object(
+    data: bytes, label: str, error: Callable[[str], BaseException] = ValueError
+) -> dict:
+    """A JSON object from bytes already read, raising error(message) on anything else
+    and on a key repeated in any object (the repository's duplicate-key policy)."""
+
+    def pairs(items: list[tuple[str, object]]) -> dict:
+        result: dict[str, object] = {}
+        for key, value in items:
+            if key in result:
+                raise _DuplicateKey(key)
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(data.decode("utf-8"), object_pairs_hook=pairs)
+    except _DuplicateKey as duplicate:
+        raise error(f"{label} repeats the key {duplicate}") from duplicate
+    except ValueError as failure:
+        raise error(f"cannot read {label}: {failure}") from failure
+    if not isinstance(value, dict):
+        raise error(f"{label} is not a JSON object")
+    return value
+
+
+def load_json_object(path: Path, error: Callable[[str], BaseException] = ValueError) -> dict:
+    """Read a JSON object file, raising error(message) on anything else and on a
+    key repeated in any object (the repository's duplicate-key policy)."""
+    try:
+        data = path.read_bytes()
+    except OSError as failure:
+        raise error(f"cannot read {path}: {failure}") from failure
+    return parse_json_object(data, str(path), error)
 
 
 def accepted_directory_name(

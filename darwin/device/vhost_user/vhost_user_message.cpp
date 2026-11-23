@@ -14,11 +14,14 @@
 #include <mutex>
 #endif
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstddef>
 #include <cstring>
+#include <optional>
 #include <poll.h>
 #include <stdexcept>
 #include <string>
@@ -107,32 +110,134 @@ void adoptReceivedDescriptors(
         describeDescriptorCeiling() + ")";
 }
 
+/* What limits one receive: the allowance of a frame whose first byte has
+ * arrived, and the budget of the wait it belongs to. */
+class FrameClock final {
+public:
+    enum class Spent {
+        none,
+        wait,
+        frame,
+    };
+
+    explicit FrameClock(const FrameBound* bound) noexcept : bound_(bound) {}
+
+    [[nodiscard]] int watch() const noexcept
+    {
+        return bound_ != nullptr ? bound_->watch : -1;
+    }
+
+    /* Whether a budget runs, so that the polls are timed. */
+    [[nodiscard]] bool timed() const noexcept
+    {
+        return frame_.has_value() ||
+            (bound_ != nullptr && bound_->wait != nullptr);
+    }
+
+    void received()
+    {
+        if (bound_ == nullptr || frame_ ||
+            bound_->allowance <= std::chrono::steady_clock::duration::zero()) {
+            return;
+        }
+        frame_.emplace(
+            bound_->allowance,
+            "vhost-user frame incomplete: its remaining bytes did not arrive "
+            "within " +
+                describeWaitTime(bound_->allowance) + " of its first byte");
+    }
+
+    /* `timeout`, a poll's, cut so that the poll ends with the budget that
+     * runs and, with one running, at least every interval: whoever stops the
+     * receive is looked for then. */
+    [[nodiscard]] int pollTimeout(int timeout) const noexcept
+    {
+        if (!timed())
+            return timeout;
+        int bounded = bound_->pollIntervalMilliseconds > 0
+            ? bound_->pollIntervalMilliseconds
+            : stopPollTimeoutMilliseconds;
+        if (frame_)
+            bounded = frame_->pollTimeout(bounded);
+        if (bound_->wait != nullptr)
+            bounded = bound_->wait->pollTimeout(bounded);
+        return timeout < 0 ? bounded : std::min(timeout, bounded);
+    }
+
+    /* Which budget a poll that begins now finds spent: only a poll that found
+     * nothing after that fails the receive, so a byte that is there is read
+     * whatever the time and a late peer is not mistaken for a silent one. */
+    [[nodiscard]] Spent spent() const noexcept
+    {
+        if (bound_ != nullptr && bound_->wait != nullptr &&
+            bound_->wait->spent()) {
+            return Spent::wait;
+        }
+        return frame_ && frame_->spent() ? Spent::frame : Spent::none;
+    }
+
+    void charge(
+        std::chrono::steady_clock::duration elapsed,
+        int askedMilliseconds) noexcept
+    {
+        if (frame_)
+            frame_->charge(elapsed, askedMilliseconds);
+        if (bound_->wait != nullptr)
+            bound_->wait->charge(elapsed, askedMilliseconds);
+    }
+
+    [[noreturn]] void fail(Spent which) const
+    {
+        if (which == Spent::wait)
+            bound_->wait->fail();
+        frame_->fail();
+    }
+
+    [[nodiscard]] std::chrono::steady_clock::time_point now() const noexcept
+    {
+        return bound_->now != nullptr
+            ? bound_->now()
+            : std::chrono::steady_clock::now();
+    }
+
+private:
+    const FrameBound* bound_;
+    std::optional<WaitBudget> frame_;
+};
+
 [[nodiscard]] bool waitForInput(
     int descriptor,
-    const std::atomic_bool* stopRequested)
+    const std::atomic_bool* stopRequested,
+    FrameClock& frame)
 {
     for (;;) {
         if (stopRequested != nullptr &&
             stopRequested->load(std::memory_order_acquire)) {
             return false;
         }
-        pollfd input {
-            .fd = descriptor,
-            .events = POLLIN,
-            .revents = 0,
-        };
+        std::array<pollfd, 2> polled {{
+            {.fd = descriptor, .events = POLLIN, .revents = 0},
+            {.fd = frame.watch(), .events = POLLPRI, .revents = 0},
+        }};
+        const nfds_t count = frame.watch() >= 0 ? 2 : 1;
 #if UML_GPU_STOP_WAIT_TESTING
         // Signal only when no byte is immediately readable. A notification
         // therefore proves that every fragment currently queued on the stream
         // has been consumed and the next production-shaped poll will block.
-        pollfd readinessProbe = input;
+        pollfd readinessProbe = polled[0];
         if (::poll(&readinessProbe, 1, 0) == 0)
             testing::notifyStopWait();
 #endif
-        const int result = ::poll(
-            &input,
-            1,
+        const bool timed = frame.timed();
+        const auto spent = frame.spent();
+        const int asked = frame.pollTimeout(
             stopRequested == nullptr ? -1 : stopPollTimeoutMilliseconds);
+        const auto started = timed
+            ? frame.now()
+            : std::chrono::steady_clock::time_point {};
+        const int result = ::poll(polled.data(), count, asked);
+        if (timed)
+            frame.charge(frame.now() - started, asked);
         if (result < 0) {
             if (errno == EINTR)
                 continue;
@@ -140,10 +245,21 @@ void adoptReceivedDescriptors(
                 "vhost-user poll failed: " +
                 std::string(std::strerror(errno)));
         }
-        if (result == 0)
+        if (result == 0) {
+            if (spent != FrameClock::Spent::none)
+                frame.fail(spent);
             continue;
-        if ((input.revents & POLLNVAL) != 0)
+        }
+        if (count == 2 && (polled[1].revents & POLLNVAL) != 0)
             throw std::runtime_error("invalid vhost-user descriptor");
+        // The watched socket first: nothing it releases may be taken once its
+        // peer has gone.
+        if (count == 2 && (polled[1].revents & (POLLHUP | POLLERR)) != 0)
+            throw VhostUserWatchedPeerEnded {};
+        if ((polled[0].revents & POLLNVAL) != 0)
+            throw std::runtime_error("invalid vhost-user descriptor");
+        if (polled[0].revents == 0)
+            continue;
         return true;
     }
 }
@@ -153,11 +269,12 @@ bool receiveExact(
     void* destination,
     std::size_t length,
     ReceivedDescriptors& descriptors,
-    const std::atomic_bool* stopRequested)
+    const std::atomic_bool* stopRequested,
+    FrameClock& frame)
 {
     auto* bytes = static_cast<std::uint8_t*>(destination);
     while (length != 0) {
-        if (!waitForInput(descriptor, stopRequested))
+        if (!waitForInput(descriptor, stopRequested, frame))
             return false;
         alignas(cmsghdr) std::array<
             std::uint8_t,
@@ -190,6 +307,7 @@ bool receiveExact(
                 std::string(std::strerror(errno)));
         }
         adoptReceivedDescriptors(header, descriptors);
+        frame.received();
         bytes += count;
         length -= static_cast<std::size_t>(count);
     }
@@ -332,12 +450,35 @@ std::uint64_t raiseDescriptorCeiling() noexcept
     return static_cast<std::uint64_t>(accepted);
 }
 
+bool vhostUserPeerHasEnded(int socket) noexcept
+{
+    for (;;) {
+        pollfd watched {.fd = socket, .events = POLLPRI, .revents = 0};
+        const int result = ::poll(&watched, 1, 0);
+        if (result < 0 && errno == EINTR)
+            continue;
+        return result > 0 && (watched.revents & (POLLHUP | POLLERR)) != 0;
+    }
+}
+
+std::string describeWaitTime(std::chrono::steady_clock::duration allowance)
+{
+    const auto milliseconds =
+        std::chrono::duration_cast<std::chrono::milliseconds>(allowance)
+            .count();
+    return milliseconds % 1000 == 0
+        ? std::to_string(milliseconds / 1000) + " s"
+        : std::to_string(milliseconds) + " ms";
+}
+
 bool receiveVhostUserMessage(
     int socket,
     VhostUserMessage& message,
-    const std::atomic_bool* stopRequested)
+    const std::atomic_bool* stopRequested,
+    const FrameBound* bound)
 {
     message = VhostUserMessage {};
+    FrameClock frame {bound};
     // Every stream fragment uses recvmsg rather than falling back to recv.
     // SCM_RIGHTS may accompany any byte in a fragmented frame, and the kernel
     // installs those descriptors as soon as that fragment is consumed.
@@ -346,7 +487,8 @@ bool receiveVhostUserMessage(
             &message.header,
             sizeof(message.header),
             message.descriptors,
-            stopRequested)) {
+            stopRequested,
+            frame)) {
         return false;
     }
     if ((message.header.flags & protocol::vhostUserVersionMask) !=
@@ -362,7 +504,13 @@ bool receiveVhostUserMessage(
         message.payload.data(),
         message.payload.size(),
         message.descriptors,
-        stopRequested);
+        stopRequested,
+        frame);
+}
+
+bool writeFailureMeansPeerClosed(int error) noexcept
+{
+    return error == EPIPE || error == ECONNRESET || error == ENOTCONN;
 }
 
 } // namespace uml::gpu

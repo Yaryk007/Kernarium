@@ -32,6 +32,26 @@ struct ProgramCacheDiagnostics final {
 	std::uint64_t validation_mismatches{};
 	std::uint64_t validation_faults{};
 	std::uint64_t validation_sequence_races{};
+	/* A translation became runnable from a registration that was not
+	 * settled. Must stay 0: an unsettled page's translation is transient. */
+	std::uint64_t unheld_runnable{};
+	/* Frame registrations by builds and by source compares that asked the
+	 * address space, and those the executor's memo answered instead. */
+	std::uint64_t holder_registrations{};
+	std::uint64_t registration_memo_hits{};
+	/* Stamp hits refused because the generation's flush serial had moved:
+	 * the body compared its source instead. */
+	std::uint64_t flush_serial_misses{};
+	/* Validations left undecided (`race`) because a frame registration was
+	 * unsettled or failed, apart from `validation_sequence_races`. */
+	std::uint64_t validation_registration_races{};
+	/* One-instruction builds, made because a frame registration failed or
+	 * was refused. */
+	std::uint64_t unregistered_transients{};
+	/* Registrations refused for a page a program covers: the state is walked
+	 * or the page is not executable. Zero in every row that does not force
+	 * one. */
+	std::uint64_t walked_refusals{};
 	/* Sweeps of an address space's link records and indirect sites, and
 	 * the records and sites they released. */
 	std::uint64_t link_sweeps{};

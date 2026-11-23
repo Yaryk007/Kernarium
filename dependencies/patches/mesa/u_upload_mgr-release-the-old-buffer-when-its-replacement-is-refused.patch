@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 09:21:42 +0900
+Subject: [PATCH] u_upload_mgr: release the old buffer when its replacement is
+ refused
+
+u_upload_alloc() gives up the full upload buffer for a new one and hands
+the old one to the caller to release. When the driver had no memory for
+the new buffer it told the caller of no buffer to release, and the
+reference the old one held was lost: a context whose uploads were
+refused kept every buffer it filled, and recovered none of them. The old
+buffer is released at once in that case. A new buffer that could not be
+mapped also left the manager pointing at the buffer it had released,
+which the next allocation released again; the pointer is cleared.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/gallium/auxiliary/util/u_upload_mgr.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/gallium/auxiliary/util/u_upload_mgr.c b/src/gallium/auxiliary/util/u_upload_mgr.c
+index bd2afdd1a07c29f7bfe9216296e802267b30e55e..7a7c4e7614cea9db782cfa72029e68dad0c08bb4 100644
+--- a/src/gallium/auxiliary/util/u_upload_mgr.c
++++ b/src/gallium/auxiliary/util/u_upload_mgr.c
+@@ -207,6 +207,7 @@ u_upload_alloc_buffer(struct u_upload_mgr *upload, unsigned min_size, struct pip
+    if (upload->map == NULL) {
+       u_upload_release_buffer(upload);
+       pipe_resource_release(upload->pipe, upload->buffer);
++      upload->buffer = NULL;
+       return 0;
+    }
+ 
+@@ -253,6 +254,9 @@ u_upload_alloc(struct u_upload_mgr *upload,
+       buffer_size = u_upload_alloc_buffer(upload, offset + size, releasebuf);
+ 
+       if (unlikely(!buffer_size)) {
++         /* The old buffer was given up for one that could not be made, and
++          * the caller is told of no buffer to release: release it here. */
++         pipe_resource_release(upload->pipe, *releasebuf);
+          *out_offset = ~0;
+          *ptr = NULL;
+          *releasebuf = NULL;

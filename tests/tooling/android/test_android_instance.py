@@ -13,11 +13,15 @@ from __future__ import annotations
 __import__("sys").dont_write_bytecode = True
 
 import datetime
+import fcntl
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -103,6 +107,44 @@ class DecisionVectors(unittest.TestCase):
                 seen.add(case["expect"])
         # The vectors exercise every action there is.
         self.assertEqual(seen, set(android_instance.ACTIONS))
+
+    def test_the_legacy_range_is_the_vectors(self) -> None:
+        document = json.loads(VECTORS.read_text(encoding="utf-8"))
+        self.assertEqual(
+            document["legacy_build_numbers"],
+            {
+                "first": android_instance.LEGACY_BUILD_FIRST,
+                "last": android_instance.LEGACY_BUILD_LAST,
+            },
+        )
+
+
+class BuildOrder(unittest.TestCase):
+    def test_the_old_counter_is_older_than_every_other_number(self) -> None:
+        first = android_instance.LEGACY_BUILD_FIRST
+        last = android_instance.LEGACY_BUILD_LAST
+        order = android_instance.build_order
+        ascending = [
+            first, first + 1, 2026110805, 2026110817, last,
+            1, 26, 27, 10_000, first - 1, last + 1, 9_999_999_999,
+        ]
+        keys = [order(number) for number in ascending]
+        self.assertEqual(len(set(keys)), len(keys))
+        for position, key in enumerate(keys):
+            for other in keys[position + 1:]:
+                self.assertLess(key, other)
+
+    def test_the_range_has_two_edges(self) -> None:
+        order = android_instance.build_order
+        self.assertEqual((android_instance.LEGACY_BUILD_FIRST, android_instance.LEGACY_BUILD_LAST),
+                         (2026110800, 2026110899))
+        # Both edges are in the range; the numbers just outside it are not.
+        self.assertEqual(order(2026110800)[0], order(2026110899)[0])
+        self.assertNotEqual(order(2026110799)[0], order(2026110800)[0])
+        self.assertNotEqual(order(2026110900)[0], order(2026110899)[0])
+        self.assertLess(order(2026110800), order(2026110799))
+        self.assertLess(order(2026110899), order(2026110900))
+        self.assertGreater(order(2026110799), order(2026110899))
 
 
 class TransitionVectors(unittest.TestCase):
@@ -380,6 +422,174 @@ class InstanceFiles(unittest.TestCase):
             self.assertEqual(state.created_with, "rel-a")
             self.assertFalse((instance / "data.img").exists())
             self.assertEqual(list(instance.glob("data.img.pre-*")), [])
+
+    def test_the_installation_identity_follows_the_data_disk(self) -> None:
+        # What the emulator keeps beside the data disk (synthetic here): an update,
+        # a retry, a restore and a start leave it, and a reset or a new data disk
+        # ends it, with what a cut-short write of it left.
+        content = (
+            '{"ethernet_mac": "02:aa:bb:cc:dd:ee", "schema": 1, '
+            '"serialno": "0123456789abcdef"}\n'
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            instance = Path(temporary) / "instance"
+            first = release("rel-a", build=100, sha="a" * 64)
+            second = release("rel-b", build=200)
+            android_instance.apply(instance, first, android_instance.decide(None, False, False, first), now=lambda: NOW)
+            (instance / "data.img").write_bytes(b"android data")
+            identity = instance / android_instance.IDENTITY_FILE
+            identity.write_text(content, encoding="utf-8")
+
+            def unchanged(step: str) -> None:
+                self.assertEqual(identity.read_text(encoding="utf-8"), content, step)
+
+            def decide(rel, **flags):
+                state = android_instance.read_state(instance)
+                return android_instance.decide(
+                    state, (instance / "data.img").exists(),
+                    any(instance.glob(android_instance.SNAPSHOT_PREFIX + "*")), rel,
+                    android_instance.Flags(**flags))
+
+            android_instance.apply(instance, second, decide(second), now=lambda: NOW)
+            unchanged("an update")
+            android_instance.apply(instance, second, decide(second, retry=True), now=lambda: NOW)
+            unchanged("a retry")
+            # The restore puts the data back and then updates again, as the rules say.
+            android_instance.apply(instance, second, decide(second, restore_snapshot=True), now=lambda: NOW)
+            unchanged("a restore")
+            android_instance.complete(instance, second, now=lambda: NOW)
+            android_instance.apply(instance, second, decide(second), now=lambda: NOW)
+            unchanged("a start")
+
+            leftover = instance / (android_instance.IDENTITY_FILE + ".tmp-123")
+            leftover.write_text("half", encoding="utf-8")
+            android_instance.apply(instance, second, decide(second, reset=True), now=lambda: NOW)
+            self.assertFalse(identity.exists() or leftover.exists(), "a reset")
+
+            (instance / "data.img").write_bytes(b"android data")
+            identity.write_text(content, encoding="utf-8")
+            (instance / "data.img").unlink()
+            decision = decide(second)
+            self.assertEqual(decision.action, "create")
+            android_instance.apply(instance, second, decision, now=lambda: NOW)
+            self.assertFalse(identity.exists(), "a data disk that is gone")
+
+    def test_a_reset_waits_for_a_start_that_holds_the_installation(self) -> None:
+        # A start prepares the data disk and makes its identity under the
+        # installation's lock; a reset that interleaves would leave the identity
+        # the start made after it deleted the one before. The reset runs after.
+        content = (
+            '{"ethernet_mac": "02:aa:bb:cc:dd:ee", "schema": 1, '
+            '"serialno": "0123456789abcdef"}\n'
+        )
+        with tempfile.TemporaryDirectory(prefix="android-instance-") as temporary:
+            instance = Path(temporary) / "instance"
+            first = release("rel-a", build=100, sha="a" * 64)
+            android_instance.apply(instance, first, android_instance.decide(None, False, False, first), now=lambda: NOW)
+            (instance / "data.img").write_bytes(b"android data")
+            identity = instance / android_instance.IDENTITY_FILE
+            holding = threading.Event()
+
+            def start() -> None:
+                # The emulator's side: its own open of the lock file, as another process has.
+                descriptor = os.open(instance / android_instance.LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o600)
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX)
+                    holding.set()
+                    time.sleep(0.4)
+                    identity.write_text(content, encoding="utf-8")
+                finally:
+                    os.close(descriptor)
+
+            starter = threading.Thread(target=start)
+            starter.start()
+            self.assertTrue(holding.wait(10))
+            state = android_instance.read_state(instance)
+            reset = android_instance.decide(state, True, False, first, android_instance.Flags(reset=True))
+            began = time.monotonic()
+            android_instance.apply(instance, first, reset, now=lambda: NOW)
+            starter.join()
+            self.assertGreaterEqual(time.monotonic() - began, 0.3, "the reset did not wait for the start")
+            self.assertFalse(identity.exists(), "the reset left the identity a start made meanwhile")
+            self.assertTrue((instance / android_instance.LOCK_FILE).exists(), "the lock file was removed")
+
+    def test_the_lock_is_waited_for_with_a_limit_and_is_reentrant(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="android-instance-") as temporary:
+            instance = Path(temporary) / "instance"
+            with android_instance.installation_lock(instance):
+                # This process's own second use does not wait for itself.
+                with android_instance.installation_lock(instance, limit=0.1):
+                    pass
+                # Another process's (here: another open file) does.
+                other = os.open(instance / android_instance.LOCK_FILE, os.O_RDWR)
+                try:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                finally:
+                    os.close(other)
+            descriptor = os.open(instance / android_instance.LOCK_FILE, os.O_RDWR)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                began = time.monotonic()
+                with self.assertRaises(android_instance.InstanceError):
+                    with android_instance.installation_lock(instance, limit=0.2):
+                        self.fail("a held installation was locked twice")
+                self.assertLess(time.monotonic() - began, 5)
+            finally:
+                os.close(descriptor)
+            # Released, it is free again.
+            with android_instance.installation_lock(instance, limit=0.2):
+                pass
+
+    def test_a_create_decided_before_another_start_made_the_disk_deletes_nothing(self) -> None:
+        # Two launches plan "create" while the installation is absent. The first
+        # applies its decision and its emulator makes the disk and the identity;
+        # the second then takes the lock and must not delete what the first made.
+        content = (
+            '{"ethernet_mac": "02:aa:bb:cc:dd:ee", "schema": 1, '
+            '"serialno": "0123456789abcdef"}\n'
+        )
+        with tempfile.TemporaryDirectory(prefix="android-instance-") as temporary:
+            instance = Path(temporary) / "instance"
+            rel = release("rel-a", build=100, sha="a" * 64)
+            one = android_instance.decide(None, False, False, rel)
+            two = android_instance.decide(None, False, False, rel)
+            self.assertEqual((one.action, two.action), ("create", "create"))
+            android_instance.apply(instance, rel, one, now=lambda: NOW)
+            (instance / "data.img").write_bytes(b"the first start's disk")
+            identity = instance / android_instance.IDENTITY_FILE
+            identity.write_text(content, encoding="utf-8")
+            state_before = (instance / android_instance.STATE_FILE).read_bytes()
+            with self.assertRaises(android_instance.InstanceError):
+                android_instance.apply(instance, rel, two, now=lambda: NOW)
+            self.assertEqual((instance / "data.img").read_bytes(), b"the first start's disk")
+            self.assertEqual(identity.read_text(encoding="utf-8"), content)
+            self.assertEqual((instance / android_instance.STATE_FILE).read_bytes(), state_before)
+            # What is decided afresh is a plain boot, and a person's reset still deletes.
+            state = android_instance.read_state(instance)
+            self.assertEqual(android_instance.decide(state, True, False, rel).action, "boot")
+            reset = android_instance.decide(state, True, False, rel, android_instance.Flags(reset=True))
+            android_instance.apply(instance, rel, reset, now=lambda: NOW)
+            self.assertFalse((instance / "data.img").exists() or identity.exists())
+
+    def test_a_restore_decided_before_the_update_ended_changes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="android-instance-") as temporary:
+            instance = Path(temporary) / "instance"
+            first = release("rel-a", build=100, sha="a" * 64)
+            second = release("rel-b", build=200)
+            android_instance.apply(instance, first, android_instance.decide(None, False, False, first), now=lambda: NOW)
+            (instance / "data.img").write_bytes(b"data before the update")
+            state = android_instance.read_state(instance)
+            android_instance.apply(instance, second, android_instance.decide(state, True, False, second), now=lambda: NOW)
+            (instance / "data.img").write_bytes(b"data after the update")
+            state = android_instance.read_state(instance)
+            restore = android_instance.decide(state, True, True, second, android_instance.Flags(restore_snapshot=True))
+            self.assertEqual(restore.action, "restore")
+            # The update boots to completion before the restore takes the lock.
+            android_instance.complete(instance, second, now=lambda: NOW)
+            with self.assertRaises(android_instance.InstanceError):
+                android_instance.apply(instance, second, restore, now=lambda: NOW)
+            self.assertEqual((instance / "data.img").read_bytes(), b"data after the update")
 
     def test_a_volume_without_clones_is_a_refusal(self) -> None:
         with tempfile.TemporaryDirectory(prefix="android-instance-") as temporary:

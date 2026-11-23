@@ -1,0 +1,67 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 02:42:12 +0900
+Subject: [PATCH] vulkan/runtime: refuse an imported pipeline binary key of the
+ wrong size
+
+vk_create_pipeline_binary copied key_size bytes of the key an application
+passes through VkPipelineBinaryKeysAndDataKHR into the binary's own key,
+which holds one blake3_hash, and only an assert guarded the copy. A release
+build compiles the assert out, so a keySize above 32 wrote the excess over the
+binary's other fields and past its allocation. The application chooses
+keySize: the registry marks it noautovalidity, so no generated check bounds it,
+and a Venus guest encodes it as a plain field beside a key array that always
+holds VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR bytes.
+
+Every key the runtime hands out is one blake3_hash, so a key of any other size
+names no binary this runtime made. Refuse it before anything is allocated or
+copied, with VK_ERROR_VALIDATION_FAILED. The command defines that result, and
+it is the one a command gives when the implementation detects invalid usage;
+an out-of-memory result would tell the caller that retrying may help, and
+VK_ERROR_UNKNOWN would not tell an application fault from an implementation
+failure. The binary is refused like any other the call cannot create: its
+handle is null, the call returns the first failure, and the rest of the call
+proceeds.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/vulkan/runtime/vk_pipeline.c | 20 ++++++++++++++++++--
+ 1 file changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/src/vulkan/runtime/vk_pipeline.c b/src/vulkan/runtime/vk_pipeline.c
+index 367b9691c7a1e6e7e0b3f95b810d40117a6236d1..44474f4e89c3fe39d767d01f40c0161914a565c7 100644
+--- a/src/vulkan/runtime/vk_pipeline.c
++++ b/src/vulkan/runtime/vk_pipeline.c
+@@ -4115,14 +4115,30 @@ vk_create_pipeline_binary(struct vk_device *device,
+                           const VkAllocationCallbacks *alloc,
+                           VkPipelineBinaryKHR *out_binary_h)
+ {
++   /* Every key this runtime hands out is a blake3_hash, so a key of any other
++    * size names no binary it made.  An application chooses the size of the
++    * key it imports: the generated validation leaves keySize unchecked (the
++    * registry marks it noautovalidity), and a Venus guest encodes it as a
++    * plain field beside a key array that always holds
++    * VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR bytes.  Refuse it before anything is
++    * allocated or copied.  VK_ERROR_VALIDATION_FAILED is the result a command
++    * gives when the implementation detects invalid usage; it is one of the
++    * results this command defines, and unlike the out-of-memory results it
++    * does not tell the caller that retrying may help.
++    */
++   if (key_size != sizeof(blake3_hash)) {
++      return vk_errorf(device, VK_ERROR_VALIDATION_FAILED,
++                       "a pipeline binary key is %zu bytes, not %zu",
++                       key_size, sizeof(blake3_hash));
++   }
++
+    struct vk_pipeline_binary *binary =
+       vk_object_alloc(device, alloc, sizeof(*binary) + data_size,
+                       VK_OBJECT_TYPE_PIPELINE_BINARY_KHR);
+    if (binary == NULL)
+       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+ 
+-   assert(key_size == sizeof(binary->key));
+-   memcpy(binary->key, key, key_size);
++   memcpy(binary->key, key, sizeof(binary->key));
+ 
+    binary->size = data_size;
+    memcpy(binary->data, data, data_size);

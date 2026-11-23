@@ -1,0 +1,174 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 22:00:40 +0900
+Subject: [PATCH] um: tell the host of a kernel write into a frame x86 code
+ runs
+
+A write(2), pwrite(2), splice, sendfile, copy_file_range or truncate
+into a page-cache or memfd frame that an x86 process runs through a
+mapping that stays in place reached no translation cache: arch/um had no
+flush_dcache_folio(), which Linux calls after every such write, so the
+engines ran the bytes they had translated and x86 hardware would run the
+new ones.
+
+flush_dcache_folio() and flush_dcache_page() now name the written frames
+with darwin_uml_vm_invalidate_code_frames(), and the host publishes the
+change at their holders. Only a folio that was queued for the host with
+guest-code permission needs the call, and the host gives that permission
+to a page of a VM_EXEC VMA alone (pte_exec() holds for every readable
+user PTE here, so it tests nothing). update_pte_range() reads the VMA's
+protection before it takes the page-table lock. Under the lock, which
+holds the frame, it sets PG_arch_1 on the folio of a present PTE of such
+a VMA, and a full barrier follows. The hook runs the same barrier before
+it tests the bit, so a writer that finds the bit clear precedes the mark
+and the host's later fetch reads its bytes. Linux clears PG_arch_1 when
+a folio is freed and enters the page cache, and no code of arch/um uses
+it. Other file I/O pays a barrier and a bit test, and a write into a
+file that is mapped without VM_EXEC makes no host call.
+
+The host cannot be entered from an interrupt, whose tick may arrive
+inside another bridge call that holds the host locks. Such a call for a
+marked folio warns instead. The folios interrupt handlers write are not
+marked: a completed read fills a folio not yet mapped, and the AF_PACKET
+and AIO rings that softirqs and bio completions write for user space are
+mapped without VM_EXEC.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ arch/um/include/asm/cacheflush.h | 15 ++++++
+ arch/um/kernel/tlb.c             | 82 ++++++++++++++++++++++++++++++++
+ 2 files changed, 97 insertions(+)
+
+diff --git a/arch/um/include/asm/cacheflush.h b/arch/um/include/asm/cacheflush.h
+index a18b3a62e8bc588cfcd054cdc48b04d932431945..af57a23a93094a2f4af4d9858a2b6c41f093e6af 100644
+--- a/arch/um/include/asm/cacheflush.h
++++ b/arch/um/include/asm/cacheflush.h
+@@ -35,6 +35,21 @@ extern void darwin_flush_icache_remote_user_range(struct mm_struct *mm,
+ #define flush_icache_remote_user_range darwin_flush_icache_remote_user_range
+ #endif
+ 
++/*
++ * x86 userspace runs translated code the host caches by frame, and an x86
++ * core would run the bytes a kernel write left in a page-cache or memfd frame
++ * a process executes through a mapping that stays in place.  Linux ends such
++ * a write with flush_dcache_folio(), so name the frame there: the host
++ * publishes it at the frames' holders.  Only a folio some user PTE with
++ * guest-code permission was queued for needs the call (PG_arch_1, which no
++ * other code here uses), so other file I/O pays a barrier and a bit test.
++ */
++#define ARCH_IMPLEMENTS_FLUSH_DCACHE_PAGE 1
++struct folio;
++extern void flush_dcache_folio(struct folio *folio);
++#define flush_dcache_folio flush_dcache_folio
++extern void flush_dcache_page(struct page *page);
++
+ /*
+  * With 4 KiB pages on a 16 KiB host, a kernel alias whose host page does not
+  * map one aligned group of four consecutive frames is a private copy, and
+diff --git a/arch/um/kernel/tlb.c b/arch/um/kernel/tlb.c
+index d0a1b2d9e9680ef987e8635138e76b6ac119e6fc..839500999a1c99ba2dc9a22c007f1f8b3cba1c4b 100644
+--- a/arch/um/kernel/tlb.c
++++ b/arch/um/kernel/tlb.c
+@@ -186,6 +186,27 @@ static inline int darwin_guest_protection(struct mm_struct *mm, int prot,
+ 		prot |= UM_PROT_GUEST_WRITABLE;
+ 	return prot;
+ }
++
++/*
++ * Mark the folio of @pfn as one a translation may exist for, before the host
++ * maps it with guest-code permission.  The bit stays until the folio is
++ * freed, so a stale mark costs one more call and never a missed one.  The
++ * barrier pairs with flush_dcache_folio()'s: a writer that finds the bit
++ * clear ran before this mark, so the host's later fetch reads its bytes.  The
++ * barrier follows a set bit too, as another mapper's mark may not have
++ * completed its barrier.
++ */
++static void darwin_mark_guest_code_folio(unsigned long pfn)
++{
++	struct folio *folio;
++
++	if (!pfn_valid(pfn))
++		return;
++	folio = page_folio(pfn_to_page(pfn));
++	if (!test_bit(PG_arch_1, folio_flags(folio, 0)))
++		set_bit(PG_arch_1, folio_flags(folio, 0));
++	smp_mb();
++}
+ #endif
+ 
+ static int kern_map(struct mm_id *mm_idp,
+@@ -650,6 +671,18 @@ static inline int update_pte_range(pmd_t *pmd, unsigned long addr,
+ 		pteval = ptep_get(pte);
+ 		darwin_pte_facts(ops->mm, addr, pteval, &vma_protection,
+ 				 &immutable);
++		/*
++		 * Mark the folio of a present PTE in an executable VMA, which is
++		 * where the host gives the page guest-code permission and so the
++		 * only place a translation of it can come from.  pte_exec() is no
++		 * test of this: here it holds for every readable user PTE.  The
++		 * host's guest-code permission and this mark come from the one
++		 * read of the VMA above, as they must.  The lock holds the frame,
++		 * which a zap could otherwise free under the mark.
++		 */
++		if (ops->mm != &init_mm && pte_present(pteval) &&
++		    (vma_protection & DARWIN_VMA_EXEC))
++			darwin_mark_guest_code_folio(pte_pfn(pteval));
+ 		if (ops->mm == &init_mm)
+ 			spin_unlock(ptl);
+ 		else
+@@ -1373,6 +1406,55 @@ static void darwin_flush_icache_frame(struct mm_struct *mm, struct page *page,
+ 		      mm->context.id.darwin_generation, addr, len);
+ }
+ 
++/*
++ * A kernel write ended in flush_dcache_folio() or flush_dcache_page(): name
++ * the frames it covers, and the host publishes the change at their holders.
++ * @phys and @length name the written frames inside @folio.  No process or
++ * address is known, and a frame the host cannot name takes the every-process
++ * route.
++ *
++ * The host cannot be entered from an interrupt, as the tick may arrive inside
++ * another bridge call that holds the host locks this one takes. The folios
++ * that interrupt handlers write are not marked: a completed read fills a
++ * folio not yet mapped, and the rings that softirqs and bio completions
++ * write for user space (AF_PACKET, AIO) are mapped without VM_EXEC. Warn
++ * about any other interrupt-context write to a marked folio, which is not
++ * published.
++ */
++static void darwin_flush_dcache_frames(struct folio *folio,
++				       phys_addr_t phys, unsigned long length)
++{
++	unsigned long long offset = 0;
++	int fd;
++
++	smp_mb();
++	if (!test_bit(PG_arch_1, folio_flags(folio, 0)))
++		return;
++	if (WARN_ONCE(!in_task(),
++		      "Darwin: kernel write to guest code frame %pa from interrupt context is not published\n",
++		      &phys))
++		return;
++	fd = phys_mapping(phys, &offset);
++	if (darwin_uml_vm_invalidate_code_frames(fd, fd < 0 ? 0 : offset,
++						 length) < 0)
++		panic("Darwin: unable to invalidate guest code frames %pa+%#lx",
++		      &phys, length);
++}
++
++void flush_dcache_folio(struct folio *folio)
++{
++	darwin_flush_dcache_frames(folio, PFN_PHYS(folio_pfn(folio)),
++				   folio_size(folio));
++}
++EXPORT_SYMBOL(flush_dcache_folio);
++
++void flush_dcache_page(struct page *page)
++{
++	darwin_flush_dcache_frames(page_folio(page), page_to_phys(page),
++				   PAGE_SIZE);
++}
++EXPORT_SYMBOL(flush_dcache_page);
++
+ /* __access_remote_vm() untagged @addr before it looked the page up. */
+ void darwin_flush_icache_user_page(struct vm_area_struct *vma,
+ 				   struct page *page, unsigned long addr,

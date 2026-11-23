@@ -68,7 +68,7 @@ index ee9fd0150f487c491d1ffa0637a004832481de8b..89a196845065fdd863ca5d0e4f5a7baa
  config GENERIC_ENTRY
  	bool
 diff --git a/arch/arm64/um/Kconfig b/arch/arm64/um/Kconfig
-index e379296b3128502aafbe5ac48c589da11fe9f37e..163835b67e17f43ebbc058d7acf26af3570bdb5b 100644
+index fc4b11b5702854b92f7a626abd660ac53bc08788..dae21a2e5fb54c3d56a9421012707c15ee82f300 100644
 --- a/arch/arm64/um/Kconfig
 +++ b/arch/arm64/um/Kconfig
 @@ -31,12 +31,20 @@ config UML_ARM64_SME
@@ -105,11 +105,11 @@ index e379296b3128502aafbe5ac48c589da11fe9f37e..163835b67e17f43ebbc058d7acf26af3
  # The AArch64 tagged-address ABI of arm64 Linux's ARM64_TAGGED_ADDR_ABI:
  # PR_SET_TAGGED_ADDR_CTRL, NT_ARM_TAGGED_ADDR_CTRL and the
 diff --git a/arch/arm64/um/Makefile b/arch/arm64/um/Makefile
-index 8fc740b497d85ddc1e749cb824e826df8e7c227c..cc95273be0999519bc1fd89160ddbf39772dbc74 100644
+index 3e3d617851f7c6299fd5402158d87c6d38fa4b9f..6d9c1245ee1ca713ceb2bd08499565278074fab2 100644
 --- a/arch/arm64/um/Makefile
 +++ b/arch/arm64/um/Makefile
-@@ -7,22 +7,29 @@ obj-$(CONFIG_UML_ARM64_SME) += sme.o sme_signal.o
- obj-$(CONFIG_UML_ARM64_TAGGED_ADDR_ABI) += tagged_addr.o
+@@ -8,22 +8,29 @@ obj-$(CONFIG_UML_ARM64_TAGGED_ADDR_ABI) += tagged_addr.o
+ obj-$(CONFIG_UML_ARM64_VDSO) += vdso/
  obj-$(CONFIG_UML_ARM64_AARCH32) += aarch32.o aarch32_pages.o \
  	armv8_deprecated.o ptrace32.o signal32.o sys32.o sys_compat.o
 +obj-$(CONFIG_COMPAT) += x86_32_syscalls.o

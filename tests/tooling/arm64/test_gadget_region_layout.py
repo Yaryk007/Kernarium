@@ -49,6 +49,7 @@ BOUNDS = {
     "a32_bank": "uml_arm64_gadget_a32_bank_section",
     "a32_cold": "uml_arm64_gadget_a32_cold_section",
     "a32_veneer": "uml_arm64_gadget_a32_veneer_section",
+    "runs": "uml_arm64_gadget_runs_section",
 }
 # The islands: parts whose words are all branches. The AArch32 part has its
 # own so that it never adds a veneer to the first.

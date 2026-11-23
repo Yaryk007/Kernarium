@@ -12,9 +12,10 @@ namespace kernarium::input {
  * wakes it, so the host wakes it for the keyboard, as a phone does. Power
  * wakes it at every press. Any other key wakes it at most once per interval,
  * because a held key repeats and a running guest only answers the edge. A key
- * release never wakes it. Touches do not go through this policy at all: they
- * never wake the guest, because a touchscreen on a phone with its display off
- * does not. */
+ * release never wakes it. A game controller's button going down wakes it as an
+ * ordinary key does. Touches do not go through this policy at all: they never
+ * wake the guest, because a touchscreen on a phone with its display off does
+ * not. */
 class KeyWakePolicy final {
 public:
     using Clock = std::chrono::steady_clock;
@@ -42,6 +43,15 @@ public:
         } while (!lastWake_.compare_exchange_weak(
             last, tick, std::memory_order_relaxed));
         return true;
+    }
+
+    /* A button of a game controller went down. It wakes like any key but
+     * Power: at most once per interval, in the keyboard's own interval, so a
+     * held button's repeats and a controller beside a keyboard send one edge.
+     * An axis never calls this. */
+    [[nodiscard]] bool shouldWakeForButtonDown(Clock::time_point now) noexcept
+    {
+        return shouldWake(false, true, now);
     }
 
 private:

@@ -4,13 +4,14 @@ import Foundation
 
 /// Decides when a running guest is paused for want of space on the device.
 ///
-/// A guest's disk is a sparse file that grows as the guest writes, and the
-/// guest mounts it so that a write the device cannot take stops it (Android's
-/// data disk is `errors=panic`). The start check covers only the first
-/// writes, so while the guest runs the application reads the free space the
-/// way it states it elsewhere and pauses the guest before the disk can fail
-/// to grow. The runtime's suspension does the pausing (`SpacePauser`); this
-/// type holds the numbers and the rules that follow from them.
+/// A guest's disk is a sparse file that grows as the guest writes. A write the
+/// device cannot take is held, with the guest's other disk I/O, until the
+/// device has room (the kernel's UBD hold). The start check covers only the
+/// first writes, so while the guest runs the application reads the space a
+/// write can use (`HostStorage`, the one figure every screen shows too) and
+/// pauses the guest before the disk can fail to grow. The runtime's
+/// suspension does the pausing (`SpacePauser`); this type holds the numbers
+/// and the rules that follow from them. "Free space" below is that figure.
 public enum RunSpace {
     public enum Verdict: Equatable, Sendable {
         case keepRunning

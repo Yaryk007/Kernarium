@@ -18,6 +18,8 @@
  *   - the arguments of "arm" filter the holders (a minimum of bytes, a
  *     minimum of idle time) and leave the state alone;
  *   - the state returns to calm when the process ends;
+ *   - memory a process frees is given back at once: it can allocate the same
+ *     size again, which the host refuses while it counts the freed memory;
  *   - an allocation the host refuses raises REFUSED and counts;
  *   - a disarmed file is woken by nothing, under pressure too.
  *
@@ -293,6 +295,7 @@ using EnumerateDevices = int32_t (*)(Handle, uint32_t *, Handle *);
 using GetMemoryProperties = void (*)(Handle, MemoryProperties *);
 using CreateDevice = int32_t (*)(Handle, const DeviceCreateInfo *, const void *, Handle *);
 using AllocateMemory = int32_t (*)(Handle, const MemoryAllocateInfo *, const void *, uint64_t *);
+using FreeMemory = void (*)(Handle, uint64_t, const void *);
 
 constexpr uint32_t memory_device_local = 1;
 
@@ -315,12 +318,18 @@ bool choose_venus_driver()
 		return false;
 	setenv("VK_ICD_FILENAMES", path, 1);
 	setenv("VK_DRIVER_FILES", path, 1);
+	/* Each allocation waits for the host's answer, as the Android image has
+	 * every process do (debug.mesa.vn.perf): the host credits a Venus
+	 * allocation to its context once its render thread has made it, and the
+	 * report never waits for the renderer. */
+	setenv("VN_PERF", "no_async_mem_alloc", 1);
 	return true;
 }
 
 struct Venus {
 	Handle device;
 	AllocateMemory allocate;
+	FreeMemory release;
 	uint32_t memory_type;
 };
 
@@ -342,7 +351,9 @@ bool venus_open(Venus &venus)
 		reinterpret_cast<GetMemoryProperties>(dlsym(library, "vkGetPhysicalDeviceMemoryProperties"));
 	auto create_device = reinterpret_cast<CreateDevice>(dlsym(library, "vkCreateDevice"));
 	venus.allocate = reinterpret_cast<AllocateMemory>(dlsym(library, "vkAllocateMemory"));
-	if (!create_instance || !enumerate || !memory_properties || !create_device || !venus.allocate) {
+	venus.release = reinterpret_cast<FreeMemory>(dlsym(library, "vkFreeMemory"));
+	if (!create_instance || !enumerate || !memory_properties || !create_device || !venus.allocate ||
+	    !venus.release) {
 		std::printf("FAIL the Vulkan loader lacks an entry point\n");
 		return false;
 	}
@@ -382,19 +393,22 @@ bool venus_open(Venus &venus)
 	return true;
 }
 
-int32_t venus_allocate(Venus &venus, uint64_t bytes)
+int32_t venus_allocate(Venus &venus, uint64_t bytes, uint64_t *made = nullptr)
 {
 	MemoryAllocateInfo allocation{5, nullptr, bytes, venus.memory_type};
 	uint64_t memory = 0;
-	return venus.allocate(venus.device, &allocation, nullptr, &memory);
+	const int32_t result = venus.allocate(venus.device, &allocation, nullptr, &memory);
+	if (made)
+		*made = memory;
+	return result;
 }
 
 /* A holder is a process named `comm` with one Venus context.  It says "a" once
  * it holds a first allocation, which tells the parent the host's overhead for
  * a context, then allocates the size each 8 bytes the parent writes ("b" when
  * done), and holds all of it until the pipe ends.  A size that does not fit is
- * the point of the refusal check: the allocation is asynchronous, so the
- * process may live on or fail later, and the parent does not judge it. */
+ * the point of the refusal check: the allocation fails, and the parent does
+ * not judge it. */
 constexpr uint64_t first_allocation = 16 * mebibyte;
 
 int holder_main(const char *comm, int ready, int command)
@@ -420,13 +434,50 @@ int holder_main(const char *comm, int ready, int command)
 	}
 }
 
+/* The process of the free-and-allocate-again check: it holds a first allocation
+ * ("a"), then, for the size the parent writes, allocates it, frees it and
+ * allocates it again, and says "b" if both allocations were admitted, "f" if
+ * not.  It lives on until the pipe ends. */
+int again_main(const char *comm, int ready, int command)
+{
+	prctl(PR_SET_NAME, comm, 0, 0, 0);
+	Venus venus{};
+	if (!venus_open(venus))
+		return 1;
+	if (int32_t result = venus_allocate(venus, first_allocation)) {
+		std::printf("FAIL the first vkAllocateMemory: %d\n", result);
+		return 1;
+	}
+	(void)!write(ready, "a", 1);
+	pollfd waiting{command, POLLIN, 0};
+	uint64_t bytes = 0;
+	if (poll(&waiting, 1, 180 * 1000) <= 0 ||
+	    read(command, &bytes, sizeof bytes) != ssize_t(sizeof bytes))
+		return 0;
+	uint64_t memory = 0;
+	int32_t result = venus_allocate(venus, bytes, &memory);
+	if (result == 0) {
+		venus.release(venus.device, memory, nullptr);
+		result = venus_allocate(venus, bytes);
+	}
+	if (result != 0)
+		std::printf("vkAllocateMemory of %llu MiB after freeing the same: %d\n",
+			    (unsigned long long)(bytes / mebibyte), result);
+	(void)!write(ready, result == 0 ? "b" : "f", 1);
+	for (;;) {
+		pollfd idle{command, POLLIN, 0};
+		if (poll(&idle, 1, 180 * 1000) <= 0 || read(command, &bytes, 1) <= 0)
+			return 0;
+	}
+}
+
 struct Child {
 	pid_t pid;
 	int ready;
 	int command;
 };
 
-Child start_holder(const char *comm)
+Child start_child(const char *comm, int (*main_of)(const char *, int, int))
 {
 	int ready[2], command[2];
 	Child child{-1, -1, -1};
@@ -436,7 +487,7 @@ Child start_holder(const char *comm)
 	if (pid == 0) {
 		close(ready[0]);
 		close(command[1]);
-		_exit(holder_main(comm, ready[1], command[0]));
+		_exit(main_of(comm, ready[1], command[0]));
 	}
 	close(ready[1]);
 	close(command[0]);
@@ -444,6 +495,11 @@ Child start_holder(const char *comm)
 	child.ready = ready[0];
 	child.command = command[1];
 	return child;
+}
+
+Child start_holder(const char *comm)
+{
+	return start_child(comm, holder_main);
 }
 
 bool child_says(const Child &child, char what, uint64_t timeout_ms)
@@ -606,6 +662,22 @@ int main()
 	check(calm, "the pressure ends when the holder ends", report.text);
 	if (calm)
 		std::printf("calm after %llu ms\n", (unsigned long long)(now_ms() - started));
+
+	/* Memory a process frees is given back: more than half of the budget,
+	 * allocated, freed and allocated again, fits each time, but not while the
+	 * host still counts the first. */
+	Child again = start_child("memagain", again_main);
+	check(again.pid > 0 && child_says(again, 'a', 180 * 1000),
+	      "a process holds a first device allocation to free and allocate again");
+	const uint64_t twice = (budget / 2 + 32 * mebibyte) / mebibyte * mebibyte;
+	std::printf("allocating, freeing and allocating %llu MiB again\n",
+		    (unsigned long long)(twice / mebibyte));
+	ask_to_hold(again, twice);
+	check(child_says(again, 'b', 60 * 1000),
+	      "a freed allocation is given back: the same size is admitted again");
+	end_holder(again);
+	wait_for(fd, report, 12000, nullptr,
+		 [](const Report &r) { return !(r.state & (state_pressure | state_refused)); });
 
 	/* An allocation the pool refuses. */
 	Child refuser = start_holder("memrefuse");

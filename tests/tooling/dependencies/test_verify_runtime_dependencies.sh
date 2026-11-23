@@ -88,10 +88,14 @@ for framework in MesaEGL MesaGallium; do
 <plist version="1.0"><dict><key>CFBundleExecutable</key><string>$framework</string></dict></plist>
 EOF
 done
+# KosmicKrisp links libcompression, which keeps its pipelines' MSL compressed.
 xcrun --sdk macosx clang -arch arm64 -dynamiclib \
 	-Wl,-install_name,@rpath/KosmicKrisp.framework/KosmicKrisp \
-	"$TEST_ROOT/kosmickrisp.c" \
+	"$TEST_ROOT/kosmickrisp.c" -lcompression \
 	-o "$PREFIX/Frameworks/KosmicKrisp.framework/KosmicKrisp"
+otool -L "$PREFIX/Frameworks/KosmicKrisp.framework/KosmicKrisp" |
+	grep -q /usr/lib/libcompression.dylib ||
+	fail "the KosmicKrisp fixture does not link libcompression"
 cat >"$PREFIX/Frameworks/KosmicKrisp.framework/Info.plist" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0"><dict><key>CFBundleExecutable</key><string>KosmicKrisp</string></dict></plist>

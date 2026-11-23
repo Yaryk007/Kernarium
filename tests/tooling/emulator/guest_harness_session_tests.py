@@ -614,15 +614,28 @@ class AttachedGuestSessionTests(unittest.TestCase):
             b"\r\n~ # ",
             b"\n/ # ",
             b"\r\n\x1b[?2004l\r# ",
+            # ash's line editor asks where the cursor is right after its
+            # prompt, and nothing on the console answers.
+            b"# \x1b[6n",
+            b"\r\n~ # \x1b[6n",
         ):
             with self.subTest(transcript=transcript):
                 self.assertIsNotNone(prompt.search(transcript))
         # Only a prompt that ends what the console has shown counts, and only
-        # on the line it ends.
+        # on the line it ends. A cursor query that is cut short, text after the
+        # prompt or after the query, and a prompt of another user are not the
+        # root shell waiting.
         for transcript in (
             b"\r\nnot a prompt # yet\r\n",
             b"\r\n~ # ls\r\n",
             b"\r\n~ $ ",
+            b"\r\n~ # \x1b",
+            b"\r\n~ # \x1b[",
+            b"\r\n~ # \x1b[6",
+            b"\r\n~ # \x1b[6nls",
+            b"\r\n~ # \x1b[6n\r\n",
+            b"\r\n~ # ls\x1b[6n",
+            b"\r\n~ $ \x1b[6n",
         ):
             with self.subTest(transcript=transcript):
                 self.assertIsNone(prompt.search(transcript))

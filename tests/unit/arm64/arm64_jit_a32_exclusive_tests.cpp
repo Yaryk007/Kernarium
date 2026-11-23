@@ -5,19 +5,26 @@
  * The compare-and-swap idiom, fault and alignment exits, two threads counting
  * exactly and an ordinary store beating a reservation are covered too. The
  * fused loop must make no helper call, also with a compare and conditional
- * branch or a CBNZ between the load and the store (A32 and T32). */
+ * branch or a CBNZ between the load and the store (A32 and T32). A branch out
+ * of a fused run that is taken, or a store whose condition fails, discards the
+ * run and executes the load-exclusive again semantically, so a loop whose other
+ * path reaches a store-exclusive without a new load still ends. */
 #include "arm64_jit_a32_test_support.hpp"
 #include "runtime_test_route.hpp"
 
 #include "cpu/arm64/aarch32/semantics_exit_counters.hpp"
 #include "cpu/arm64/jit/jit_cache_geometry.hpp"
+#include "cpu/arm64/jit/jit_executor.hpp"
 
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <initializer_list>
 #include <pthread.h>
 #include <thread>
+#include <utility>
+#include <vector>
 
 using namespace uml::emulator::tests;
 using namespace uml::emulator::tests::a32;
@@ -148,8 +155,10 @@ void thumb_fused_add(unsigned long generation) {
 }
 
 /* A branch out of the run: LDREX, a compare or CBNZ, a conditional branch to
- * the exit, then the STREX. The run is one fused block with no helper exit
- * on either arm, and the taken arm closes the monitor. */
+ * the exit, then the STREX. The run is one fused block. When the store runs
+ * there is no helper exit; when the branch is taken (or the store's condition
+ * fails) the run is discarded and the LDREX executes again through the one
+ * helper exit, whose reservation is still armed at the SVC. */
 void branch_out_of_the_run(unsigned long generation) {
   const auto arm = [&](Fixture &fixture, unsigned mode) {
     // mode 0: ldrex r3; cmp r3,r1; bne out; strex r12,r2; cmp r12,#0; bne 0.
@@ -188,8 +197,17 @@ void branch_out_of_the_run(unsigned long generation) {
       const auto result = fixture.run(cpu);
       ::uml::cpu::arm64::aarch32::count_a32_library_exits(false);
       require(result.reason == ExitReason::system_call);
-      require(::uml::cpu::arm64::aarch32::a32_library_exit_total() == 0);
-      require(cpu.exclusive_size == 0);
+      if (stays) {
+        // The deferred LDREX is the only helper exit; the compare, the branch
+        // and a condition-failed STREX run inline.
+        require(::uml::cpu::arm64::aarch32::a32_library_exit_total() == 1);
+        require(cpu.exclusive_size == 4);
+        require(cpu.exclusive_address == data_base);
+        require(cpu.exclusive_value == 77);
+      } else {
+        require(::uml::cpu::arm64::aarch32::a32_library_exit_total() == 0);
+        require(cpu.exclusive_size == 0);
+      }
       if (mode == 0) {
         require(cpu.registers[3] == 77);
         require(fixture.read32(0) == (stays ? 77U : 99U));
@@ -233,8 +251,15 @@ void thumb_branch_out_of_the_run(unsigned long generation) {
       const auto result = fixture.run(cpu);
       ::uml::cpu::arm64::aarch32::count_a32_library_exits(false);
       require(result.reason == ExitReason::system_call);
-      require(::uml::cpu::arm64::aarch32::a32_library_exit_total() == 0);
-      require(cpu.exclusive_size == 0);
+      if (stays) {
+        require(::uml::cpu::arm64::aarch32::a32_library_exit_total() == 1);
+        require(cpu.exclusive_size == 4);
+        require(cpu.exclusive_address == data_base);
+        require(cpu.exclusive_value == (form == 0 ? 55U : 3U));
+      } else {
+        require(::uml::cpu::arm64::aarch32::a32_library_exit_total() == 0);
+        require(cpu.exclusive_size == 0);
+      }
       require(cpu.registers[2] == (form == 0 ? 55U : (stays ? 3U : 0U)));
       if (stays) {
         require(fixture.read32(0) == (form == 0 ? 55U : 3U));
@@ -249,6 +274,395 @@ void thumb_branch_out_of_the_run(unsigned long generation) {
   fixture.code16(0, {0xe850, 0x2f00, 0x428a, thumb_branch(ne, 3, 8), 0xe840,
                      0x4300, 0x2b00, thumb_branch(ne, 7, 0), 0xdf00});
   require(block_instructions(fixture, 0, 9, true) == 6);
+}
+
+
+/* ---- The exits of a fused run discard it (rows R10a-R10g) ---------------- */
+
+using ::uml::cpu::EngineEvent;
+using Registers = std::initializer_list<std::pair<unsigned, std::uint32_t>>;
+
+struct BlockRun final {
+  bool finished{};
+  std::size_t retired{};
+  std::array<std::uint64_t, 31> registers{};
+  std::uint32_t nzcv{};
+  std::uint32_t memory{};
+};
+
+[[nodiscard]] arm64::CpuState start_state(bool thumb, std::size_t offset,
+                                          Registers registers) {
+  auto cpu = Fixture::task(thumb, offset);
+  cpu.registers[0] = data_base;
+  for (const auto &[index, value] : registers)
+    cpu.registers[index] = value;
+  return cpu;
+}
+
+/* Runs `cpu` until the SVC one block at a time, in at most 100 dispatches,
+ * through the executor's own entry (the native translation) or with
+ * single-stepping (the semantic control, one instruction per dispatch). */
+[[nodiscard]] BlockRun run_blocks(Fixture &fixture, arm64::CpuState cpu,
+                                  bool single_step) {
+  ::uml::cpu::arm64::JitExecutor executor;
+  ::uml::memory::StaticGuestMemory memory;
+  const auto generation = fixture.generation();
+  require(executor.begin_execution(generation, cpu.pc));
+  executor.set_single_step(single_step);
+  BlockRun run;
+  auto event = EngineEvent::continued;
+  for (unsigned dispatch = 0;
+       dispatch < 100U && event == EngineEvent::continued; ++dispatch) {
+    std::size_t executed = 0;
+    event = executor.run_a32_block(cpu, memory, generation, executed);
+    run.retired += executed;
+  }
+  run.finished = event == EngineEvent::system_call;
+  run.registers = cpu.registers;
+  run.nzcv = cpu.nzcv;
+  run.memory = fixture.read32(0);
+  executor.end_execution();
+  return run;
+}
+
+/* A loop with an exit that reaches a store-exclusive without a new
+ * load-exclusive. The architecture ends it in `retired` instructions with
+ * `final_memory` in the word, as single-stepping does; the translation must
+ * give the same registers, flags, memory and retirement, and so must the
+ * gadget engine (registers and memory). The block that opens the loop holds
+ * `fused_block` instructions: the fused run, or one when the shape is not
+ * fused. */
+void loop_makes_progress(unsigned long generation, bool thumb,
+                         const std::vector<std::uint32_t> &arm_words,
+                         const std::vector<std::uint16_t> &thumb_halves,
+                         std::uint32_t memory, Registers registers,
+                         std::size_t retired, std::uint32_t final_memory,
+                         Registers final_registers, std::size_t fused_block) {
+  Fixture fixture{generation};
+  std::size_t offset = 0;
+  if (thumb) {
+    for (const auto half : thumb_halves) {
+      fixture.code16(offset, {half});
+      offset += 2;
+    }
+  } else {
+    for (const auto word : arm_words) {
+      fixture.code32(offset, {word});
+      offset += 4;
+    }
+  }
+  const auto cpu = start_state(thumb, 0, registers);
+  require(block_instructions(fixture, 0,
+                             thumb ? thumb_halves.size() : arm_words.size(),
+                             thumb) == fused_block);
+
+  fixture.data32(0, memory);
+  const auto control = run_blocks(fixture, cpu, true);
+  require(control.finished && control.retired == retired);
+  require(control.memory == final_memory);
+  for (const auto &[index, value] : final_registers)
+    require(control.registers[index] == value);
+
+  fixture.data32(0, memory);
+  const auto native = run_blocks(fixture, cpu, false);
+  require(native.finished);
+  require(native.retired == control.retired);
+  require(native.registers == control.registers);
+  require(native.nzcv == control.nzcv);
+  require(native.memory == control.memory);
+
+  fixture.data32(0, memory);
+  const auto engine =
+      ::uml::cpu::make_cpu_engine(::uml::cpu::EngineKind::gadgets);
+  require(engine != nullptr);
+  auto gadget_cpu = cpu;
+  const auto result = fixture.run_on(*engine, gadget_cpu, 1000);
+  require(result.reason == ExitReason::system_call);
+  require(fixture.read32(0) == final_memory);
+  for (const auto &[index, value] : final_registers)
+    require(gadget_cpu.registers[index] == value);
+}
+
+constexpr std::uint32_t arm_ldrex_r3 = 0xe190'3f9fU;  // ldrex r3, [r0]
+constexpr std::uint32_t arm_cmp_r3_r1 = 0xe153'0001U; // cmp r3, r1
+constexpr std::uint32_t arm_strex_r12_r2 = 0xe180'cf92U; // strex r12, r2, [r0]
+constexpr std::uint32_t arm_cmp_r12_0 = 0xe35c'0000U;
+constexpr std::uint32_t arm_strex_r6_r7 = 0xe180'6f97U;  // strex r6, r7, [r0]
+constexpr std::uint32_t arm_cmp_r6_0 = 0xe356'0000U;
+
+/* R10a: the taken branch of the run reaches a second STREX that has no LDREX
+ * of its own. `1: ldrex r3,[r0]; cmp r3,r1; bne 2f; strex r12,r2,[r0];
+ * cmp r12,#0; bne 1b; svc; 2: strex r6,r7,[r0]; cmp r6,#0; bne 1b; svc`
+ * with memory 41 and r1 = 42. The word and the byte form. */
+void arm_side_exit_loop_ends(unsigned long generation) {
+  for (const bool byte : {false, true}) {
+    const std::uint32_t load = byte ? 0xe1d0'3f9fU : arm_ldrex_r3;
+    const std::uint32_t first = byte ? 0xe1c0'cf92U : arm_strex_r12_r2;
+    const std::uint32_t second = byte ? 0xe1c0'6f97U : arm_strex_r6_r7;
+    loop_makes_progress(
+        generation + (byte ? 1U : 0U), false,
+        {load, arm_cmp_r3_r1, arm_branch(ne, 2, 7), first, arm_cmp_r12_0,
+         arm_branch(ne, 5, 0), arm_svc, second, arm_cmp_r6_0,
+         arm_branch(ne, 9, 0), arm_svc},
+        {}, 41, {{1, 42}, {2, 42}, {6, 9}, {7, 43}, {12, 0xdead}}, 7, 43,
+        {{3, 41}, {6, 0}, {12, 0xdead}}, 6);
+  }
+}
+
+/* R10b: the STREX under a condition that fails, then a STREX that needs the
+ * LDREX's reservation: `1: ldrex r3,[r0]; cmp r3,r1; strexeq r12,r2,[r0];
+ * strex r6,r7,[r0]; cmp r6,#0; bne 1b; svc`, the same with `strexne
+ * r12,r4,[r0]` as the fourth word, and the halfword form of the first. */
+void arm_condition_failed_store_loop_ends(unsigned long generation) {
+  loop_makes_progress(
+      generation, false,
+      {arm_ldrex_r3, arm_cmp_r3_r1, 0x0180'cf92U, arm_strex_r6_r7,
+       arm_cmp_r6_0, arm_branch(ne, 5, 0), arm_svc},
+      {}, 41, {{1, 42}, {2, 42}, {6, 9}, {7, 43}, {12, 0xdead}}, 7, 43,
+      {{3, 41}, {6, 0}, {12, 0xdead}}, 3);
+  loop_makes_progress(
+      generation + 1U, false,
+      {arm_ldrex_r3, arm_cmp_r3_r1, 0x0180'cf92U, 0x1180'cf94U,
+       0xe35c'0000U, arm_branch(ne, 5, 0), arm_svc},
+      {}, 41, {{1, 42}, {2, 42}, {4, 55}, {12, 0xdead}}, 7, 55,
+      {{3, 41}, {12, 0}}, 3);
+  loop_makes_progress(
+      generation + 2U, false,
+      {0xe1f0'3f9fU, arm_cmp_r3_r1, 0x01e0'cf92U, 0xe1e0'6f97U,
+       arm_cmp_r6_0, arm_branch(ne, 5, 0), arm_svc},
+      {}, 41, {{1, 42}, {2, 42}, {6, 9}, {7, 43}, {12, 0xdead}}, 7, 43,
+      {{3, 41}, {6, 0}, {12, 0xdead}}, 3);
+}
+
+/* R10c: the same loops in Thumb: a B<cond>.N, a B<cond>.W, and CBNZ (whose
+ * loop retires six, so it is compared with its own control). The status
+ * registers are low so that the compares are 16-bit. */
+void thumb_side_exit_loops_end(unsigned long generation) {
+  constexpr std::uint16_t ldrex_r3[] = {0xe850, 0x3f00};
+  constexpr std::uint16_t strex_r5_r2[] = {0xe840, 0x2500};
+  constexpr std::uint16_t strex_r6_r7[] = {0xe840, 0x7600};
+  constexpr std::uint16_t cmp_r3_r1 = 0x428b;
+  constexpr std::uint16_t cmp_r5_0 = 0x2d00;
+  constexpr std::uint16_t cmp_r6_0 = 0x2e00;
+  constexpr std::uint16_t svc = 0xdf00;
+  const Registers regs{{1, 42}, {2, 42}, {5, 9}, {6, 9}, {7, 43}};
+  // bne.n
+  loop_makes_progress(
+      generation, true, {},
+      {ldrex_r3[0], ldrex_r3[1], cmp_r3_r1, thumb_branch(ne, 3, 9),
+       strex_r5_r2[0], strex_r5_r2[1], cmp_r5_0, thumb_branch(ne, 7, 0), svc,
+       strex_r6_r7[0], strex_r6_r7[1], cmp_r6_0, thumb_branch(ne, 12, 0),
+       svc},
+      41, regs, 7, 43, {{3, 41}, {5, 9}, {6, 0}}, 6);
+  // bne.w: B<cond>.W with a six-halfword reach.
+  loop_makes_progress(
+      generation + 1U, true, {},
+      {ldrex_r3[0], ldrex_r3[1], cmp_r3_r1, 0xf040, 0x8005, strex_r5_r2[0],
+       strex_r5_r2[1], cmp_r5_0, thumb_branch(ne, 8, 0), svc, strex_r6_r7[0],
+       strex_r6_r7[1], cmp_r6_0, thumb_branch(ne, 13, 0), svc},
+      41, regs, 7, 43, {{3, 41}, {5, 9}, {6, 0}}, 6);
+  // cbnz r3, 2f
+  loop_makes_progress(
+      generation + 2U, true, {},
+      {ldrex_r3[0], ldrex_r3[1], 0xb923, strex_r5_r2[0], strex_r5_r2[1],
+       cmp_r5_0, thumb_branch(ne, 6, 0), svc, strex_r6_r7[0], strex_r6_r7[1],
+       cmp_r6_0, thumb_branch(ne, 11, 0), svc},
+      41, regs, 6, 43, {{3, 41}, {5, 9}, {6, 0}}, 5);
+}
+
+/* R10d: a store in an IT block is not fused (the LDREX's block is one
+ * instruction), before or after the exits roll back, and its loops end
+ * through the semantic path. */
+void thumb_it_forms_end(unsigned long generation) {
+  constexpr std::uint16_t ldrex_r3[] = {0xe850, 0x3f00};
+  constexpr std::uint16_t cmp_r3_r1 = 0x428b;
+  constexpr std::uint16_t strex_r5_r2[] = {0xe840, 0x2500};
+  constexpr std::uint16_t strex_r5_r4[] = {0xe840, 0x4500};
+  constexpr std::uint16_t strex_r6_r7[] = {0xe840, 0x7600};
+  constexpr std::uint16_t cmp_r5_0 = 0x2d00;
+  constexpr std::uint16_t cmp_r6_0 = 0x2e00;
+  constexpr std::uint16_t svc = 0xdf00;
+  const Registers regs{{1, 42}, {2, 42}, {4, 55}, {5, 9}, {6, 9}, {7, 43}};
+  // it eq; strexeq r5,r2,[r0]; strex r6,r7,[r0]
+  const std::vector<std::uint16_t> it_eq{
+      ldrex_r3[0], ldrex_r3[1], cmp_r3_r1, 0xbf08, strex_r5_r2[0],
+      strex_r5_r2[1], strex_r6_r7[0], strex_r6_r7[1], cmp_r6_0,
+      thumb_branch(ne, 9, 0), svc};
+  loop_makes_progress(generation, true, {}, it_eq, 41, regs, 8, 43,
+                      {{3, 41}, {5, 9}, {6, 0}}, 1);
+  // ite eq; strexeq r5,r2,[r0]; strexne r5,r4,[r0]
+  const std::vector<std::uint16_t> ite_eq{
+      ldrex_r3[0], ldrex_r3[1], cmp_r3_r1, 0xbf0c, strex_r5_r2[0],
+      strex_r5_r2[1], strex_r5_r4[0], strex_r5_r4[1], cmp_r5_0,
+      thumb_branch(ne, 9, 0), svc};
+  loop_makes_progress(generation + 1U, true, {}, ite_eq, 41, regs, 8, 55,
+                      {{3, 41}, {5, 0}}, 1);
+}
+
+/* R10e: a fused run entered from the executor, the success path first, then
+ * the exit. The exit retires the deferred LDREX only: the PC is after it, the
+ * reservation is the one it takes, Rt is memory's value, and the middle's
+ * write to r4, the flags and every other register are as they were before the
+ * block. The loop then ends with r4 raised once, as its single-stepped control
+ * ends. */
+void rollback_leaves_the_state_at_the_load(unsigned long generation,
+                                           bool thumb) {
+  Fixture fixture{generation};
+  std::size_t units;
+  constexpr std::uint32_t ldrex_bytes = 4;
+  if (!thumb) {
+    // 1: ldrex r3,[r0]; add r4,r4,#1; cmp r3,r1; bne 2f; strex r12,r2,[r0];
+    // cmp r12,#0; bne 1b; svc; 2: strex r6,r7,[r0]; cmp r6,#0; bne 1b; svc
+    fixture.code32(0, {arm_ldrex_r3, 0xe284'4001U, arm_cmp_r3_r1,
+                       arm_branch(ne, 3, 8), arm_strex_r12_r2,
+                       arm_cmp_r12_0, arm_branch(ne, 6, 0), arm_svc,
+                       arm_strex_r6_r7, arm_cmp_r6_0, arm_branch(ne, 10, 0),
+                       arm_svc});
+    units = 12;
+  } else {
+    fixture.code16(0, {0xe850, 0x3f00, 0xf104, 0x0401, 0x428b,
+                       thumb_branch(ne, 5, 11), 0xe840, 0x2500, 0x2d00,
+                       thumb_branch(ne, 9, 0), 0xdf00, 0xe840, 0x7600,
+                       0x2e00, thumb_branch(ne, 14, 0), 0xdf00});
+    units = 16;
+  }
+  // The block is entered at its first instruction, linked or not.
+  std::vector<std::byte> code(units * (thumb ? 2 : 4));
+  fixture.read_code(0, code);
+  const auto key = thumb ? key::t32_key(code_base) : key::a32_key(code_base);
+  require(!::uml::cpu::arm64::jit::testing::compile_a32_linked_block(key, code)
+               .code.link_target_safe);
+  constexpr std::size_t fused = 5; // ldrex, add, cmp, bne, strex
+  const auto compiled =
+      ::uml::cpu::arm64::jit::testing::compile_a32_block(key, code);
+  require(compiled.code.guest_instructions >= fused);
+
+  auto cpu = start_state(thumb, 0, {{1, 42}, {2, 100}, {4, 7}, {7, 43},
+                                    {5, 0xa5a5}, {12, 0xdead}});
+  fixture.data32(0, 42);
+  ::uml::cpu::arm64::JitExecutor executor;
+  ::uml::memory::StaticGuestMemory memory;
+  const auto generation_id = fixture.generation();
+  require(executor.begin_execution(generation_id, cpu.pc));
+  ::uml::cpu::arm64::aarch32::reset_a32_library_exits();
+  ::uml::cpu::arm64::aarch32::count_a32_library_exits(true);
+  std::size_t executed = 0;
+  require(executor.run_a32_block(cpu, memory, generation_id, executed) ==
+          EngineEvent::continued);
+  ::uml::cpu::arm64::aarch32::count_a32_library_exits(false);
+  // The success path is the fused translation: no helper exit, the monitor
+  // closed. A first store to the page may fail like any, and the pass then
+  // repeats, so the memory word is not asserted.
+  require(executed >= fused);
+  require(::uml::cpu::arm64::aarch32::a32_library_exit_total() == 0);
+  require(cpu.exclusive_size == 0);
+
+  // The exit path on the same translation.
+  fixture.data32(0, 41);
+  cpu.pc = key;
+  cpu.registers[3] = 0x5555;
+  cpu.registers[4] = 7;
+  cpu.registers[5] = 0xa5a5;
+  cpu.registers[6] = 9;
+  cpu.registers[12] = 0xdead;
+  cpu.nzcv = flag_c | flag_v;
+  const auto before = cpu.registers;
+  ::uml::cpu::arm64::aarch32::reset_a32_library_exits();
+  ::uml::cpu::arm64::aarch32::count_a32_library_exits(true);
+  executed = 0;
+  require(executor.run_a32_block(cpu, memory, generation_id, executed) ==
+          EngineEvent::continued);
+  ::uml::cpu::arm64::aarch32::count_a32_library_exits(false);
+  require(executed == 1);
+  require(::uml::cpu::arm64::aarch32::a32_library_exit_total() == 1);
+  require(cpu.pc == (thumb ? key::t32_key(code_base + ldrex_bytes)
+                           : key::a32_key(code_base + ldrex_bytes)));
+  require(cpu.exclusive_size == 4 && cpu.exclusive_address == data_base);
+  require(cpu.exclusive_value == 41);
+  require(cpu.registers[3] == 41);
+  for (unsigned index = 0; index < 31U; ++index)
+    require(index == 3U || cpu.registers[index] == before[index]);
+  require(cpu.nzcv == (flag_c | flag_v));
+  require(fixture.read32(0) == 41);
+  // The rest of the loop, against the single-stepped control from the start
+  // of the pass.
+  std::size_t retired = 0;
+  auto event = EngineEvent::continued;
+  for (unsigned dispatch = 0; dispatch < 20U && event == EngineEvent::continued;
+       ++dispatch) {
+    executed = 0;
+    event = executor.run_a32_block(cpu, memory, generation_id, executed);
+    retired += executed;
+  }
+  require(event == EngineEvent::system_call);
+  executor.end_execution();
+  fixture.data32(0, 41);
+  auto control_cpu = start_state(thumb, 0, {{1, 42}, {2, 100}, {4, 7}, {7, 43},
+                                            {5, 0xa5a5}, {6, 9}, {12, 0xdead}});
+  control_cpu.nzcv = flag_c | flag_v;
+  const auto control = run_blocks(fixture, control_cpu, true);
+  require(control.finished);
+  require(cpu.registers[4] == 8 && cpu.registers[6] == 0);
+  require(cpu.registers == control.registers && cpu.nzcv == control.nzcv);
+  require(fixture.read32(0) == 43 && control.memory == 43);
+  require(retired + 1 == control.retired);
+}
+
+/* R10f: a fused block is never a link target. Its rollback publishes nothing,
+ * so a predecessor linked into it would lose the registers it changed in the
+ * host. Each predecessor stores directly (so its chain holds a publication and
+ * a fused block would qualify), sets r4 and r9, and reaches the loop by `b` or
+ * by `bx lr`; the loop is compiled first and each runs several passes, so the
+ * indirect link is trained and then used. */
+void fused_block_is_not_a_link_target(unsigned long generation) {
+  Fixture fixture{generation};
+  constexpr std::size_t loop_offset = 0x40;
+  constexpr std::size_t direct_offset = 0;
+  constexpr std::size_t indirect_offset = 0x80;
+  constexpr int loop_word = loop_offset / 4;
+  fixture.code32(direct_offset,
+                 {0xe588'5000U,                 // str r5, [r8]
+                  0xe3a0'4064U,                 // mov r4, #100
+                  0xe3a0'90c8U,                 // mov r9, #200
+                  arm_branch(14, 3, loop_word)}); // b the loop
+  fixture.code32(indirect_offset,
+                 {0xe588'5000U, 0xe3a0'4064U, 0xe3a0'90c8U,
+                  0xe12f'ff1eU});                // bx lr
+  fixture.code32(loop_offset,
+                 {arm_ldrex_r3, arm_cmp_r3_r1,
+                  arm_branch(ne, loop_word + 2, loop_word + 7),
+                  arm_strex_r12_r2, arm_cmp_r12_0,
+                  arm_branch(ne, loop_word + 5, loop_word), arm_svc,
+                  arm_strex_r6_r7, arm_cmp_r6_0,
+                  arm_branch(ne, loop_word + 9, loop_word), arm_svc});
+  std::vector<std::byte> code(11 * 4);
+  fixture.read_code(loop_offset, code);
+  require(!::uml::cpu::arm64::jit::testing::compile_a32_linked_block(
+               key::a32_key(code_base + loop_offset), code)
+               .code.link_target_safe);
+
+  const auto pass = [&](std::size_t offset) {
+    auto cpu = start_state(false, offset,
+                           {{1, 42}, {2, 42}, {4, 1}, {5, 0x1234}, {6, 9},
+                            {7, 43}, {8, data_base + 64}, {9, 2},
+                            {14, code_base + loop_offset}});
+    fixture.data32(0, 41);
+    const auto result = fixture.run(cpu, 4096);
+    require(result.reason == ExitReason::system_call);
+    require(cpu.registers[4] == 100 && cpu.registers[9] == 200);
+    require(cpu.registers[3] == 41 && cpu.registers[6] == 0);
+    require(fixture.read32(0) == 43 && fixture.read32(64) == 0x1234);
+  };
+  // The loop is translated first, entered on its own and taking its store.
+  {
+    auto cpu = start_state(false, loop_offset, {{1, 41}, {2, 42}, {7, 43}});
+    fixture.data32(0, 41);
+    require(fixture.run(cpu, 4096).reason == ExitReason::system_call);
+  }
+  for (unsigned round = 0; round < 4U; ++round) {
+    pass(direct_offset);
+    pass(indirect_offset);
+  }
 }
 
 void byte_and_halfword_runs(unsigned long generation) {
@@ -491,6 +905,13 @@ int main() {
   thumb_fused_add(0x1a32'0403);
   branch_out_of_the_run(0x1a32'0410);
   thumb_branch_out_of_the_run(0x1a32'0420);
+  arm_side_exit_loop_ends(0x1a32'0430);
+  arm_condition_failed_store_loop_ends(0x1a32'0440);
+  thumb_side_exit_loops_end(0x1a32'0450);
+  thumb_it_forms_end(0x1a32'0460);
+  rollback_leaves_the_state_at_the_load(0x1a32'0470, false);
+  rollback_leaves_the_state_at_the_load(0x1a32'0471, true);
+  fused_block_is_not_a_link_target(0x1a32'0480);
   byte_and_halfword_runs(0x1a32'0404);
   faults_and_alignment(0x1a32'0406);
   two_threads_count_exactly(0x1a32'0407);

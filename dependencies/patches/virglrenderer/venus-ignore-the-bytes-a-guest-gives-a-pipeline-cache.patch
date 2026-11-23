@@ -1,0 +1,135 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 11:04:05 +0900
+Subject: [PATCH] venus: ignore the bytes a guest gives a pipeline cache
+
+vkCreatePipelineCache handed the guest's initial data to the driver, whose
+runtime parses it when the cache is made, deserializing every object of a type
+the driver knows, and again when a pipeline looks an object up.  Everything
+such a blob must carry (the header values, the object keys) is computable by
+the guest, and the parsers behind it, the shader record, the NIR and the MSL
+a record holds, are written for the host's own serializer and not for hostile
+input; in the product the renderer runs in the app's own process.
+
+A cache is now always created empty: the data a guest sends with it is
+ignored, whatever its size or header, and the renderer says how much.  What
+vkGetPipelineCacheData returns is the blob the driver serializes for an empty
+cache, taken once when the cache is made: a header a guest that stores the
+data and passes it back finds valid, with no object, so a guest does not keep
+megabytes the host would never read, and the two-call size idiom answers that
+size and a prefix with VK_INCOMPLETE for a short buffer.
+vkMergePipelineCaches between caches of one context is forwarded as before.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/venus/vkr_pipeline.c | 59 +++++++++++++++++++++++++++++++++++-----
+ src/venus/vkr_pipeline.h |  8 ++++++
+ 2 files changed, 60 insertions(+), 7 deletions(-)
+
+diff --git a/src/venus/vkr_pipeline.c b/src/venus/vkr_pipeline.c
+index 070755ff2120f1a9b679c1551bc3d2486c5e7145..29494bd26b7cbb932b6a3496c60a833b27aa7228 100644
+--- a/src/venus/vkr_pipeline.c
++++ b/src/venus/vkr_pipeline.c
+@@ -65,11 +65,44 @@ vkr_dispatch_vkDestroyPipelineLayout(struct vn_dispatch_context *dispatch,
+    vkr_pipeline_layout_destroy_and_remove(dispatch->data, args);
+ }
+ 
++/* A pipeline cache starts empty, whatever data the guest sends with it.  The
++ * driver parses what it is given when the cache is made and again when a
++ * pipeline looks an object up, as if the host's own serializer had written it,
++ * and a guest can compute everything such a blob must carry, so the bytes of a
++ * guest are never handed to the driver.  The host's own caches, which only
++ * host code writes, are the ones that keep a pipeline warm across starts. */
+ static void
+ vkr_dispatch_vkCreatePipelineCache(struct vn_dispatch_context *dispatch,
+                                    struct vn_command_vkCreatePipelineCache *args)
+ {
+-   vkr_pipeline_cache_create_and_add(dispatch->data, args);
++   TRACE_FUNC();
++   struct vkr_context *ctx = dispatch->data;
++   struct vkr_device *dev = vkr_device_from_handle(args->device);
++   struct vn_device_proc_table *vk = &dev->proc_table;
++   const VkDevice device = dev->base.handle.device;
++
++   VkPipelineCacheCreateInfo *info = (VkPipelineCacheCreateInfo *)args->pCreateInfo;
++   if (info->initialDataSize || info->pInitialData) {
++      vkr_log("vkCreatePipelineCache: ignoring the %zu bytes of data the guest sent",
++              (size_t)info->initialDataSize);
++      info->initialDataSize = 0;
++      info->pInitialData = NULL;
++   }
++
++   struct vkr_pipeline_cache *cache = vkr_pipeline_cache_create_and_add(ctx, args);
++   if (!cache)
++      return;
++
++   /* What the guest reads back of a cache is what an empty one serializes to,
++    * taken once now that the cache is empty: the header, which a guest that
++    * stores the data and passes it back finds valid, and no object, which the
++    * host would never read from the guest again. */
++   size_t size = 0;
++   const VkPipelineCache handle = cache->base.handle.pipeline_cache;
++   if (vk->GetPipelineCacheData(device, handle, &size, NULL) == VK_SUCCESS &&
++       size <= sizeof(cache->blob) &&
++       vk->GetPipelineCacheData(device, handle, &size, cache->blob) == VK_SUCCESS)
++      cache->blob_size = (uint32_t)size;
+ }
+ 
+ static void
+@@ -79,17 +112,29 @@ vkr_dispatch_vkDestroyPipelineCache(struct vn_dispatch_context *dispatch,
+    vkr_pipeline_cache_destroy_and_remove(dispatch->data, args);
+ }
+ 
++/* The two-call idiom over the blob of an empty cache: no buffer asks the size,
++ * and a buffer that is too small gets its prefix and VK_INCOMPLETE. */
+ static void
+-vkr_dispatch_vkGetPipelineCacheData(UNUSED struct vn_dispatch_context *dispatch,
++vkr_dispatch_vkGetPipelineCacheData(struct vn_dispatch_context *dispatch,
+                                     struct vn_command_vkGetPipelineCacheData *args)
+ {
+    TRACE_FUNC();
+-   struct vkr_device *dev = vkr_device_from_handle(args->device);
+-   struct vn_device_proc_table *vk = &dev->proc_table;
++   struct vkr_context *ctx = dispatch->data;
++   const struct vkr_pipeline_cache *cache = vkr_pipeline_cache_from_handle(args->pipelineCache);
++
++   if (VKR_REFUSE_NULL_HANDLE(ctx, cache) || VKR_REFUSE_NULL_HANDLE(ctx, args->pDataSize))
++      return;
++
++   if (!args->pData) {
++      *args->pDataSize = cache->blob_size;
++      args->ret = VK_SUCCESS;
++      return;
++   }
+ 
+-   vn_replace_vkGetPipelineCacheData_args_handle(args);
+-   args->ret = vk->GetPipelineCacheData(args->device, args->pipelineCache,
+-                                        args->pDataSize, args->pData);
++   const size_t size = MIN2(*args->pDataSize, (size_t)cache->blob_size);
++   memcpy(args->pData, cache->blob, size);
++   *args->pDataSize = size;
++   args->ret = size < cache->blob_size ? VK_INCOMPLETE : VK_SUCCESS;
+ }
+ 
+ static void
+diff --git a/src/venus/vkr_pipeline.h b/src/venus/vkr_pipeline.h
+index a356ebfc6dc9ce5cd01b8eb790026b12da5fc1e3..9dbebf93ac4b7a1f691ba3de916dc731b8094ea9 100644
+--- a/src/venus/vkr_pipeline.h
++++ b/src/venus/vkr_pipeline.h
+@@ -18,8 +18,16 @@ struct vkr_pipeline_layout {
+ };
+ VKR_DEFINE_OBJECT_CAST(pipeline_layout, VK_OBJECT_TYPE_PIPELINE_LAYOUT, VkPipelineLayout)
+ 
++/* What a guest is given as the data of a pipeline cache: the blob the driver
++ * serializes for an empty one, which is a header and no object.  The driver
++ * writes 36 bytes; the room is the most the renderer keeps per cache. */
++#define VKR_PIPELINE_CACHE_BLOB_MAX 64
++
+ struct vkr_pipeline_cache {
+    struct vkr_object base;
++
++   uint32_t blob_size;
++   uint8_t blob[VKR_PIPELINE_CACHE_BLOB_MAX];
+ };
+ VKR_DEFINE_OBJECT_CAST(pipeline_cache, VK_OBJECT_TYPE_PIPELINE_CACHE, VkPipelineCache)
+ 

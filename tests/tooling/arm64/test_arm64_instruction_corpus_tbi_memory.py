@@ -28,7 +28,6 @@ __import__("sys").dont_write_bytecode = True
 
 import hashlib
 import importlib.util
-import json
 import pathlib
 import re
 import sys
@@ -168,12 +167,9 @@ def check_record(gen, record: dict, meta: dict) -> int:
 def main() -> int:
     gen = load_generator()
     builder = gen.corpus
-    corpus, tokens = builder.decode_pack(pathlib.Path(sys.argv[1]).read_bytes())
-    records = [item for item in map(json.loads,
-                                    builder.dump_corpus(corpus, tokens))
-               if "cases" in item]
+    corpus, _tokens = builder.decode_pack(pathlib.Path(sys.argv[1]).read_bytes())
     check_model(gen)
-    ours = [item for item in records if item["producer"] == gen.PRODUCER]
+    ours = list(builder.dump_records(corpus, [gen.PRODUCER]))
     if len(ours) != 1:
         raise SystemExit(f"{len(ours)} arm64-tbi-memory records, expected one")
     cases = check_record(gen, ours[0], corpus.meta.get("tbi_memory", {}))

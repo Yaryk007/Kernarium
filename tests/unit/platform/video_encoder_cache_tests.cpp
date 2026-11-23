@@ -266,6 +266,12 @@ void run(const fs::path& directory)
     invalid.push_back({"not JSON", "this is not a capability cache\n"});
     invalid.push_back({"another host", replaceFirst(edited, "\"host\":\"", "\"host\":\"elsewhere/")});
     invalid.push_back({"another revision", replaceFirst(edited, "\"revision\":", "\"revision\":9")});
+    {
+        // Files of a released build, which may hold a result that lacked the answer of a probe,
+        // carry revision 5; this build's carry 6.
+        require(edited.find("\"revision\":6") != std::string::npos, "this build writes revision 6");
+        invalid.push_back({"the revision before this one", replaceFirst(edited, "\"revision\":6", "\"revision\":5")});
+    }
     invalid.push_back({"a value out of range", replaceFirst(edited, "\"minimumQp\":", "\"minimumQp\":9")});
     invalid.push_back({"a missing field", replaceFirst(edited, "\"sizeAlignment\":", "\"sizeAlignmentX\":")});
     {

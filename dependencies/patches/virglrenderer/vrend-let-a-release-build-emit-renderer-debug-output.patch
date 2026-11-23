@@ -83,7 +83,7 @@ index 86288cb87213521b65c9ab69097209cd2de0ed09..bcec83586480dc30cb037fb023bcb7cf
  #define VREND_DEBUG(flag, ctx,  ...) \
     if (VREND_DEBUG_ENABLED && vrend_debug(ctx, flag)) \
 diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
-index c3de7629e9eb15f64e4bed92f163a3e0a8577ff8..d37273d63b85e55c0615f1ea787faee596053fa6 100644
+index 4770e3c6ee037cbc5545e215fe30a838b7b0f76f..ec9cabedb541a490be7d8c9e8a19de13de2b8e86 100644
 --- a/src/vrend/vrend_renderer.c
 +++ b/src/vrend/vrend_renderer.c
 @@ -7728,9 +7728,7 @@ int vrend_renderer_init(const struct vrend_if_cbs *cbs, uint32_t flags)

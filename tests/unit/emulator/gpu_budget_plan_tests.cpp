@@ -81,17 +81,18 @@ void theArgumentsStateTheLimitAndTheCache()
 	require(plan.guest_memory == 1536 * mib);
 	require(plan.guest_cpus == 4);
 	require(plan.process_limit == 2867 * mib);
-	require(plan.engine == 316 * mib,
-		"the cache the launch states and four vCPUs' slot tags");
+	require(plan.engine == 317 * mib,
+		"the cache the launch states, four vCPUs' slot tags and the burst");
 	/* Without parameters the launch takes the conservative set: 64 MiB for
 	 * the application, 320 for the rest of the engine, 149 of headroom. */
 	const auto launch = emulator::plan_gpu_budget(arguments, {});
-	require(launch.engine == (316 + 320) * mib);
+	require(launch.engine == (317 + 320) * mib);
 	require(launch.budget.available ==
-		(2867 - 1536 - 64 - 636 - 149) * mib);
-	require(launch.budget.bytes == 482 * mib);
-	require(plan.budget.available == 2867 * mib - 1536 * mib - 316 * mib);
-	require(plan.budget.bytes == 768 * mib);
+		(2867 - 1536 - 64 - 637 - 149) * mib);
+	require(launch.budget.bytes == 481 * mib);
+	require(plan.budget.available == 2867 * mib - 1536 * mib - 317 * mib);
+	require(plan.budget.bytes == 1014 * mib,
+		"the remainder, not bounded by the guest");
 	require(!plan.budget.short_of_floor);
 }
 
@@ -126,14 +127,15 @@ void theDerivedGadgetCacheCountsAsEngineMemory()
 	/* A quarter of 1536 MiB is 384, and an eighth of the limit is 358: one
 	 * vCPU's cap is under both, and sixteen vCPUs' above both. */
 	const auto one = planned("--memory-limit=2867M", "ncpus=1");
-	require(one.engine == (128 + 4) * mib, "one vCPU's cap and slot tags");
+	require(one.engine == (160 + 4 + 1) * mib,
+		"one vCPU's cap, slot tags and burst");
 	const auto sixteen = planned("--memory-limit=2867M", "ncpus=16");
-	require(sixteen.engine == 2867 * mib / 8 + 64 * mib,
-		"an eighth of the limit and sixteen vCPUs' slot tags");
+	require(sixteen.engine == 2867 * mib / 8 + (64 + 2) * mib,
+		"an eighth of the limit, sixteen vCPUs' slot tags and the burst");
 	const auto roomy = planned("--memory-limit=8192M", "ncpus=16");
-	require(roomy.engine == (384 + 64) * mib, "a quarter of the guest");
+	require(roomy.engine == (384 + 64 + 2) * mib, "a quarter of the guest");
 	const auto roomy_one = planned("--memory-limit=8192M", "ncpus=1");
-	require(roomy_one.engine == (128 + 4) * mib, "one vCPU's cap");
+	require(roomy_one.engine == (160 + 4 + 1) * mib, "one vCPU's cap");
 }
 
 /* The most RAM the application's settings offer is the largest guest for which
@@ -152,7 +154,7 @@ void thePlanAgreesWithTheMaximumGuestMemory()
 			std::uint64_t{maximum} * mib, 2867 * mib, 0, cpus, no_terms);
 		require(at.process_limit == 2867 * mib);
 		require(!at.budget.short_of_floor, "the maximum fits");
-		require(at.budget.available >= 384 * mib);
+		require(at.budget.available >= 352 * mib);
 		const auto above = emulator::plan_gpu_budget(
 			std::uint64_t{maximum + 64U} * mib, 2867 * mib, 0, cpus,
 			no_terms);
@@ -195,22 +197,24 @@ void thePlanAtTheDefaultLeavesTheGPUItsFloor()
 /* The host GPU's budget of the default guest on an iPad mini 6 (2867 MiB,
  * 1536 MiB) under the conservative launch set at 1 through 8 vCPUs: the limit
  * less 64 MiB for the application, 1536 for the guest, the cache cap, 4 MiB
- * of slot tags per vCPU, 320 MiB for the rest of the engine and 149 of
- * headroom. */
+ * of slot tags per vCPU, the burst allowance, 320 MiB for the rest of the
+ * engine and 149 of headroom. */
 void theGPUBudgetOfTheDefaultOnAnIPadMini()
 {
 	const LimitScope scope;
 	if (platform::process_memory_limit_bytes() != 0)
 		return; /* a host that sets its own limit */
-	constexpr std::uint64_t cache[8]{128, 160, 192, 224, 240, 240, 272, 272};
-	constexpr std::uint64_t expected[8]{666, 630, 594, 558, 538, 534, 498, 494};
+	constexpr std::uint64_t cache[8]{160, 192, 224, 256, 272, 272, 304, 304};
+	constexpr std::uint64_t burst[8]{1, 1, 1, 1, 1, 1, 1, 2};
+	constexpr std::uint64_t expected[8]{633, 597, 561, 525, 505, 501, 465, 460};
 	for (unsigned cpus = 1; cpus <= 8; ++cpus) {
 		const auto plan = emulator::plan_gpu_budget(
 			1536 * mib, 2867 * mib, 0, cpus, {});
-		require(plan.engine == (cache[cpus - 1] + 4 * cpus + 320) * mib);
+		require(plan.engine ==
+			(cache[cpus - 1] + 4 * cpus + burst[cpus - 1] + 320) * mib);
 		require(plan.budget.available ==
-			(2867 - 64 - 1536 - cache[cpus - 1] - 4 * cpus - 320 - 149) *
-				mib);
+			(2867 - 64 - 1536 - cache[cpus - 1] - 4 * cpus - burst[cpus - 1] -
+				320 - 149) * mib);
 		require(plan.budget.bytes == expected[cpus - 1] * mib,
 			std::to_string(cpus).c_str());
 		require(!plan.budget.short_of_floor);
@@ -239,8 +243,8 @@ void aLauncherTakesTheDefaultGuestMemoryOnlyWhereALimitIsStated()
 		"the applications' default vCPU count");
 	require(argument({"--memory-limit=3584M", "ncpus=6"}) == "mem=2048M");
 	require(argument({"--memory-limit=4096M", "ncpus=6"}) == "mem=2560M");
-	/* Where a guest may have 4096 MiB the default also keeps the GPU a
-	 * gibibyte: 3584 MiB would leave it 739 at six vCPUs, 3072 leaves 1251. */
+	/* Where a guest may have 4096 MiB the default also keeps the GPU 992
+	 * MiB: 3584 MiB would leave it 706 at six vCPUs, 3072 leaves 1218. */
 	require(argument({"--memory-limit=5120M", "ncpus=6"}) == "mem=3072M");
 	require(argument({"--memory-limit=8192M", "ncpus=8"}) == "mem=4096M",
 		"the range's top");
@@ -265,15 +269,15 @@ void theVCPUCountMovesTheBudget()
 		return emulator::plan_gpu_budget(2240 * mib, 2867 * mib, 0, cpus,
 			no_terms);
 	};
-	/* Two vCPUs: a 160 MiB cache and 8 MiB of tags leave 459 MiB. */
-	require(plan(2).engine == 168 * mib);
-	require(plan(2).budget.available == 459 * mib);
+	/* Two vCPUs: a 192 MiB cache, 8 MiB of tags and 1 MiB of burst leave 426. */
+	require(plan(2).engine == 201 * mib);
+	require(plan(2).budget.available == 426 * mib);
 	require(!plan(2).budget.short_of_floor);
-	/* Eight: 272 MiB and 32 MiB leave 323, under the floor. */
-	require(plan(8).engine == 304 * mib);
-	require(plan(8).budget.available == 323 * mib);
+	/* Eight: 304 MiB, 32 MiB and 2 MiB leave 289, under the floor. */
+	require(plan(8).engine == 338 * mib);
+	require(plan(8).budget.available == 289 * mib);
 	require(plan(8).budget.short_of_floor);
-	require(plan(8).budget.bytes == 384 * mib);
+	require(plan(8).budget.bytes == 352 * mib);
 }
 
 void theLaunchParametersDefaultToTheLaunchSet()
@@ -297,31 +301,32 @@ void theLaunchParametersAreSubtracted()
 	const auto plan = emulator::plan_gpu_budget(arguments,
 		{.application = 300 * mib, .engine_rest = 50 * mib,
 			.headroom = 100 * mib});
-	require(plan.engine == 416 * mib, "E is the cache, the tags and E_rest");
+	require(plan.engine == 417 * mib,
+		"E is the cache, the tags, the burst and E_rest");
 	require(plan.budget.available ==
-		(2867 - 1536 - 416 - 300 - 100) * mib);
-	require(plan.budget.bytes == 515 * mib, "the remainder");
+		(2867 - 1536 - 417 - 300 - 100) * mib);
+	require(plan.budget.bytes == 514 * mib, "the remainder");
 	require(!plan.budget.short_of_floor);
 
 	const auto exact = emulator::plan_gpu_budget(arguments,
 		{.application = 300 * mib, .engine_rest = 50 * mib,
-			.headroom = 231 * mib});
-	require(exact.budget.available == 384 * mib);
-	require(exact.budget.bytes == 384 * mib, "the floor");
+			.headroom = 262 * mib});
+	require(exact.budget.available == 352 * mib);
+	require(exact.budget.bytes == 352 * mib, "the floor");
 	require(!exact.budget.short_of_floor, "the floor itself is not short");
 
 	const auto starved = emulator::plan_gpu_budget(arguments,
 		{.application = 400 * mib, .engine_rest = 50 * mib,
 			.headroom = 200 * mib});
 	require(starved.budget.short_of_floor);
-	require(starved.budget.bytes == 384 * mib);
+	require(starved.budget.bytes == 352 * mib);
 	const auto line = emulator::describe_gpu_budget_shortfall(starved);
 	require(line.find('\n') == std::string::npos, "one line");
 	require(line.find("2867 MiB") != std::string::npos, line.c_str());
-	require(line.find("384 MiB") != std::string::npos, line.c_str());
+	require(line.find("352 MiB") != std::string::npos, line.c_str());
 }
 
-void noLimitLeavesHalfTheGuest()
+void noLimitLeavesTheGuest()
 {
 	const LimitScope scope;
 	if (platform::process_memory_limit_bytes() != 0)
@@ -330,8 +335,18 @@ void noLimitLeavesHalfTheGuest()
 		std::vector<std::string>{"uml-darwin", "mem=2048M"},
 		{.application = 500 * mib, .headroom = 500 * mib});
 	require(plan.process_limit == 0);
-	require(plan.budget.bytes == 1024 * mib);
+	require(plan.budget.bytes == 2048 * mib, "the guest's RAM");
 	require(!plan.budget.short_of_floor);
+	/* A launch that states a limit is evaluated as the device is, small
+	 * guest or not. */
+	const auto stated = emulator::plan_gpu_budget(
+		std::vector<std::string>{"uml-darwin", "mem=512M",
+			"--memory-limit=2867M", "--gadget-cache-budget=128M",
+			"ncpus=1"},
+		no_terms);
+	require(stated.process_limit == 2867 * mib);
+	require(stated.budget.bytes == (2867 - 512 - 133) * mib,
+		"a small guest on a stated limit gets the remainder");
 }
 
 } // namespace
@@ -360,7 +375,7 @@ int main()
 			theLaunchParametersDefaultToTheLaunchSet},
 		{"the-launch-parameters-are-subtracted",
 			theLaunchParametersAreSubtracted},
-		{"no-limit-leaves-half-the-guest", noLimitLeavesHalfTheGuest},
+		{"no-limit-leaves-the-guest", noLimitLeavesTheGuest},
 	};
 	return uml::testing::runNamedTests(tests);
 }

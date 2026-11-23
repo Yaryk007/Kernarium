@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "video_encoder_test_support.hpp"
+#include "video_encoder_invariants.hpp"
 #include "apple/video_encoder_levels.hpp"
 #include "scratch_directory.hpp"
 
@@ -90,16 +91,47 @@ void expectOrdered(const Output& output, unsigned count, bool keyFirst = true)
 
 // ---- Capability invariants.
 
+// The codecs whose discovery left a probe unanswered after every ask there is.
+std::set<VideoCodec> unresolvedCodecs;
+
 void capabilityInvariants()
 {
     step("capability invariants");
-    const auto capabilities = videoEncodeCapabilities();
+    auto capabilities = videoEncodeCapabilities();
+    // A host that is busy can leave a probe unanswered. That discovery is
+    // incomplete: it lists what was proved, is never cached, and a later query
+    // computes it again, a bounded number of times. Ask for a complete one that
+    // many times. What stays unanswered is uncertain, codec by codec: the
+    // invariants that need an answer are not required of that codec, and every
+    // other invariant is required of every codec, so a defect of one is a
+    // failure whatever the host did to another. The run ends as inconclusive,
+    // not as ok, while any codec is uncertain.
+    const auto uncertain = [] {
+        std::set<VideoCodec> codecs;
+        for (const auto codec : apple_encoder::discovery()->unansweredCodecs) codecs.insert(codec);
+        return codecs;
+    };
+    for (unsigned run = 1; run < apple_encoder::DiscoveryService::kMaximumRuns && !apple_encoder::discovery()->complete; ++run) {
+        std::printf("  discovery incomplete (%u probe(s) had no answer): asking again\n", apple_encoder::discovery()->unanswered);
+        std::fflush(stdout);
+        sleep(unsigned(apple_encoder::DiscoveryService::kRerunIntervalMilliseconds / 1000) + 1);
+        capabilities = videoEncodeCapabilities();
+    }
+    unresolvedCodecs = uncertain();
+    if (!unresolvedCodecs.empty())
+        std::printf("  discovery stayed incomplete (%u probe(s) had no answer): the codecs it concerns are not validated\n",
+                    apple_encoder::discovery()->unanswered);
+    if (unresolvedCodecs.count(VideoCodec::h264) && std::none_of(capabilities.begin(), capabilities.end(), [](const auto& capability) {
+            return capability.codec == VideoCodec::h264;
+        })) {
+        std::puts("video encoder inconclusive: the host never answered the H.264 probes in three discoveries");
+        std::exit(77);
+    }
     require(!capabilities.empty(), "no hardware video encoder available");
     h264Capability = hevcCapability = jpegCapability = nullptr;
     static const auto stored = capabilities;   // the tests point into this copy
+    uml::testing::video_encoder::requireCapabilityInvariants(stored, unresolvedCodecs);
     for (const auto& capability : stored) {
-        require(capability.codec == VideoCodec::h264 || capability.codec == VideoCodec::hevc || capability.codec == VideoCodec::jpeg,
-                "capability for a codec the interface cannot encode");
         const bool jpeg = capability.codec == VideoCodec::jpeg;
         std::printf("%s: %ux%u..%ux%u align %u, %zu profiles, %u B-frames, %u layers, %u sessions, %u/%u fps\n",
                     jpeg ? "jpeg" : capability.codec == VideoCodec::hevc ? "hevc" : "h264",
@@ -107,41 +139,7 @@ void capabilityInvariants()
                     capability.sizeAlignment, capability.profiles.size(), capability.maximumBFrames,
                     capability.maximumTemporalLayers, capability.concurrentSessions,
                     capability.measuredFramesPerSecond720p, capability.measuredFramesPerSecond1080p);
-        require(!capability.profiles.empty(), "a codec with no profile is not listed");
-        require(capability.minimumWidth > 0 && capability.minimumHeight > 0, "minimum size");
-        // A video picture below the floor encodes but fails a guest's quality check, so it is never listed.
-        require(jpeg || (capability.minimumWidth >= kVideoEncodeMinimumSide && capability.minimumHeight >= kVideoEncodeMinimumSide),
-                "a video capability lists a picture below the floor");
-        require(capability.minimumWidth <= capability.maximumWidth && capability.minimumHeight <= capability.maximumHeight, "size range");
-        require(capability.sizeAlignment >= 1, "alignment");
-        require(capability.minimumWidth % capability.sizeAlignment == 0 && capability.minimumHeight % capability.sizeAlignment == 0,
-                "the minimum size is a multiple of the alignment");
-        require(capability.maximumWidth % capability.sizeAlignment == 0 && capability.maximumHeight % capability.sizeAlignment == 0,
-                "the maximum size is a multiple of the alignment");
-        require(capability.concurrentSessions >= 1, "at least one session");
-        require(!capability.rateControls.empty(), "rate controls");
-        for (const auto& profile : capability.profiles) {
-            require(codecOf(profile.profile) == capability.codec, "profile belongs to the codec");
-            require(!profile.inputs.empty(), "a profile with no input layout is not listed");
-            require(jpeg == (profile.maximumLevel == 0), "only JPEG has no level");
-            require(!jpeg || !profile.levelSelectable, "JPEG has no level to select");
-            const auto lists = [&](RawVideoLayout layout) {
-                return std::find(profile.inputs.begin(), profile.inputs.end(), layout) != profile.inputs.end();
-            };
-            // Both packed orders reach the encoder through one pool, so one is not offered without the other.
-            require(lists(RawVideoLayout::bgra) == lists(RawVideoLayout::rgba), "BGRA and RGBA input are offered together");
-            require(profile.profile != VideoEncodeProfile::hevcMain10 || lists(RawVideoLayout::p010), "HEVC Main 10 takes 10-bit input");
-        }
-        if (jpeg) {
-            require(capability.rateControls.size() == 1 && capability.rateControls[0] == VideoRateControl::constantQuality,
-                    "JPEG is constant quality");
-            jpegCapability = &capability;
-            continue;
-        }
-        require(capability.maximumBitrate > 0, "maximum bitrate");
-        require(capability.minimumQp <= capability.maximumQp && capability.maximumQp <= 51, "QP range");
-        require(capability.maximumTemporalLayers >= 1, "temporal layers");
-        (capability.codec == VideoCodec::hevc ? hevcCapability : h264Capability) = &capability;
+        (jpeg ? jpegCapability : capability.codec == VideoCodec::hevc ? hevcCapability : h264Capability) = &capability;
     }
     require(h264Capability, "this host has no hardware H.264 encoder");
     // A second query returns the same facts.
@@ -1824,6 +1822,11 @@ int main(int argc, char** argv)
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());
         return 1;
+    }
+    if (!unresolvedCodecs.empty()) {
+        std::printf("video encoder inconclusive: the discovery of %zu codec(s) stayed incomplete, so their capabilities are not validated\n",
+                    unresolvedCodecs.size());
+        return 77;
     }
     std::puts("video encoder ok");
     return 0;

@@ -14,11 +14,6 @@ void A32Compiler::emit_cold_paths() {
     emit_translation_cold(path);
   for (const auto &path : crossing_cold_)
     emit_crossing_cold(path);
-  for (const auto &path : resume_cold_) {
-    bind(path.label);
-    emit(0xd503'3f5fU); // clrex
-    emitter_.branch(path.continuation);
-  }
   for (const auto &path : float_cold_) {
     bind(path.label);
     emit_fp_write(true);
@@ -44,10 +39,6 @@ void A32Compiler::emit_cold_paths() {
       exit_event(Event::illegal_instruction, key_of(d), d.it);
       break;
     case ColdPath::Kind::branch:
-      if (cold.monitor) {
-        emit(0xd503'3f5fU); // clrex
-        clear_exclusive_monitor();
-      }
       exit_direct(cold.target, 0U, cold.index + 1U);
       break;
     case ColdPath::Kind::code_changed:
@@ -66,8 +57,13 @@ void A32Compiler::emit_cold_paths() {
       else
         emit_slow_helper(cold);
       break;
-    case ColdPath::Kind::exclusive_mismatch:
-      emit_slow_helper(cold);
+    case ColdPath::Kind::exclusive_rollback:
+      /* The run is discarded: nothing it computed is published (the label's
+       * exit masks are empty), and the load-exclusive that opens it runs
+       * again after the executor ends this block's publication. The fused
+       * block marks a direct write, so it always holds one. */
+      emit(0xd503'3f5fU); // clrex
+      emit_deferred_exclusive(cold);
       break;
     }
   }

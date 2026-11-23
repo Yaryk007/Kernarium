@@ -11,14 +11,16 @@
 // the guest's retry loop, exactly as the architecture allows.
 //
 // A STREX under a condition (STREXEQ after a CMP, the compare-and-swap
-// idiom) branches over the store on the host flags the run's CMP left, and
-// the skipped arm clears the monitor. A conditional forward branch or
-// CBZ/CBNZ between the two (the other compare-and-swap and try-lock idiom,
-// LDREX, CMP, BNE out, STREX) is a side exit whose taken arm clears the
-// monitor and links to the target. Whatever the run declines (a pair, a
-// condition on anything but the store, an instruction that is not plain
-// register arithmetic, an IT block, too many live registers) takes the slow
-// helper, one instruction at a time.
+// idiom) tests the host flags the run's CMP left, and a conditional forward
+// branch or CBZ/CBNZ between the two (the other compare-and-swap and
+// try-lock idiom, LDREX, CMP, BNE out, STREX) tests them too. When the
+// branch is taken or the store's condition fails, the run is discarded as if
+// it had not started: the exit publishes nothing and the LDREX that opens the
+// block runs again semantically, so the guest's loop meets the architecture
+// at every exit. Whatever the run declines (a pair, a condition on anything
+// but the store, an instruction that is not plain register arithmetic, an IT
+// block, too many live registers) takes the slow helper, one instruction at
+// a time.
 
 #include "a32_compiler.hpp"
 
@@ -156,6 +158,20 @@ std::size_t A32Compiler::try_fuse_exclusive() {
   const unsigned bytes = load.bytes;
   const auto slow = cold_exit(ColdPath::Kind::exclusive_slow);
   const auto fault = cold_exit(ColdPath::Kind::memory_fault);
+  /*
+   * The exit that discards the run. A fused block is entered only from the
+   * executor (it begins with an exclusive, so it is never a link target), which
+   * loads every core register from CpuState, and the run writes no CpuState
+   * slot before an exit. The exit therefore publishes nothing, whatever the
+   * kept-register hosts hold: both of its masks are empty, and its flags are
+   * the memory state of this point, before load_flags() below.
+   */
+  Arm64Emitter::Label rollback{};
+  if (leaves || conditional) {
+    rollback = cold_exit(ColdPath::Kind::exclusive_rollback);
+    cold_.back().dirty_gprs = 0;
+    cold_.back().dirty_vectors = 0;
+  }
 
   const unsigned base = use(load.n, fallback_n);
   const auto form_address = [&] {
@@ -219,24 +235,17 @@ std::size_t A32Compiler::try_fuse_exclusive() {
   count_ = 1;
   for (; count_ < store_index; ++count_) {
     if (continues_past(cur().inst))
-      (void)emit_side_exit_branch(true);
+      emit_run_exit_branch(rollback);
     else
       (void)emit_operation();
   }
-  Arm64Emitter::Label resume{};
-  if (conditional) {
-    resume = make_label();
-    const auto skipped = make_label();
-    emitter_.branch_condition(skipped, block_[store_index].inst.cond ^ 1U);
-    resume_cold_.push_back({.label = skipped, .continuation = resume});
-  }
+  if (conditional)
+    emitter_.branch_condition(rollback, block_[store_index].inst.cond ^ 1U);
   mark_direct_memory_write();
   const auto source = read_native_gpr(store.t, false, fallback_m);
   emit(enc::stxr(size_field(bytes), status.host, source.host, host_address,
                  store.release));
   commit_native_gpr(status, store.d, false);
-  if (conditional)
-    bind(resume);
   clear_exclusive_monitor();
   emitter_.load_b(host_address, 19, offsetof(JitChainState, link_selector));
   // The caller's loop counts the last instruction of the run.

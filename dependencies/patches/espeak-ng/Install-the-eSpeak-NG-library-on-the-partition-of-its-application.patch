@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 01:45:50 +0900
+Subject: [PATCH] Install the eSpeak NG library on the partition of its
+ application
+
+The app is installed on the product partition and does not embed its
+libraries, so Soong installs its JNI library as a file of its own. The
+library had no partition of its own and went to system, which the
+product's generic system rule keeps free of the device makefile's own
+files, and the analysis of the image build stopped on it. The library
+now installs on the product partition with the application that loads
+it, by the module's own partition property.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ Android.bp | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/Android.bp b/Android.bp
+index c19d7b3b64026ff250431aaaf522ddd5e3e4eaa4..0c610171c58cbe4bbdb54d5d8802181bd9bd1948 100644
+--- a/Android.bp
++++ b/Android.bp
+@@ -208,10 +208,12 @@ cc_binary_host {
+     ],
+ }
+ 
+-// The JNI library of the app.
++// The JNI library of the app. The app is installed on the product partition and
++// does not embed its libraries, so the library installs there with it.
+ cc_library_shared {
+     name: "espeak_ng_ttsespeak",
+     stem: "libttsespeak",
++    product_specific: true,
+     defaults: ["espeak_ng_device"],
+     licenses: ["external_espeak_ng_app_license"],
+     stl: "c++_static",

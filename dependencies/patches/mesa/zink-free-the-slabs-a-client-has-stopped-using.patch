@@ -1,0 +1,718 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 16:49:54 +0900
+Subject: [PATCH] zink: free the slabs a client has stopped using
+
+A slab of small buffers is freed only when the allocator reclaims its
+last entry, and the allocator reclaims entries only when a request of
+the slab's size finds no free one, stopping after the second entry
+that is still in use. A client that stops allocating therefore leaves
+every slab it filled allocated: an Android guest that closed a WebGL
+page kept 20 empty 2 MiB slabs, 40 MiB, for as long as it stayed idle.
+
+The buffer cache's reaper now also reclaims the slab entries that have
+been free for a second and can be reused, so a slab whose entries have
+all been free that long is freed, its buffer goes to the cache, and the
+cache's own expiry frees it. A client that frees small buffers and
+takes them again each frame keeps its slabs. A host's request to
+release cached memory reclaims every entry that can be reused rather
+than the first few.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .../auxiliary/pipebuffer/pb_cache_reaper.c    |  49 ++-
+ .../auxiliary/pipebuffer/pb_cache_reaper.h    |  17 +-
+ .../pipebuffer/pb_cache_reaper_test.c         | 319 +++++++++++++++++-
+ src/gallium/drivers/zink/zink_bo.c            |  25 +-
+ src/util/pb_slab.c                            |  66 ++++
+ src/util/pb_slab.h                            |  25 ++
+ 6 files changed, 484 insertions(+), 17 deletions(-)
+
+diff --git a/src/gallium/auxiliary/pipebuffer/pb_cache_reaper.c b/src/gallium/auxiliary/pipebuffer/pb_cache_reaper.c
+index 4ec9753fb7848c3fd0fd3a01c829bee42c83002a..01ac4e76712d093fc53e34885a0891d77be1721c 100644
+--- a/src/gallium/auxiliary/pipebuffer/pb_cache_reaper.c
++++ b/src/gallium/auxiliary/pipebuffer/pb_cache_reaper.c
+@@ -6,6 +6,7 @@
+ 
+ #include "c11/time.h"
+ #include "util/cnd_monotonic.h"
++#include "util/pb_slab.h"
+ #include "util/u_atomic.h"
+ #include "util/u_memory.h"
+ #include "util/u_thread.h"
+@@ -16,6 +17,11 @@ struct pb_cache_reaper {
+    struct pb_cache *cache;
+    thrd_t thread;
+ 
++   /* The slab manager whose entries the thread also reclaims once they have
++    * waited slab_age_ms, or NULL. Read and written under lock. */
++   struct pb_slabs *slabs;
++   unsigned slab_age_ms;
++
+    /* Guards stop and orders a wake-up after the thread's decision to sleep. */
+    mtx_t lock;
+    struct u_cnd_monotonic wake;
+@@ -53,6 +59,19 @@ reaper_thread(void *data)
+ 
+    mtx_lock(&reaper->lock);
+    while (!reaper->stop) {
++      /* An entry that waited long enough is reclaimed first: a slab it
++       * empties hands its buffer to the cache, which the expiry below
++       * counts. */
++      int64_t slab_ms = -1;
++      struct pb_slabs *slabs = reaper->slabs;
++      if (slabs) {
++         mtx_unlock(&reaper->lock);
++         pb_slabs_reclaim_aged(slabs, reaper->slab_age_ms, &slab_ms);
++         mtx_lock(&reaper->lock);
++         if (reaper->stop)
++            break;
++      }
++
+       const int64_t left_ms = pb_cache_next_expiry_ms(reaper->cache);
+ 
+       if (left_ms == 0) {
+@@ -61,16 +80,22 @@ reaper_thread(void *data)
+          mtx_unlock(&reaper->lock);
+          pb_cache_release_expired(reaper->cache);
+          mtx_lock(&reaper->lock);
+-      } else if (left_ms > 0) {
+-         /* A buffer added meanwhile expires after this one, so only the
++      } else if (left_ms > 0 || slab_ms > 0) {
++         /* A buffer added meanwhile expires after this one, and an entry
++          * freed meanwhile ages after the ones that wait, so only the nearer
+           * deadline, or the end of the reaper, needs to wake us. */
+          struct timespec deadline;
+-         deadline_after_ms(&deadline, left_ms);
++         deadline_after_ms(&deadline,
++                           left_ms < 0 ? slab_ms :
++                           slab_ms < 0 || left_ms < slab_ms ? left_ms : slab_ms);
+          u_cnd_monotonic_timedwait(&reaper->wake, &reaper->lock, &deadline);
+       } else {
+          p_atomic_set(&reaper->sleeping, 1);
+-         /* An addition that did not see the flag is in the cache by now. */
+-         if (pb_cache_next_expiry_ms(reaper->cache) < 0 && !reaper->stop)
++         /* An addition that did not see the flag is in the cache by now,
++          * and a freed entry is on the slabs' list. */
++         if (pb_cache_next_expiry_ms(reaper->cache) < 0 &&
++             !(reaper->slabs && pb_slabs_has_waiting(reaper->slabs)) &&
++             !reaper->stop)
+             u_cnd_monotonic_wait(&reaper->wake, &reaper->lock);
+          p_atomic_set(&reaper->sleeping, 0);
+       }
+@@ -107,6 +132,20 @@ fail_alloc:
+    return NULL;
+ }
+ 
++void
++pb_cache_reaper_set_slabs(struct pb_cache_reaper *reaper,
++                          struct pb_slabs *slabs, unsigned min_age_ms)
++{
++   if (!reaper)
++      return;
++
++   mtx_lock(&reaper->lock);
++   reaper->slab_age_ms = min_age_ms;
++   reaper->slabs = slabs;
++   u_cnd_monotonic_signal(&reaper->wake);
++   mtx_unlock(&reaper->lock);
++}
++
+ void
+ pb_cache_reaper_wake(struct pb_cache_reaper *reaper)
+ {
+diff --git a/src/gallium/auxiliary/pipebuffer/pb_cache_reaper.h b/src/gallium/auxiliary/pipebuffer/pb_cache_reaper.h
+index 2c48a44935698b7e3913e7785bb61fc74aaf7812..a901deb31a3a24631441e0a1070bc8a022f86edd 100644
+--- a/src/gallium/auxiliary/pipebuffer/pb_cache_reaper.h
++++ b/src/gallium/auxiliary/pipebuffer/pb_cache_reaper.h
+@@ -25,6 +25,7 @@ extern "C" {
+  * cache was created with.
+  */
+ struct pb_cache_reaper;
++struct pb_slabs;
+ 
+ /**
+  * Starts a reaper for \p cache, whose thread is named \p name.  The cache
+@@ -34,9 +35,23 @@ struct pb_cache_reaper;
+ struct pb_cache_reaper *
+ pb_cache_reaper_create(struct pb_cache *cache, const char *name);
+ 
++/**
++ * Has the reaper also reclaim the entries of \p slabs that were freed at least
++ * \p min_age_ms ago and can be reused, so that a slab all of whose entries
++ * went that long ago is freed, and its buffer goes to the cache, without an
++ * allocation of its size to find it.  Entries freed and taken again sooner
++ * stay.  Call it once, before any entry is freed; the slabs must outlive the
++ * reaper, and the caller reports each entry it frees with
++ * pb_cache_reaper_wake().  Accepts NULL.
++ */
++void
++pb_cache_reaper_set_slabs(struct pb_cache_reaper *reaper,
++                          struct pb_slabs *slabs, unsigned min_age_ms);
++
+ /**
+  * Tells the reaper that a buffer was added to its cache, after
+- * pb_cache_add_buffer() returned.  Cheap unless the reaper is asleep with
++ * pb_cache_add_buffer() returned, or that an entry was freed to its slabs,
++ * after pb_slab_free() returned.  Cheap unless the reaper is asleep with
+  * nothing to wait for.  Accepts NULL, so a caller whose reaper could not be
+  * created needs no test.
+  */
+diff --git a/src/gallium/auxiliary/pipebuffer/pb_cache_reaper_test.c b/src/gallium/auxiliary/pipebuffer/pb_cache_reaper_test.c
+index b6a3eebe72c5dec96e74f34af99cc7010d3e8368..f506b51443eb41006af7576a9f411c643b871c09 100644
+--- a/src/gallium/auxiliary/pipebuffer/pb_cache_reaper_test.c
++++ b/src/gallium/auxiliary/pipebuffer/pb_cache_reaper_test.c
+@@ -3,16 +3,18 @@
+  */
+ 
+ /* pb_cache_release_expired(), pb_cache_next_expiry_ms() and the reaper that
+- * frees a cache's expired buffers while nothing is added.  The buffers are
+- * heap blocks the cache destroys with free(); every check aborts, so the
+- * test fails in a build without assertions as well.  Built with
+- * -Db_sanitize=thread it covers the reaper's thread against the paths that
+- * add, reclaim and release buffers. */
++ * frees a cache's expired buffers while nothing is added, and the slab
++ * entries the reaper reclaims once they have been free for a while.  The
++ * buffers are heap blocks the cache destroys with free(); every check
++ * aborts, so the test fails in a build without assertions as well.  Built
++ * with -Db_sanitize=thread it covers the reaper's thread against the paths
++ * that add, reclaim and release buffers. */
+ 
+ #include "c11/threads.h"
+ #include "pipebuffer/pb_cache.h"
+ #include "pipebuffer/pb_cache_reaper.h"
+ #include "util/os_time.h"
++#include "util/pb_slab.h"
+ #include "util/u_atomic.h"
+ 
+ #include <stddef.h>
+@@ -56,6 +58,14 @@ destroy_bo(void *winsys, struct pb_buffer_lean *buf)
+    free(buf);
+ }
+ 
++static void
++destroy_bo_unused(void *winsys, struct pb_buffer_lean *buf)
++{
++   (void)winsys;
++   (void)buf;
++   CHECK(!"the slab test's cache holds no buffer");
++}
++
+ static bool
+ can_reclaim_bo(void *winsys, struct pb_buffer_lean *buf)
+ {
+@@ -332,6 +342,298 @@ test_concurrent_add_reclaim_reap(void)
+    pb_cache_deinit(&world.cache);
+ }
+ 
++
++/* A slab of SLAB_ENTRIES entries of 64 bytes, as a driver's slab buffer holds
++ * its sub-allocations; an entry is busy while the device is still using it. */
++#define SLAB_ENTRIES 4
++#define SLAB_AGE_MS  150
++
++struct slab_entry {
++   struct pb_slab_entry base;
++   bool busy;
++};
++
++struct slab_world {
++   struct pb_slabs slabs;
++   struct pb_cache cache;
++   struct pb_cache_reaper *reaper;
++   int slabs_made;
++   int slabs_freed;
++};
++
++struct test_slab {
++   struct pb_slab base;
++   struct slab_entry entries[SLAB_ENTRIES];
++};
++
++static struct pb_slab *
++slab_alloc(void *priv, unsigned heap, unsigned entry_size, unsigned group_index)
++{
++   struct slab_world *world = priv;
++   struct test_slab *slab = calloc(1, sizeof(*slab));
++   CHECK(slab);
++
++   slab->base.num_entries = SLAB_ENTRIES;
++   slab->base.num_free = SLAB_ENTRIES;
++   slab->base.group_index = group_index;
++   slab->base.entry_size = entry_size;
++   list_inithead(&slab->base.free);
++   for (unsigned i = 0; i < SLAB_ENTRIES; i++) {
++      slab->entries[i].base.slab = &slab->base;
++      list_addtail(&slab->entries[i].base.head, &slab->base.free);
++   }
++   p_atomic_inc(&world->slabs_made);
++   return &slab->base;
++}
++
++static void
++slab_free(void *priv, struct pb_slab *slab)
++{
++   struct slab_world *world = priv;
++   p_atomic_inc(&world->slabs_freed);
++   free(slab);
++}
++
++static bool
++slab_can_reclaim(void *priv, struct pb_slab_entry *entry)
++{
++   (void)priv;
++   return !p_atomic_read(&((struct slab_entry *)entry)->busy);
++}
++
++static void
++slab_world_init(struct slab_world *world)
++{
++   *world = (struct slab_world){0};
++   pb_cache_init(&world->cache, BUCKETS, 60u * 1000000u, 1.5f, 0, UINT64_MAX,
++                 offsetof(struct test_bo, entry), world, destroy_bo_unused,
++                 can_reclaim_bo);
++   CHECK(world->cache.buckets);
++   CHECK(pb_slabs_init(&world->slabs, 6, 8, 1, false, world, slab_can_reclaim,
++                       slab_alloc, slab_free));
++   world->reaper = pb_cache_reaper_create(&world->cache, "pb-slab-test");
++   CHECK(world->reaper);
++   pb_cache_reaper_set_slabs(world->reaper, &world->slabs, SLAB_AGE_MS);
++}
++
++static void
++slab_world_fini(struct slab_world *world)
++{
++   pb_cache_reaper_destroy(world->reaper);
++   pb_slabs_deinit(&world->slabs);
++   pb_cache_deinit(&world->cache);
++   CHECK(p_atomic_read(&world->slabs_made) ==
++         p_atomic_read(&world->slabs_freed));
++}
++
++static struct slab_entry *
++slab_take(struct slab_world *world)
++{
++   struct pb_slab_entry *entry = pb_slab_alloc(&world->slabs, 64, 0);
++   CHECK(entry);
++   return (struct slab_entry *)entry;
++}
++
++/* What bo_slab_destroy() does when the last reference goes. */
++static void
++slab_give(struct slab_world *world, struct slab_entry *entry)
++{
++   pb_slab_free(&world->slabs, &entry->base);
++   pb_cache_reaper_wake(world->reaper);
++}
++
++static void
++wait_slabs_freed(struct slab_world *world, int count)
++{
++   const int64_t start = now_ms();
++   while (p_atomic_read(&world->slabs_freed) < count) {
++      CHECK(now_ms() - start < WAIT_LIMIT_MS);
++      sleep_ms(2);
++   }
++}
++
++/* A slab all of whose entries went is freed by the reaper once they have been
++ * free for the age, not before, with no allocation to find it. */
++static void
++test_reaper_frees_an_empty_slab(void)
++{
++   struct slab_world world;
++   slab_world_init(&world);
++
++   struct slab_entry *entries[SLAB_ENTRIES];
++   for (unsigned i = 0; i < SLAB_ENTRIES; i++)
++      entries[i] = slab_take(&world);
++   CHECK(p_atomic_read(&world.slabs_made) == 1);
++   const int64_t freed_at = now_ms();
++   for (unsigned i = 0; i < SLAB_ENTRIES; i++)
++      slab_give(&world, entries[i]);
++
++   sleep_ms(SLAB_AGE_MS / 3);
++   CHECK(p_atomic_read(&world.slabs_freed) == 0);
++   wait_slabs_freed(&world, 1);
++   CHECK(now_ms() - freed_at >= SLAB_AGE_MS);
++   CHECK(now_ms() - freed_at < SLAB_AGE_MS + 1000);
++   CHECK(!pb_slabs_has_waiting(&world.slabs));
++
++   /* The reaper goes back to sleep and wakes for the next entry. */
++   sleep_ms(50);
++   struct slab_entry *again = slab_take(&world);
++   CHECK(p_atomic_read(&world.slabs_made) == 2);
++   slab_give(&world, again);
++   wait_slabs_freed(&world, 2);
++
++   slab_world_fini(&world);
++}
++
++/* A slab that keeps an entry is not freed, and the entries that are free
++ * stay free for the client to take again. */
++static void
++test_reaper_keeps_a_slab_in_use(void)
++{
++   struct slab_world world;
++   slab_world_init(&world);
++
++   struct slab_entry *entries[SLAB_ENTRIES];
++   for (unsigned i = 0; i < SLAB_ENTRIES; i++)
++      entries[i] = slab_take(&world);
++   for (unsigned i = 1; i < SLAB_ENTRIES; i++)
++      slab_give(&world, entries[i]);
++   sleep_ms(SLAB_AGE_MS * 3);
++   CHECK(p_atomic_read(&world.slabs_freed) == 0);
++   CHECK(!pb_slabs_has_waiting(&world.slabs));
++
++   /* The entries the reaper reclaimed are taken again from the same slab. */
++   for (unsigned i = 1; i < SLAB_ENTRIES; i++)
++      entries[i] = slab_take(&world);
++   CHECK(p_atomic_read(&world.slabs_made) == 1);
++
++   for (unsigned i = 0; i < SLAB_ENTRIES; i++)
++      slab_give(&world, entries[i]);
++   wait_slabs_freed(&world, 1);
++   slab_world_fini(&world);
++}
++
++/* An entry the device still uses is tried again, and its slab is freed once
++ * it is done, without anything else happening to the slabs. */
++static void
++test_reaper_waits_for_the_device(void)
++{
++   struct slab_world world;
++   slab_world_init(&world);
++
++   struct slab_entry *entries[SLAB_ENTRIES];
++   for (unsigned i = 0; i < SLAB_ENTRIES; i++)
++      entries[i] = slab_take(&world);
++   p_atomic_set(&entries[1]->busy, true);
++   for (unsigned i = 0; i < SLAB_ENTRIES; i++)
++      slab_give(&world, entries[i]);
++
++   sleep_ms(SLAB_AGE_MS * 3);
++   CHECK(p_atomic_read(&world.slabs_freed) == 0);
++   CHECK(pb_slabs_has_waiting(&world.slabs));
++
++   const int64_t done_at = now_ms();
++   p_atomic_set(&entries[1]->busy, false);
++   wait_slabs_freed(&world, 1);
++   /* The retry interval, with room for a loaded machine. */
++   CHECK(now_ms() - done_at < 1000);
++   slab_world_fini(&world);
++}
++
++/* The reclaim a host asks for takes every entry that can be reused, though
++ * the oldest are still busy; the allocator's own walk gives up after two. */
++static void
++test_reclaim_all_passes_busy_entries(void)
++{
++   struct slab_world world;
++   slab_world_init(&world);
++   /* Nothing ages while this runs. */
++   pb_cache_reaper_set_slabs(world.reaper, &world.slabs, 3600u * 1000u);
++
++   struct slab_entry *first[SLAB_ENTRIES], *second[SLAB_ENTRIES];
++   for (unsigned i = 0; i < SLAB_ENTRIES; i++)
++      first[i] = slab_take(&world);
++   for (unsigned i = 0; i < SLAB_ENTRIES; i++)
++      second[i] = slab_take(&world);
++   CHECK(p_atomic_read(&world.slabs_made) == 2);
++
++   p_atomic_set(&first[0]->busy, true);
++   p_atomic_set(&first[1]->busy, true);
++   slab_give(&world, first[0]);
++   slab_give(&world, first[1]);
++   slab_give(&world, first[2]);
++   slab_give(&world, first[3]);
++   for (unsigned i = 0; i < SLAB_ENTRIES; i++)
++      slab_give(&world, second[i]);
++
++   CHECK(pb_slabs_reclaim(&world.slabs) == 0);
++   CHECK(p_atomic_read(&world.slabs_freed) == 0);
++   CHECK(pb_slabs_reclaim_all(&world.slabs) == 6);
++   CHECK(p_atomic_read(&world.slabs_freed) == 1);
++
++   p_atomic_set(&first[0]->busy, false);
++   p_atomic_set(&first[1]->busy, false);
++   CHECK(pb_slabs_reclaim_all(&world.slabs) == 2);
++   CHECK(p_atomic_read(&world.slabs_freed) == 2);
++   slab_world_fini(&world);
++}
++
++/* Threads that take and give entries against the reaper. */
++struct slab_worker {
++   struct slab_world *world;
++   unsigned seed;
++};
++
++static int
++slab_worker_main(void *data)
++{
++   struct slab_worker *worker = data;
++   struct slab_world *world = worker->world;
++   struct slab_entry *held[6] = {0};
++
++   for (int i = 0; i < ITERATIONS; i++) {
++      worker->seed = worker->seed * 1664525u + 1013904223u;
++      const unsigned pick = (worker->seed >> 16) % 6;
++      if (held[pick]) {
++         slab_give(world, held[pick]);
++         held[pick] = NULL;
++      } else {
++         held[pick] = slab_take(world);
++      }
++      if ((worker->seed & 0x3ff) == 0)
++         sleep_ms(2);
++   }
++   for (int i = 0; i < 6; i++)
++      if (held[i])
++         slab_give(world, held[i]);
++   return 0;
++}
++
++static void
++test_concurrent_slabs_and_reaper(void)
++{
++   struct slab_world world;
++   slab_world_init(&world);
++   pb_cache_reaper_set_slabs(world.reaper, &world.slabs, 1);
++
++   thrd_t threads[WORKERS];
++   struct slab_worker workers[WORKERS];
++   for (int i = 0; i < WORKERS; i++) {
++      workers[i] = (struct slab_worker){&world, 777u + 104729u * i};
++      CHECK(thrd_create(&threads[i], slab_worker_main, &workers[i]) ==
++            thrd_success);
++   }
++   for (int i = 0; i < WORKERS; i++)
++      CHECK(thrd_join(threads[i], NULL) == thrd_success);
++
++   const int64_t start = now_ms();
++   while (pb_slabs_has_waiting(&world.slabs)) {
++      CHECK(now_ms() - start < WAIT_LIMIT_MS);
++      sleep_ms(2);
++   }
++   slab_world_fini(&world);
++}
++
+ int
+ main(void)
+ {
+@@ -340,6 +642,11 @@ main(void)
+    test_reaper_leaves_reclaimed();
+    test_reaper_destroy_is_prompt();
+    test_concurrent_add_reclaim_reap();
+-   printf("the reaper frees every expired buffer and no other\n");
++   test_reaper_frees_an_empty_slab();
++   test_reaper_keeps_a_slab_in_use();
++   test_reaper_waits_for_the_device();
++   test_reclaim_all_passes_busy_entries();
++   test_concurrent_slabs_and_reaper();
++   printf("the reaper frees every expired buffer and slab and no other\n");
+    return 0;
+ }
+diff --git a/src/gallium/drivers/zink/zink_bo.c b/src/gallium/drivers/zink/zink_bo.c
+index fa06199bb212150b1cb64015907bc882929a6a04..42c394eee1363db75cb78e48ffc072d7f2bae17a 100644
+--- a/src/gallium/drivers/zink/zink_bo.c
++++ b/src/gallium/drivers/zink/zink_bo.c
+@@ -181,12 +181,18 @@ bo_slab_destroy(struct zink_screen *screen, struct zink_bo *bo)
+ 
+    bo_clear_vis_vram_full(screen, bo);
+    pb_slab_free(&screen->pb.bo_slabs, &bo->u.slab.entry);
++   /* The reaper frees the slab once all of its entries have been free for a
++    * while, which an allocation of the entry's size would otherwise be the
++    * only thing to do. */
++   pb_cache_reaper_wake(screen->pb.bo_reaper);
+ }
+ 
+ static unsigned
+ release_cached_buffers(struct zink_screen *screen)
+ {
+-   unsigned num_reclaims = pb_slabs_reclaim(&screen->pb.bo_slabs);
++   /* Every entry that can be reused, not the first few that can be: a slab
++    * that is free except for entries behind a busy one is freed too. */
++   unsigned num_reclaims = pb_slabs_reclaim_all(&screen->pb.bo_slabs);
+    num_reclaims += pb_cache_release_all_buffers(&screen->pb.bo_cache);
+    return num_reclaims;
+ }
+@@ -1379,6 +1385,12 @@ bo_slab_alloc_normal(void *priv, unsigned mem_type_idx, unsigned entry_size, uns
+    return bo_slab_alloc(priv, mem_type_idx, entry_size, group_index, false);
+ }
+ 
++/* How long every entry of a slab must have been free before the reaper frees
++ * the slab.  A client that frees small buffers and allocates them again each
++ * frame keeps its slabs; one that stopped gives them back about this long
++ * after, and the cache's own expiry after that. */
++#define ZINK_BO_SLAB_IDLE_MS 1000
++
+ /* The most memory the cache keeps of buffers nobody uses.  A host driver that
+  * reports its physical memory as one heap, as KosmicKrisp does, makes a
+  * fraction of the heap a bound that follows the machine: 8 GiB on a Mac with
+@@ -1427,17 +1439,20 @@ zink_bo_init(struct zink_screen *screen)
+                         (void*)bo_slab_free)) {
+       return false;
+    }
++   pb_cache_reaper_set_slabs(screen->pb.bo_reaper, &screen->pb.bo_slabs,
++                             ZINK_BO_SLAB_IDLE_MS);
+    return true;
+ }
+ 
+ void
+ zink_bo_deinit(struct zink_screen *screen)
+ {
+-   /* Freeing the slabs' buffers adds them to the cache, so the reaper stops
+-    * after the slabs and before the cache. */
++   /* The reaper reaches the slabs, so it stops first.  Freeing the slabs'
++    * buffers adds them to the cache, which pb_cache_deinit() empties. */
++   struct pb_cache_reaper *reaper = screen->pb.bo_reaper;
++   screen->pb.bo_reaper = NULL;
++   pb_cache_reaper_destroy(reaper);
+    if (screen->pb.bo_slabs.groups)
+       pb_slabs_deinit(&screen->pb.bo_slabs);
+-   pb_cache_reaper_destroy(screen->pb.bo_reaper);
+-   screen->pb.bo_reaper = NULL;
+    pb_cache_deinit(&screen->pb.bo_cache);
+ }
+diff --git a/src/util/pb_slab.c b/src/util/pb_slab.c
+index 24f4d3411377f1f97b7f66ebb0a692d9356d430f..de2bb66a9f17e716b238c56fe8eafd8064678d84 100644
+--- a/src/util/pb_slab.c
++++ b/src/util/pb_slab.c
+@@ -27,6 +27,7 @@
+ 
+ #include "pb_slab.h"
+ 
++#include "util/os_time.h"
+ #include "util/u_math.h"
+ #include "util/u_memory.h"
+ 
+@@ -73,6 +74,16 @@ pb_slab_reclaim(struct pb_slabs *slabs, struct pb_slab_entry *entry)
+ 
+ #define MAX_FAILED_RECLAIMS 2
+ 
++/* How long pb_slabs_reclaim_aged() leaves an entry that is old enough but
++ * still in use before it tries it again. */
++#define AGED_RECLAIM_RETRY_MS 100
++
++static inline unsigned
++pb_slabs_now_ms(void)
++{
++   return (unsigned)(os_time_get_nano() / 1000000);
++}
++
+ static unsigned
+ pb_slabs_reclaim_locked(struct pb_slabs *slabs)
+ {
+@@ -112,6 +123,60 @@ pb_slabs_reclaim_all_locked(struct pb_slabs *slabs)
+    return num_reclaims;
+ }
+ 
++unsigned
++pb_slabs_reclaim_all(struct pb_slabs *slabs)
++{
++   simple_mtx_lock(&slabs->mutex);
++   const unsigned num_reclaims = pb_slabs_reclaim_all_locked(slabs);
++   simple_mtx_unlock(&slabs->mutex);
++   return num_reclaims;
++}
++
++unsigned
++pb_slabs_reclaim_aged(struct pb_slabs *slabs, unsigned min_age_ms,
++                      int64_t *next_ms)
++{
++   struct pb_slab_entry *entry, *next;
++   unsigned num_reclaims = 0;
++   int64_t wait_ms = -1;
++
++   simple_mtx_lock(&slabs->mutex);
++   /* Read under the lock, where pb_slab_free() stamps the entries: no entry
++    * on the list was stamped after this. */
++   const unsigned now_ms = pb_slabs_now_ms();
++   /* The list is in the order the entries were freed. */
++   LIST_FOR_EACH_ENTRY_SAFE(entry, next, &slabs->reclaim, head) {
++      const unsigned age_ms = now_ms - entry->free_ms;
++      if (age_ms < min_age_ms) {
++         const int64_t left_ms = min_age_ms - age_ms;
++         wait_ms = wait_ms < 0 || left_ms < wait_ms ? left_ms : wait_ms;
++         break;
++      }
++      if (slabs->can_reclaim(slabs->priv, entry)) {
++         pb_slab_reclaim(slabs, entry);
++         num_reclaims++;
++      } else {
++         /* In use by the device, which says nothing about the entries after
++          * it: they may have been used by work that has finished. */
++         wait_ms = wait_ms < 0 || AGED_RECLAIM_RETRY_MS < wait_ms ?
++                   AGED_RECLAIM_RETRY_MS : wait_ms;
++      }
++   }
++   simple_mtx_unlock(&slabs->mutex);
++
++   *next_ms = wait_ms;
++   return num_reclaims;
++}
++
++bool
++pb_slabs_has_waiting(struct pb_slabs *slabs)
++{
++   simple_mtx_lock(&slabs->mutex);
++   const bool waiting = !list_is_empty(&slabs->reclaim);
++   simple_mtx_unlock(&slabs->mutex);
++   return waiting;
++}
++
+ /* Allocate a slab entry of the given size from the given heap.
+  *
+  * This will try to re-use entries that have previously been freed. However,
+@@ -211,6 +276,7 @@ void
+ pb_slab_free(struct pb_slabs* slabs, struct pb_slab_entry *entry)
+ {
+    simple_mtx_lock(&slabs->mutex);
++   entry->free_ms = pb_slabs_now_ms();
+    list_addtail(&entry->head, &slabs->reclaim);
+    simple_mtx_unlock(&slabs->mutex);
+ }
+diff --git a/src/util/pb_slab.h b/src/util/pb_slab.h
+index 7ef7c5ddc234c7e029bc617e10a9f21f24060307..f8ce003d90e5c9a19b9d41fbd67960de658e4d82 100644
+--- a/src/util/pb_slab.h
++++ b/src/util/pb_slab.h
+@@ -61,6 +61,9 @@ struct pb_slab_entry
+ {
+    struct list_head head;
+    struct pb_slab *slab; /* the slab that contains this buffer */
++   /* When pb_slab_free() queued the entry, in milliseconds on a clock that
++    * wraps; only the difference of two readings means anything. */
++   unsigned free_ms;
+ };
+ 
+ /* Descriptor of a slab from which many entries are carved out.
+@@ -145,6 +148,28 @@ pb_slab_free(struct pb_slabs* slabs, struct pb_slab_entry *entry);
+ unsigned
+ pb_slabs_reclaim(struct pb_slabs *slabs);
+ 
++/* Reclaims every entry that can be reused, however many cannot: the walk of
++ * pb_slabs_reclaim() stops after two that cannot, and a slab whose entries
++ * wait behind them stays allocated until an allocation of its size finds no
++ * free entry. */
++unsigned
++pb_slabs_reclaim_all(struct pb_slabs *slabs);
++
++/* Reclaims every entry that was passed to pb_slab_free() at least min_age_ms
++ * ago and can be reused, so a slab that all of its entries left that long
++ * ago is freed and an entry that a client frees and takes again within the
++ * age stays where it is. *next_ms is set to when the call is worth making
++ * again: the milliseconds until the oldest entry left ages, or until an aged
++ * entry that cannot be reused yet is tried again, and -1 when no entry waits.
++ * Returns the number of entries reclaimed. */
++unsigned
++pb_slabs_reclaim_aged(struct pb_slabs *slabs, unsigned min_age_ms,
++                      int64_t *next_ms);
++
++/* Whether any entry waits to be reclaimed. */
++bool
++pb_slabs_has_waiting(struct pb_slabs *slabs);
++
+ bool
+ pb_slabs_init(struct pb_slabs *slabs,
+               unsigned min_order, unsigned max_order,

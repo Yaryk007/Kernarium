@@ -28,6 +28,14 @@ public:
         std::span<const std::uint8_t> request, std::size_t responseCapacity) override;
     bool takeQueueCompletion(uml::virtio::VhostUserQueueCompletion&) override;
     void reset() noexcept override;
+    /* Readable while an event waits for a buffer of the guest's event queue. */
+    int eventDescriptor() const noexcept override;
+    void drainEventSource() override;
+    /* A codec stream outlives a guest suspend: the buffers it holds stay
+     * with the device, and the transport keeps their completions until the
+     * ring is enabled again. */
+    bool keepsDeferredRequestsWhileDisabled() const noexcept override { return true; }
+    bool keepsRequestsOnDisabledRing() const noexcept override { return true; }
 
 private:
     class Implementation;

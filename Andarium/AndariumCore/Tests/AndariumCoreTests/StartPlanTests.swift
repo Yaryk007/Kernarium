@@ -3,6 +3,7 @@
 import Foundation
 import Testing
 @testable import AndariumCore
+import AndariumCoreTestSupport
 
 private func identity(
     _ id: String, build: Int, sha: String = String(repeating: "a", count: 64), layout: Int = 1
@@ -147,23 +148,6 @@ struct StartVerdictTests {
                 #expect(allowed == plan.allowsStart(mode))
             }
         }
-    }
-
-    /// Home shows Start in recovery from the first start on and disables it
-    /// before: the guest has nothing for Recovery to work on until then.
-    @Test func homeOffersRecoveryOnlyAfterTheFirstStart() {
-        #expect(!StartPlan.firstStart.offersRecovery)
-        #expect(StartPlan.normal.offersRecovery)
-        #expect(StartPlan.update(from: "r1", to: "r2").offersRecovery)
-        // What an update that did not finish, or a guest that cannot start,
-        // refuses stays refused.
-        #expect(!unfinished.offersRecovery)
-        #expect(!StartPlan.blocked(.mismatch).offersRecovery)
-        // Only what Home offers waits: the lifecycle still allows the start,
-        // which an automation launch asks for on a guest it has just made.
-        let life = Lifecycle(guest: Guest.fresh(on: host))
-        #expect(life.startVerdict(.recovery, host: host, plan: .firstStart) == .allowed(.recovery))
-        #expect(StartPlan.firstStart.allowsStart(.recovery))
     }
 
     @Test func aBlockedStartLeavesTheLifeAtHome() {

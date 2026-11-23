@@ -1,0 +1,16 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+//
+// Copy to Update.local.xcconfig, which Git ignores, and name where the
+// version file of the sideloaded applications is published. Store a host and a
+// path, never a whole address: `//` starts a comment in an xcconfig, and the
+// code builds https://<host><path>. A Release build made with this file has the
+// update notice, which reads that file once a day; every other build carries no
+// address and no notice.
+//
+// The file's links are accepted on its own host and on the hosts listed
+// below: exact names and *.domain for every subdomain of it, separated by
+// spaces, empty for none.
+
+DEVELOPER_UPDATE_HOST = example.com
+DEVELOPER_UPDATE_PATH = /source.json
+DEVELOPER_UPDATE_LINK_HOSTS =

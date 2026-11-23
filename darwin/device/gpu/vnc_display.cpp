@@ -149,6 +149,10 @@ VncDisplay::VncDisplay(
         if (!epoch)
             return RFB_CLIENT_REFUSE;
         client->clientData = makeClientData(*epoch, true);
+        /* The event thread serves every client, so the count is this
+         * client's and no other's. */
+        display->reportClients(stateClientCount(
+            display->clientState_.load(std::memory_order_acquire)));
         client->clientGoneHook = [](rfbClientPtr disconnected) noexcept {
             static_cast<VncDisplay*>(disconnected->screen->screenData)
                 ->clientDisconnected(disconnected);
@@ -656,6 +660,7 @@ void VncDisplay::clientDisconnected(rfbClientPtr client) noexcept
                 desired,
                 std::memory_order_release,
                 std::memory_order_relaxed)) {
+            reportClients(stateClientCount(desired));
             return;
         }
     }

@@ -108,22 +108,22 @@ struct SideKeysGuestTests {
             let safe = root.safeAreaInsets
             let width = root.bounds.width - safe.left - safe.right
             let height = root.bounds.height - safe.top - safe.bottom
-            func inWindow(_ x: CGFloat, _ y: CGFloat) -> CGPoint {
+            @MainActor func inWindow(_ x: CGFloat, _ y: CGFloat) -> CGPoint {
                 root.convert(CGPoint(x: safe.left + x, y: safe.top + y), to: window)
             }
-            func reachesDisplay(_ point: CGPoint) -> Bool {
+            @MainActor func reachesDisplay(_ point: CGPoint) -> Bool {
                 guard let view = window.hitTest(point, with: nil) else { return false }
                 return view === guest || view.isDescendant(of: guest)
             }
-            func finger(at point: CGPoint) -> Finger {
+            @MainActor func finger(at point: CGPoint) -> Finger {
                 let touch = Finger()
                 touch.point = guest.convert(point, from: window)
                 return touch
             }
             /// The fraction of the display's width a contact reported at `point`.
             let range = Double(KERNARIUM_RUNTIME_TOUCH_MAXIMUM) + 1
-            func column(of point: CGPoint) -> Double { Double(guest.convert(point, from: window).x / guest.bounds.width) }
-            func openKeys() async throws {
+            @MainActor func column(of point: CGPoint) -> Double { Double(guest.convert(point, from: window).x / guest.bounds.width) }
+            @MainActor func openKeys() async throws {
                 model.session.sideKeysOpen = true
                 try await Task.sleep(for: .milliseconds(800))
                 root.layoutIfNeeded()

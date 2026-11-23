@@ -18,6 +18,15 @@
  *			once the other side has gone, reused in place;
  *	remap		MAP_FIXED, munmap and mmap, and mremap put other
  *			instructions at the address;
+ *	shared		a process rewrites and synchronizes code on a page it
+ *			shares with another process, which only runs it and
+ *			has translated it since the fork, the executable view
+ *			at the null page in a second run, which the guest's
+ *			root can map;
+ *	lazy-remote	another process writes the page with process_vm_writev(),
+ *			into a mapping its owner has not touched since the fork,
+ *			or into one its owner replaces with another frame
+ *			after the kernel pinned the first;
  *	vcpu		threads on other vCPUs ran the function, and the caller
  *			that links to it, before the store and run them after;
  *	flood		another vCPU publishes many code changes while this one
@@ -37,10 +46,13 @@ using u32 = unsigned int;
 using u64 = unsigned long;
 
 constexpr long nr_read = 63, nr_write = 64, nr_pipe2 = 59, nr_exit_group = 94,
-	nr_futex = 98, nr_munmap = 215, nr_mremap = 216, nr_clone = 220,
-	nr_mmap = 222, nr_mprotect = 226, nr_wait4 = 260;
+	nr_ftruncate = 46, nr_futex = 98, nr_munmap = 215, nr_mremap = 216,
+	nr_clone = 220, nr_mmap = 222, nr_mprotect = 226, nr_wait4 = 260,
+	nr_process_vm_writev = 271, nr_memfd_create = 279, nr_ioctl = 29,
+	nr_userfaultfd = 282;
 constexpr long prot_none = 0, prot_read = 1, prot_write = 2, prot_exec = 4;
-constexpr long map_private = 0x02, map_fixed = 0x10, map_anonymous = 0x20;
+constexpr long map_shared = 0x01, map_private = 0x02, map_fixed = 0x10,
+	map_anonymous = 0x20;
 constexpr long mremap_maymove = 1, mremap_fixed = 2;
 constexpr long futex_wait_private = 128, futex_wake_private = 129;
 constexpr long sigchld = 17;
@@ -440,6 +452,432 @@ void case_remap()
 	expect("remap-old-address-unchanged", 4, call_caller(region));
 }
 
+/* Code two processes share. A page of a memfd is mapped writable and
+ * executable, MAP_SHARED, and the process forks. The parent only runs the
+ * function; the child rewrites it through the writable view and synchronizes
+ * it for the executable one, as __clear_cache does, and tells the parent. The
+ * parent warms after the fork, which flushes its own translations, so the
+ * translation it holds is the one the child's change must reach. A process
+ * with the privilege can map the executable view at the null page, which asks
+ * the same of the synchronization there; mapping it must succeed. */
+void case_shared_code(bool at_null_page)
+{
+	constexpr u32 rounds = 8;
+	constexpr u32 warm_calls = 200;
+	const long fd = raw_syscall(nr_memfd_create,
+		reinterpret_cast<long>("code-change"), 0);
+	if (fd < 0 || raw_syscall(nr_ftruncate, fd, static_cast<long>(page)) != 0) {
+		print("code-change: memfd failed\n");
+		leave(4);
+	}
+	const char *const check_name =
+		at_null_page ? "shared-null-page" : "shared-memfd";
+	const long writable = raw_syscall(nr_mmap, 0, static_cast<long>(page),
+		prot_read | prot_write, map_shared, fd, 0);
+	/* The null page is a page like another to the guest's kernel, which lets
+	 * a privileged process map code there. */
+	const long executable = raw_syscall(nr_mmap, 0, static_cast<long>(page),
+		prot_read | prot_exec, map_shared | (at_null_page ? map_fixed : 0),
+		fd, 0);
+	if ((writable < 0 && writable > -4096) ||
+	    (executable < 0 && executable > -4096)) {
+		print("code-change: shared mmap failed\n");
+		leave(4);
+	}
+	auto *rw = reinterpret_cast<volatile u32 *>(writable);
+	const auto write_function = [&](u32 value) {
+		rw[0] = movz_w(0, value);
+		rw[1] = ret;
+		__asm__ volatile("dc cvau, %0\n\tdsb ish\n\tic ivau, %1\n\t"
+			"dsb ish\n\tisb"
+			:
+			: "r"(rw), "r"(executable)
+			: "memory");
+	};
+	const auto run = [&]() -> long {
+		register long x0 __asm__("x0");
+		__asm__ volatile("isb\n\tblr %1"
+			: "=r"(x0)
+			: "r"(executable)
+			: "x1", "x2", "x3", "x30", "memory", "cc");
+		return x0;
+	};
+	write_function(1);
+
+	int to_child[2];
+	int to_parent[2];
+	raw_syscall(nr_pipe2, reinterpret_cast<long>(to_child), 0);
+	raw_syscall(nr_pipe2, reinterpret_cast<long>(to_parent), 0);
+	const long child = raw_syscall(nr_clone, sigchld, 0, 0, 0, 0);
+	if (child < 0) {
+		print("code-change: fork failed\n");
+		leave(4);
+	}
+	char token = 0;
+	if (child == 0) {
+		for (u32 round = 1; round <= rounds; ++round) {
+			if (raw_syscall(nr_read, to_child[0],
+				    reinterpret_cast<long>(&token), 1) != 1)
+				leave(3);
+			write_function(10 + round);
+			raw_syscall(nr_write, to_parent[1],
+				reinterpret_cast<long>(&token), 1);
+		}
+		leave(0);
+	}
+	for (u32 round = 1; round <= rounds; ++round) {
+		for (u32 call = 0; call < warm_calls; ++call)
+			(void)run();
+		raw_syscall(nr_write, to_child[1], reinterpret_cast<long>(&token), 1);
+		if (raw_syscall(nr_read, to_parent[0],
+			    reinterpret_cast<long>(&token), 1) != 1) {
+			print("code-change: shared read failed\n");
+			leave(4);
+		}
+		expect(check_name, 10 + round, run());
+	}
+	int status = 0;
+	raw_syscall(nr_wait4, child, reinterpret_cast<long>(&status), 0, 0);
+	expect(at_null_page ? "shared-null-page-child" : "shared-memfd-child", 0,
+		status);
+}
+
+/* A page of a memfd, mapped writable and executable and shared, is run by
+ * the parent; the child forks with it and does not touch it. The parent then
+ * writes the page through the child's mapping with process_vm_writev(), as a
+ * debugger or a runtime patching another process does. The kernel writes
+ * through the frame, for a child whose software page table has no entry for
+ * the page yet, and the parent runs the new instruction all the same. After
+ * the child has touched the page (so has an entry), the same holds. It runs
+ * first: after the other cases the frame has held code before, which hides a
+ * missed publication. */
+void case_lazy_remote_target()
+{
+	constexpr u32 warm_calls = 200;
+	const long fd = raw_syscall(nr_memfd_create,
+		reinterpret_cast<long>("code-change-lazy"), 0);
+	if (fd < 0 || raw_syscall(nr_ftruncate, fd, static_cast<long>(page)) != 0) {
+		print("code-change: lazy memfd failed\n");
+		leave(4);
+	}
+	const long executable = raw_syscall(nr_mmap, 0, static_cast<long>(page),
+		prot_read | prot_write | prot_exec, map_shared, fd, 0);
+	if (executable < 0 && executable > -4096) {
+		print("code-change: lazy mmap failed\n");
+		leave(4);
+	}
+	auto *rw = reinterpret_cast<volatile u32 *>(executable);
+	rw[0] = movz_w(0, 1);
+	rw[1] = ret;
+	publish(reinterpret_cast<void *>(executable), 8);
+	const auto run = [&]() -> long {
+		register long x0 __asm__("x0");
+		__asm__ volatile("isb\n\tblr %1"
+			: "=r"(x0)
+			: "r"(executable)
+			: "x1", "x2", "x3", "x30", "memory", "cc");
+		return x0;
+	};
+	int to_child[2];
+	int to_parent[2];
+	raw_syscall(nr_pipe2, reinterpret_cast<long>(to_child), 0);
+	raw_syscall(nr_pipe2, reinterpret_cast<long>(to_parent), 0);
+	const long child = raw_syscall(nr_clone, sigchld, 0, 0, 0, 0);
+	if (child < 0) {
+		print("code-change: lazy fork failed\n");
+		leave(4);
+	}
+	char token = 0;
+	if (child == 0) {
+		if (raw_syscall(nr_read, to_child[0],
+			    reinterpret_cast<long>(&token), 1) != 1)
+			leave(4);
+		/* A read of the page gives the child its mapping. */
+		const u32 touched = rw[0];
+		(void)touched;
+		raw_syscall(nr_write, to_parent[1], reinterpret_cast<long>(&token), 1);
+		if (raw_syscall(nr_read, to_child[0],
+			    reinterpret_cast<long>(&token), 1) != 1)
+			leave(4);
+		leave(0);
+	}
+	for (u32 call = 0; call < warm_calls; ++call)
+		(void)run();
+	struct IoVec {
+		void *base;
+		u64 length;
+	};
+	u32 instruction = movz_w(0, 11);
+	IoVec local{&instruction, 4};
+	IoVec remote{reinterpret_cast<void *>(executable), 4};
+	const auto copy = [&]() {
+		return raw_syscall(nr_process_vm_writev, child,
+			reinterpret_cast<long>(&local), 1,
+			reinterpret_cast<long>(&remote), 1, 0);
+	};
+	expect("lazy-remote-copy", 4, copy());
+	expect("lazy-remote-untouched", 11, run());
+	raw_syscall(nr_write, to_child[1], reinterpret_cast<long>(&token), 1);
+	if (raw_syscall(nr_read, to_parent[0],
+		    reinterpret_cast<long>(&token), 1) != 1) {
+		print("code-change: lazy read failed\n");
+		leave(4);
+	}
+	instruction = movz_w(0, 12);
+	expect("lazy-remote-copy-again", 4, copy());
+	expect("lazy-remote-touched", 12, run());
+	raw_syscall(nr_write, to_child[1], reinterpret_cast<long>(&token), 1);
+	int status = 0;
+	raw_syscall(nr_wait4, child, reinterpret_cast<long>(&status), 0, 0);
+	expect("lazy-remote-child", 0, status);
+}
+
+/* userfaultfd(2) on the writer's source buffer: the kernel's read of it
+ * waits for a monitor, with the target's pages already pinned and its
+ * memory map unlocked. */
+struct UffdApi {
+	u64 api;
+	u64 features;
+	u64 ioctls;
+};
+
+struct UffdRange {
+	u64 start;
+	u64 length;
+};
+
+struct UffdRegister {
+	UffdRange range;
+	u64 mode;
+	u64 ioctls;
+};
+
+struct UffdCopy {
+	u64 destination;
+	u64 source;
+	u64 length;
+	u64 mode;
+	long copied;
+};
+
+struct UffdMessage {
+	unsigned char event;
+	unsigned char reserved1;
+	unsigned short reserved2;
+	u32 reserved3;
+	u64 flags;
+	u64 address;
+	u64 reserved4;
+};
+
+static_assert(sizeof(UffdMessage) == 32);
+
+constexpr u64 uffdio_api = 0xc018aa3fUL, uffdio_register = 0xc020aa00UL,
+	uffdio_copy = 0xc028aa03UL;
+constexpr u64 uffd_api = 0xaa, uffd_register_missing = 1;
+constexpr unsigned char uffd_event_pagefault = 0x12;
+/* The guest's page, which is smaller than the host's: the unit of
+ * UFFDIO_COPY. */
+constexpr u64 uffd_page = 4096;
+
+/* A page of a memfd holding "movz w0, #value; ret", mapped writable,
+ * executable and shared at `at`. */
+long code_file(const char *label, u32 value, long &at)
+{
+	const long fd = raw_syscall(nr_memfd_create, reinterpret_cast<long>(label), 0);
+	if (fd < 0 || raw_syscall(nr_ftruncate, fd, static_cast<long>(page)) != 0) {
+		print("code-change: remapped memfd failed\n");
+		leave(4);
+	}
+	at = raw_syscall(nr_mmap, 0, static_cast<long>(page),
+		prot_read | prot_write | prot_exec, map_shared, fd, 0);
+	if (at < 0 && at > -4096) {
+		print("code-change: remapped mmap failed\n");
+		leave(4);
+	}
+	auto *words = reinterpret_cast<volatile u32 *>(at);
+	words[0] = movz_w(0, value);
+	words[1] = ret;
+	publish(reinterpret_cast<void *>(at), 8);
+	return fd;
+}
+
+/* A process writes another's page with process_vm_writev() while that
+ * process, between the kernel's pin of the page and its store, puts another
+ * frame at the same address. The writer's source buffer is registered with
+ * userfaultfd, so the copy from it waits for the target, which is the
+ * monitor, after the pin. The store lands in the frame the kernel pinned,
+ * which this process runs as code; the frame mapped at the address now has
+ * no code. The kernel names the frame it wrote, so the code is new when it
+ * is called again, the mapping in the target still shows the other frame,
+ * and the first frame holds the new instruction.
+ *
+ *	R	runs the frame and checks
+ *	W	writes: process_vm_writev(T, S) with S registered
+ *	T	holds the frame, then remaps its address to another frame when
+ *		the fault on S arrives, and resolves the fault
+ *
+ * It runs early too: the first frame has not held other code. */
+void case_lazy_remote_remapped()
+{
+	constexpr u32 warm_calls = 200;
+	const char *name = "lazy-remote-remapped";
+	long executable = 0;
+	long other = 0;
+	code_file("code-change-remap-first", 1, executable);
+	const long second = code_file("code-change-remap-second", 3, other);
+	raw_syscall(nr_munmap, other, static_cast<long>(page));
+	const auto run = [&]() -> long {
+		register long x0 __asm__("x0");
+		__asm__ volatile("isb\n\tblr %1"
+			: "=r"(x0)
+			: "r"(executable)
+			: "x1", "x2", "x3", "x30", "memory", "cc");
+		return x0;
+	};
+	int to_writer_view[2];
+	int from_writer[2];
+	int to_writer[2];
+	int from_target[2];
+	int to_target[2];
+	raw_syscall(nr_pipe2, reinterpret_cast<long>(to_writer_view), 0);
+	raw_syscall(nr_pipe2, reinterpret_cast<long>(from_writer), 0);
+	raw_syscall(nr_pipe2, reinterpret_cast<long>(to_writer), 0);
+	raw_syscall(nr_pipe2, reinterpret_cast<long>(from_target), 0);
+	raw_syscall(nr_pipe2, reinterpret_cast<long>(to_target), 0);
+	const long writer = raw_syscall(nr_clone, sigchld, 0, 0, 0, 0);
+	if (writer < 0) {
+		print("code-change: remapped fork failed\n");
+		leave(4);
+	}
+	if (writer == 0) {
+		const long source = raw_syscall(nr_mmap, 0, static_cast<long>(page),
+			prot_read | prot_write, map_private | map_anonymous, -1, 0);
+		if (source < 0 && source > -4096) {
+			print("code-change: remapped source failed\n");
+			leave(4);
+		}
+		const long monitor = raw_syscall(nr_userfaultfd, 0);
+		UffdApi api{uffd_api, 0, 0};
+		UffdRegister registration{{static_cast<u64>(source), page},
+			uffd_register_missing, 0};
+		if (monitor < 0 ||
+		    raw_syscall(nr_ioctl, monitor, static_cast<long>(uffdio_api),
+			    reinterpret_cast<long>(&api)) != 0 ||
+		    raw_syscall(nr_ioctl, monitor, static_cast<long>(uffdio_register),
+			    reinterpret_cast<long>(&registration)) != 0) {
+			print("code-change: userfaultfd failed\n");
+			leave(4);
+		}
+		const long target = raw_syscall(nr_clone, sigchld, 0, 0, 0, 0);
+		if (target < 0) {
+			print("code-change: remapped fork failed\n");
+			leave(4);
+		}
+		if (target == 0) {
+			auto *view = reinterpret_cast<volatile u32 *>(executable);
+			/* A store of its own puts the page in this process's
+			 * address space. */
+			view[1] = view[1];
+			raw_syscall(nr_write, to_writer_view[1],
+				reinterpret_cast<long>(&executable), sizeof(executable));
+			/* The copy from the source buffer faults: the page is
+			 * pinned, and nothing is stored yet. */
+			UffdMessage message{};
+			if (raw_syscall(nr_read, monitor, reinterpret_cast<long>(&message),
+				    sizeof(message)) != static_cast<long>(sizeof(message)) ||
+			    message.event != uffd_event_pagefault) {
+				print("code-change: userfaultfd message failed\n");
+				leave(4);
+			}
+			/* Another frame at the address, and its page in this
+			 * process's address space. */
+			const long remapped = raw_syscall(nr_mmap, executable,
+				static_cast<long>(page), prot_read | prot_write | prot_exec,
+				map_shared | map_fixed, second, 0);
+			if (remapped != executable) {
+				print("code-change: remap failed\n");
+				leave(4);
+			}
+			view[1] = view[1];
+			char token = 0;
+			raw_syscall(nr_write, from_target[1], reinterpret_cast<long>(&token), 1);
+			raw_syscall(nr_read, to_target[0], reinterpret_cast<long>(&token), 1);
+			/* The writer's buffer gets the new instruction, and the
+			 * copy goes on. */
+			const long carrier = raw_syscall(nr_mmap, 0, static_cast<long>(page),
+				prot_read | prot_write, map_private | map_anonymous, -1, 0);
+			if (carrier < 0 && carrier > -4096) {
+				print("code-change: remapped carrier failed\n");
+				leave(4);
+			}
+			*reinterpret_cast<volatile u32 *>(carrier) = movz_w(0, 2);
+			UffdCopy fill{static_cast<u64>(source), static_cast<u64>(carrier),
+				uffd_page, 0, 0};
+			if (raw_syscall(nr_ioctl, monitor, static_cast<long>(uffdio_copy),
+				    reinterpret_cast<long>(&fill)) != 0 ||
+			    fill.copied != static_cast<long>(uffd_page)) {
+				print("code-change: userfaultfd copy failed\n");
+				leave(4);
+			}
+			raw_syscall(nr_read, to_target[0], reinterpret_cast<long>(&token), 1);
+			const u32 seen = view[0];
+			raw_syscall(nr_write, from_target[1], reinterpret_cast<long>(&seen),
+				sizeof(seen));
+			leave(0);
+		}
+		long view = 0;
+		raw_syscall(nr_read, to_writer_view[0], reinterpret_cast<long>(&view),
+			sizeof(view));
+		char token = 0;
+		raw_syscall(nr_write, from_writer[1], reinterpret_cast<long>(&token), 1);
+		raw_syscall(nr_read, to_writer[0], reinterpret_cast<long>(&token), 1);
+		struct IoVec {
+			void *base;
+			u64 length;
+		};
+		IoVec local{reinterpret_cast<void *>(source), 4};
+		IoVec remote{reinterpret_cast<void *>(view), 4};
+		const long done = raw_syscall(nr_process_vm_writev, target,
+			reinterpret_cast<long>(&local), 1,
+			reinterpret_cast<long>(&remote), 1, 0);
+		char reply = done == 4 ? 1 : 0;
+		raw_syscall(nr_write, from_writer[1], reinterpret_cast<long>(&reply), 1);
+		int status = 0;
+		raw_syscall(nr_wait4, target, reinterpret_cast<long>(&status), 0, 0);
+		leave(status == 0 ? 0 : 5);
+	}
+	char token = 0;
+	raw_syscall(nr_read, from_writer[0], reinterpret_cast<long>(&token), 1);
+	/* The forks flushed this process's translations: run the code again so
+	 * that the write meets a warm one. */
+	for (u32 call = 0; call < warm_calls; ++call)
+		(void)run();
+	expect(name, 1, run());
+	raw_syscall(nr_write, to_writer[1], reinterpret_cast<long>(&token), 1);
+	/* The target has put the other frame at the address. */
+	raw_syscall(nr_read, from_target[0], reinterpret_cast<long>(&token), 1);
+	for (u32 call = 0; call < warm_calls; ++call)
+		(void)run();
+	expect(name, 1, run());
+	raw_syscall(nr_write, to_target[1], reinterpret_cast<long>(&token), 1);
+	char reply = 0;
+	raw_syscall(nr_read, from_writer[0], reinterpret_cast<long>(&reply), 1);
+	expect("lazy-remote-remapped-copy", 1, reply);
+	expect(name, 2, run());
+	/* The store was made in the frame that was pinned, not the one that
+	 * is mapped now. */
+	expect("lazy-remote-remapped-frame", movz_w(0, 2),
+		*reinterpret_cast<volatile u32 *>(executable));
+	raw_syscall(nr_write, to_target[1], reinterpret_cast<long>(&token), 1);
+	u32 seen = 0;
+	raw_syscall(nr_read, from_target[0], reinterpret_cast<long>(&seen), sizeof(seen));
+	expect("lazy-remote-remapped-target", movz_w(0, 3), seen);
+	int status = 0;
+	raw_syscall(nr_wait4, writer, reinterpret_cast<long>(&status), 0, 0);
+	expect("lazy-remote-remapped-exit", 0, status);
+}
+
 void futex_wait(volatile int *address, int expected)
 {
 	raw_syscall(nr_futex, reinterpret_cast<long>(address), futex_wait_private, expected, 0);
@@ -727,6 +1165,8 @@ void *memcpy(void *destination, const void *source, u64 length)
 
 int guest_main()
 {
+	case_lazy_remote_target();
+	case_lazy_remote_remapped();
 	case_smc("smc-same-page", callee_near);
 	case_smc("smc-other-page", callee_far);
 	case_smc_running_block();
@@ -735,6 +1175,8 @@ int guest_main()
 	case_fork("fork-child-first", false, false);
 	case_fork("fork-child-gone", true, true);
 	case_remap();
+	case_shared_code(false);
+	case_shared_code(true);
 	case_vcpu(false);
 	case_vcpu(true);
 	case_flood();

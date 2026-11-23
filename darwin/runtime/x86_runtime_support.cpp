@@ -3,7 +3,9 @@
 
 #if DARWIN_UML_X86_64_GUEST
 
+#include "cpu/x86_64/code_page_registry.hpp"
 #include "cpu/x86_64/decoder.hpp"
+#include "memory/mmu/frame_accounting.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -117,6 +119,34 @@ void note_x86_jit_ordering(unsigned long generation, bool marked,
 	bool ordered, std::uint64_t rip) noexcept
 {
 	mm_shared_log().note_jit(generation, marked, ordered, rip);
+}
+
+void report_x86_run_counters() noexcept
+{
+	const char *path = std::getenv("UML_X86_ACCOUNTING_LOG");
+	if (path == nullptr || path[0] == '\0')
+		return;
+	std::FILE *file = std::fopen(path, "ae");
+	if (file == nullptr)
+		return;
+	const auto accounting = ::uml::memory::FrameAccounting::diagnostics();
+	const auto registrations = x86_64::registration_totals();
+	std::fprintf(file,
+		"uml-x86 accounting unresolved_kernel_writes=%llu "
+		"direct_range_drops=%llu global_holds=%llu "
+		"registration_failures=%llu holder_registrations=%llu "
+		"flush_serial_misses=%llu registration_refusals=%llu "
+		"registration_unsettled=%llu kernel_frame_writes=%llu\n",
+		static_cast<unsigned long long>(accounting.unresolved_kernel_writes),
+		static_cast<unsigned long long>(accounting.direct_range_drops),
+		static_cast<unsigned long long>(accounting.global_holds),
+		static_cast<unsigned long long>(registrations.failures),
+		static_cast<unsigned long long>(registrations.registrations),
+		static_cast<unsigned long long>(registrations.flush_serial_misses),
+		static_cast<unsigned long long>(registrations.refusals),
+		static_cast<unsigned long long>(registrations.unsettled),
+		static_cast<unsigned long long>(accounting.kernel_frame_writes));
+	std::fclose(file);
 }
 
 std::uint32_t x86_noncanonical_vector(StaticGuestMemory &memory,

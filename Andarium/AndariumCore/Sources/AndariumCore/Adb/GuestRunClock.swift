@@ -34,6 +34,12 @@ public final class GuestRunClock: @unchecked Sendable {
         }
     }
 
+    /// `now` in seconds.
+    public var seconds: TimeInterval {
+        let elapsed = now.components
+        return TimeInterval(elapsed.seconds) + TimeInterval(elapsed.attoseconds) / 1e18
+    }
+
     public var isPaused: Bool {
         lock.withLock { resumedAt == nil }
     }

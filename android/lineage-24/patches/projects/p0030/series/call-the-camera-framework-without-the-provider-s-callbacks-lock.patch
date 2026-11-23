@@ -1,0 +1,119 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 12:40:00 +0000
+Subject: [PATCH] call the camera framework without the provider's callbacks
+ lock
+
+The provider's three status callbacks to the framework (camera device,
+physical camera device and torch mode) held callbacks_lock_ across the
+synchronous binder call into cameraserver. setCallback() takes the same
+lock. A call into cameraserver waits for one of its binder threads, and
+during its start-up enumeration cameraserver has none: its only thread
+is waiting for the provider's reply. When the provider was already
+registered then, a callback made from a thread of the HAL (the torch
+status of a camera whose session is blocked) held the lock while it
+waited for cameraserver, and the provider's handler of the
+enumeration's own call waited for the lock. Neither returned:
+cameraserver never published its service and the device had no
+cameras until the next boot.
+
+Take a copy of the callbacks pointer under the lock and call the
+framework through the copy, without the lock. The pointer was also read
+unlocked before it was tested.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .../hal/aidl_service/aidl_camera_provider.cc  | 23 +++++++++++--------
+ .../hal/aidl_service/aidl_camera_provider.h   |  3 +++
+ 2 files changed, 17 insertions(+), 9 deletions(-)
+
+diff --git a/common/hal/aidl_service/aidl_camera_provider.cc b/common/hal/aidl_service/aidl_camera_provider.cc
+index dec681641fd8973f60a8bff902ae286c5d0feef6..f033ad2ffe1e90045e62c1c326ad1a7ec5d4194c 100644
+--- a/common/hal/aidl_service/aidl_camera_provider.cc
++++ b/common/hal/aidl_service/aidl_camera_provider.cc
+@@ -59,6 +59,11 @@ std::shared_ptr<AidlCameraProvider> AidlCameraProvider::Create() {
+   return provider;
+ }
+ 
++std::shared_ptr<ICameraProviderCallback> AidlCameraProvider::CurrentCallbacks() {
++  std::unique_lock<std::mutex> lock(callbacks_lock_);
++  return callbacks_;
++}
++
+ status_t AidlCameraProvider::Initialize() {
+   google_camera_provider_ = CameraProvider::Create();
+   if (google_camera_provider_ == nullptr) {
+@@ -70,7 +75,8 @@ status_t AidlCameraProvider::Initialize() {
+       .camera_device_status_change = google_camera_hal::CameraDeviceStatusChangeFunc(
+           [this](std::string camera_id,
+                  google_camera_hal::CameraDeviceStatus new_status) {
+-            if (callbacks_ == nullptr) {
++            auto callbacks = CurrentCallbacks();
++            if (callbacks == nullptr) {
+               ALOGE("%s: callbacks_ is null", __FUNCTION__);
+               return;
+             }
+@@ -84,8 +90,7 @@ status_t AidlCameraProvider::Initialize() {
+               return;
+             }
+ 
+-            std::unique_lock<std::mutex> lock(callbacks_lock_);
+-            auto aidl_res = callbacks_->cameraDeviceStatusChange(
++            auto aidl_res = callbacks->cameraDeviceStatusChange(
+                 "device@" +
+                     device::implementation::AidlCameraDevice::kDeviceVersion +
+                     "/" + kProviderName + "/" + camera_id,
+@@ -100,7 +105,8 @@ status_t AidlCameraProvider::Initialize() {
+           google_camera_hal::PhysicalCameraDeviceStatusChangeFunc(
+               [this](std::string camera_id, std::string physical_camera_id,
+                      google_camera_hal::CameraDeviceStatus new_status) {
+-                if (callbacks_ == nullptr) {
++                auto callbacks = CurrentCallbacks();
++                if (callbacks == nullptr) {
+                   ALOGE("%s: callbacks_ is null", __FUNCTION__);
+                   return;
+                 }
+@@ -129,8 +135,7 @@ status_t AidlCameraProvider::Initialize() {
+                   return;
+                 }
+ 
+-                std::unique_lock<std::mutex> lock(callbacks_lock_);
+-                auto aidl_res = callbacks_->physicalCameraDeviceStatusChange(
++                auto aidl_res = callbacks->physicalCameraDeviceStatusChange(
+                     "device@" +
+                         device::implementation::AidlCameraDevice::kDeviceVersion +
+                         "/" + kProviderName + "/" + camera_id,
+@@ -145,7 +150,8 @@ status_t AidlCameraProvider::Initialize() {
+       .torch_mode_status_change = google_camera_hal::TorchModeStatusChangeFunc(
+           [this](std::string camera_id,
+                  google_camera_hal::TorchModeStatus new_status) {
+-            if (callbacks_ == nullptr) {
++            auto callbacks = CurrentCallbacks();
++            if (callbacks == nullptr) {
+               ALOGE("%s: callbacks_ is null", __FUNCTION__);
+               return;
+             }
+@@ -159,8 +165,7 @@ status_t AidlCameraProvider::Initialize() {
+               return;
+             }
+ 
+-            std::unique_lock<std::mutex> lock(callbacks_lock_);
+-            auto aidl_res = callbacks_->torchModeStatusChange(
++            auto aidl_res = callbacks->torchModeStatusChange(
+                 "device@" +
+                     device::implementation::AidlCameraDevice::kDeviceVersion +
+                     "/" + kProviderName + "/" + camera_id,
+diff --git a/common/hal/aidl_service/aidl_camera_provider.h b/common/hal/aidl_service/aidl_camera_provider.h
+index 34c88cdcaeb91e8edc1e6f977ae3f94dfb5b5c77..aa8da2fd000652bdbc2e6a549717b659d585c41c 100644
+--- a/common/hal/aidl_service/aidl_camera_provider.h
++++ b/common/hal/aidl_service/aidl_camera_provider.h
+@@ -89,6 +89,9 @@ class AidlCameraProvider : public BnCameraProvider {
+   bool ParseDeviceName(const std::string& device_name,
+                        std::string* device_version, std::string* camera_id);
+ 
++  // The callbacks of the framework, set by setCallback(). callbacks_lock_ guards the pointer only: the
++  // framework is called through a copy of it (CurrentCallbacks()), never with the lock held.
++  std::shared_ptr<ICameraProviderCallback> CurrentCallbacks();
+   std::mutex callbacks_lock_;
+   std::shared_ptr<ICameraProviderCallback> callbacks_;
+ 

@@ -24,6 +24,14 @@ SUPPORT = TESTS / "integration" / "support"
 RUNNERS = {
     "run_android_adb_debugging": (TESTS / "integration/android/run_android_adb_debugging.py", 5575),
     "run_android_oobe": (TESTS / "integration/android/run_android_oobe.py", 5576),
+    "run_android_microg_spoofing": (TESTS / "integration/android/run_android_microg_spoofing.py", 5577),
+    "run_android_thermal": (TESTS / "integration/android/run_android_thermal.py", 5578),
+    "run_android_gamepad": (TESTS / "integration/android/run_android_gamepad.py", 5579),
+    "run_android_camera": (TESTS / "integration/android/run_android_camera.py", 5580),
+    "run_android_keymouse": (TESTS / "integration/android/run_android_keymouse.py", 5582),
+    "run_android_wifi_network": (TESTS / "integration/android/run_android_wifi_network.py", 5584),
+    "run_android_orientation": (TESTS / "integration/android/run_android_orientation.py", 5586),
+    "run_android_vulkan_smoke": (TESTS / "integration/android/run_android_vulkan_smoke.py", 5587),
     "android_launch_suite": (TESTS / "perf/android_launch_suite.py", 5601),
 }
 SLOT = "21300"

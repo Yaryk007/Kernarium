@@ -123,4 +123,25 @@ bool GuestPlaneReader::read(std::uint64_t offset, std::span<std::uint8_t> out)
     return done == out.size();
 }
 
+bool GuestPlaneWriter::write(std::uint64_t offset, std::span<const std::uint8_t> data)
+{
+    if (offset < indexStart_) index_ = 0, indexStart_ = 0;
+    while (index_ < segments_.size() && offset >= indexStart_ + segments_[index_].length) {
+        indexStart_ += segments_[index_].length;
+        ++index_;
+    }
+    std::size_t done = 0;
+    std::uint64_t start = offset - indexStart_;
+    for (std::size_t index = index_; done < data.size() && index < segments_.size(); ++index) {
+        const auto& segment = segments_[index];
+        const auto size = std::min<std::size_t>(data.size() - done, segment.length - start);
+        // The transfer only reads the bytes when it writes.
+        const auto piece = std::span<std::uint8_t>(const_cast<std::uint8_t*>(data.data()) + done, size);
+        if (!transferOne(mapper_, regions_, segment, start, piece, true)) return false;
+        done += size;
+        start = 0;
+    }
+    return done == data.size();
+}
+
 } // namespace uml::video

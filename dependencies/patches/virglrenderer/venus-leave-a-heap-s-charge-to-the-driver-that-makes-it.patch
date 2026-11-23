@@ -29,7 +29,7 @@ Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
  4 files changed, 71 insertions(+), 61 deletions(-)
 
 diff --git a/src/venus/vkr_device.c b/src/venus/vkr_device.c
-index c4f4abd5ef8fbdb387c0157711b2b2b7f3afe134..9343e4d77c5433eff6aeca41c135622bed6ac74f 100644
+index cefd916c8219a8901a6c5e096b84538142813d0d..0711db10d5a38eca6a049a654a5c86b7861cad40 100644
 --- a/src/venus/vkr_device.c
 +++ b/src/venus/vkr_device.c
 @@ -5,8 +5,6 @@
@@ -94,7 +94,7 @@ index c4f4abd5ef8fbdb387c0157711b2b2b7f3afe134..9343e4d77c5433eff6aeca41c135622b
        free(exts);
        free(dev);
 diff --git a/src/venus/vkr_device_memory.c b/src/venus/vkr_device_memory.c
-index 65b58fca5172571b4fceb86606aa104e9a15ea8e..62e9470c76338eb9e84ebb0946f1c9ac38f56176 100644
+index 6b0035c49b6f77262f8a74d0a236f80ea94e67c7..673f6c448f7ed3b41318b740f5bea060416b7111 100644
 --- a/src/venus/vkr_device_memory.c
 +++ b/src/venus/vkr_device_memory.c
 @@ -240,7 +240,8 @@ vkr_gbm_get_fd_info_from_allocation_info(UNUSED struct vkr_physical_device *phys

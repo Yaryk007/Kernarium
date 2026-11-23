@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 13:40:51 +0900
+Subject: [PATCH] um: tell the host of the pages a Darwin UBD read wrote
+
+A read into a page that a process has pinned and runs (an O_DIRECT or
+io_uring fixed-buffer read into its own code) is written by the UBD
+worker through the kernel's alias of the page, with no user address on
+the path. On x86-64 the host translates the code of such a page and has
+to hear of the write: the flush at the pin came before it, and the
+translation of a page that ran after the pin is stale once the read
+lands. End each segment of a read with flush_dcache_page(), as a driver
+that fills pages itself does (zram). The call is empty where the
+architecture has no hook. The x86-64 hook, in the worker's task context,
+costs a barrier and a bit test for a page no process runs, and names the
+frame of one a process does.
+
+The call that names the frames now promises any frame of guest RAM, an
+anonymous page included, and no longer only a page-cache or memfd frame:
+the bridge ABI version is 28, the fingerprint is unchanged, and the
+kernel's copies of the headers are regenerated.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ arch/um/drivers/ubd_kern.c                  | 9 +++++++++
+ arch/um/os-Darwin/uml_darwin_abi_identity.h | 2 +-
+ arch/um/os-Darwin/uml_darwin_memory.h       | 7 +++++--
+ 3 files changed, 15 insertions(+), 3 deletions(-)
+
+diff --git a/arch/um/drivers/ubd_kern.c b/arch/um/drivers/ubd_kern.c
+index 014713811def177352661c62d89dd1c5b0d00639..0281490c9da38d3fdfe0275924a1196058c38364 100644
+--- a/arch/um/drivers/ubd_kern.c
++++ b/arch/um/drivers/ubd_kern.c
+@@ -1408,6 +1408,15 @@ static void darwin_ubd_work(struct work_struct *work)
+ 		rq_for_each_segment(bvec, req, iter) {
+ 			darwin_ubd_run(dev, io_req, bvec_virt(&bvec),
+ 				       bvec.bv_len, byte_offset);
++			/*
++			 * A read wrote the page through the kernel's alias, and
++			 * the page may be one a process runs, pinned before the
++			 * read (O_DIRECT, io_uring buffers): where a core holds
++			 * the old bytes, flush_dcache_page() says so. It is the
++			 * way a driver that fills pages itself ends the write.
++			 */
++			if (req_op(req) == REQ_OP_READ)
++				flush_dcache_page(bvec.bv_page);
+ 			if (io_req->error)
+ 				goto out;
+ 			byte_offset += bvec.bv_len;
+diff --git a/arch/um/os-Darwin/uml_darwin_abi_identity.h b/arch/um/os-Darwin/uml_darwin_abi_identity.h
+index a5723f9ae3fbbffa4bd04528184148b66b9f5162..e6a4ad31b7cfb3c1c9f4c51a055aa65d74712798 100644
+--- a/arch/um/os-Darwin/uml_darwin_abi_identity.h
++++ b/arch/um/os-Darwin/uml_darwin_abi_identity.h
+@@ -3,7 +3,7 @@
+ #ifndef UML_DARWIN_ABI_IDENTITY_H
+ #define UML_DARWIN_ABI_IDENTITY_H
+ 
+-#define DARWIN_UML_ABI_VERSION 27U
++#define DARWIN_UML_ABI_VERSION 28U
+ #define DARWIN_UML_ABI_FINGERPRINT 0x3d09b8eeee7ea3c2ULL
+ 
+ #endif
+diff --git a/arch/um/os-Darwin/uml_darwin_memory.h b/arch/um/os-Darwin/uml_darwin_memory.h
+index 24cfef381dfb32736935b7a68345a90b77552f8b..cb7f8f8ab934a29447e8227225373fd62ded07ab 100644
+--- a/arch/um/os-Darwin/uml_darwin_memory.h
++++ b/arch/um/os-Darwin/uml_darwin_memory.h
+@@ -51,8 +51,11 @@ int darwin_uml_vm_invalidate_code_frame(unsigned long generation,
+ 					unsigned long long offset);
+ /* Linux wrote the bytes of the whole guest pages [offset, offset + length)
+  * of the frame at fd through its own alias, for no process and at no
+- * user address: a write(2), splice(2) or truncate into a page-cache or
+- * memfd frame some process maps and runs as code. The change is published
++ * user address, into a frame some process maps and runs as code: a write(2),
++ * splice(2) or truncate into a page-cache or memfd frame, or a block
++ * device's read into a page a process pinned (O_DIRECT, io_uring), whether
++ * that page is anonymous or a file's. Any frame of guest RAM is named the
++ * same way, by the fd and offset of its backing. The change is published
+  * at every x86 translation of those pages, whichever address spaces map
+  * them; an arm64 guest follows the architecture's cache maintenance and is
+  * not told. A negative fd names no frame, and every address space hears of

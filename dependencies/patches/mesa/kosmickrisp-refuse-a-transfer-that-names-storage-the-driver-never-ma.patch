@@ -1,0 +1,305 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 03:24:05 +0900
+Subject: [PATCH] kosmickrisp: refuse a transfer that names storage the driver
+ never made
+
+A Venus guest binds image and buffer memory without waiting for the
+result, so a bind the driver refused, or one the guest never made, left
+an image whose planes had no Metal texture, or a buffer with no Metal
+buffer, and the guest went on to copy to it. The copy commands passed
+that nil to Metal, which Apple's GPU drivers dereference without a
+check: the host ended in copyFromBuffer:toTexture:, in the field on A14
+iPhones, and every other device has the same unchecked load.
+
+The copy commands check the buffer or image plane they hand Metal first
+and, when there is none, record VK_ERROR_VALIDATION_FAILED_EXT on the
+command buffer and hand Metal nothing for it: the buffer copy, the
+copies between buffers and images in both directions and through device
+addresses, and the image copy. A command of several regions may have
+recorded the regions before the first one without storage. The image
+clears made their meta view with the result only asserted, so an image
+with no texture left the view unset and the clear used it; they record
+the view's error, VK_ERROR_OUT_OF_DEVICE_MEMORY, and return instead.
+Fills, updates and query-result copies do not hand Metal the buffer;
+they reach the GPU by its address, and an unbound buffer is not guarded
+there.
+
+A buffer bind that Metal refuses answered VK_SUCCESS with no handle.
+kk_bind_buffer_memory now fails with VK_ERROR_OUT_OF_DEVICE_MEMORY then,
+and kk_BindImageMemory2 reports each bind's own result in
+VkBindMemoryStatus, where it wrote VK_SUCCESS.
+
+A failed bind logs one line, nothing on success: which path refused it,
+and the format, tiling, usage, extent, samples, offset and sizes of what
+it was asked to bind, in numbers only. vk_errorf prints nothing in a
+release build, so no report named why the bind failed.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/kosmickrisp/vulkan/kk_buffer.c    | 21 +++++++++++-
+ src/kosmickrisp/vulkan/kk_cmd_clear.c |  9 +++--
+ src/kosmickrisp/vulkan/kk_cmd_copy.c  | 49 +++++++++++++++++++++++++++
+ src/kosmickrisp/vulkan/kk_image.c     | 42 +++++++++++++++++++----
+ 4 files changed, 111 insertions(+), 10 deletions(-)
+
+diff --git a/src/kosmickrisp/vulkan/kk_buffer.c b/src/kosmickrisp/vulkan/kk_buffer.c
+index 2a53a8e6ca7a5c1433388093bd2a740f43c4159d..fa9e458bb9f3ff12833d105c8bd87c5b4e0d31c3 100644
+--- a/src/kosmickrisp/vulkan/kk_buffer.c
++++ b/src/kosmickrisp/vulkan/kk_buffer.c
+@@ -13,6 +13,8 @@
+ 
+ #include "kosmickrisp/bridge/mtl_bridge.h"
+ 
++#include "util/log.h"
++
+ #include "vk_debug_utils.h"
+ 
+ static uint64_t
+@@ -171,7 +173,24 @@ kk_bind_buffer_memory(struct kk_device *dev, const VkBindBufferMemoryInfo *info)
+        * pointer, use the mapped buffer directly and retain a reference */
+       buffer->mtl_handle = mem->bo->map;
+       buffer->offset = info->memoryOffset;
+-      mtl_retain(buffer->mtl_handle);
++      if (buffer->mtl_handle)
++         mtl_retain(buffer->mtl_handle);
++   }
++
++   /* Metal refuses a buffer that does not fit the heap where it was asked to
++    * start. The commands that name the buffer hand Metal its handle, which
++    * Apple's GPU drivers dereference, so a buffer with none is a failed bind
++    * and not a bound one. */
++   if (!buffer->mtl_handle) {
++      mesa_loge("kosmickrisp: buffer bind failed: Metal gave no buffer (size "
++                "%" PRIu64 ", offset %" PRIu64 ", memory size %" PRIu64
++                ", %s)",
++                (uint64_t)buffer->vk.size, (uint64_t)info->memoryOffset,
++                (uint64_t)mem->bo->size_B,
++                mem->bo->mtl_handle ? "heap" : "host pointer");
++      buffer->offset = 0u;
++      return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
++                       "Metal gave no buffer for the bound memory");
+    }
+ 
+    buffer->vk.device_address =
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_clear.c b/src/kosmickrisp/vulkan/kk_cmd_clear.c
+index 3d47aec9399bbc01ffae6be11231912c272cdb6c..f64e82142a569eeb3fb75fe6402d0e6a53eff622 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_clear.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_clear.c
+@@ -41,7 +41,7 @@ clear_image(struct kk_cmd_buffer *cmd, struct kk_image *image,
+             const VkImageSubresourceRange *ranges)
+ {
+    struct kk_device *dev = kk_cmd_buffer_device(cmd);
+-   ASSERTED VkResult result;
++   VkResult result;
+ 
+    for (uint32_t r = 0; r < range_count; r++) {
+       const uint32_t level_count =
+@@ -90,7 +90,12 @@ clear_image(struct kk_cmd_buffer *cmd, struct kk_image *image,
+          VkImageView view;
+          result =
+             vk_meta_create_image_view(&cmd->vk, &dev->meta, &view_info, &view);
+-         assert(result == VK_SUCCESS);
++         /* An image that was never bound, or whose bind failed, has no Metal
++          * texture to make a view of, and the view is left unset. */
++         if (result != VK_SUCCESS) {
++            vk_command_buffer_set_error(&cmd->vk, result);
++            return;
++         }
+ 
+          VkRenderingInfo render = {
+             .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_copy.c b/src/kosmickrisp/vulkan/kk_cmd_copy.c
+index 8636a37742d03b93db2000f29bd4c362fd91857f..103b02cc2a375420cc1b72795d0e1b494ea0bddb 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_copy.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_copy.c
+@@ -19,6 +19,34 @@
+ 
+ #include "util/format/u_format.h"
+ 
++/* A transfer hands Metal the Metal object of every buffer and image plane it
++ * names. A buffer or image that was never bound, or whose bind failed, has
++ * none, and Apple's GPU drivers dereference a nil argument and end the
++ * process. The command then records an error on its command buffer and hands
++ * Metal nothing for that object; the regions of a copy before the first one
++ * that names it are already recorded. */
++static bool
++kk_cmd_buffer_has_metal_buffer(struct kk_cmd_buffer *cmd,
++                               const struct kk_buffer *buffer)
++{
++   if (likely(buffer->mtl_handle != NULL))
++      return true;
++
++   vk_command_buffer_set_error(&cmd->vk, VK_ERROR_VALIDATION_FAILED_EXT);
++   return false;
++}
++
++static bool
++kk_cmd_buffer_has_metal_texture(struct kk_cmd_buffer *cmd,
++                                const struct kk_image_plane *plane)
++{
++   if (likely(plane->mtl_handle != NULL))
++      return true;
++
++   vk_command_buffer_set_error(&cmd->vk, VK_ERROR_VALIDATION_FAILED_EXT);
++   return false;
++}
++
+ VKAPI_ATTR void VKAPI_CALL
+ kk_CmdCopyBuffer2(VkCommandBuffer commandBuffer,
+                   const VkCopyBufferInfo2 *pCopyBufferInfo)
+@@ -27,6 +55,10 @@ kk_CmdCopyBuffer2(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(kk_buffer, src, pCopyBufferInfo->srcBuffer);
+    VK_FROM_HANDLE(kk_buffer, dst, pCopyBufferInfo->dstBuffer);
+ 
++   if (!kk_cmd_buffer_has_metal_buffer(cmd, src) ||
++       !kk_cmd_buffer_has_metal_buffer(cmd, dst))
++      return;
++
+    mtl_compute_encoder *encoder = cs_get_compute(cmd, true);
+    for (uint32_t i = 0; i < pCopyBufferInfo->regionCount; i++) {
+       const VkBufferCopy2 *region = &pCopyBufferInfo->pRegions[i];
+@@ -119,12 +151,17 @@ kk_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(kk_buffer, buffer, pCopyBufferToImageInfo->srcBuffer);
+    VK_FROM_HANDLE(kk_image, image, pCopyBufferToImageInfo->dstImage);
+ 
++   if (!kk_cmd_buffer_has_metal_buffer(cmd, buffer))
++      return;
++
+    mtl_compute_encoder *encoder = cs_get_compute(cmd, true);
+    for (int r = 0; r < pCopyBufferToImageInfo->regionCount; r++) {
+       const VkBufferImageCopy2 *region = &pCopyBufferToImageInfo->pRegions[r];
+       const uint8_t plane_index = kk_image_memory_aspects_to_plane(
+          image, region->imageSubresource.aspectMask);
+       struct kk_image_plane *plane = &image->planes[plane_index];
++      if (!kk_cmd_buffer_has_metal_texture(cmd, plane))
++         return;
+       struct kk_buffer_image_copy_info info =
+          vk_buffer_image_copy_to_mtl_buffer_image_copy(region, plane);
+       info.mtl_data.buffer = buffer->mtl_handle;
+@@ -150,12 +187,17 @@ kk_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(kk_image, image, pCopyImageToBufferInfo->srcImage);
+    VK_FROM_HANDLE(kk_buffer, buffer, pCopyImageToBufferInfo->dstBuffer);
+ 
++   if (!kk_cmd_buffer_has_metal_buffer(cmd, buffer))
++      return;
++
+    mtl_compute_encoder *encoder = cs_get_compute(cmd, true);
+    for (unsigned r = 0; r < pCopyImageToBufferInfo->regionCount; r++) {
+       const VkBufferImageCopy2 *region = &pCopyImageToBufferInfo->pRegions[r];
+       const uint8_t plane_index = kk_image_memory_aspects_to_plane(
+          image, region->imageSubresource.aspectMask);
+       struct kk_image_plane *plane = &image->planes[plane_index];
++      if (!kk_cmd_buffer_has_metal_texture(cmd, plane))
++         return;
+       struct kk_buffer_image_copy_info info =
+          vk_buffer_image_copy_to_mtl_buffer_image_copy(region, plane);
+       info.mtl_data.buffer = buffer->mtl_handle;
+@@ -213,6 +255,8 @@ kk_cmd_copy_memory_image(VkCommandBuffer commandBuffer,
+       const uint8_t plane_index = kk_image_memory_aspects_to_plane(
+          image, region->imageSubresource.aspectMask);
+       struct kk_image_plane *plane = &image->planes[plane_index];
++      if (!kk_cmd_buffer_has_metal_texture(cmd, plane))
++         return;
+       struct kk_buffer_image_copy_info info =
+          vk_buffer_image_copy_to_mtl_buffer_image_copy(&buffer_region, plane);
+       info.mtl_data.buffer = address.buffer;
+@@ -538,6 +582,11 @@ kk_CmdCopyImage2(VkCommandBuffer commandBuffer,
+       uint8_t dst_index =
+          kk_image_aspects_to_plane(dst, region->dstSubresource.aspectMask);
+ 
++      /* Both copy paths below read the planes' Metal textures. */
++      if (!kk_cmd_buffer_has_metal_texture(cmd, &src->planes[src_index]) ||
++          !kk_cmd_buffer_has_metal_texture(cmd, &dst->planes[dst_index]))
++         return;
++
+       if (can_do_image_to_image_copy(src, src_index, dst, dst_index))
+          copy_image(cmd, src, src_index, dst, dst_index, region);
+       else {
+diff --git a/src/kosmickrisp/vulkan/kk_image.c b/src/kosmickrisp/vulkan/kk_image.c
+index 817129a045ecb0a16e64765133f6ec182f8d6b62..7a185da161da86cb5cd15d7a7e96401c23d348dd 100644
+--- a/src/kosmickrisp/vulkan/kk_image.c
++++ b/src/kosmickrisp/vulkan/kk_image.c
+@@ -29,6 +29,8 @@
+ 
+ #include "drm-uapi/drm_fourcc.h"
+ 
++#include "util/log.h"
++
+ #include "vk_debug_utils.h"
+ 
+ static void kk_image_report_address_binding(struct kk_device *dev,
+@@ -1129,14 +1131,39 @@ kk_image_plane_report_address_binding(struct kk_device *dev,
+                              plane->layout.size_B, type);
+ }
+ 
++/* A Venus guest binds without waiting for the result, and vk_errorf prints
++ * nothing in a release build, so a bind that fails is otherwise invisible. One
++ * line says which path refused the bind and what it was asked to bind, in
++ * numbers only. */
++static VkResult
++kk_image_plane_bind_failed(struct kk_device *dev,
++                           const struct kk_image_plane *plane,
++                           const struct kk_device_memory *mem,
++                           uint64_t offset_B, const char *reason)
++{
++   const struct kk_image_layout *layout = &plane->layout;
++
++   mesa_loge("kosmickrisp: image bind failed: %s (format %s, %s, usage 0x%x, "
++             "type %u, extent %ux%ux%u, layers %u, levels %u, samples %u, "
++             "image size %" PRIu64 ", offset %" PRIu64 ", memory size %"
++             PRIu64 ", %s)",
++             reason, util_format_short_name(layout->format.pipe),
++             layout->linear ? "linear" : "optimal", (unsigned)layout->usage,
++             (unsigned)layout->type, layout->width_px, layout->height_px,
++             layout->depth_px, layout->layers, (unsigned)layout->levels,
++             (unsigned)layout->sample_count_sa, layout->size_B, offset_B,
++             mem->bo->size_B, mem->bo->mtl_handle ? "heap" : "host pointer");
++   return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY, "%s", reason);
++}
++
+ static VkResult
+ kk_image_plane_bind(struct kk_device *dev, struct kk_image *image,
+                     struct kk_image_plane *plane, struct kk_device_memory *mem,
+                     uint64_t offset_B)
+ {
+    if (!plane->layout.linear && !mem->bo->mtl_handle) {
+-      return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+-                       "optimal image memory has no Metal heap");
++      return kk_image_plane_bind_failed(
++         dev, plane, mem, offset_B, "optimal image memory has no Metal heap");
+    }
+ 
+    /* Linear textures in Metal need to be allocated through a buffer... */
+@@ -1146,8 +1173,8 @@ kk_image_plane_bind(struct kk_device *dev, struct kk_image *image,
+    if (!plane->mtl_handle) {
+       plane->mem = NULL;
+       plane->mem_offset_B = 0;
+-      return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+-                       "Metal refused the image texture");
++      return kk_image_plane_bind_failed(dev, plane, mem, offset_B,
++                                        "Metal refused the image texture");
+    }
+    plane->addr = mem->bo->gpu + offset_B;
+ 
+@@ -1170,8 +1197,9 @@ kk_image_plane_bind(struct kk_device *dev, struct kk_image *image,
+          plane->mem = NULL;
+          plane->mem_offset_B = 0;
+          plane->addr = 0;
+-         return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+-                          "Metal refused the auxiliary image texture");
++         return kk_image_plane_bind_failed(
++            dev, plane, mem, offset_B,
++            "Metal refused the auxiliary image texture");
+       }
+    }
+ 
+@@ -1273,7 +1301,7 @@ kk_BindImageMemory2(VkDevice device, uint32_t bindInfoCount,
+       const VkBindMemoryStatusKHR *status =
+          vk_find_struct_const(pBindInfos[i].pNext, BIND_MEMORY_STATUS_KHR);
+       if (status != NULL && status->pResult != NULL)
+-         *status->pResult = VK_SUCCESS;
++         *status->pResult = result;
+ 
+       if (first_error_or_success == VK_SUCCESS)
+          first_error_or_success = result;

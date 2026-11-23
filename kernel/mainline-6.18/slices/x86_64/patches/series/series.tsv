@@ -9,3 +9,4 @@ patch	arm64-single-step-x86-64-tasks-with-RFLAGS.TF.patch
 patch	arm64-implement-modify_ldt-for-x86-tasks.patch
 patch	arm64-keep-an-x86-64-task-s-CS-and-SS-through-its-signals.patch
 patch	uml-report-a-page-fault-s-P-bit-to-x86-tasks.patch
+patch	um-tell-the-host-of-a-kernel-write-into-a-frame-x86-code-runs.patch

@@ -131,13 +131,40 @@ public:
     {
         return false;
     }
-    /* Whether the transport answers a guest's kick before it runs the
-     * kicked queue rather than after. The kicking vCPU waits for that answer
-     * with its interrupts off, so a device whose requests can run long, or
-     * whose guest waits for their completions anyway, frees the vCPU for the
-     * length of the work. While such a queue runs the guest adds buffers
-     * without kicking, and the transport looks for them before it finishes.
-     */
+    /* Whether a request the device deferred survives the disable of its
+     * ring. A guest suspends by disabling its rings one after another and
+     * resumes by enabling them in the same order, sending nothing else but
+     * kicks, which keep or drop a disabled ring's request buffers as below,
+     * so a device that holds a request across the suspend, a codec stream's
+     * queued buffer, is not reset by the disable: the transport keeps what
+     * the device completes meanwhile and writes it to the ring when the ring
+     * is enabled again. A message that changes the memory, the features, a
+     * ring's layout or base, or ends the connection resets such a device
+     * first, as does the GET_FEATURES that closes a driver's teardown.
+     * Without it, disabling a ring while the device holds a request resets
+     * the device. Setting it also keeps the request buffers on a disabled
+     * ring, as keepsRequestsOnDisabledRing() does, since the guest can post
+     * one before the ring's enable reaches the transport. A device that
+     * names a shared-memory region may set it: the GET_FEATURES that would
+     * reset the device is not answered while the transport waits for the
+     * acknowledgement of a map or unmap, but once the wait is over, behind
+     * the messages queued before it. The wait ends with the acknowledgement,
+     * the end of the backend-request channel, the end of the main socket or a
+     * service stop, and fails when backendAcknowledgementBound of its polls
+     * is spent once a reply the front-end waits for is behind it. */
+    [[nodiscard]] virtual bool keepsDeferredRequestsWhileDisabled() const noexcept
+    {
+        return false;
+    }
+    /* Whether the transport runs a kicked queue with the guest's
+     * notifications off: it tells the guest not to kick
+     * (VRING_USED_F_NO_NOTIFY) while the queue runs, looks for the buffers
+     * the guest adds meanwhile before it finishes, and answers a kick that
+     * asks for an answer before it runs the queue rather than after. Only a
+     * console's kick asks for one; every other driver's asks for none, so its
+     * vCPU never waits for the backend. A device whose requests can run long,
+     * or whose guest waits for their completions anyway, sets it, so the
+     * guest's kicks do not pile up behind the work. */
     [[nodiscard]] virtual bool answersKicksBeforeRunning() const noexcept
     {
         return false;
@@ -172,6 +199,11 @@ public:
     // A device with asynchronous device-to-driver data can expose one
     // readiness descriptor. The transport drains it on its worker and then
     // retries queues which may previously have had no device data available.
+    // An in-process transport blocks while it is idle, so a device must make
+    // this descriptor readable whenever it has work that no message from the
+    // guest starts: data for a buffer the guest queued, a completion for
+    // takeQueueCompletion(), a config change for configChangePending(), or a
+    // timer. A device with no such work returns -1.
     [[nodiscard]] virtual int eventDescriptor() const noexcept { return -1; }
     virtual void drainEventSource() {}
     [[nodiscard]] virtual bool takeQueueCompletion(
@@ -185,6 +217,10 @@ public:
     {
         return false;
     }
+    /* Whether the change is announced now. A claim that fails while the change
+     * stays pending, or that announces part of it and leaves the rest pending
+     * after clearConfigChange(), is made again every 100 ms, for a device
+     * whose wait ends without an event on its descriptor. */
     [[nodiscard]] virtual bool claimConfigChange() noexcept
     {
         return configChangePending();

@@ -4,7 +4,7 @@ format	4
 product	apple-gpu-vulkan-experiment
 platform	ios-simulator
 architecture	arm64
-deployment_target	27.0
+deployment_target	26.0
 linkage	static-and-framework
 payload	static-libepoxy,static-libvirglrenderer,dynamic-MesaEGL-framework,dynamic-MesaGallium-framework
 gl_provider	llvmpipe,softpipe

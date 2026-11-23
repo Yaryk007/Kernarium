@@ -17,8 +17,9 @@
 
 # Select the UML-safe branches in the inherited Cuttlefish product before it
 # is evaluated. The Darwin machine has no nested Trusty VM, modem, NFC,
-# Bluetooth, GNSS, biometric, secure-element, or camera transport, and its
-# Wi-Fi is the kernel's virtual one (kernarium_net_setup).
+# Bluetooth, biometric, or secure-element transport, and its Wi-Fi is
+# the kernel's virtual one (kernarium_net_setup). Its GNSS is the host's
+# position, behind the kernel's /dev/gnss0 (overlay/gnss).
 TRUSTY_SYSTEM_VM := disabled
 UML_ANDROID_SECURITY_HALS := nonsecure
 UML_ANDROID_BUILTIN_KERNEL := true
@@ -53,7 +54,14 @@ LOCAL_SENSOR_PRODUCT_PACKAGE := \
     android.hardware.sensors@2.1-impl.andarium
 LOCAL_ENABLE_NFC := false
 LOCAL_ENABLE_FRP := false
-LOCAL_GNSS_PRODUCT_PACKAGE :=
+# Cuttlefish's gnss fragment installs this package where it would install the
+# example HAL's APEX, which stays excluded below. The HAL reads the host's
+# receiver (/dev/gnss0) and is declared on every device.
+LOCAL_GNSS_PRODUCT_PACKAGE := android.hardware.gnss-service.andarium
+# Cuttlefish's thermal fragment installs this package where it would install the
+# example HAL's APEX, which stays excluded below. The HAL reports the host's
+# thermal state (overlay/thermal) and is declared on every device.
+LOCAL_THERMAL_HAL_PRODUCT_PACKAGE := android.hardware.thermal-service.andarium
 # Select the inherited HIDL primary HAL explicitly so Cuttlefish does not also
 # append its MMAP-capable product-property defaults.
 LOCAL_AUDIO_PRODUCT_PACKAGE := \
@@ -75,12 +83,13 @@ TARGET_DEDICATED_RECOVERY := true
 TARGET_NO_RECOVERY := false
 
 # LineageOS switches, read while its configuration is inherited below. The
-# machine has no camera, no charger or fastboot transport, and no hardware to
-# apply effects to, so the matching defaults of the LineageOS product chain stay
-# out. Its microphone is the Virtio sound capture stream (config/
-# primary_audio_policy_configuration.xml, config/kernarium_core_hardware.xml). Debug builds carry `su` for the
+# machine has no charger or fastboot transport, and no hardware to apply
+# effects to, so the matching defaults of the LineageOS product chain stay out.
+# Its cameras are the host's, shared through the camera device (the camera
+# block below), so the camera application of that chain stays in. Its microphone
+# is the Virtio sound capture stream (config/primary_audio_policy_configuration.xml,
+# config/kernarium_core_hardware.xml). Debug builds carry `su` for the
 # development tooling; a user build never does.
-PRODUCT_NO_CAMERA := true
 TARGET_EXCLUDES_AUDIOFX := true
 # The Android UML ELF is built and published independently; the board stages it
 # from the kernel artifact, so LineageOS's own kernel build stays off.
@@ -116,10 +125,25 @@ PRODUCT_COPY_FILES_EXCLUDE += \
 PRODUCT_EXTRA_RECOVERY_KEYS :=
 
 PRODUCT_PACKAGES_EXCLUDE += cuttlefish_sensor_injection
+
+# The vibrator is advertised only on a device with haptics. The host selects the
+# "haptics" SKU at boot (androidboot.product.hardware.sku=haptics); the ODM
+# manifest of that SKU (BoardConfig.mk) alone declares the HAL, and its init
+# script starts the service for that SKU alone. Cuttlefish's own vibrator (an
+# APEX of the AOSP example HAL that only sleeps) stays excluded below.
+PRODUCT_PACKAGES += android.hardware.vibrator-service.andarium
 PRODUCT_COPY_FILES += \
     device/kernarium/andarium/sensors/hals.conf:$(TARGET_COPY_OUT_VENDOR)/etc/sensors/hals.conf \
     frameworks/native/data/etc/android.hardware.sensor.accelerometer.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.sensor.accelerometer.xml \
     frameworks/native/data/etc/android.hardware.sensor.gyroscope.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.sensor.gyroscope.xml
+
+# The compass is advertised only on a host with a magnetometer. The host says so
+# at boot (androidboot.kernarium.compass=1), and then the sensors HAL lists the
+# magnetometer (overlay/sensors) and SystemConfig (route p0007) reads this
+# directory, which nothing else reads. Both SKU directories are taken (the
+# camera layouts' and the haptics').
+PRODUCT_COPY_FILES += \
+    frameworks/native/data/etc/android.hardware.sensor.compass.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/kernarium_compass/android.hardware.sensor.compass.xml
 
 PRODUCT_NAME := lineage_andarium
 PRODUCT_DEVICE := andarium
@@ -280,7 +304,6 @@ KERNARIUM_REMOVED_PACKAGES := \
     TeleService \
     Telecom \
     TelecomShim \
-    TelephonyProvider \
     android.hardware.biometrics.face-service.default \
     android.hardware.biometrics.fingerprint-service.default \
     android.hardware.motioncontext-service.default \
@@ -300,6 +323,7 @@ KERNARIUM_REMOVED_PACKAGES := \
     com.android.hardware.security.authgraph \
     com.android.hardware.security.secretkeeper \
     com.android.hardware.tetheroffload \
+    com.android.hardware.thermal \
     com.android.hardware.usb \
     com.android.hardware.vibrator \
     com.android.vndk.v31 \
@@ -308,6 +332,9 @@ KERNARIUM_REMOVED_PACKAGES := \
     com.android.vndk.v34 \
     com.google.emulated.camera.provider.hal \
     com.google.emulated.camera.provider.hal.v4l2 \
+    emu_camera_back.json \
+    emu_camera_depth.json \
+    emu_camera_front.json \
     com.google.cf.confirmationui \
     com.google.cf.health \
     com.google.cf.bt \
@@ -318,7 +345,6 @@ KERNARIUM_REMOVED_PACKAGES := \
     gsi_tool \
     gsid \
     android.hardware.health-service.cuttlefish_recovery \
-    messaging \
     pmg_daemon \
     sample_camera_extensions.xml \
     snapshotctl \
@@ -341,6 +367,14 @@ PRODUCT_PACKAGES_EXCLUDE += \
     metrics_helper \
     sleep
 
+# TalkBack, Android's screen reader, and eSpeak NG, its voice: the image's
+# only speech engine. Both are built from source, from the pinned trees that
+# prepare-sources.sh materializes at external/talkback and external/espeak-ng
+# (third_party/accessibility).
+PRODUCT_PACKAGES += \
+    TalkBack \
+    eSpeakNG
+
 # The keyboard (LatinIME) and ThemePicker come from the LineageOS product
 # chain. resize2fs grows the compact userdata filesystem
 # online after the host expands its partition, once /data is mounted
@@ -362,6 +396,8 @@ endif
 
 # Replace the handheld feature declaration and remove optional feature files
 # for absent hardware. This keeps PackageManager truthful for sideloaded apps.
+# The camera features are among them: the host's cameras decide them, and a
+# permission directory of the camera layout (overlay/camera) declares them.
 # The guest declares android.hardware.wifi, which virt_wifi provides, and not
 # android.hardware.ethernet: eth0 is the management NIC, and the framework would
 # otherwise start Ethernet management on it. virt_wifi is a station without
@@ -381,7 +417,6 @@ PRODUCT_COPY_FILES_EXCLUDE += \
     frameworks/native/data/etc/android.hardware.camera.raw.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.camera.raw.xml \
     frameworks/native/data/etc/android.hardware.consumerir.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.consumerir.xml \
     frameworks/native/data/etc/android.hardware.ethernet.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.ethernet.xml \
-    frameworks/native/data/etc/android.hardware.location.gps.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.location.gps.xml \
     frameworks/native/data/etc/android.hardware.usb.accessory.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.usb.accessory.xml \
     frameworks/native/data/etc/android.hardware.usb.host.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.usb.host.xml \
     frameworks/native/data/etc/android.hardware.uwb.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.uwb.xml \
@@ -390,6 +425,34 @@ PRODUCT_COPY_FILES_EXCLUDE += \
     frameworks/native/data/etc/android.software.verified_boot.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.software.verified_boot.xml
 PRODUCT_COPY_FILES += \
     device/kernarium/andarium/config/kernarium_core_hardware.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/handheld_core_hardware.xml
+
+# The default display configuration: when the thermal HAL reports SEVERE (the
+# host is hot) the display's render rate is held to 30 Hz. The framework reads
+# the map from this file for a display that has none of its own (route p0007).
+PRODUCT_COPY_FILES += \
+    device/kernarium/andarium/config/displayconfig_default.xml:$(TARGET_COPY_OUT_VENDOR)/etc/displayconfig/default.xml
+
+# The host's keyboard and mouse are virtio-input devices (1af4:0003 to 0005) that
+# exist from boot and are plugged into Android only while the host reports the
+# hardware. Android finds a device's key layout and configuration by its vendor and
+# product, and /vendor/usr is one of the places it looks (libs/input/InputDevice.cpp).
+# The side-key keyboard (1af4:0002) gets a layout of its five keys alone, so that
+# Android stops counting it as a full keyboard. The keyboard and the mouse are
+# external, as a USB keyboard and mouse are, and the absolute pointer follows the
+# display's orientation. The three new devices have no layout or character map of
+# their own: Android's keyboard layout choice is the user's.
+PRODUCT_COPY_FILES += \
+    device/kernarium/andarium/input/Vendor_1af4_Product_0002.kl:$(TARGET_COPY_OUT_VENDOR)/usr/keylayout/Vendor_1af4_Product_0002.kl \
+    device/kernarium/andarium/input/Vendor_1af4_Product_0003.idc:$(TARGET_COPY_OUT_VENDOR)/usr/idc/Vendor_1af4_Product_0003.idc \
+    device/kernarium/andarium/input/Vendor_1af4_Product_0004.idc:$(TARGET_COPY_OUT_VENDOR)/usr/idc/Vendor_1af4_Product_0004.idc \
+    device/kernarium/andarium/input/Vendor_1af4_Product_0005.idc:$(TARGET_COPY_OUT_VENDOR)/usr/idc/Vendor_1af4_Product_0005.idc
+
+# Every device declares the location and GPS features, whether or not the host
+# has a position to give: the GNSS HAL (overlay/gnss) is the guest's GPS. The
+# platform's file declares both features; LocationManagerService creates the gps
+# provider only with android.hardware.location.
+PRODUCT_COPY_FILES += \
+    frameworks/native/data/etc/android.hardware.location.gps.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.location.gps.xml
 
 # The Vulkan HAL is Mesa's Venus driver built from this project's pinned guest
 # Mesa source. Its generated Soong module names are scoped with a venus_
@@ -455,6 +518,11 @@ PRODUCT_ARTIFACT_PATH_REQUIREMENT_ALLOWED_LIST += system/bin/kernarium_vk_presen
 # (init.vendor.rc runs it at post-fs-data).
 PRODUCT_PACKAGES += kernarium_net_setup
 
+# The host's game controllers become HID devices of the guest through /dev/uhid,
+# which the kernel's own drivers bind (overlay/gamepad). Every device has a host,
+# so every device runs the relay; it creates nothing until a controller connects.
+PRODUCT_PACKAGES += kernarium_gamepad
+
 # The Wi-Fi module's resources are overlaid by KernariumWifiOverlay
 # (rro/KernariumWifiOverlay): virt_wifi cannot change its MAC address, so the
 # framework must not randomize it.
@@ -465,10 +533,33 @@ PRODUCT_PACKAGES += KernariumWifiOverlay
 # sets the home pin size to zero and leaves the WebView pin as it was.
 PRODUCT_PACKAGES += KernariumPinnerOverlay
 
+# Text messages come from the host only: the Andarium application sends one
+# over its own vsock port to KernariumSms (sms/), which delivers it as the radio
+# stack delivers one from the network. The service runs only while messages are
+# in flight: a small native holder keeps the port from boot and never reads it,
+# and starts the service through a script (sms/listener) when a connection
+# waits. Messaging is the SMS application and
+# TelephonyProvider stores the messages. The product declares
+# android.hardware.telephony.messaging and config_sms_capable, which the SMS
+# role needs, and no telephony: nothing in the guest can send a message.
+# TelephonyProvider requests MANAGE_APP_OPS_MODES itself (route p0034), which
+# TeleService otherwise brings to their shared uid.
+PRODUCT_PACKAGES += KernariumSms kernarium_sms_listener kernarium_sms_wake_script messaging TelephonyProvider
+
 # Once boot completes, a script saves the virtual Wi-Fi network (VirtWifi, open)
-# the first time only. It does not turn Wi-Fi on, and a network the user forgets
-# stays forgotten. It runs from system_ext in a core domain of its own.
+# the first time, and saves it again on a boot before the station first joins it
+# that finds Wi-Fi on and nothing joined. It does not turn Wi-Fi on, and a network
+# the user forgets stays forgotten. It runs from system_ext in a core domain of
+# its own.
 PRODUCT_PACKAGES += kernarium_wifi_network_script
+
+# Very old 32-bit games (applications that target an API level below 14) read a
+# Java byte[] through its object pointer, leak local references and assume a heap
+# below 2 GiB. ActivityThread loads this library into the process of such an
+# application and nothing else (overlay/oldapp; the hook is a frameworks/base
+# topic); the library gives that application what Dalvik gave it.
+PRODUCT_PACKAGES += libkernarium_oldapp
+PRODUCT_ARTIFACT_PATH_REQUIREMENT_ALLOWED_LIST += system/lib/libkernarium_oldapp.so
 
 # Cached apps the system starts at boot (privacy sandbox, backup, key
 # provisioning, domain verification, Health Connect) keep memory until the low
@@ -484,10 +575,33 @@ PRODUCT_PACKAGES += kernarium_reclaim_boot_apps_script
 # with it off alone. It runs from system_ext in a core domain of its own.
 PRODUCT_PACKAGES += kernarium_time_zone_script
 
+# Android hides its on-screen keyboard while a hardware keyboard is attached unless
+# "Show on-screen keyboard" is on. The SettingsProvider overlay turns it off for a new
+# guest; once boot completes this script turns it off, once, for a guest whose settings
+# an older release created with it on. It runs from system_ext in a core domain of its own.
+PRODUCT_PACKAGES += kernarium_keyboard_default_script
+
+# Old app compatibility is a choice per application (persist.sys.kernarium.oldapp.<package>,
+# typed by sepolicy/system_ext/private/kernarium_oldapp_prop.te). The adb shell user lists the
+# applications it can apply to and sets the choice with this command, which Andarium runs; it is
+# a Java tool, so the package manager can give the labels in the guest's language.
+PRODUCT_PACKAGES += kernarium_oldapp
+
+# Andarium's Add to Home Screen needs the launcher applications with their labels (in the guest's
+# language) and icons, and a safe way to start one. The adb shell user runs this command: a Java tool
+# started through app_process like kernarium_oldapp, so it needs no service and no permission of its own
+# (overlay/app_shortcuts). It draws no icon: KernariumIcons (overlay/app_icons) does, in an isolated process
+# behind a provider that only the shell user may use. That application is an ordinary one, signed with the
+# default key and with no SELinux rule of its own.
+PRODUCT_PACKAGES += kernarium_apps
+PRODUCT_PACKAGES += KernariumIcons
+
 # A Vulkan hardware-buffer import check: it fills gralloc buffers of several
 # formats and widths through the CPU, imports each into Vulkan and reads it
 # back, so a row pitch the driver cannot import or the renderer misreads fails
-# the run.
+# the run. It also shares host-visible memory as a file descriptor (the opaque-fd
+# and dma-buf handle types) and maps, reads and imports it, so a driver that does
+# not offer the fd extensions beside the hardware buffer ones fails the run.
 PRODUCT_PACKAGES += kernarium_vk_ahb_import
 PRODUCT_ARTIFACT_PATH_REQUIREMENT_ALLOWED_LIST += system/bin/kernarium_vk_ahb_import
 
@@ -520,7 +634,7 @@ PRODUCT_ARTIFACT_PATH_REQUIREMENT_ALLOWED_LIST += system/bin/kernarium_egl_confi
 # software one. The service brings the vendor variants of the libraries it
 # links, the plugin store among them; naming one of those here would install its
 # core variant under /system, which the generic system artifact path
-# requirement refuses. The XML lists the encoders and the HEVC and H.264
+# requirement refuses. The XML lists the encoders and the HEVC, H.264 and VP9
 # decoders, and the properties enable exactly those components; it also updates
 # the limits of the software HEVC and VP9 decoders, which advertise less than
 # they decode, to 3840x2160. The store
@@ -547,10 +661,39 @@ PRODUCT_VENDOR_PROPERTIES += \
     ro.vendor.v4l2_codec2.video_pixel_rate=108000000 \
     ro.vendor.v4l2_codec2.decoder.supported.h264=true \
     ro.vendor.v4l2_codec2.decoder.supported.hevc=true \
+    ro.vendor.v4l2_codec2.decoder.supported.vp9=true \
     ro.vendor.v4l2_codec2.decode_concurrent_instances=4 \
     ro.vendor.v4l2_codec2.video_decode_pixel_rate=456192000
 
 PRODUCT_PACKAGE_OVERLAYS += device/kernarium/andarium/overlay
+
+# The host's cameras. The camera device (Virtio ID 65533) gives each camera a V4L2
+# capture node and a metadata node; the emulated camera HAL of hardware/google/camera
+# (route p0030) takes the cameras, frames, stills, RAW and metadata from them and sends
+# the controls back. Its provider is the lazy service: a system_ext init file restarts
+# it whenever cameraserver starts, so that cameraserver lists the cameras, and the
+# process exits when no application holds a camera or the torch (ro.camera.enableLazyHal
+# tells cameraserver so; init starts the provider again through its interface). The
+# stock emulated provider of the inherited product is an APEX that this product removes,
+# its JSON characteristics with it; the HAL reads one
+# template (emu_camera_v4l2.json) and the camera descriptions of the nodes, which is what
+# ro.vendor.camera.config selects. No vendor extensions exist, so the inherited property
+# that enables the CameraX extensions is dropped. The host composes a camera layout from
+# its cameras and passes it as androidboot.product.vendor.sku: the permission directory
+# of that layout declares the camera features and an init trigger selects its media
+# profiles (camera_layouts.mk, generated). The libraries are installed in /vendor, where
+# the provider finds its HWL by name.
+PRODUCT_SOONG_NAMESPACES += hardware/google/camera
+PRODUCT_PACKAGES += \
+    android.hardware.camera.provider@2.7-service-google-lazy \
+    emu_camera_v4l2.json \
+    libgooglecamerahwl_impl
+PRODUCT_PRODUCT_PROPERTIES += \
+    ro.camera.enableLazyHal=true
+PRODUCT_VENDOR_PROPERTIES += \
+    ro.vendor.camera.config=v4l2
+PRODUCT_VENDOR_PROPERTY_BLACKLIST += ro.camerax.extensions.enabled
+include device/kernarium/andarium/camera/generated/camera_layouts.mk
 
 # The virtio-gpu device paces the display with a vblank timer, so a present
 # fence signals when the frame is shown. The inherited Cuttlefish graphics

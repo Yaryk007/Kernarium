@@ -1,0 +1,30 @@
+# Golden frames of the gamepad wire (vsock 5558), the contract between the
+# guest's gamepad relay (android/lineage-24/overlay/gamepad) and the host
+# (Andarium/AndariumCore GamepadProtocol.swift).
+#
+# One frame per line: `name: <hex bytes>`. A line that starts with `#` is a
+# comment, and the comment above a frame says what it means. Every number is
+# little endian.
+#
+# A frame is an 8-byte header and a payload: "AGP1" (41 47 50 31), a u16 type
+# and a u16 payload length of at most 4400. Both ends close the connection on
+# every `reject-` frame, and neither encodes one.
+
+# DESTROY (2), host to guest: slot 1, three reserved bytes.
+destroy-slot-1: 41 47 50 31 02 00 04 00 01 00 00 00
+
+# INPUT (3), host to guest: slot 0, one reserved byte, length 3, the report
+# 01 80 80 with its report ID.
+input-slot-0: 41 47 50 31 03 00 07 00 00 00 03 00 01 80 80
+
+# HELLO (16), guest to host: protocol version 1, 8 slots, one reserved byte.
+hello: 41 47 50 31 10 00 04 00 01 00 08 00
+
+# The magic's last byte is 2, not 1: not this protocol's frame.
+reject-magic: 41 47 50 32 02 00 04 00 01 00 00 00
+
+# Type 255 is no frame of the protocol.
+reject-type: 41 47 50 31 ff 00 04 00 01 00 00 00
+
+# A payload length of 4401 is over the limit; the header alone decides.
+reject-length: 41 47 50 31 03 00 31 11

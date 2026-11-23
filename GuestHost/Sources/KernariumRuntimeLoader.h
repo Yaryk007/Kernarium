@@ -9,12 +9,6 @@
 
 #include "../../Kernarium/Runtime/KernariumRuntime.h"
 
-/* UML_APP_STORE_APPLICATION is defined by the App Store configuration of the
- * application that compiles this loader (Andarium/README.md#configurations).
- * That configuration leaves out the loader's debugging and automation
- * entries: the display mirror, console input and the automation lookups. The
- * App Store runtime answers the first two with -ENOTSUP in any case. */
-
 NS_ASSUME_NONNULL_BEGIN
 
 typedef void (^KernariumConsoleOutputHandler)(NSData* data);
@@ -24,6 +18,23 @@ typedef void (^KernariumConsoleOutputHandler)(NSData* data);
 typedef void (^KernariumRestartHandler)(
     uint32_t event,
     uint32_t restartCount);
+/* The guest powered its GNSS receiver on (`powered` is true) or off, delivered
+ * on the main queue. */
+typedef void (^KernariumLocationReceiverHandler)(BOOL powered);
+/* What the host is doing for the guest's cameras (a
+ * KERNARIUM_RUNTIME_CAMERA_STATE_ value), delivered on the main queue in the
+ * order the states happened. */
+typedef void (^KernariumCameraStateHandler)(int state);
+/* A level the system's memory pressure reached the host at (a
+ * KERNARIUM_RUNTIME_MEMORY_PRESSURE_ value) and what the host does about it
+ * (a KERNARIUM_RUNTIME_MEMORY_RESPONSE_ value), delivered on the main queue in
+ * the order the levels arrived. */
+typedef void (^KernariumMemoryPressureHandler)(int level, int response);
+/* The guest's keyboard lights, an application's pointer capture or the guest's
+ * registration of its keyboard or pointer changed (a
+ * KERNARIUM_RUNTIME_INPUT_STATUS_ value, and whether it is on), delivered on
+ * the main queue. */
+typedef void (^KernariumInputStatusHandler)(int status, BOOL on);
 
 #ifdef __cplusplus
 extern "C" {
@@ -39,17 +50,25 @@ int kernarium_runtime_loader_run(
     const kernarium_runtime_boot* boot);
 
 void kernarium_runtime_loader_request_stop(void);
-/* Flushes the guest's writable host files. Returns the number that could not
- * be flushed, or a negative value when no runtime is loaded. */
-int kernarium_runtime_loader_sync(void);
-/* Leaves the guest safely abandonable, and lets it run again. */
-int kernarium_runtime_loader_quiesce(void);
+/* The calls that write the guest's storage back. Each returns the number of
+ * host files that could not be flushed, or what the runtime returns: -EINVAL for
+ * a `settle` whose struct_size is smaller than the structure, which is then left
+ * untouched, in the loader as in the runtime. With no runtime loaded it returns
+ * -1 and reports NO_GUEST, the one return below zero that carries a report: no
+ * guest runs, so nothing is settled and nothing unsettled. `settle` (nullable)
+ * reports what the guest confirmed; see kernarium_runtime_sync_function. */
+/* Has the guest write its storage back and flushes the guest's writable host
+ * files. */
+int kernarium_runtime_loader_sync(kernarium_runtime_settle* _Nullable settle);
+/* Leaves the guest safely abandonable. Pair it with
+ * kernarium_runtime_loader_resume. */
+int kernarium_runtime_loader_quiesce(kernarium_runtime_settle* _Nullable settle);
 /* quiesce that keeps the guest's RAM in the process, where a quiesce would
  * hibernate it: for a host short of the space the image takes. Pair it with
  * kernarium_runtime_loader_resume. */
-int kernarium_runtime_loader_quiesce_resident(void);
+int kernarium_runtime_loader_quiesce_resident(kernarium_runtime_settle* _Nullable settle);
 void kernarium_runtime_loader_resume(void);
-/* Holds (nonzero) or releases (zero) the guest's GPU requests; see
+/* Holds (1, or 2 to hold at once) or releases (zero) the guest's GPU requests; see
  * kernarium_runtime_set_gpu_hold_function. Returns the runtime's answer, or -1
  * when no runtime is loaded. */
 int kernarium_runtime_loader_set_gpu_hold(int held);
@@ -77,7 +96,6 @@ int kernarium_runtime_loader_read_guest_memory(
  * background policy; see kernarium_runtime_set_background_throttle_function.
  * Returns the number of threads changed, or -1 when no runtime is loaded. */
 int kernarium_runtime_loader_set_background_throttle(int enabled);
-#ifndef UML_APP_STORE_APPLICATION
 /* Mirrors the guest's display to `sink`, or stops the mirror for a null sink;
  * see kernarium_runtime_set_frame_sink_function. Returns the runtime's answer,
  * or -1 when no runtime is loaded. */
@@ -86,7 +104,6 @@ int kernarium_runtime_loader_set_frame_sink(
     void* _Nullable context,
     uint32_t maximum_width,
     uint32_t frames_per_second);
-#endif
 /* Turns periodic guest page-cache trimming on (nonzero) only while the guest
  * is kept running in the background, and off again on return to the
  * foreground. Returns 0 once the guest has applied it, a negative value
@@ -122,12 +139,37 @@ kernarium_launch_memory_set kernarium_runtime_loader_launch_memory_set(void);
 /* The parameters the most guest RAM a person may choose is measured with: they
  * count none of A, E_rest and S. Only the maximum uses them. */
 kernarium_launch_memory_set kernarium_runtime_loader_maximum_memory_set(void);
+/* The most guest RAM, in MiB, this host admits whatever the budget says (C of
+ * runtime/guest_memory_budget.hpp): the RAM the runtime's native kernel window
+ * holds for this process, 9152 on an iOS device or the Simulator and 1 TiB in
+ * a macOS window, and no more than the host's own RAM, on the 64 MiB steps; in
+ * an application signed without Extended Virtual Addressing, no more than the
+ * address space the system leaves it holds a window of. Zero where that holds
+ * none of even the smallest guest: nothing is admitted. The settings' ruler
+ * ends here at most. */
+uint32_t kernarium_runtime_loader_guest_memory_ceiling_mib(void);
+/* 1 when a run starts a guest of `memory_mib` MiB on this host, 0 when it is
+ * refused: the sizes from the range's minimum through the ceiling above in
+ * its steps, none where the ceiling is zero. Every size the settings offer is
+ * one. The runtime's own test is the same without the address space of an
+ * application the system limits, whose reservation of the window is the check
+ * there. */
+uint32_t kernarium_runtime_loader_guest_memory_admitted(uint32_t memory_mib);
+/* The shape of that test, for the applications' own restatements of it to be
+ * checked against: the least size, the step and the top of any host's range
+ * (no ceiling is above it). */
+typedef struct kernarium_guest_memory_range {
+    uint32_t minimum_mib;
+    uint32_t step_mib;
+    uint32_t largest_mib;
+} kernarium_guest_memory_range;
+kernarium_guest_memory_range kernarium_runtime_loader_guest_memory_range(void);
 /* The most guest RAM, in MiB, the settings offer at `guest_processor_count`
  * vCPUs with `parameters` (zero vCPUs count as one): the largest multiple of 64
- * from 512 through 4096 that leaves the host GPU its 384 MiB floor under the
- * memory limit the system sets this process. 4096 where the system sets none,
- * the Mac included; 512 where even that leaves less than the floor. The
- * settings pass the maximum set. */
+ * from 512 through the ceiling above that leaves the host GPU its 352 MiB floor
+ * under the memory limit the system sets this process. The ceiling where the
+ * system sets none, the Mac included; 512 where even that leaves less than the
+ * floor. The settings pass the maximum set. */
 uint32_t kernarium_runtime_loader_maximum_guest_memory_mib(
     uint32_t guest_processor_count,
     kernarium_launch_memory_set parameters);
@@ -139,9 +181,10 @@ uint32_t kernarium_runtime_loader_maximum_guest_memory_mib_for_limit(
 /* The guest RAM, in MiB, a new guest gets at `guest_processor_count` vCPUs
  * (zero counts as one): the conservative size below, and where the system's
  * limit lets a guest have 4096 MiB at one vCPU also no more than the largest
- * multiple of 512 that leaves the host GPU a budget of 1024 MiB with
- * `parameters`, the launch set. 4096 where the system sets no limit. A guest
- * with more is likely to run short of graphics memory. */
+ * multiple of 512 that leaves the host GPU a budget of 992 MiB with
+ * `parameters`, the launch set. Never more than 4096, whatever is offered;
+ * 4096 where the system sets no limit. A guest with more is likely to run
+ * short of graphics memory. */
 uint32_t kernarium_runtime_loader_default_guest_memory_mib(
     uint32_t guest_processor_count,
     kernarium_launch_memory_set parameters);
@@ -150,11 +193,24 @@ uint32_t kernarium_runtime_loader_default_guest_memory_mib_for_limit(
     uint64_t limit_bytes,
     uint32_t guest_processor_count,
     kernarium_launch_memory_set parameters);
+/* Nonzero where the default above is the size the host GPU's 992 MiB budget
+ * rule lowered, below the conservative size: a guest with more has less than
+ * that for the GPU from the next multiple of 512, which the applications warn
+ * about. Zero where the default is the conservative size, and then it says
+ * nothing of the GPU's budget. The same choice makes the default. */
+uint32_t kernarium_runtime_loader_default_guest_memory_holds_gpu_budget(
+    uint32_t guest_processor_count,
+    kernarium_launch_memory_set parameters);
+/* The same for a memory limit the caller states in bytes, zero for none. */
+uint32_t kernarium_runtime_loader_default_guest_memory_holds_gpu_budget_for_limit(
+    uint64_t limit_bytes,
+    uint32_t guest_processor_count,
+    kernarium_launch_memory_set parameters);
 /* The most guest RAM, in MiB, before the system is likely to end the process
  * at `guest_processor_count` vCPUs: the most guest RAM with `parameters`, the
- * launch set, taken down to a multiple of 512 and held within 1536 through
- * 4096, and never above the maximum the settings offer. 4096 where the system
- * sets no limit. A guest with more is likely to be ended by the system. */
+ * launch set, taken down to a multiple of 512, at least 1536, and never above
+ * the maximum the settings offer. The maximum where the system sets no limit. A
+ * guest with more is likely to be ended by the system. */
 uint32_t kernarium_runtime_loader_conservative_guest_memory_mib(
     uint32_t guest_processor_count,
     kernarium_launch_memory_set parameters);
@@ -167,7 +223,7 @@ uint32_t kernarium_runtime_loader_conservative_guest_memory_mib_for_limit(
  * at `guest_processor_count` vCPUs gets with `parameters` (zero vCPUs count as
  * one) under the memory limit the system sets this process: the evaluation the
  * run itself makes (kernarium_runtime_plan_gpu_budget_function), rounded down.
- * Half the guest RAM where the system sets no limit. */
+ * The guest RAM where the system sets no limit. */
 uint32_t kernarium_runtime_loader_gpu_budget_mib(
     uint32_t guest_memory_mib,
     uint32_t guest_processor_count,
@@ -178,6 +234,35 @@ uint32_t kernarium_runtime_loader_gpu_budget_mib_for_limit(
     uint32_t guest_memory_mib,
     uint32_t guest_processor_count,
     kernarium_launch_memory_set parameters);
+/* The most host-side memory, in MiB, that a live camera session holds out of
+ * the GPU budget B of `gpu_budget_mib` MiB: the camera device's ceiling for
+ * the tier that budget gets (uml::camera::cameraHostMemoryReserveMiB,
+ * darwin/device/camera/camera_tiers.hpp), which bounds the layouts of the
+ * system cameras (a development synthetic source can hold more). It needs no
+ * runtime; it is what the application plans with where the runtime cannot say
+ * the exact figure (kernarium_runtime_loader_plan_camera_reserve_mib). */
+uint32_t kernarium_runtime_loader_camera_reserve_mib(uint32_t gpu_budget_mib);
+/* The host-side memory, in MiB, that a live camera session of this host holds
+ * out of the GPU budget B of `gpu_budget_mib` MiB, as the runtime composes it
+ * (kernarium_runtime_plan_camera_reserve_function): the layout of the cameras it
+ * discovers and the colour data in `camera_calibration_path` (null for none)
+ * decides how much. While the cameras are live the GPU's pool is B less this
+ * figure, taken after B is clamped to its floor; blocked cameras or none take
+ * nothing, and a host without a camera answers 0. Discovery asks for no
+ * permission and opens no session. The runtime discovers the cameras for the
+ * first question and keeps them with the answers composed from them;
+ * `rediscover` (not 0) discovers again and composes every answer again, which
+ * a caller sets on the first of the questions it asks together. The figure is
+ * the next boot's while the camera source, the cameras and the calibration data
+ * are unchanged since it was composed. `*exact`, when
+ * not null, is set to 1 for the layout's own figure and to 0 where the figure is
+ * the ceiling, because no runtime is loaded or it could not discover the
+ * cameras. Any thread. */
+uint32_t kernarium_runtime_loader_plan_camera_reserve_mib(
+    uint32_t gpu_budget_mib,
+    const char* _Nullable camera_calibration_path,
+    uint32_t rediscover,
+    uint32_t* _Nullable exact);
 /* The vCPU count the applications default to and offer at most on a device with
  * `physical_processor_count` physical cores (zero counts as one): every core,
  * and never more than the count the memory budget is measured for
@@ -185,6 +270,19 @@ uint32_t kernarium_runtime_loader_gpu_budget_mib_for_limit(
  * it too, for the same reason. */
 uint32_t kernarium_runtime_loader_application_vcpu_limit(
     uint32_t physical_processor_count);
+/* Prepares the JIT for a guest of `guest_memory_mib` and `guest_processor_count`
+ * vCPUs when `enable` is nonzero, or tells an attached debugger to detach when
+ * it is zero; see kernarium_runtime_prepare_jit_function. Returns the runtime's
+ * KERNARIUM_RUNTIME_JIT_ answer, or KERNARIUM_RUNTIME_JIT_UNSUPPORTED when no
+ * runtime is loaded. It blocks for the seconds a debugger takes, so call it
+ * away from the main thread. */
+int kernarium_runtime_loader_prepare_jit(
+    int enable,
+    uint32_t guest_memory_mib,
+    uint32_t guest_processor_count);
+/* Whether a debugger is attached to this process, which the application knows
+ * before any runtime is loaded. */
+int kernarium_runtime_loader_debugger_attached(void);
 /* Turns the guest's microphone on (nonzero) or off (zero), as
  * kernarium_runtime_set_microphone_function does, and returns the resulting
  * KERNARIUM_RUNTIME_MICROPHONE_ value, or -1 when no runtime is loaded. It
@@ -206,7 +304,68 @@ void kernarium_runtime_loader_set_console_output_handler(
  * It may be set before a runtime is selected. */
 void kernarium_runtime_loader_set_restart_handler(
     KernariumRestartHandler _Nullable handler);
-#ifndef UML_APP_STORE_APPLICATION
+/* Receives the guest's receiver-power events (see
+ * kernarium_runtime_set_location_receiver_callback_function), or none for a nil
+ * handler. It may be set before a runtime is selected. */
+void kernarium_runtime_loader_set_location_receiver_handler(
+    KernariumLocationReceiverHandler _Nullable handler);
+/* Gives the guest's GNSS receiver the host's newest fix, or with a null `fix`
+ * drops it; see kernarium_runtime_report_location_function. Returns 0, or a
+ * negated errno: -ENODEV when no runtime is loaded or no guest with a receiver
+ * runs, -EINVAL for a fix the runtime refuses. */
+int kernarium_runtime_loader_report_location(
+    const kernarium_runtime_location_fix* _Nullable fix);
+/* The Android guest's hardware keyboard, mouse and pointer
+ * (kernarium_runtime_set_input_connected_function and the entries after it).
+ * Each returns 0, or a negated errno: -ENODEV when no runtime is loaded or no
+ * guest with the devices runs, -EINVAL for an argument the runtime refuses. */
+int kernarium_runtime_loader_set_input_connected(int device, BOOL connected);
+int kernarium_runtime_loader_send_keyboard_usage(uint32_t usage, BOOL pressed);
+int kernarium_runtime_loader_send_pointer(
+    uint32_t x,
+    uint32_t y,
+    uint32_t buttons,
+    BOOL inRange);
+int kernarium_runtime_loader_send_mouse(
+    int32_t dx,
+    int32_t dy,
+    uint32_t buttons,
+    int32_t wheel,
+    int32_t horizontalWheel);
+/* Receives the keyboard lights and the pointer capture (see
+ * kernarium_runtime_set_input_status_callback_function), or none for a nil
+ * handler. It may be set before a runtime is selected. */
+void kernarium_runtime_loader_set_input_status_handler(
+    KernariumInputStatusHandler _Nullable handler);
+/* A button of a game controller went down: wakes a guest that suspended
+ * itself, as a key down does; see kernarium_runtime_wake_for_input_function.
+ * It does nothing when no runtime is loaded or the runtime has no such entry.
+ * It may be called from any thread. */
+void kernarium_runtime_loader_wake_for_input(void);
+/* Tells the runtime which denial of the network the application's notice is up
+ * for, for the session record; see kernarium_runtime_set_network_notice_function.
+ * Returns 0, or a negated errno: -ENODEV when no runtime is loaded, -EINVAL for
+ * a value the runtime does not know. */
+int kernarium_runtime_loader_set_network_notice(int notice);
+/* Receives the camera state (see
+ * kernarium_runtime_set_camera_state_callback_function), or none for a nil
+ * handler. It may be set before a runtime is selected. */
+void kernarium_runtime_loader_set_camera_state_handler(
+    KernariumCameraStateHandler _Nullable handler);
+/* Tells the camera how far the host turns the guest's picture; see
+ * kernarium_runtime_set_camera_rotation_function. Returns 0, or a negated
+ * errno: -ENODEV when no runtime is loaded, -EINVAL for a value the runtime
+ * refuses. */
+int kernarium_runtime_loader_set_camera_rotation(uint32_t degrees);
+/* Receives the levels of the system's memory pressure and the host's response
+ * (see kernarium_runtime_set_memory_pressure_callback_function), or none for a
+ * nil handler. It may be set before a runtime is selected. Each report is
+ * queued to the main queue as one block that holds the handler of its time, so
+ * the number of reports waiting is not bounded while the main queue is busy, and
+ * setting or clearing the handler does not cancel the ones already queued: they
+ * reach the handler they were queued for. */
+void kernarium_runtime_loader_set_memory_pressure_handler(
+    KernariumMemoryPressureHandler _Nullable handler);
 /* Whether the selected runtime is an automation build and the launch asked it,
  * through the environment, to start the background job with the guest. Always
  * zero for a release runtime, which cannot be asked, and when none is loaded. */
@@ -219,7 +378,6 @@ int kernarium_runtime_loader_automation_hold_delay_ms(void);
 int kernarium_runtime_loader_send_console_input(
     const void* buffer,
     size_t length);
-#endif
 /* Opens a stream to the guest's vsock port; see
  * kernarium_runtime_connect_vsock_function. Returns a connected descriptor
  * the caller owns, or a negated errno: -ENODEV when no runtime is loaded or no

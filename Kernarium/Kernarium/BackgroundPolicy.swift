@@ -275,7 +275,7 @@ final class BackgroundController {
         // held as for any guest that leaves the foreground, and nothing else
         // is asked of it.
         if spaceHeld {
-            holdGPU()
+            holdGPU(before: deadline)
             phase = .quiesced
             return
         }
@@ -283,7 +283,7 @@ final class BackgroundController {
             enterBackgroundWithJob(until: deadline)
             return
         }
-        holdGPU()
+        holdGPU(before: deadline)
         switch chosen {
         case .pictureInPicture
         where effects.pictureInPictureActive ||
@@ -321,7 +321,7 @@ final class BackgroundController {
         }
         // A launch that asked for a later hold keeps it later.
         if delay <= 0 {
-            holdGPU()
+            holdGPU(before: deadline)
         }
         effects.flushGuest(until: deadline)
         effects.setPageCacheTrimming(true)
@@ -483,8 +483,10 @@ final class BackgroundController {
         phase = .foreground
     }
 
-    private func holdGPU() {
-        effects.gpuHold.hold()
+    /// Holds the GPU, and the camera wait that may come first stays inside
+    /// `deadline`, the edge's, when there is one.
+    private func holdGPU(before deadline: DispatchTime? = nil) {
+        effects.gpuHold.hold(before: deadline)
         endHoldDelay()
     }
 

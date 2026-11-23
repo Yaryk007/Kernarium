@@ -342,6 +342,40 @@ void test_stop_requests_belong_to_one_run()
 	self_stopping_handle = nullptr;
 }
 
+unsigned int refused_window_entries;
+
+int refused_window_kernel(int, char *const[], char *const[])
+{
+	++refused_window_entries;
+	return 0;
+}
+
+/* A run whose guest the host cannot hold ends with a result of its own before
+ * its kernel starts, rather than the kernel's exit ending the process, and
+ * leaves the process's guest unspent: the next run, in a window the host has,
+ * boots. A window at an address no process has stands for a host that will not
+ * reserve it. */
+void test_run_the_host_cannot_hold_fails_before_the_kernel_starts()
+{
+	constexpr std::uintptr_t beyond_the_address_space = 1ULL << 48;
+	const auto emulator = make_emulator(refused_window_kernel);
+	const char *arguments[]{"uml-test", "--execution-engine=gadgets"};
+	uml::emulator::testing::place_native_kernel_window(
+		beyond_the_address_space);
+	const int refused =
+		uml_emulator_run(emulator.get(), 2, arguments, nullptr);
+	uml::emulator::testing::place_native_kernel_window(
+		uml::testing::native_test_window_start);
+	require(refused == -UML_EMULATOR_OUT_OF_MEMORY,
+		"a run whose window the host would not reserve did not fail with "
+		"the out-of-memory result");
+	require(refused_window_entries == 0,
+		"a run the host could not hold entered its kernel");
+	require(uml_emulator_run(emulator.get(), 2, arguments, nullptr) == 0 &&
+			refused_window_entries == 1,
+		"a refused run spent the process's guest");
+}
+
 void test_run_boundary()
 {
 	/* The guest kernel reads guest_hwcaps() of the probed host, the words
@@ -664,6 +698,7 @@ int main()
 		test_capabilities_describe_the_kernel();
 		test_stop_requests_belong_to_one_run();
 		test_run_boundary();
+		test_run_the_host_cannot_hold_fails_before_the_kernel_starts();
 		{
 			RunWindowSlot native_shadow_slot;
 			test_native_shadow_domains_retire_on_every_handle_exit(

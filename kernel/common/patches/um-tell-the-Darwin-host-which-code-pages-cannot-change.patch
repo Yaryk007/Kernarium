@@ -1,0 +1,290 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 17:04:30 +0900
+Subject: [PATCH] um: tell the Darwin host which code pages cannot change
+
+The host checks the bytes of a guest code page before it runs
+translated code from it, and every address space did so alone: one
+library page, mapped by many processes, was hashed once for each.
+
+A verdict may be shared only for a page that nothing can change while a
+mapping of it exists, and only the guest kernel knows that.
+update_pte_range now decides it from the PTE it read under the
+page-table lock: the page is an up-to-date page-cache page of a file on
+EROFS, which is read-only, and a write through a private mapping copies
+the page first and leaves that mapping on an anonymous page. The answer
+travels with the guest-code and executable bits as
+UM_PROT_GUEST_IMMUTABLE, and map() turns it into bit 1 of the
+guest_code argument. It never reaches the host protection.
+
+Kernel mappings, absent or special PTEs, anonymous pages, other file
+systems and DAX never carry the bit. A run of PTEs sent as one host call
+is keyed by its protection, so a run never mixes the two kinds.
+
+The bridge keeps its declarations and gains a meaning for bit 1 of
+guest_code, so the ABI version is 29 (the topics before it end at 28) and
+the fingerprint is unchanged. A host that ignores the bit stays correct.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ arch/arm64/um/user-offsets.c                |   2 +
+ arch/um/kernel/tlb.c                        | 108 ++++++++++++++++----
+ arch/um/os-Darwin/skas/mem.c                |   8 +-
+ arch/um/os-Darwin/uml_darwin_abi_identity.h |   2 +-
+ arch/um/os-Darwin/uml_darwin_memory.h       |   6 ++
+ 5 files changed, 102 insertions(+), 24 deletions(-)
+
+diff --git a/arch/arm64/um/user-offsets.c b/arch/arm64/um/user-offsets.c
+index fad1abac06375c29246c39c7e0d22b714a0a38ee..8d650259a53c4ac2976c7a0c9b5fac2330e8a304 100644
+--- a/arch/arm64/um/user-offsets.c
++++ b/arch/arm64/um/user-offsets.c
+@@ -60,4 +60,6 @@ void foo(void)
+ 	/* Semantic Darwin translation flag; never passed to mmap(2). */
+ 	DEFINE(UM_PROT_GUEST_CODE, 8);
+ 	DEFINE(UM_PROT_GUEST_WRITABLE, 16);
++	/* The page cannot change while mapped; see darwin_pte_immutable(). */
++	DEFINE(UM_PROT_GUEST_IMMUTABLE, 32);
+ }
+diff --git a/arch/um/kernel/tlb.c b/arch/um/kernel/tlb.c
+index 4b3b6019b6650d789f8f339311f3b874e799383c..d0a1b2d9e9680ef987e8635138e76b6ac119e6fc 100644
+--- a/arch/um/kernel/tlb.c
++++ b/arch/um/kernel/tlb.c
+@@ -3,8 +3,11 @@
+  * Copyright (C) 2000 - 2007 Jeff Dike (jdike@{addtoit,linux.intel}.com)
+  */
+ 
++#include <linux/fs.h>
++#include <linux/magic.h>
+ #include <linux/mm.h>
+ #include <linux/module.h>
++#include <linux/pagemap.h>
+ #include <linux/sched/signal.h>
+ #include <linux/string.h>
+ #include <linux/uaccess.h>
+@@ -82,21 +85,16 @@ static spinlock_t *darwin_pte_lockptr(struct mm_struct *mm, pmd_t *pmd)
+ #define DARWIN_VMA_EXEC		(1U << 0)
+ #define DARWIN_VMA_WRITABLE	(1U << 1)
+ 
+-static unsigned int darwin_vma_protection(struct mm_struct *mm,
+-					  unsigned long address)
++/*
++ * The VMA's protection of the Linux page at @address, from the one lookup
++ * a user PTE needs.  The complete page-table walk holds mmap_read_lock().
++ * Looking up only the current Linux page avoids the four-quarter bookkeeping
++ * that was needed when a 4 KiB guest shared a 16 KiB Darwin VM slot.
++ */
++static unsigned int darwin_vma_protection(const struct vm_area_struct *vma)
+ {
+-	struct vm_area_struct *vma;
+ 	unsigned int protection = 0;
+ 
+-	if (mm == &init_mm)
+-		return 0;
+-	/* The complete page-table walk holds mmap_read_lock().  Looking up only
+-	 * the current Linux page avoids the four-quarter bookkeeping that was
+-	 * needed when a 4 KiB guest shared a 16 KiB Darwin VM slot.
+-	 */
+-	vma = find_vma(mm, address);
+-	if (vma == NULL || vma->vm_start > address)
+-		return 0;
+ 	if (vma->vm_flags & VM_EXEC)
+ 		protection |= DARWIN_VMA_EXEC;
+ 	if (vma->vm_flags & VM_WRITE)
+@@ -104,19 +102,86 @@ static unsigned int darwin_vma_protection(struct mm_struct *mm,
+ 	return protection;
+ }
+ 
++/*
++ * Whether the page @pteval names cannot change while any mapping of it
++ * exists: an up-to-date page-cache page of a file on EROFS.  The file system
++ * is read-only, and a write through a private mapping copies the page first,
++ * which leaves that mapping on an anonymous page.  The host shares what it
++ * verified about the bytes of such a page between address spaces and about
++ * no other.  The default is false: kernel mappings, absent or special PTEs,
++ * anonymous pages, any other file system and DAX.
++ *
++ * The caller holds the page-table lock of @pteval and the mmap lock for
++ * reading, and the decision is made from the PTE it read under that lock,
++ * so the fact travels with the very mapping it describes.  Nothing here may
++ * sleep.
++ */
++static bool darwin_pte_immutable(struct vm_area_struct *vma,
++				 unsigned long address, pte_t pteval)
++{
++	struct address_space *mapping;
++	struct folio *folio;
++	struct page *page;
++	struct inode *inode;
++
++	if (!pte_exec(pteval))
++		return false;
++	page = vm_normal_page(vma, address, pteval);
++	if (page == NULL)
++		return false;
++	folio = page_folio(page);
++	if (folio_test_anon(folio) || !folio_test_uptodate(folio))
++		return false;
++	mapping = folio_mapping(folio);
++	if (mapping == NULL)
++		return false;
++	inode = mapping->host;
++	return inode != NULL && inode->i_sb->s_magic == EROFS_SUPER_MAGIC_V1 &&
++	       !IS_DAX(inode);
++}
++
++/*
++ * What the host needs to know of a present user PTE besides the PTE itself,
++ * from one VMA lookup under the page-table lock: the VMA's protection and
++ * whether the page is immutable.  Both stay zero for a kernel mapping, an
++ * absent PTE, and an address no VMA covers.
++ */
++static void darwin_pte_facts(struct mm_struct *mm, unsigned long address,
++			     pte_t pteval, unsigned int *vma_protection,
++			     bool *immutable)
++{
++	struct vm_area_struct *vma;
++
++	*vma_protection = 0;
++	*immutable = false;
++	if (mm == &init_mm || !pte_present(pteval))
++		return;
++	vma = find_vma(mm, address);
++	if (vma == NULL || vma->vm_start > address)
++		return;
++	*vma_protection = darwin_vma_protection(vma);
++	*immutable = darwin_pte_immutable(vma, address, pteval);
++}
++
+ /*
+  * Add Darwin's guest bits to generic UML's host protection.  A kernel page
+  * keeps generic UML's host execute bit, which Darwin applies to a whole VM
+  * slot.  A user page takes both bits from its VMA, whose execute state is
+- * metadata used only to decide which guest pages need translation.
++ * metadata used only to decide which guest pages need translation.  The
++ * immutable fact is meaningful only for a page that is guest code and
++ * executable, and is added to no other.
+  */
+ static inline int darwin_guest_protection(struct mm_struct *mm, int prot,
+-					  int x, unsigned int vma_protection)
++					  int x, unsigned int vma_protection,
++					  bool immutable)
+ {
+ 	if (mm == &init_mm)
+ 		return x ? prot | UM_PROT_GUEST_CODE : prot;
+-	if (vma_protection & DARWIN_VMA_EXEC)
++	if (vma_protection & DARWIN_VMA_EXEC) {
+ 		prot |= UM_PROT_GUEST_CODE;
++		if (x && immutable)
++			prot |= UM_PROT_GUEST_IMMUTABLE;
++	}
+ 	if (vma_protection & DARWIN_VMA_WRITABLE)
+ 		prot |= UM_PROT_GUEST_WRITABLE;
+ 	return prot;
+@@ -219,7 +284,7 @@ static int darwin_init_mm_pte_prot(pte_t pteval)
+ 	prot = (r ? UM_PROT_READ : 0) |
+ 	       (w ? UM_PROT_WRITE : 0) |
+ 	       (x ? UM_PROT_EXEC : 0);
+-	return darwin_guest_protection(&init_mm, prot, x, 0);
++	return darwin_guest_protection(&init_mm, prot, x, 0, false);
+ }
+ 
+ static int darwin_map_init_mm_pte(struct vm_ops *ops,
+@@ -550,6 +615,8 @@ static inline int update_pte_range(pmd_t *pmd, unsigned long addr,
+ 	do {
+ #ifdef UML_HOST_DARWIN
+ 		pte_t pteval;
++		unsigned int vma_protection;
++		bool immutable;
+ 
+ 		/*
+ 		 * UML's original shadow-TLB walker was uniprocessor-only.  Clearing
+@@ -581,6 +648,8 @@ static inline int update_pte_range(pmd_t *pmd, unsigned long addr,
+ 				return -EAGAIN;
+ 		}
+ 		pteval = ptep_get(pte);
++		darwin_pte_facts(ops->mm, addr, pteval, &vma_protection,
++				 &immutable);
+ 		if (ops->mm == &init_mm)
+ 			spin_unlock(ptl);
+ 		else
+@@ -601,10 +670,6 @@ static inline int update_pte_range(pmd_t *pmd, unsigned long addr,
+ 			unsigned long phys = pte_val(pteval) & PAGE_MASK;
+ 			int fd = phys_mapping(phys, &offset);
+ 			int r, w, x, prot;
+-#ifdef UML_HOST_DARWIN
+-			unsigned int vma_protection =
+-				darwin_vma_protection(ops->mm, addr);
+-#endif
+ 
+ 			r = pte_read(pteval);
+ 			w = pte_write(pteval);
+@@ -620,7 +685,8 @@ static inline int update_pte_range(pmd_t *pmd, unsigned long addr,
+ 			       (x ? UM_PROT_EXEC : 0);
+ #ifdef UML_HOST_DARWIN
+ 			prot = darwin_guest_protection(ops->mm, prot, x,
+-						       vma_protection);
++						       vma_protection,
++						       immutable);
+ #endif
+ 
+ #ifdef UML_HOST_DARWIN
+diff --git a/arch/um/os-Darwin/skas/mem.c b/arch/um/os-Darwin/skas/mem.c
+index 66322482ae2fc166561d4fd0bc3f3651d3a7e76c..7733cd06d22a11c0ed81004a43c6e6e75ca96d7b 100644
+--- a/arch/um/os-Darwin/skas/mem.c
++++ b/arch/um/os-Darwin/skas/mem.c
+@@ -8,11 +8,15 @@ int map(struct mm_id *mm_id, unsigned long address, unsigned long length,
+ 	int protection, int fd, unsigned long long offset)
+ {
+ 	int execute = !!(protection & UM_PROT_EXEC);
++	int guest_code = 0;
+ 	int host_protection;
+ 	int result;
+ 
++	/* Bit 0 of guest_code is guest code; bit 1 adds that the page is
++	 * immutable.  Neither reaches host_protection.
++	 */
+ 	if (protection & UM_PROT_GUEST_CODE)
+-		execute |= 2;
++		guest_code = (protection & UM_PROT_GUEST_IMMUTABLE) ? 3 : 1;
+ 	if (protection & UM_PROT_GUEST_WRITABLE)
+ 		execute |= 4;
+ 	host_protection = (protection & UM_PROT_READ ? PROT_READ : 0) |
+@@ -20,7 +24,7 @@ int map(struct mm_id *mm_id, unsigned long address, unsigned long length,
+ 		(execute & 1 ? PROT_EXEC : 0);
+ 	result = darwin_uml_vm_map_generation(
+ 		mm_id->darwin_generation, (void *)address, fd, offset, length,
+-		host_protection, !!(execute & 2), !!(execute & 4));
++		host_protection, guest_code, !!(execute & 4));
+ 	return result < 0 ? -errno : result;
+ }
+ 
+diff --git a/arch/um/os-Darwin/uml_darwin_abi_identity.h b/arch/um/os-Darwin/uml_darwin_abi_identity.h
+index e6a4ad31b7cfb3c1c9f4c51a055aa65d74712798..1101f7902ea4f8b0fa476b2fa4ecd36b71d87cbf 100644
+--- a/arch/um/os-Darwin/uml_darwin_abi_identity.h
++++ b/arch/um/os-Darwin/uml_darwin_abi_identity.h
+@@ -3,7 +3,7 @@
+ #ifndef UML_DARWIN_ABI_IDENTITY_H
+ #define UML_DARWIN_ABI_IDENTITY_H
+ 
+-#define DARWIN_UML_ABI_VERSION 28U
++#define DARWIN_UML_ABI_VERSION 29U
+ #define DARWIN_UML_ABI_FINGERPRINT 0x3d09b8eeee7ea3c2ULL
+ 
+ #endif
+diff --git a/arch/um/os-Darwin/uml_darwin_memory.h b/arch/um/os-Darwin/uml_darwin_memory.h
+index cb7f8f8ab934a29447e8227225373fd62ded07ab..d10cbcc4e291cd0882bac98e9d0e9043ec6dc839 100644
+--- a/arch/um/os-Darwin/uml_darwin_memory.h
++++ b/arch/um/os-Darwin/uml_darwin_memory.h
+@@ -6,6 +6,12 @@
+ extern "C" {
+ #endif
+ 
++/* guest_code is a bit set. Zero maps a page that is not guest code. Bit 0
++ * marks guest code. Bit 1, meaningful only with bit 0 (the value 3), is the
++ * kernel's fact that no store can change the page while it is mapped: an
++ * up-to-date page-cache page of a read-only file system. The host shares what
++ * it verified about such a page between address spaces and about no other. A
++ * kernel that never sets bit 1 stays correct. */
+ int darwin_uml_vm_map(void *address, int fd, unsigned long long offset,
+ 		      unsigned long length, int protection, int guest_code,
+ 		      int guest_writable);

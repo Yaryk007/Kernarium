@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 01:32:40 +0000
+Subject: [PATCH] leave Google Lens out of the camera app
+
+The camera app requires its Lens launcher module, which installs the package
+com.google.android.apps.googlecamera.fishfood, and offers a Lens button in its QR mode when the
+Google app and that launcher are both installed. A product without Google apps has neither.
+
+Stop requiring the launcher module, and make the app report Lens as unavailable, so no package a
+user installs makes the button appear.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ app/Android.bp                                    |  1 -
+ .../lineageos/aperture/utils/GoogleLensUtils.kt   | 15 ++++-----------
+ 2 files changed, 4 insertions(+), 12 deletions(-)
+
+diff --git a/app/Android.bp b/app/Android.bp
+index b24f01446ae106922849175420bb0e5464605f1b..b49c216a4aa7ab5b9b632fb97c451ff802a68fa7 100644
+--- a/app/Android.bp
++++ b/app/Android.bp
+@@ -23,7 +23,6 @@ android_app {
+ 
+     required: [
+         "ApertureFrameworksBaseOverlay",
+-        "ApertureLensLauncher",
+         "initial-package-stopped-states-org.lineageos.aperture",
+         "preinstalled-packages-org.lineageos.aperture",
+     ],
+diff --git a/app/src/main/java/org/lineageos/aperture/utils/GoogleLensUtils.kt b/app/src/main/java/org/lineageos/aperture/utils/GoogleLensUtils.kt
+index df7e21a71eb8e859913d91ddb14425b0647c4739..a928ddb9af2394e108cf33917d5cfe92575e81ae 100644
+--- a/app/src/main/java/org/lineageos/aperture/utils/GoogleLensUtils.kt
++++ b/app/src/main/java/org/lineageos/aperture/utils/GoogleLensUtils.kt
+@@ -9,19 +9,12 @@ import android.content.Context
+ import android.content.Intent
+ 
+ object GoogleLensUtils {
+-    private const val GSA_PACKAGE_NAME = "com.google.android.googlequicksearchbox"
+     private const val LAUNCHER_PACKAGE_NAME = "com.google.android.apps.googlecamera.fishfood"
+ 
+-    private fun isGsaAvailable(context: Context) = runCatching {
+-        context.packageManager.getApplicationInfo(GSA_PACKAGE_NAME, 0).enabled
+-    }.getOrDefault(false)
+-
+-    private fun isLensLauncherAvailable(context: Context) = runCatching {
+-        context.packageManager.getApplicationInfo(LAUNCHER_PACKAGE_NAME, 0).enabled
+-    }.getOrDefault(false)
+-
+-    fun isGoogleLensAvailable(context: Context) =
+-        isGsaAvailable(context) && isLensLauncherAvailable(context)
++    // This build carries neither the Google app nor the launcher that opens Lens from the
++    // camera, so the camera never offers Lens, whatever a user installs.
++    @Suppress("UNUSED_PARAMETER")
++    fun isGoogleLensAvailable(context: Context) = false
+ 
+     fun launchGoogleLens(context: Context) {
+         context.startActivity(

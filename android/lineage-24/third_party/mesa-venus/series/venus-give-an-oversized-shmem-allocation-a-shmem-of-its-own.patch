@@ -1,0 +1,210 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 23:25:57 +0900
+Subject: [PATCH] venus: give an oversized shmem allocation a shmem of its own
+
+vn_renderer_shmem_pool serves the short-lived commands and replies of an
+instance from one shmem and installs a larger one as the pool's shmem when an
+allocation does not fit. The pool then holds that shmem, mapped and resident,
+until later allocations have used up what is left of it. A reply of hundreds of
+MiB, such as the data of vkGetPipelineCacheData for a large cache, therefore
+left the pool holding a power-of-two shmem of up to twice the reply, on the
+guest and on the host, long after the reply was consumed. The shmem cache would
+not have kept a shmem that large, but the pool's own reference did.
+
+Serve an allocation larger than 16 MiB from a shmem of its own that the pool
+never holds: the caller owns the only reference, and the shmem is destroyed
+when the caller drops it. Smaller allocations are suballocated as before. The
+size policy is a plain header so that a test can cover it without a renderer.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/virtio/vulkan/meson.build                 |  7 +++
+ .../tests/vn_renderer_shmem_pool_size_test.c  | 53 +++++++++++++++++++
+ .../vulkan/vn_renderer_shmem_pool_size.h      | 44 +++++++++++++++
+ src/virtio/vulkan/vn_renderer_util.c          | 25 ++++++---
+ src/virtio/vulkan/vn_renderer_util.h          |  1 +
+ 5 files changed, 123 insertions(+), 7 deletions(-)
+ create mode 100644 src/virtio/vulkan/tests/vn_renderer_shmem_pool_size_test.c
+ create mode 100644 src/virtio/vulkan/vn_renderer_shmem_pool_size.h
+
+diff --git a/src/virtio/vulkan/meson.build b/src/virtio/vulkan/meson.build
+index 44686d67c24858caee94886a10af8eb16cf0790d..903a20edee5ab1c7846a9a01991b8ca96eb076cc 100644
+--- a/src/virtio/vulkan/meson.build
++++ b/src/virtio/vulkan/meson.build
+@@ -203,4 +203,11 @@ if with_tests
+                include_directories : inc_include),
+     suite : ['venus'],
+   )
++  test(
++    'vn_renderer_shmem_pool_size',
++    executable('vn_renderer_shmem_pool_size_test',
++               'tests/vn_renderer_shmem_pool_size_test.c',
++               include_directories : inc_include),
++    suite : ['venus'],
++  )
+ endif
+diff --git a/src/virtio/vulkan/tests/vn_renderer_shmem_pool_size_test.c b/src/virtio/vulkan/tests/vn_renderer_shmem_pool_size_test.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..0c5ed01f2cc20abbfe6add7a1303cc8e3e30e318
+--- /dev/null
++++ b/src/virtio/vulkan/tests/vn_renderer_shmem_pool_size_test.c
+@@ -0,0 +1,53 @@
++/*
++ * Copyright 2026
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "../vn_renderer_shmem_pool_size.h"
++
++#include <stdint.h>
++#include <stdio.h>
++
++#define CHECK(expr)                                                           \
++   do {                                                                      \
++      if (!(expr)) {                                                         \
++         fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #expr);             \
++         return 1;                                                           \
++      }                                                                      \
++   } while (0)
++
++int
++main(void)
++{
++   const size_t min_alloc = (size_t)1 << 20;
++
++   /* Commands and replies the pool is made for stay in it, up to the bound. */
++   CHECK(!vn_renderer_shmem_pool_is_dedicated(0));
++   CHECK(!vn_renderer_shmem_pool_is_dedicated(4096));
++   CHECK(!vn_renderer_shmem_pool_is_dedicated(VN_RENDERER_SHMEM_POOL_MAX_SIZE));
++
++   /* Past it, as a pipeline cache blob that an application saves is, an
++    * allocation gets a shmem of its own. */
++   CHECK(vn_renderer_shmem_pool_is_dedicated(VN_RENDERER_SHMEM_POOL_MAX_SIZE + 1));
++   CHECK(vn_renderer_shmem_pool_is_dedicated((size_t)240565361));
++
++   /* The shmem is a power of two, to hit the shmem cache, and never smaller than
++    * the pool's minimum. */
++   CHECK(vn_renderer_shmem_pool_shmem_size(min_alloc, 0) == min_alloc);
++   CHECK(vn_renderer_shmem_pool_shmem_size(min_alloc, min_alloc) == min_alloc);
++   CHECK(vn_renderer_shmem_pool_shmem_size(min_alloc, min_alloc + 1) ==
++         2 * min_alloc);
++   CHECK(vn_renderer_shmem_pool_shmem_size(
++            min_alloc, VN_RENDERER_SHMEM_POOL_MAX_SIZE + 1) ==
++         (size_t)32 << 20);
++   CHECK(vn_renderer_shmem_pool_shmem_size(min_alloc, (size_t)240565361) ==
++         (size_t)256 << 20);
++   CHECK(vn_renderer_shmem_pool_shmem_size((size_t)64 << 10, (size_t)100 << 10) ==
++         (size_t)128 << 10);
++
++   /* A size no power of two reaches reports failure instead of looping. */
++   CHECK(vn_renderer_shmem_pool_shmem_size(min_alloc, SIZE_MAX) == 0);
++
++   printf("vn_renderer_shmem_pool_size passed\n");
++   return 0;
++}
+diff --git a/src/virtio/vulkan/vn_renderer_shmem_pool_size.h b/src/virtio/vulkan/vn_renderer_shmem_pool_size.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..c6efd004b5d73cba3808588d16c0ac2af43c86db
+--- /dev/null
++++ b/src/virtio/vulkan/vn_renderer_shmem_pool_size.h
+@@ -0,0 +1,44 @@
++/*
++ * Copyright 2026
++ * SPDX-License-Identifier: MIT
++ */
++
++#ifndef VN_RENDERER_SHMEM_POOL_SIZE_H
++#define VN_RENDERER_SHMEM_POOL_SIZE_H
++
++#include <stdbool.h>
++#include <stddef.h>
++
++/* A shmem pool serves short-lived commands and replies from one shmem.  An
++ * allocation larger than this is not a suballocation: it gets a shmem of its
++ * own, which is destroyed with its last reference.  Served from the pool, it
++ * would become the pool's shmem and stay mapped, and resident, until later
++ * allocations had used up what is left of it, which is long after a command or
++ * reply of hundreds of MiB is done.  The cache an application saves with
++ * vkGetPipelineCacheData is one.
++ */
++#define VN_RENDERER_SHMEM_POOL_MAX_SIZE ((size_t)16 << 20)
++
++static inline bool
++vn_renderer_shmem_pool_is_dedicated(size_t size)
++{
++   return size > VN_RENDERER_SHMEM_POOL_MAX_SIZE;
++}
++
++/* The size of the shmem that serves an allocation of `size`: a power of two,
++ * to hit the shmem cache, and at least `min_alloc_size`.  Returns 0 when no
++ * such size fits in a size_t.
++ */
++static inline size_t
++vn_renderer_shmem_pool_shmem_size(size_t min_alloc_size, size_t size)
++{
++   size_t alloc_size = min_alloc_size;
++   while (alloc_size < size) {
++      alloc_size <<= 1;
++      if (!alloc_size)
++         return 0;
++   }
++   return alloc_size;
++}
++
++#endif /* VN_RENDERER_SHMEM_POOL_SIZE_H */
+diff --git a/src/virtio/vulkan/vn_renderer_util.c b/src/virtio/vulkan/vn_renderer_util.c
+index fd724bdb3fb25b6cf00aeb19097aee751e2dac3e..c4917837333f62ea0be157664494ad8e3e520734 100644
+--- a/src/virtio/vulkan/vn_renderer_util.c
++++ b/src/virtio/vulkan/vn_renderer_util.c
+@@ -67,13 +67,10 @@ vn_renderer_shmem_pool_grow_locked(struct vn_renderer *renderer,
+                                    size_t size)
+ {
+    VN_TRACE_FUNC();
+-   /* power-of-two to hit shmem cache */
+-   size_t alloc_size = pool->min_alloc_size;
+-   while (alloc_size < size) {
+-      alloc_size <<= 1;
+-      if (!alloc_size)
+-         return false;
+-   }
++   const size_t alloc_size =
++      vn_renderer_shmem_pool_shmem_size(pool->min_alloc_size, size);
++   if (!alloc_size)
++      return false;
+ 
+    struct vn_renderer_shmem *shmem =
+       vn_renderer_shmem_create(renderer, alloc_size);
+@@ -96,6 +93,20 @@ vn_renderer_shmem_pool_alloc(struct vn_renderer *renderer,
+                              size_t size,
+                              size_t *out_offset)
+ {
++   if (unlikely(vn_renderer_shmem_pool_is_dedicated(size))) {
++      const size_t alloc_size =
++         vn_renderer_shmem_pool_shmem_size(pool->min_alloc_size, size);
++      if (!alloc_size)
++         return NULL;
++
++      /* The caller holds the only reference, and the pool none. */
++      struct vn_renderer_shmem *shmem =
++         vn_renderer_shmem_create(renderer, alloc_size);
++      if (shmem)
++         *out_offset = 0;
++      return shmem;
++   }
++
+    mtx_lock(&pool->mutex);
+    if (unlikely(size > pool->size - pool->used)) {
+       if (!vn_renderer_shmem_pool_grow_locked(renderer, pool, size)) {
+diff --git a/src/virtio/vulkan/vn_renderer_util.h b/src/virtio/vulkan/vn_renderer_util.h
+index 4b5253ac175c1143cb4b50ac57f3f3b5d17be607..78aa85759977b0f8414b9f37ac2aa25d933457e8 100644
+--- a/src/virtio/vulkan/vn_renderer_util.h
++++ b/src/virtio/vulkan/vn_renderer_util.h
+@@ -7,6 +7,7 @@
+ #define VN_RENDERER_UTIL_H
+ 
+ #include "vn_renderer.h"
++#include "vn_renderer_shmem_pool_size.h"
+ 
+ /* for suballocations of short-lived shmems, thread-safe */
+ struct vn_renderer_shmem_pool {

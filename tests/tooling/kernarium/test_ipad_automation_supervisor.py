@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""The iPad automation script signals only the supervisor it started.
+"""The iPad automation script signals only the supervisor it started, and the
+supervisor ends xcodebuild when its log reports the device connection lost.
 
 `start` records the supervisor's pid, and nothing clears that record when the
 host ends. By the time `stop --force` or `status` reads it, the pid can name
@@ -25,6 +26,10 @@ import sys
 import tempfile
 import time
 import unittest
+import uuid
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from automation_fakes import FakeDevice  # noqa: E402
 
 
 SCRIPT = Path(__file__).resolve().parents[3] / "Kernarium/scripts/ipad-automation.py"
@@ -145,6 +150,95 @@ class SupervisorRecordTests(unittest.TestCase):
         self.assertTrue(self.status()["supervisor_running"])
         self.stop()
         self.assertEqual(supervisor.wait(timeout=30), -15)
+
+
+class LostConnectionTests(unittest.TestCase):
+    """The supervisor runs the real script against the fake xcodebuild, whose
+    `connection-lost` control prints xcodebuild's block for CoreDevice error 3
+    and starts the runner again by itself some seconds later (6 by default)."""
+
+    def setUp(self) -> None:
+        self.device = FakeDevice()
+        self.addCleanup(self.device.cleanup)
+        self.processes: list[subprocess.Popen] = []
+        self.addCleanup(self.reap)
+        self.directory = self.device.state_dir / self.device.udid
+        self.directory.mkdir(parents=True)
+
+    def reap(self) -> None:
+        for process in self.processes:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=30)
+
+    def supervise(self, named: bool) -> tuple[subprocess.Popen, str, Path]:
+        """A supervisor started the way `start` starts one, with its output in
+        the host log (named to it with `--log` when `named`); returns it, its
+        nonce and the log."""
+        nonce = uuid.uuid4().hex
+        log = self.directory / f"host-{nonce}.log"
+        run = next((self.device.derived / "Build/Products").glob("*.xctestrun"))
+        with open(log, "w") as output:
+            process = subprocess.Popen(
+                [sys.executable, str(SCRIPT), "--device", self.device.udid,
+                 "--state-dir", str(self.device.state_dir), "_supervise",
+                 "--xctestrun", str(run),
+                 "--result-bundle", str(self.directory / f"host-{nonce}.xcresult"),
+                 "--seconds", "3600", "--nonce", nonce, "--term-wait", "2",
+                 "--device-reports-dir", str(self.device.reports),
+                 "--leave-device-reports", *(["--log", str(log)] if named else [])],
+                env=self.device.environment, stdin=subprocess.DEVNULL,
+                stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+        self.processes.append(process)
+        self.device.wait(lambda: self.device.serving(nonce), 30, "the host serves")
+        return process, nonce, log
+
+    def test_xcodebuild_is_ended_before_it_starts_the_runner_again(self) -> None:
+        # Rule: with its log named, the supervisor ends xcodebuild (SIGTERM) as
+        # soon as the log reports the connection lost, says so before its own
+        # exit line, and only the one runner ever came up. The test below is
+        # the control: the same host, not told its log.
+        process, nonce, log = self.supervise(named=True)
+        xcodebuild = self.device.invocations()[0]["pid"]
+        self.device.control(nonce, "connection-lost")
+        process.wait(timeout=60)
+        self.assertFalse(self.device.alive(xcodebuild))
+        text = log.read_text()
+        self.assertEqual(text.count("Running tests..."), 1, text)
+        lost = text.index("ipad-automation: the device connection was lost at ")
+        self.assertIn("(CoreDevice error 3): ending xcodebuild before it starts "
+                      "the runner again", text[lost:])
+        self.assertLess(lost, text.index("ipad-automation: xcodebuild exited with "
+                                         "status -15"))
+
+    def test_a_diagnostic_that_carries_the_block_leaves_a_healthy_host_alone(self) -> None:
+        # Rule: a command's failure text with line breaks puts whole lines in
+        # the log, the lost-connection lines of another process among them
+        # (a key modifier "\n" and the three lines). That is not xcodebuild
+        # reporting its own connection lost: the host keeps serving and the
+        # supervisor ends nothing.
+        process, nonce, log = self.supervise(named=True)
+        self.device.control(nonce, "forged-diagnostic")
+        self.device.wait(lambda: "Code: 3" in log.read_text(), 15,
+                         "the diagnostic is in the log")
+        time.sleep(1.5)
+        self.assertIsNone(process.poll())
+        self.assertTrue(self.device.serving(nonce))
+        text = log.read_text()
+        self.assertNotIn("ending xcodebuild", text)
+        self.assertNotIn("exited with status", text)
+
+    def test_a_supervisor_that_is_not_told_its_log_does_not_read_it(self) -> None:
+        # The control for the test above: the fake xcodebuild does what the
+        # real one did, and ends by itself with status 65.
+        self.device.scenarios([{"kind": "serve", "lost_relaunch_after": 1}])
+        process, nonce, log = self.supervise(named=False)
+        self.device.control(nonce, "connection-lost")
+        process.wait(timeout=60)
+        text = log.read_text()
+        self.assertEqual(text.count("Running tests..."), 2, text)
+        self.assertIn("ipad-automation: xcodebuild exited with status 65", text)
+        self.assertNotIn("ending xcodebuild", text)
 
 
 if __name__ == "__main__":

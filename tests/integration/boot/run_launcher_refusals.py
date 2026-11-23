@@ -27,8 +27,9 @@ TIMEOUT_SECONDS = 30
 # Skips the rootfs lookup; no case boots far enough to open it.
 NO_ROOTFS = "ubd0=/dev/null"
 # The Virtio device identifiers of the explicit transport arguments.
-BATTERY, CONSOLE, AUDIO, VIDEO, VIDEO_ENCODER, GPU, VSOCK = (
-    65535, 3, 25, 31, 30, 16, 19)
+BATTERY, CONSOLE, AUDIO, VIDEO, VIDEO_ENCODER, GPU, VSOCK, GNSS = (
+    65535, 3, 25, 31, 30, 16, 19, 65534)
+CAMERA = 65533
 
 
 def explicit(device_id: int) -> str:
@@ -40,13 +41,63 @@ CONSOLE_COLLISION = COLLISION.format(
     "a host Virtio console or serial socket", "Virtio console"
 )
 CONFIGURE = "Unable to configure host devices: "
+HARDWARE_INPUT_DISPLAY = (
+    "--hardware-input requires --gpu with a VNC or native display")
+# The release a guest boots is stated by the launcher of an Android release
+# from that release's own files, never by a caller: this launcher refuses the
+# option, so a Linux guest cannot be given an Android release's identity.
+AOT_RELEASE = "--aot-release=r1," + "a" * 64 + "," + "b" * 64
+AOT_RELEASE_REFUSAL = (
+    CONFIGURE + "--aot-release is stated by the launcher of an Android release "
+    "from the release it boots; a command line cannot name it")
 
 # (arguments, the stderr line the launcher must print)
 REFUSALS: list[tuple[list[str], str]] = [
     (["--battery", explicit(BATTERY)], COLLISION.format("--battery", "Virtio battery")),
+    (["--gnss", explicit(GNSS)], COLLISION.format("--gnss", "Virtio GNSS")),
+    (["--location=fixed:35.0,139.0", explicit(GNSS)],
+     COLLISION.format("--location", "Virtio GNSS")),
+    (["--location="],
+     CONFIGURE + "invalid --location '': expected fixed:, approximate: or "
+     "route:"),
+    (["--location=fixed:91,0"],
+     CONFIGURE + "invalid --location 'fixed:91,0': expected "
+     "fixed:LAT,LON[,ALT[,ACC]]"),
+    (["--location=approximate:1,2,3"],
+     CONFIGURE + "invalid --location 'approximate:1,2,3': expected "
+     "approximate:LAT,LON"),
+    (["--location=route:{tmp}/nonexistent/route.csv"],
+     CONFIGURE + "invalid --location 'route:{tmp}/nonexistent/route.csv': "
+     "cannot read the route file"),
     (["--video", explicit(VIDEO)], COLLISION.format("--video", "Virtio video")),
     (["--video-encoder", explicit(VIDEO_ENCODER)],
      COLLISION.format("--video-encoder", "Virtio video encoder")),
+    (["--camera=synthetic", explicit(CAMERA)],
+     COLLISION.format("--camera", "Virtio camera")),
+    (["--camera=blocked", "--camera-profile=laptop", explicit(CAMERA)],
+     COLLISION.format("--camera", "Virtio camera")),
+    (["--camera=webcam"],
+     CONFIGURE + "--camera must be none, synthetic, blocked or host"),
+    (["--camera-profile=phone"],
+     CONFIGURE + "--camera-profile requires --camera=synthetic or "
+     "--camera=blocked"),
+    (["--camera=host", "--camera-profile=phone"],
+     CONFIGURE + "--camera-profile requires --camera=synthetic or "
+     "--camera=blocked"),
+    (["--camera=synthetic", "--camera-profile=watch"],
+     CONFIGURE + "--camera-profile must be phone, tablet, laptop or "
+     "phone-turned-front"),
+    (["--camera-layout=auto"],
+     CONFIGURE + "--camera-layout requires --camera"),
+    (["--camera=synthetic", "--camera-layout=front"],
+     CONFIGURE + "--camera-layout must be auto"),
+    (["--camera-tier=large"], CONFIGURE + "--camera-tier requires --camera"),
+    (["--camera=synthetic", "--camera-tier=huge"],
+     CONFIGURE + "--camera-tier must be small or large"),
+    (["--camera-calibration-dir={tmp}/cal"],
+     CONFIGURE + "--camera-calibration-dir requires --camera"),
+    (["--camera=synthetic", "--camera-calibration-dir="],
+     CONFIGURE + "--camera-calibration-dir requires a path"),
     (["--audio", explicit(AUDIO)], COLLISION.format("--audio", "Virtio Sound")),
     (["--gpu", explicit(GPU)], COLLISION.format("--gpu", "Virtio-GPU")),
     (["--vsock-forward=0-5555", explicit(VSOCK)],
@@ -127,6 +178,12 @@ REFUSALS: list[tuple[list[str], str]] = [
      CONFIGURE + "--gpu-auto-resize requires --gpu-display=native"),
     (["--gpu-dpi=96", "--gpu-width=5000"],
      CONFIGURE + "--gpu-dpi requires display dimensions no larger than 4095"),
+    (["--hardware-input"], CONFIGURE + HARDWARE_INPUT_DISPLAY),
+    (["--hardware-input", "--gpu-display=offscreen"],
+     CONFIGURE + HARDWARE_INPUT_DISPLAY),
+    ([AOT_RELEASE], AOT_RELEASE_REFUSAL),
+    (["--aot=on", AOT_RELEASE], AOT_RELEASE_REFUSAL),
+    (["--aot-release="], AOT_RELEASE_REFUSAL),
 ]
 
 # (arguments, the start of the stderr line): the service cannot bind its
@@ -154,10 +211,23 @@ ACCEPTED: list[list[str]] = [
     ["--gpu-display=offscreen", "--gpu-offscreen-mirror=off"],
     ["--gpu", "--battery", "--audio", "--video", "--video-encoder",
      explicit(BATTERY), explicit(GPU)],
+    ["--camera=synthetic", "--camera-profile=tablet",
+     "--camera-calibration-dir={tmp}/calibration"],
+    ["--camera=synthetic", "--camera-tier=large"],
+    ["--camera=blocked", "--camera-profile=laptop"],
+    ["--camera=blocked"],
+    ["--camera=host"],
+    ["--camera=none"],
     ["--audio-output=null"],
     ["--audio", "--audio-output=host"],
     ["--audio-input=silent"],
     ["--vsock-forward=127.0.0.1:0-5555", "--vsock-forward=6000-7"],
+    ["--gnss"],
+    ["--location=fixed:35.6895,139.6917,40,8", "--vsock-forward=0-5555"],
+    ["--location=approximate:48.85,2.35"],
+    ["--hardware-input", "--gpu"],
+    ["--hardware-input", "--gpu-display=vnc", "--gpu-vnc-port=0"],
+    ["--hardware-input", "--gpu-display=native"],
 ]
 
 
@@ -192,6 +262,7 @@ def check(emulator: pathlib.Path) -> None:
         for arguments, message in REFUSALS:
             arguments = [argument.format(tmp=root) for argument in arguments]
             result = run(emulator, scratch, arguments)
+            message = message.format(tmp=root)
             lines = result.stderr.splitlines()
             if result.returncode != 1 or message not in lines:
                 raise CaseFailure(

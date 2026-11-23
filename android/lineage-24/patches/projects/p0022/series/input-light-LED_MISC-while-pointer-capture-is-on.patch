@@ -1,0 +1,145 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 23:10:01 +0000
+Subject: [PATCH] input: light LED_MISC while pointer capture is on
+
+Pointer capture gives an application the raw relative motion of the mouse and keeps the device's
+own pointer still, but nothing tells the device that it happened. A virtual mouse that stands for a
+person's mouse on another system needs to know, so that the other system can hold its own pointer.
+
+Light the device's LED_MISC while the mapper is in pointer capture and put it out when it leaves,
+the way a keyboard's lock LEDs follow the lock keys. Only a device that advertises LED_MISC is
+touched; every other device sees no change. EventHub names LEDs through a key layout, which a mouse
+does not have, so a device without a layout maps ALED_MISC to LED_MISC itself. The mapper's dump
+shows the state of the LED.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ services/inputflinger/reader/EventHub.cpp     |  7 ++++++
+ .../reader/mapper/CursorInputMapper.cpp       | 16 ++++++++++++
+ .../reader/mapper/CursorInputMapper.h         |  4 +++
+ .../tests/CursorInputMapper_test.cpp          | 25 +++++++++++++++++++
+ 4 files changed, 52 insertions(+)
+
+diff --git a/services/inputflinger/reader/EventHub.cpp b/services/inputflinger/reader/EventHub.cpp
+index ca79fc5ef2fd93aacb7e9466c9eee103bf651c53..e59508c071b2df25bebefa6d635bbe0505540183 100644
+--- a/services/inputflinger/reader/EventHub.cpp
++++ b/services/inputflinger/reader/EventHub.cpp
+@@ -790,6 +790,13 @@ void EventHub::Device::setLedForControllerLocked() {
+ 
+ status_t EventHub::Device::mapLed(int32_t led, int32_t* outScanCode) const {
+     if (!keyMap.haveKeyLayout()) {
++        // A key layout names the LEDs of a keyboard, and only a keyboard gets one. The LED that a
++        // cursor device lights while pointer capture is on belongs to the device itself, and
++        // ALED_MISC is the evdev code LED_MISC, as it is in every layout.
++        if (led == ALED_MISC && ledBitmask.test(LED_MISC)) {
++            *outScanCode = LED_MISC;
++            return NO_ERROR;
++        }
+         return NAME_NOT_FOUND;
+     }
+ 
+diff --git a/services/inputflinger/reader/mapper/CursorInputMapper.cpp b/services/inputflinger/reader/mapper/CursorInputMapper.cpp
+index da0901b2a27cff837c32675de256d8317cc1d819..9bf69aa3d939964be19db454863ac4a03ae581ae 100644
+--- a/services/inputflinger/reader/mapper/CursorInputMapper.cpp
++++ b/services/inputflinger/reader/mapper/CursorInputMapper.cpp
+@@ -159,6 +159,9 @@ void CursorInputMapper::dump(std::string& dump) {
+     dump += StringPrintf(INDENT3 "ButtonState: 0x%08x\n", mButtonState);
+     dump += StringPrintf(INDENT3 "Down: %s\n", toString(isPointerDown(mButtonState)));
+     dump += StringPrintf(INDENT3 "DownTime: %" PRId64 "\n", mDownTime);
++    dump += StringPrintf(INDENT3 "PointerCaptureLed: %s\n",
++                         getDeviceContext().hasLed(ALED_MISC) ? toString(mPointerCaptureLed)
++                                                              : "<none>");
+ }
+ 
+ std::list<NotifyArgs> CursorInputMapper::reconfigure(nsecs_t when,
+@@ -497,6 +500,7 @@ void CursorInputMapper::configureOnPointerCapture(const InputReaderConfiguration
+         if (mParameters.mode == Parameters::Mode::POINTER) {
+             mParameters.mode = Parameters::Mode::POINTER_RELATIVE;
+             mSource = AINPUT_SOURCE_MOUSE_RELATIVE;
++            setPointerCaptureLed(true);
+         } else {
+             ALOGE("Cannot request pointer capture, device is not in MODE_POINTER");
+         }
+@@ -504,6 +508,7 @@ void CursorInputMapper::configureOnPointerCapture(const InputReaderConfiguration
+         if (mParameters.mode == Parameters::Mode::POINTER_RELATIVE) {
+             mParameters.mode = Parameters::Mode::POINTER;
+             mSource = AINPUT_SOURCE_MOUSE;
++            setPointerCaptureLed(false);
+         } else {
+             ALOGE("Cannot release pointer capture, device is not in MODE_POINTER_RELATIVE");
+         }
+@@ -511,6 +516,17 @@ void CursorInputMapper::configureOnPointerCapture(const InputReaderConfiguration
+     bumpGeneration();
+ }
+ 
++// A device that advertises LED_MISC is told when pointer capture starts and ends, as a keyboard is
++// told its lock state: a virtual mouse can pass that on to whatever it is the mouse of. A device
++// without the LED sees no change.
++void CursorInputMapper::setPointerCaptureLed(bool on) {
++    if (!getDeviceContext().hasLed(ALED_MISC)) {
++        return;
++    }
++    getDeviceContext().setLedState(ALED_MISC, on);
++    mPointerCaptureLed = on;
++}
++
+ void CursorInputMapper::configureOnChangePointerSpeed(const InputReaderConfiguration& config) {
+     if (mParameters.mode == Parameters::Mode::POINTER_RELATIVE) {
+         // Disable any acceleration or scaling for the pointer when Pointer Capture is enabled.
+diff --git a/services/inputflinger/reader/mapper/CursorInputMapper.h b/services/inputflinger/reader/mapper/CursorInputMapper.h
+index 7215403de285ce55454ae103cb4bc4863c038cf0..08fdce0c79dd16679f17de3e14edd0d15570bc47 100644
+--- a/services/inputflinger/reader/mapper/CursorInputMapper.h
++++ b/services/inputflinger/reader/mapper/CursorInputMapper.h
+@@ -126,11 +126,15 @@ private:
+ 
+     bool mMouseReverseVerticalScrolling = false;
+ 
++    // Whether the device's LED_MISC was last lit, for a device that has one.
++    bool mPointerCaptureLed = false;
++
+     explicit CursorInputMapper(InputDeviceContext& deviceContext,
+                                const InputReaderConfiguration& readerConfig);
+     void dumpParameters(std::string& dump);
+     void configureBasicParams();
+     void configureOnPointerCapture(const InputReaderConfiguration& config);
++    void setPointerCaptureLed(bool on);
+     void configureOnChangePointerSpeed(const InputReaderConfiguration& config);
+     void configureOnChangeDisplayInfo(const InputReaderConfiguration& config);
+     void configureOnChangeMouseSettings(const InputReaderConfiguration& config);
+diff --git a/services/inputflinger/tests/CursorInputMapper_test.cpp b/services/inputflinger/tests/CursorInputMapper_test.cpp
+index e13e44083efbf9052ab1342ac63f29a1563561d3..3fa992f9409b6b44d14a807b77fd75f3c1c68dd4 100644
+--- a/services/inputflinger/tests/CursorInputMapper_test.cpp
++++ b/services/inputflinger/tests/CursorInputMapper_test.cpp
+@@ -407,6 +407,31 @@ TEST_F(CursorInputMapperUnitTest, ProcessPointerCapture) {
+                                      WithPositiveAxis(AMOTION_EVENT_AXIS_RELATIVE_Y)));
+ }
+ 
++/**
++ * A device that advertises LED_MISC has it lit while pointer capture is on and put out when it ends.
++ */
++TEST_F(CursorInputMapperUnitTest, PointerCaptureLightsTheMiscLed) {
++    EXPECT_CALL(mMockEventHub, hasLed(EVENTHUB_ID, ALED_MISC)).WillRepeatedly(Return(true));
++    EXPECT_CALL(mMockEventHub, setLedState(EVENTHUB_ID, ALED_MISC, true)).Times(1);
++    EXPECT_CALL(mMockEventHub, setLedState(EVENTHUB_ID, ALED_MISC, false)).Times(1);
++    createMapper();
++
++    setPointerCapture(true);
++    setPointerCapture(false);
++}
++
++/**
++ * A device without LED_MISC sees no change.
++ */
++TEST_F(CursorInputMapperUnitTest, PointerCaptureLeavesADeviceWithoutTheMiscLedAlone) {
++    EXPECT_CALL(mMockEventHub, hasLed(EVENTHUB_ID, ALED_MISC)).WillRepeatedly(Return(false));
++    EXPECT_CALL(mMockEventHub, setLedState).Times(0);
++    createMapper();
++
++    setPointerCapture(true);
++    setPointerCapture(false);
++}
++
+ TEST_F(CursorInputMapperUnitTest, PopulateDeviceInfoReturnsScaledRangeInNavigationMode) {
+     mPropertyMap.addProperty("cursor.mode", "navigation");
+     createMapper();

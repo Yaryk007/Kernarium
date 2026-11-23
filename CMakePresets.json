@@ -194,30 +194,12 @@
       }
     },
     {
-      "name": "kernarium-ios-device-android-stikdebug-jit",
-      "displayName": "Kernarium iOS device Android runtime with experimental StikDebug JIT (4 KiB)",
-      "inherits": "kernarium-ios-device-android",
-      "binaryDir": "${sourceDir}/.build/kernarium-runtime-ios-device-android-4k-stikdebug-jit",
-      "cacheVariables": {
-        "UML_ENABLE_IOS_STIKDEBUG_JIT": true
-      }
-    },
-    {
       "name": "kernarium-ios-device-android-automation",
       "displayName": "Kernarium iOS device Android automation runtime (4 KiB)",
       "inherits": "kernarium-ios-device-android",
       "binaryDir": "${sourceDir}/.build/kernarium-runtime-ios-device-android-4k-automation",
       "cacheVariables": {
         "UML_KERNARIUM_AUTOMATION_HARNESS": true
-      }
-    },
-    {
-      "name": "kernarium-ios-device-android-app-store",
-      "displayName": "Kernarium iOS device Android App Store runtime (4 KiB)",
-      "inherits": "kernarium-ios-device-android",
-      "binaryDir": "${sourceDir}/.build/kernarium-runtime-ios-device-android-4k-app-store",
-      "cacheVariables": {
-        "UML_APP_STORE_RUNTIME": true
       }
     },
     {
@@ -349,18 +331,8 @@
       "targets": ["KernariumRuntime", "architecture-audit"]
     },
     {
-      "name": "kernarium-ios-device-android-stikdebug-jit",
-      "configurePreset": "kernarium-ios-device-android-stikdebug-jit",
-      "targets": ["KernariumRuntime", "architecture-audit"]
-    },
-    {
       "name": "kernarium-ios-device-android-automation",
       "configurePreset": "kernarium-ios-device-android-automation",
-      "targets": ["KernariumRuntime", "architecture-audit"]
-    },
-    {
-      "name": "kernarium-ios-device-android-app-store",
-      "configurePreset": "kernarium-ios-device-android-app-store",
       "targets": ["KernariumRuntime", "architecture-audit"]
     },
     {
@@ -417,7 +389,7 @@
       },
       "filter": {
         "include": {
-          "name": "^(gpu-|platform-video-(decoder|encoder(-recovery|-cache)?)$|video-encoder-capabilities$|virtio-(battery|console|input|sound|video|video-encoder)-protocol$)"
+          "name": "^(gpu-|platform-video-(decoder(-recovery)?|encoder(-recovery|-cache)?)$|video-encoder-capabilities$|virtio-(battery|console|input|sound|video|video-encoder)-protocol$)"
         }
       },
       "execution": {

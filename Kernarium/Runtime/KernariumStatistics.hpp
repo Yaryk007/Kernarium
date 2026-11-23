@@ -24,6 +24,8 @@ namespace kernarium::statistics {
 struct DisplayFigures final {
     std::uint64_t presentedFrames {};
     std::uint64_t offeredFrames {};
+    /* The rate the host granted the display's mode (Display::refreshRate). */
+    std::uint32_t refreshRate {};
 };
 
 /* The device memory budget and the usage the budget refuses by, as the GPU
@@ -66,6 +68,7 @@ struct GpuMemoryFigures final {
     result.processor_time_ns = guest.guest_cpu_time_ns;
     result.presented_frames = display ? display->presentedFrames : 0U;
     result.offered_frames = display ? display->offeredFrames : 0U;
+    result.display_refresh_hz = display ? display->refreshRate : 0U;
     result.memory_bytes = guest.guest_ram_bytes;
     result.memory_held_bytes = guest.guest_ram_held_bytes;
     result.gpu_memory_refusals = memoryRefusals.value_or(0U);

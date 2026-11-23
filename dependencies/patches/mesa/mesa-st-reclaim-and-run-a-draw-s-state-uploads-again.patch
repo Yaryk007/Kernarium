@@ -1,0 +1,183 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 07:29:03 +0900
+Subject: [PATCH] mesa/st: reclaim and run a draw's state uploads again
+
+When the driver refused the memory a state update uploads into, the
+state tracker skipped the draw, raised GL_OUT_OF_MEMORY and ran the
+update again with the next draw. The memory refused is often held for
+work that has finished, so the application lost a draw it could have
+made.
+
+st_validate_state() now gives back what the driver can (u_reclaim), and
+runs the updates that failed once more when the room has shown. Only
+when they still fail does it skip the draw and raise the error as
+before. The updates it runs again do not reclaim in their turn.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/mesa/state_tracker/st_context.h |  5 +++
+ src/mesa/state_tracker/st_draw.c    | 33 +++++++++++++---
+ src/mesa/state_tracker/st_util.h    | 60 +++++++++++++++++------------
+ 3 files changed, 69 insertions(+), 29 deletions(-)
+
+diff --git a/src/mesa/state_tracker/st_context.h b/src/mesa/state_tracker/st_context.h
+index 7d8eb0650559adfe1b1d9a5ae4d0772783919b05..a2c5d02d3e4153237156c28e7ae1981c2811dcd2 100644
+--- a/src/mesa/state_tracker/st_context.h
++++ b/src/mesa/state_tracker/st_context.h
+@@ -182,6 +182,11 @@ struct st_context
+     */
+    bool upload_failed;
+ 
++   /* The state updates are running again after a reclaim: another failure
++    * is reported, not reclaimed for.
++    */
++   bool reclaiming;
++
+    /* driver supports scissored clears */
+    bool can_scissor_clear;
+ 
+diff --git a/src/mesa/state_tracker/st_draw.c b/src/mesa/state_tracker/st_draw.c
+index 58b264fbb7445b1d47683e3be99cc24e0e5651bf..7cfcb62e9ed44ce3a31de1e4b73017ae00fe02a9 100644
+--- a/src/mesa/state_tracker/st_draw.c
++++ b/src/mesa/state_tracker/st_draw.c
+@@ -58,6 +58,7 @@
+ #include "util/u_inlines.h"
+ #include "util/format/u_format.h"
+ #include "util/u_prim.h"
++#include "util/u_reclaim.h"
+ #include "util/u_draw.h"
+ #include "util/u_upload_mgr.h"
+ #include "util/u_threaded_context.h"
+@@ -71,13 +72,35 @@ static_assert(GL_QUADS == MESA_PRIM_QUADS, "enum mismatch");
+ static_assert(GL_TRIANGLE_STRIP_ADJACENCY == MESA_PRIM_TRIANGLE_STRIP_ADJACENCY, "enum mismatch");
+ static_assert(GL_PATCHES == MESA_PRIM_PATCHES, "enum mismatch");
+ 
+-void
+-st_report_upload_failure(struct st_context *st)
++/**
++ * A state update could not get the upload memory it needs: the driver
++ * refused it, and the state is dirty again. The driver is asked to give back
++ * what it can, and the updates run once more, a little later, when the room
++ * it freed has shown in the budget. When they still fail, nothing is lost but
++ * the draw: GL_OUT_OF_MEMORY is raised, and the state stays dirty for the
++ * next one to try.
++ */
++bool
++st_retry_state_after_reclaim(struct st_context *st,
++                             const st_state_bitset pipeline_state_mask)
+ {
+-   /* The driver had no memory for the upload a state update needed. Nothing
+-    * is lost but the draw: the state stays dirty for the next one to retry.
+-    */
++   struct u_reclaim reclaim;
++
++   /* The retry runs the updates, which must not reclaim again. */
++   if (!st->reclaiming && u_reclaim_begin(st->pipe, true, &reclaim)) {
++      bool updated;
++
++      st->reclaiming = true;
++      u_reclaim_settle(&reclaim);
++      updated = st_update_dirty_states(st, pipeline_state_mask);
++      st->reclaiming = false;
++      u_reclaim_end(&reclaim, updated);
++      if (updated)
++         return true;
++   }
++
+    _mesa_error(st->ctx, GL_OUT_OF_MEMORY, "no memory for the draw's uploads");
++   return false;
+ }
+ 
+ /**
+diff --git a/src/mesa/state_tracker/st_util.h b/src/mesa/state_tracker/st_util.h
+index 958103528bf25761d89ff23bb63f65fbbb74c2c3..9ae4b2cbc0773e8d3c714e7dc3248e6bc1b80d83 100644
+--- a/src/mesa/state_tracker/st_util.h
++++ b/src/mesa/state_tracker/st_util.h
+@@ -118,8 +118,7 @@ st_point_size_per_vertex(struct gl_context *ctx)
+ /**
+  * Called by a state update function that needed memory for an upload and the
+  * driver had none. The update could not finish, so the state is marked
+- * dirty again for the next draw to try once more, and the draw that asked
+- * for the validation must be skipped.
++ * dirty again for the next validation to try once more.
+  */
+ static inline void
+ st_note_upload_failure(struct st_context *st, unsigned atom)
+@@ -128,16 +127,14 @@ st_note_upload_failure(struct st_context *st, unsigned atom)
+    ST_SET_STATE(st->ctx->NewDriverState, atom);
+ }
+ 
+-void
+-st_report_upload_failure(struct st_context *st);
+-
+ /**
+- * Validate the state. Returns false, after raising GL_OUT_OF_MEMORY, when a
+- * state update could not get the upload memory it needs: the caller must not
+- * draw, because the state the draw would use is incomplete.
++ * Run the update functions of the states in the mask that have changed since
++ * the last draw. Returns false when one could not get the upload memory it
++ * needs, which has left its state dirty.
+  */
+ static inline bool
+-st_validate_state(struct st_context *st, const st_state_bitset pipeline_state_mask)
++st_update_dirty_states(struct st_context *st,
++                       const st_state_bitset pipeline_state_mask)
+ {
+    struct gl_context *ctx = st->ctx;
+ 
+@@ -147,24 +144,39 @@ st_validate_state(struct st_context *st, const st_state_bitset pipeline_state_ma
+    BITSET_AND(dirty, dirty, ctx->NewDriverState);
+    BITSET_AND(dirty, dirty, st->active_states);
+ 
+-   if (!BITSET_IS_EMPTY(dirty)) {
+-      BITSET_ANDNOT(ctx->NewDriverState, ctx->NewDriverState, dirty);
++   if (BITSET_IS_EMPTY(dirty))
++      return true;
+ 
+-      /* Execute functions that set states that have been changed since
+-       * the last draw.
+-       */
+-      unsigned i;
+-      st->upload_failed = false;
+-      BITSET_FOREACH_SET(i, dirty, ST_NUM_ATOMS)
+-         st->update_functions[i](st);
++   BITSET_ANDNOT(ctx->NewDriverState, ctx->NewDriverState, dirty);
+ 
+-      if (unlikely(st->upload_failed)) {
+-         st_report_upload_failure(st);
+-         return false;
+-      }
+-   }
++   /* Execute functions that set states that have been changed since
++    * the last draw.
++    */
++   unsigned i;
++   st->upload_failed = false;
++   BITSET_FOREACH_SET(i, dirty, ST_NUM_ATOMS)
++      st->update_functions[i](st);
++
++   return !st->upload_failed;
++}
++
++bool
++st_retry_state_after_reclaim(struct st_context *st,
++                             const st_state_bitset pipeline_state_mask);
++
++/**
++ * Validate the state. Returns false, after raising GL_OUT_OF_MEMORY, when a
++ * state update could not get the upload memory it needs even after the
++ * driver gave back what it could: the caller must not draw, because the state
++ * the draw would use is incomplete.
++ */
++static inline bool
++st_validate_state(struct st_context *st, const st_state_bitset pipeline_state_mask)
++{
++   if (likely(st_update_dirty_states(st, pipeline_state_mask)))
++      return true;
+ 
+-   return true;
++   return st_retry_state_after_reclaim(st, pipeline_state_mask);
+ }
+ 
+ #ifdef __cplusplus

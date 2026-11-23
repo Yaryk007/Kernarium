@@ -722,7 +722,11 @@ int main()
 {
 	const uml::testing::RuntimeTestRoute runtime_route;
 	constexpr std::size_t gib = std::size_t{1024} * 1024U * 1024U;
-	require(arm64::set_jit_cache_budget(1U * gib, 3));
+	/* Three executors at their 256 MiB cap, and the shared tier above its
+	 * floor. */
+	require(arm64::set_jit_cache_budget(2U * gib, 3));
+	require(arm64::jit_shared_translation_cache_budget() >=
+		arm64::minimum_shared_translation_tier_bytes);
 	unsigned long generation = 0x30a3'2000UL;
 	for (const auto isa : {Isa::a64, Isa::a32, Isa::t32}) {
 		tracked_variant_runs_the_block(isa, generation++);

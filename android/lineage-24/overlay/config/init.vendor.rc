@@ -110,12 +110,14 @@ on property:sys.boot_completed=1
     write /sys/kernel/rcu_expedited 0
     swapon_all /vendor/etc/fstab.uml
 
+# No keychord starts it: init counts the keys that are down together across every
+# input device, so with a keyboard attached, ordinary typing (A and B with key
+# rollover) would start a full dumpstate. Bug reports are taken over adb.
 service bugreport /system/bin/dumpstate -d -p -z
     class main
     user root
     disabled
     oneshot
-    keycodes 30 48
 
 on early-init && property:ro.boot.enable_bootanimation=0
     setprop debug.sf.nobootanimation 1

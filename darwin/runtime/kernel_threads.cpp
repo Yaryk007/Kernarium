@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "kernel_threads.hpp"
 
+#include "platform/host_wait.hpp"
+
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -27,6 +29,8 @@ struct Slot final {
 	std::atomic<std::uint64_t> word{0};
 	void *(*start)(void *){};
 	void *argument{};
+	/* What the thread in the slot is waiting for. Only that thread writes it. */
+	::uml::platform::WaitCell wait;
 };
 
 constexpr std::uint32_t reclaiming = ~std::uint32_t{0};
@@ -40,6 +44,7 @@ constexpr std::uint32_t reclaiming = ~std::uint32_t{0};
 std::array<Slot, kernel_thread_capacity> slots;
 std::atomic<bool> overflow{false};
 std::atomic<bool> reclaim_inhibited{false};
+std::atomic<std::uint32_t> fence_epoch{0};
 std::atomic<unsigned> reclaims_active{0};
 
 /* A creator that finds the table full while it is inhibited waits for the
@@ -95,8 +100,10 @@ void reclaim() noexcept
 	for (Slot &slot : slots) {
 		std::uint64_t expected = 0;
 		if (slot.word.compare_exchange_strong(expected, pack(creator, 0),
-			    std::memory_order_acq_rel))
+			    std::memory_order_acq_rel)) {
+			slot.wait.reset();
 			return &slot;
+		}
 	}
 	return nullptr;
 }
@@ -126,6 +133,9 @@ void *entry(void *argument) noexcept
 	auto *slot = static_cast<Slot *>(argument);
 	void *(*const start)(void *) = slot->start;
 	void *const routine_argument = slot->argument;
+	/* Before any wait is marked, so that the thread's local storage exists
+	 * by the time a signal handler could ask for it. */
+	::uml::platform::current_wait_cell = &slot->wait;
 	slot->word.store(pack(0, mach_thread_self()), std::memory_order_release);
 	return start(routine_argument);
 }
@@ -157,8 +167,10 @@ void snapshot_kernel_threads(KernelThreadSnapshot &snapshot) noexcept
 		const std::uint64_t seen = slot.word.load(std::memory_order_acquire);
 		const auto creator = static_cast<mach_port_t>(seen >> 32);
 		const auto thread = static_cast<mach_port_t>(seen & 0xffffffffU);
-		if (thread != MACH_PORT_NULL)
+		if (thread != MACH_PORT_NULL) {
+			snapshot.waits[snapshot.thread_count] = slot.wait.word();
 			snapshot.threads[snapshot.thread_count++] = thread;
+		}
 		else if (creator != MACH_PORT_NULL && creator != reclaiming)
 			snapshot.creators[snapshot.creator_count++] = creator;
 	}
@@ -181,8 +193,19 @@ std::size_t reclaim_ended_kernel_threads() noexcept
 	}
 }
 
+std::uint32_t kernel_thread_fence_epoch() noexcept
+{
+	return fence_epoch.load(std::memory_order_acquire);
+}
+
+bool kernel_thread_reclaim_inhibited() noexcept
+{
+	return reclaim_inhibited.load(std::memory_order_acquire);
+}
+
 void set_kernel_thread_reclaim_inhibited(bool inhibited) noexcept
 {
+	fence_epoch.fetch_add(1, std::memory_order_acq_rel);
 	reclaim_inhibited.store(inhibited, std::memory_order_seq_cst);
 	if (!inhibited)
 		return;

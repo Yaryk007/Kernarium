@@ -123,6 +123,19 @@ inline constexpr std::uint64_t a64_tbi_key_bit = std::uint64_t{1} << 61;
 	return isa == GuestIsa::t32 ? 2U : 4U;
 }
 
+/* The key of the AArch32 unit `units` units on from `key`, which is the one
+ * the PC reaches by running on. It wraps at the top of the 32-bit address
+ * space as the PC does, so the key that follows a canonical key is canonical:
+ * an advance that carried into the key's 33rd bit would name address zero by
+ * a key no translation is stored under. */
+[[nodiscard]] constexpr std::uint64_t key_advance(std::uint64_t key,
+	std::size_t units) noexcept
+{
+	const auto pc = static_cast<std::uint32_t>(
+		key_pc(key) + units * isa_unit_bytes(key_isa(key)));
+	return key_is_thumb(key) ? t32_key(pc) : a32_key(pc);
+}
+
 /* Where the guest bytes of a translation start. An A64 key may carry the
  * SVCR mode in its two low bits and the top-byte-ignore bit; the gadget
  * engine's keys carry neither. */
@@ -141,6 +154,11 @@ static_assert(key_isa(t32_key(0x1002)) == GuestIsa::t32);
 static_assert(key_pc(a32_key(0xffff'fffcU)) == 0xffff'fffcU);
 static_assert(key_pc(t32_key(0xffff'fffeU)) == 0xffff'fffeU);
 static_assert(key_from_target(0x1001U) == t32_key(0x1000U));
+static_assert(key_advance(a32_key(0x1000U), 3) == a32_key(0x100cU));
+static_assert(key_advance(t32_key(0x1000U), 3) == t32_key(0x1006U));
+static_assert(key_advance(a32_key(0xffff'fffcU), 1) == a32_key(0));
+static_assert(key_advance(t32_key(0xffff'fffeU), 1) == t32_key(0));
+static_assert(key_advance(t32_key(0xffff'fffcU), 2) == t32_key(0));
 static_assert(key_from_target(0x1000U) == a32_key(0x1000U));
 static_assert(key_from_target(0x1002U) == a32_key(0x1002U));
 static_assert(key_target_value(key_from_target(0x1001U)) == 0x1001U);

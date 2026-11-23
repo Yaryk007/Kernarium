@@ -118,6 +118,39 @@ target_compile_definitions(uml_static_retire_tests PRIVATE
 uml_add_unit_test(NAME memory-static-retire COMMAND uml_static_retire_tests
     LABELS tsan)
 
+# The x86-64 guest's writer accounting at the four mapping primitives.
+if(UML_BUILD_X86_64_GUEST)
+    add_executable(uml_frame_accounting_tests
+        frame_accounting_tests.cpp
+        $<TARGET_OBJECTS:uml_static_mmu_test_variant>)
+    target_link_libraries(uml_frame_accounting_tests PRIVATE
+        UML::BridgeAbi
+        UML::MemorySharedBacking)
+    target_include_directories(uml_frame_accounting_tests PRIVATE
+        ${PROJECT_SOURCE_DIR}/darwin/memory
+        ${PROJECT_SOURCE_DIR}/darwin/memory/mmu)
+    target_compile_definitions(uml_frame_accounting_tests PRIVATE
+        UML_MEMORY_ALLOCATION_TESTING=1)
+    uml_add_unit_test(NAME memory-frame-accounting
+        COMMAND uml_frame_accounting_tests LABELS tsan)
+
+    # The holders of those frames: registration, the debt it owes, and the
+    # publication of a store or a kernel write at every holder.
+    add_executable(uml_frame_holder_tests
+        frame_holder_tests.cpp
+        $<TARGET_OBJECTS:uml_static_mmu_test_variant>)
+    target_link_libraries(uml_frame_holder_tests PRIVATE
+        UML::BridgeAbi
+        UML::MemorySharedBacking)
+    target_include_directories(uml_frame_holder_tests PRIVATE
+        ${PROJECT_SOURCE_DIR}/darwin/memory
+        ${PROJECT_SOURCE_DIR}/darwin/memory/mmu)
+    target_compile_definitions(uml_frame_holder_tests PRIVATE
+        UML_MEMORY_ALLOCATION_TESTING=1)
+    uml_add_unit_test(NAME memory-frame-holders
+        COMMAND uml_frame_holder_tests LABELS tsan)
+endif()
+
 # What a mapping change publishes as a code change.
 add_executable(uml_static_mmu_code_change_tests
     static_mmu_code_change_tests.cpp
@@ -131,6 +164,76 @@ target_compile_definitions(uml_static_mmu_code_change_tests PRIVATE
     UML_MEMORY_ALLOCATION_TESTING=1)
 uml_add_unit_test(NAME static-mmu-code-change
     COMMAND uml_static_mmu_code_change_tests LABELS tsan)
+
+# The executable-mapping count of a physical page's record and its epoch.
+add_executable(uml_static_mmu_executable_count_tests
+    static_mmu_executable_count_tests.cpp
+    $<TARGET_OBJECTS:uml_static_mmu_test_variant>)
+target_link_libraries(uml_static_mmu_executable_count_tests PRIVATE
+    UML::BridgeAbi
+    UML::MemorySharedBacking)
+target_include_directories(uml_static_mmu_executable_count_tests PRIVATE
+    ${PROJECT_SOURCE_DIR}/darwin/memory/mmu)
+target_compile_definitions(uml_static_mmu_executable_count_tests PRIVATE
+    UML_MEMORY_ALLOCATION_TESTING=1)
+uml_add_unit_test(NAME static-mmu-executable-count
+    COMMAND uml_static_mmu_executable_count_tests LABELS tsan)
+
+# What StaticGuestMemory reports as a code page's stamp.
+add_executable(uml_static_guest_memory_stamp_tests
+    static_guest_memory_stamp_tests.cpp
+    $<TARGET_OBJECTS:uml_static_guest_memory>
+    $<TARGET_OBJECTS:uml_static_mmu_test_variant>)
+target_link_libraries(uml_static_guest_memory_stamp_tests PRIVATE
+    UML::BridgeAbi
+    UML::MemorySharedBacking)
+target_include_directories(uml_static_guest_memory_stamp_tests PRIVATE
+    ${PROJECT_SOURCE_DIR}/darwin
+    ${PROJECT_SOURCE_DIR}/darwin/memory/mmu)
+target_compile_definitions(uml_static_guest_memory_stamp_tests PRIVATE
+    UML_MEMORY_ALLOCATION_TESTING=1)
+uml_add_unit_test(NAME static-guest-memory-stamp
+    COMMAND uml_static_guest_memory_stamp_tests LABELS tsan)
+
+# Which generations hold a translation of a frame of guest code, and what a
+# code synchronization or a kernel write tells them. The fetch observer holds a
+# reader between its copy of a frame and its return.
+add_executable(uml_static_mmu_code_holder_tests
+    static_mmu_code_holder_tests.cpp
+    $<TARGET_OBJECTS:uml_static_mmu_test_variant>
+    $<TARGET_OBJECTS:uml_static_guest_memory_test_variant>)
+target_link_libraries(uml_static_mmu_code_holder_tests PRIVATE
+    UML::BridgeAbi
+    UML::MemorySharedBacking)
+target_include_directories(uml_static_mmu_code_holder_tests PRIVATE
+    ${PROJECT_SOURCE_DIR}/darwin
+    ${PROJECT_SOURCE_DIR}/darwin/memory/mmu)
+target_compile_definitions(uml_static_mmu_code_holder_tests PRIVATE
+    UML_MEMORY_ALLOCATION_TESTING=1
+    UML_STATIC_GUEST_MEMORY_TESTING=1)
+uml_add_unit_test(NAME static-mmu-code-holder
+    COMMAND uml_static_mmu_code_holder_tests LABELS tsan)
+
+# The counters reporter's start leaves the caller's signal mask as it found it
+# when an allocation or the thread's creation fails, before and after the
+# signals are blocked.
+add_executable(uml_code_holder_reporter_tests
+    code_holder_reporter_tests.cpp
+    $<TARGET_OBJECTS:uml_static_mmu_test_variant>)
+target_link_libraries(uml_code_holder_reporter_tests PRIVATE
+    UML::BridgeAbi
+    UML::MemorySharedBacking
+    uml_test_allocation_failure)
+target_include_directories(uml_code_holder_reporter_tests PRIVATE
+    ${PROJECT_SOURCE_DIR}/darwin/memory/mmu)
+target_compile_definitions(uml_code_holder_reporter_tests PRIVATE
+    UML_MEMORY_ALLOCATION_TESTING=1)
+uml_add_unit_test(NAME code-holder-reporter-path-failure
+    COMMAND uml_code_holder_reporter_tests 1)
+uml_add_unit_test(NAME code-holder-reporter-thread-failure
+    COMMAND uml_code_holder_reporter_tests 2)
+uml_add_unit_test(NAME code-holder-reporter-create-failure
+    COMMAND uml_code_holder_reporter_tests 3)
 
 # The fill index's word layout and radix table, and the backing slots its
 # words name. The slot test builds real backings.

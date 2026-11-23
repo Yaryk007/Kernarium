@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 import AndariumCore
+import AndariumCoreTestSupport
 import Foundation
+import Observation
 import Testing
 @testable import Andarium
 
@@ -29,6 +31,29 @@ private final class Pace {
         let continuation = held
         held = nil
         continuation?.resume()
+    }
+}
+
+/// Counts how often the model tells its views the notice changed.
+@MainActor
+private final class NoticeChanges {
+    private(set) var count = 0
+    private let model: AppModel
+
+    init(_ model: AppModel) {
+        self.model = model
+        watch()
+    }
+
+    private func watch() {
+        withObservationTracking {
+            _ = model.graphicsNotice
+        } onChange: { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.count += 1
+                self?.watch()
+            }
+        }
     }
 }
 
@@ -95,6 +120,31 @@ struct GraphicsNoticeFlowTests {
         #expect(pace.waits == [.seconds(2), .seconds(2), .seconds(2)])
         #expect(driver.statisticsAsked == 0, "the statistics were read for a notice")
         #expect(!model.graphicsNotice.isShowing)
+        model.phase = .home
+    }
+
+    @Test func readingsThatFindNothingNewLeaveTheViewsAlone() async {
+        let pace = Pace()
+        let driver = StubDriver(plan: .normal)
+        driver.refusalCounts = [0, 0, 0, 0, 3, 3, 3]
+        let model = runningModel(driver, pace: pace)
+        let changes = NoticeChanges(model)
+        #expect(await until { pace.isWaiting })
+        await settle()
+        #expect(changes.count == 1, "the first reading is the baseline, which is a change")
+        // The same count again and again, a reading every two seconds: each
+        // finds the notice as it was, so nothing it feeds is redrawn.
+        for _ in 0..<3 { #expect(await nextReading(pace, driver)) }
+        await settle()
+        #expect(changes.count == 1)
+        // A refusal is news, once.
+        #expect(await nextReading(pace, driver))
+        await settle()
+        #expect(model.graphicsNotice.isShowing)
+        #expect(changes.count == 2)
+        for _ in 0..<2 { #expect(await nextReading(pace, driver)) }
+        await settle()
+        #expect(changes.count == 2)
         model.phase = .home
     }
 

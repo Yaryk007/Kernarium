@@ -3,13 +3,15 @@
 import Foundation
 import Testing
 @testable import AndariumCore
+import AndariumCoreTestSupport
 
 private func releaseIdentity(
-    _ id: String = "20261031-los24-r4", build: Int = 100, sha: String = String(repeating: "a", count: 64)
+    _ id: String = "20261031-los24-r4", build: Int = 100, sha: String = String(repeating: "a", count: 64),
+    proof: Bool = false
 ) -> ReleaseIdentity {
     ReleaseIdentity(
         releaseID: id, buildFingerprint: "fp-\(id)", buildNumber: build, securityPatch: "2026-10-01",
-        systemDiskSHA256: sha, dataLayout: 1, minimumGiB: 4, defaultGiB: 8, maximumGiB: 64
+        systemDiskSHA256: sha, dataLayout: 1, minimumGiB: 4, defaultGiB: 8, maximumGiB: 64, isUnsignedProof: proof
     )
 }
 
@@ -27,6 +29,134 @@ private func makeStorage(release: ReleaseIdentity = releaseIdentity()) throws ->
 private let host = HostDevice(
     name: "iPad", processorCount: 6, memory: MemoryPolicy(maximumsMiB: [4096]), freeStorageBytes: 40_000_000_000
 )
+
+/// Set up never replaces files the rules would not let a new guest replace
+/// when an unsigned proof is involved: a guest whose settings file is missing
+/// but whose data and record are intact is not erased by Set up. Erase is the
+/// way out, and stays with the explicit Erase action.
+struct UnsignedProofSetUpTests {
+    private static let proof = "unsigned-proof-p1"
+    private let host = HostDevice(
+        name: "iPad", processorCount: 6, memory: MemoryPolicy(maximumsMiB: [4096]), freeStorageBytes: 40_000_000_000
+    )
+
+    /// A guest `release` set up, its data written, and its settings file lost.
+    private func guestWithoutSettings(
+        _ release: ReleaseIdentity
+    ) async throws -> (TwoDiskStorage, URL, Data, Data) {
+        let (storage, root) = try makeStorage(release: release)
+        _ = try await storage.create(Guest.fresh(on: host))
+        try Data("android data".utf8).write(to: storage.locations.data)
+        try FileManager.default.removeItem(at: storage.locations.settings)
+        #expect(try storage.load() == nil)
+        return (storage, root, try Data(contentsOf: storage.locations.data), try Data(contentsOf: storage.locations.directory.appendingPathComponent("instance.json")))
+    }
+
+    private func untouched(_ storage: TwoDiskStorage, data: Data, record: Data) throws {
+        #expect(try Data(contentsOf: storage.locations.data) == data)
+        #expect(try Data(contentsOf: storage.locations.directory.appendingPathComponent("instance.json")) == record)
+        #expect(!FileManager.default.fileExists(atPath: storage.locations.settings.path))
+    }
+
+    @Test func aProofDoesNotSetUpOverTheDataOfASignedGuest() async throws {
+        let (signed, root, data, record) = try await guestWithoutSettings(releaseIdentity())
+        defer { try? FileManager.default.removeItem(at: root) }
+        let proof = TwoDiskStorage(
+            locations: signed.locations, release: releaseIdentity(Self.proof, build: 300, proof: true),
+            releaseDirectory: signed.releaseDirectory
+        )
+        await #expect(throws: InstanceError.refused(StartBlock.mismatch.explanation)) {
+            try await proof.create(Guest.fresh(on: host))
+        }
+        try untouched(proof, data: data, record: record)
+    }
+
+    @Test func aSignedReleaseDoesNotSetUpOverTheDataOfAProofsGuest() async throws {
+        let (made, root, data, record) = try await guestWithoutSettings(releaseIdentity(Self.proof, build: 300, proof: true))
+        defer { try? FileManager.default.removeItem(at: root) }
+        let signed = TwoDiskStorage(locations: made.locations, release: releaseIdentity(build: 400), releaseDirectory: made.releaseDirectory)
+        await #expect(throws: InstanceError.self) { try await signed.create(Guest.fresh(on: host)) }
+        try untouched(signed, data: data, record: record)
+        // Nor does the same proof set itself up again over its own data.
+        await #expect(throws: InstanceError.self) { try await made.create(Guest.fresh(on: host)) }
+        try untouched(made, data: data, record: record)
+    }
+
+    @Test func aProofSetsUpWhereTheRulesCreate() async throws {
+        let proof = releaseIdentity(Self.proof, build: 300, proof: true)
+        let (storage, root) = try makeStorage(release: proof)
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try await storage.create(Guest.fresh(on: host))
+        let state = try #require(try InstanceFiles(directory: storage.locations.directory).readState())
+        #expect(state.releaseID == Self.proof && state.isUnsignedProof)
+
+        // A record with no data behind it holds nothing to keep: a signed guest's, and a proof's.
+        for earlier in [releaseIdentity(), releaseIdentity("unsigned-proof-p0", build: 250, proof: true)] {
+            let (first, otherRoot) = try makeStorage(release: earlier)
+            defer { try? FileManager.default.removeItem(at: otherRoot) }
+            _ = try await first.create(Guest.fresh(on: host))
+            let second = TwoDiskStorage(locations: first.locations, release: proof, releaseDirectory: first.releaseDirectory)
+            _ = try await second.create(Guest.fresh(on: host))
+            #expect(try InstanceFiles(directory: first.locations.directory).readState()?.releaseID == Self.proof)
+        }
+    }
+
+    /// A signed update to a release did not finish, and a proof carries that
+    /// release's ID: starting, Try Again and the restore all leave the files
+    /// as they are, and the plan is the mismatch Home words.
+    @Test func aProofOfTheIDOfAnUnfinishedSignedUpdateStartsNothingAndRestoresNothing() async throws {
+        let id = "20261102-los24-r5"
+        let (before, root) = try makeStorage(release: releaseIdentity("20261031-los24-r4", build: 100))
+        defer { try? FileManager.default.removeItem(at: root) }
+        let guest = try await before.create(Guest.fresh(on: host))
+        try await before.prepareStart(guest)
+        try Data("android data".utf8).write(to: before.locations.data)
+        try before.completeRun()
+        let signed = TwoDiskStorage(
+            locations: before.locations, release: releaseIdentity(id, build: 200, sha: String(repeating: "b", count: 64)),
+            releaseDirectory: before.releaseDirectory
+        )
+        try await signed.prepareStart(guest)
+        let files = InstanceFiles(directory: before.locations.directory)
+        let record = try Data(contentsOf: files.state)
+        let snapshot = files.snapshot(for: id)
+        #expect(try files.readState()?.pendingUpdate?.toReleaseID == id)
+        #expect(try Data(contentsOf: snapshot) == Data("android data".utf8))
+
+        let proof = TwoDiskStorage(
+            locations: before.locations,
+            release: releaseIdentity(id, build: 200, sha: String(repeating: "c", count: 64), proof: true),
+            releaseDirectory: before.releaseDirectory
+        )
+        #expect(proof.startPlan() == .blocked(.mismatch))
+        await #expect(throws: InstanceError.refused(StartBlock.mismatch.explanation)) { try await proof.prepareStart(guest) }
+        #expect(throws: InstanceError.refused(StartBlock.mismatch.explanation)) { try proof.restoreUpdate() }
+        await #expect(throws: InstanceError.refused(StartBlock.mismatch.explanation)) {
+            try await proof.create(Guest.fresh(on: host))
+        }
+        #expect(try Data(contentsOf: files.state) == record)
+        #expect(try Data(contentsOf: before.locations.data) == Data("android data".utf8))
+        #expect(try Data(contentsOf: snapshot) == Data("android data".utf8))
+
+        // The signed release keeps Try Again, which changes the record's last start only.
+        try await signed.prepareStart(guest)
+        #expect(try files.readState()?.pendingUpdate?.toReleaseID == id)
+        #expect(FileManager.default.fileExists(atPath: snapshot.path))
+    }
+
+    @Test func aRecordNobodyCanReadIsNotReplacedByAProof() async throws {
+        let proof = releaseIdentity(Self.proof, build: 300, proof: true)
+        let (storage, root) = try makeStorage(release: proof)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: storage.locations.directory, withIntermediateDirectories: true)
+        let record = storage.locations.directory.appendingPathComponent("instance.json")
+        try Data("not json".utf8).write(to: record)
+        try Data("android data".utf8).write(to: storage.locations.data)
+        await #expect(throws: (any Error).self) { try await storage.create(Guest.fresh(on: host)) }
+        #expect(try Data(contentsOf: record) == Data("not json".utf8))
+        #expect(try Data(contentsOf: storage.locations.data) == Data("android data".utf8))
+    }
+}
 
 struct StorageTests {
     @Test func aStorageWithNothingInItHasNoGuest() throws {
@@ -79,31 +209,27 @@ struct StorageTests {
         #expect(second >= first + (8 << 20))
     }
 
-    /// Start in recovery waits for the first start: the plan is the first
-    /// start until the runtime has created the data disk, and an erased and
-    /// recreated guest is back to it.
+    /// The plan is the first start until the runtime has created the data
+    /// disk, and an erased and recreated guest is back to it.
     @Test func theFirstStartLastsUntilTheDataDiskExistsAndAnEraseReturnsToIt() async throws {
         let (storage, root) = try makeStorage()
         defer { try? FileManager.default.removeItem(at: root) }
         let guest = try await storage.create(Guest.fresh(on: host))
         #expect(storage.startPlan() == .firstStart)
-        #expect(storage.startPlan()?.offersRecovery == false)
         // The first start is prepared and under way; the runtime creates the
         // disk and Android sets itself up.
         try await storage.prepareStart(guest)
         #expect(storage.startPlan() == .firstStart)
         try Data("android data".utf8).write(to: storage.locations.data)
         #expect(storage.startPlan() == .normal)
-        #expect(storage.startPlan()?.offersRecovery == true)
         // The plan lasts across a clean shutdown and a new process.
         try storage.bootCompleted()
         try storage.completeRun()
-        #expect(storage.startPlan()?.offersRecovery == true)
+        #expect(storage.startPlan() == .normal)
 
         try await storage.erase()
         _ = try await storage.create(Guest.fresh(on: host))
         #expect(storage.startPlan() == .firstStart)
-        #expect(storage.startPlan()?.offersRecovery == false)
     }
 
     @Test func eraseDeletesTheDataTheRecordAndTheChoicesSoNoGuestIsLeft() async throws {
@@ -130,6 +256,33 @@ struct StorageTests {
         #expect(storage.startPlan() == .firstStart)
         let next = try await storage.create(Guest.fresh(on: host))
         #expect(next.cores == host.processorCount)
+    }
+
+    /// The serial number and eth0 address the runtime keeps beside the data disk
+    /// belong to the installation: a start, a resize and a clean shutdown leave
+    /// them, and an erase deletes them so that the next installation has values
+    /// of its own (the content is synthetic).
+    @Test func theInstallationIdentityLastsUntilTheGuestIsErased() async throws {
+        let (storage, root) = try makeStorage()
+        defer { try? FileManager.default.removeItem(at: root) }
+        var guest = try await storage.create(Guest.fresh(on: host))
+        let content = Data(#"{"ethernet_mac": "02:aa:bb:cc:dd:ee", "schema": 1, "serialno": "0123456789abcdef"}"#.utf8)
+        let identity = storage.locations.directory.appendingPathComponent(InstanceFiles.identityFile)
+        let leftover = storage.locations.directory.appendingPathComponent(InstanceFiles.identityFile + ".tmp-77")
+        try Data(repeating: 1, count: 4096).write(to: storage.locations.data)
+        try content.write(to: identity)
+
+        try await storage.prepareStart(guest)
+        guest.pendingCapacityGiB = guest.effectiveCapacityGiB + 8
+        try storage.save(guest)
+        try storage.bootCompleted()
+        try storage.completeRun()
+        #expect(try Data(contentsOf: identity) == content)
+
+        try Data("half".utf8).write(to: leftover)
+        try await storage.erase()
+        #expect(!FileManager.default.fileExists(atPath: identity.path))
+        #expect(!FileManager.default.fileExists(atPath: leftover.path))
     }
 
     @Test func eraseWithNoGuestChangesNothing() async throws {
@@ -320,5 +473,80 @@ struct DiskPathTests {
             releaseDirectory: release
         )
         await #expect(throws: StorageError.unusableDiskPath(release.path)) { try await storage.create(Guest.fresh(on: host)) }
+    }
+}
+
+/// A launch where no size can start (`MemoryPolicy.hasRoom`) shows a memory of
+/// zero for that run alone: the guest it saves does not replace the size the
+/// person had, so that a later launch with room starts from that size, or from
+/// the default where none was ever kept, and not from the least size.
+struct NoRoomMemoryIsNotKeptTests {
+    private let none = MemoryPolicy(
+        processorCount: 6, bound: { _ in 0 }, defaultMemory: { _ in 0 }, safeMemory: { _ in 0 },
+        graphicsMemory: { _, _ in 1000 })
+    private let room = MemoryPolicy(maximumsMiB: [4096, 4096, 4096, 4096, 4096, 4096])
+
+    private func device(_ memory: MemoryPolicy) -> HostDevice {
+        HostDevice(name: "iPad", processorCount: 6, memory: memory, freeStorageBytes: 40_000_000_000)
+    }
+
+    @Test func aLaunchWithNoRoomDoesNotReplaceTheSizeThePersonHad() async throws {
+        let (storage, root) = try makeStorage()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try await storage.create(Guest(cores: 4, memoryMiB: 3072, capacityGiB: 8))
+        let shown = LaunchOverrides().applied(to: try #require(try storage.load()), on: device(none))
+        #expect(shown.memoryMiB == 0)
+        // The run's end saves the guest it shows.
+        try storage.save(shown)
+        #expect(try #require(try storage.load()).memoryMiB == 3072)
+        // Every other choice is saved as it is.
+        var changed = shown
+        changed.cores = 2
+        try storage.save(changed)
+        let reread = try #require(try storage.load())
+        #expect(reread.cores == 2 && reread.memoryMiB == 3072)
+        let later = LaunchOverrides().applied(to: reread, on: device(room))
+        #expect(later.memoryMiB == 3072)
+    }
+
+    /// A record that cannot be read, or decoded, is not "nothing stored": the
+    /// save of a memory of zero fails with the error and the record stays as it
+    /// is, for the size in it is the person's.
+    @Test func aRecordThatCannotBeReadIsNotReplacedByTheZeroOfALaunchWithNoRoom() async throws {
+        let (storage, root) = try makeStorage()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try await storage.create(Guest(cores: 4, memoryMiB: 3072, capacityGiB: 8))
+        let file = storage.locations.settings
+        let shown = LaunchOverrides().applied(to: try #require(try storage.load()), on: device(none))
+        #expect(shown.memoryMiB == 0)
+
+        // Denied.
+        let record = try Data(contentsOf: file)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: file.path)
+        #expect(throws: (any Error).self) { try storage.save(shown) }
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+        #expect(try Data(contentsOf: file) == record)
+        #expect(try #require(try storage.load()).memoryMiB == 3072)
+
+        // Not a record.
+        let garbage = Data("{ not a record".utf8)
+        try garbage.write(to: file)
+        #expect(throws: (any Error).self) { try storage.save(shown) }
+        #expect(try Data(contentsOf: file) == garbage)
+
+        // A size to keep needs no reading, and is saved as it is.
+        try storage.save(Guest(cores: 4, memoryMiB: 2048, capacityGiB: 8))
+        #expect(try #require(try storage.load()).memoryMiB == 2048)
+    }
+
+    @Test func aGuestSetUpWithNoRoomTakesTheDefaultOnceThereIsRoom() async throws {
+        let (storage, root) = try makeStorage()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try await storage.create(Guest.fresh(on: device(none)))
+        let stored = try #require(try storage.load())
+        let later = LaunchOverrides().applied(to: stored, on: device(room))
+        let wanted = room.defaultMemoryMiB(vCPUs: later.cores)
+        #expect(wanted > Limits.minimumMemoryMiB)
+        #expect(later.memoryMiB == wanted)
     }
 }

@@ -44,7 +44,7 @@ def compile_object(root: Path, name: str, source: str) -> Path:
     output = root / f"{name}.o"
     built = run([
         "xcrun", "--sdk", "iphoneos", "clang++", "-std=c++20",
-        "-target", "arm64-apple-ios27.0", "-c", str(source_path),
+        "-target", "arm64-apple-ios26.0", "-c", str(source_path),
         "-o", str(output),
     ])
     if built.returncode != 0:

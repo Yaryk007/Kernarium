@@ -43,7 +43,7 @@ index cbde781ba79ab59c889e919d66e59486d021d13c..0cafd3bbb5a447764ac4931ad2a15a46
     'venus/vkr_image.c',
     'venus/vkr_instance.c',
 diff --git a/src/venus/vkr_device_memory.c b/src/venus/vkr_device_memory.c
-index d0945d02dbedbe405aa532f2104cb87b792c6252..918e9b4efb813b6773a407e7b579640b8cb3a2d6 100644
+index 530efdff06399c9f64f499faacf7967631e182b1..fcb391d8c3c893988923c1999cf4a96fe448f417 100644
 --- a/src/venus/vkr_device_memory.c
 +++ b/src/venus/vkr_device_memory.c
 @@ -11,7 +11,7 @@

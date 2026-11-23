@@ -120,8 +120,8 @@ Lx86_zero_ready\@:
 	.endif
 .endm
 
-/* The stream an unlinked BlockLink names is the link_exit word right in front
- * of that BlockLink, so the RIP is the BlockLink's own. */
+/* An unlinked BlockLink's pair enters here with the stream naming that
+ * BlockLink, so the RIP is the BlockLink's own. */
 gadget link_exit
 	ldr x9, [_stream, #16]
 	str x9, [_vcpu, #UML_X86_64_CPU_RIP]
@@ -384,7 +384,6 @@ gadget jump_linked
 	x86_memory_order_boundary
 	follow_block_link x8
 
-.purgem follow_block_link
 .purgem follow_indirect_link
 .purgem follow_target_link
 

@@ -72,4 +72,25 @@ private:
     std::uint64_t indexStart_ {};
 };
 
+/* Writes one plane of a guest buffer in pieces, such as the rows of a
+ * picture, the way GuestPlaneReader reads it. */
+class GuestPlaneWriter final {
+public:
+    GuestPlaneWriter(const GuestMapper& mapper, const uml::virtio::SharedMemoryRegions* regions,
+                     std::span<const GuestSegment> segments) noexcept
+        : mapper_(mapper), regions_(regions), segments_(segments)
+    {
+    }
+    /* Writes `data` at `offset` bytes into the plane; false when the plane is
+     * shorter than that or a segment cannot be reached. */
+    [[nodiscard]] bool write(std::uint64_t offset, std::span<const std::uint8_t> data);
+
+private:
+    const GuestMapper& mapper_;
+    const uml::virtio::SharedMemoryRegions* regions_;
+    std::span<const GuestSegment> segments_;
+    std::size_t index_ {};
+    std::uint64_t indexStart_ {};
+};
+
 } // namespace uml::video

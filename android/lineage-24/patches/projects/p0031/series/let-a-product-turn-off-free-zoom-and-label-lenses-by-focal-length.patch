@@ -1,0 +1,463 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 04:48:41 +0900
+Subject: [PATCH] let a product turn off free zoom and label lenses by focal
+ length
+
+Add the bool config_enableZoom, true by default. When a product sets it
+to false, the user can't zoom freely: pinch to zoom does nothing, the
+zoom slider never shows, the Zoom action is gone from the settings of
+the hardware keys (a stored one is ignored), and tapping the active lens
+button does nothing. The lens buttons are the only way to change the
+field of view.
+
+Label and order the lens buttons by the ratio of each camera's 35
+mm-equivalent focal length (the focal length over the sensor diagonal)
+to that of the main camera of its side, instead of the ratio of view
+angles that CameraX truncates to whole degrees. The main camera of a
+side is the one with the lowest ID, and all the external cameras are
+one side. A ratio within 20 % of 0.5, 1, 2, 2.5, 3, 4 or 5 takes that
+label, and any other shows one decimal. CameraX's ratio stays the
+fallback for a camera whose characteristics lack the focal length or
+the sensor size.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .../org/lineageos/aperture/CameraActivity.kt  | 12 ++-
+ .../lineageos/aperture/SettingsActivity.kt    | 25 ++++++
+ .../org/lineageos/aperture/models/Camera.kt   | 40 ++++++++++
+ .../aperture/repositories/CameraRepository.kt | 19 ++++-
+ .../repositories/OverlaysRepository.kt        |  5 ++
+ .../aperture/ui/views/LensSelectorLayout.kt   |  6 +-
+ .../aperture/utils/LensZoomRatioUtils.kt      | 79 +++++++++++++++++++
+ .../aperture/viewmodels/CameraViewModel.kt    | 35 ++++++--
+ app/src/main/res/values/config.xml            |  5 ++
+ 9 files changed, 212 insertions(+), 14 deletions(-)
+ create mode 100644 app/src/main/java/org/lineageos/aperture/utils/LensZoomRatioUtils.kt
+
+diff --git a/app/src/main/java/org/lineageos/aperture/CameraActivity.kt b/app/src/main/java/org/lineageos/aperture/CameraActivity.kt
+index 9d51ad19e01fbed191f84a0a101b5480d0a52e65..a1f5caa90d4d66ca80f4fa28910d7a3d60e3a95f 100644
+--- a/app/src/main/java/org/lineageos/aperture/CameraActivity.kt
++++ b/app/src/main/java/org/lineageos/aperture/CameraActivity.kt
+@@ -1091,11 +1091,15 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
+         launch {
+             viewModel.zoomState.collectLatest { zoomState ->
+                 zoomState?.takeIf { it.minZoomRatio != it.maxZoomRatio }?.let {
+-                    zoomLevel.progress = it.linearZoom
+-                    zoomLevel.isVisible = true
++                    if (viewModel.enableZoom) {
++                        zoomLevel.progress = it.linearZoom
++                        zoomLevel.isVisible = true
+ 
+-                    handler.removeMessages(MSG_HIDE_ZOOM_SLIDER)
+-                    handler.sendMessageDelayed(handler.obtainMessage(MSG_HIDE_ZOOM_SLIDER), 2000)
++                        handler.removeMessages(MSG_HIDE_ZOOM_SLIDER)
++                        handler.sendMessageDelayed(
++                            handler.obtainMessage(MSG_HIDE_ZOOM_SLIDER), 2000
++                        )
++                    }
+ 
+                     lensSelectorLayout.onZoomRatioChanged(it.zoomRatio)
+                 }
+diff --git a/app/src/main/java/org/lineageos/aperture/SettingsActivity.kt b/app/src/main/java/org/lineageos/aperture/SettingsActivity.kt
+index 9198171ae5f3d891ecbeb6a34d02ed1fe236fe91..99db5c863923c9b4405f8fa998118d43a9888f9f 100644
+--- a/app/src/main/java/org/lineageos/aperture/SettingsActivity.kt
++++ b/app/src/main/java/org/lineageos/aperture/SettingsActivity.kt
+@@ -33,6 +33,7 @@ import com.google.android.material.appbar.AppBarLayout
+ import com.google.android.material.appbar.MaterialToolbar
+ import kotlinx.coroutines.launch
+ import org.lineageos.aperture.ext.setOffset
++import org.lineageos.aperture.models.GestureAction
+ import org.lineageos.aperture.models.HardwareKey
+ import org.lineageos.aperture.models.Permission
+ import org.lineageos.aperture.models.PermissionState
+@@ -239,7 +240,16 @@ class SettingsActivity : AppCompatActivity(R.layout.activity_settings) {
+ 
+             val context = requireContext()
+ 
++            val enableZoom = (context.applicationContext as ApertureApplication)
++                .overlaysRepository.enableZoom
++            val zoomActionValue = GestureAction.ZOOM.toPreferenceString()
++
+             for (hardwareKey in HardwareKey.entries) {
++                // The keys that only zoom have nothing to do when the user can't zoom
++                if (!enableZoom && hardwareKey.defaultAction == GestureAction.ZOOM) {
++                    continue
++                }
++
+                 val actionPreference = ListPreference(context, null).apply {
+                     key = hardwareKey.actionSharedPreferenceKey
+                     setTitle(hardwareKey.actionPreferenceTitleStringResId)
+@@ -265,6 +275,14 @@ class SettingsActivity : AppCompatActivity(R.layout.activity_settings) {
+                             setEntryValues(R.array.gesture_actions_no_default_no_two_way_values)
+                         }
+                     }
++                    if (!enableZoom) {
++                        // Leave out the Zoom action
++                        val keptIndices = entryValues.indices.filter {
++                            entryValues[it].toString() != zoomActionValue
++                        }
++                        setEntries(keptIndices.map { entries[it] }.toTypedArray())
++                        setEntryValues(keptIndices.map { entryValues[it] }.toTypedArray())
++                    }
+                     setDefaultValue(hardwareKey.defaultAction.toPreferenceString())
+                     isIconSpaceReserved = false
+                     summaryProvider = ListPreference.SimpleSummaryProvider.getInstance()
+@@ -279,6 +297,8 @@ class SettingsActivity : AppCompatActivity(R.layout.activity_settings) {
+                         setSummary(hardwareKey.invertPreferenceSummaryStringResId!!)
+                         setDefaultValue(false)
+                         isIconSpaceReserved = false
++                        // Inverting is for the Zoom action only
++                        isVisible = enableZoom
+                     }
+ 
+                     val keyCategory = PreferenceCategory(context, null).apply {
+@@ -292,6 +312,11 @@ class SettingsActivity : AppCompatActivity(R.layout.activity_settings) {
+                     keyCategory.addPreference(actionPreference)
+                     keyCategory.addPreference(invertPreference)
+ 
++                    // A stored Zoom action is ignored when the user can't zoom
++                    if (!enableZoom && actionPreference.value == zoomActionValue) {
++                        actionPreference.value = hardwareKey.defaultAction.toPreferenceString()
++                    }
++
+                     actionPreference.setOnPreferenceChangeListener { _, newValue ->
+                         val value = newValue as String
+                         val gestureAction = preferenceStringToGestureAction(value) ?: run {
+diff --git a/app/src/main/java/org/lineageos/aperture/models/Camera.kt b/app/src/main/java/org/lineageos/aperture/models/Camera.kt
+index 0847e6fd0c324d502037861064150c946fb6f8f2..776087556aaf29fa6c46bdd105e941578c9840c0 100644
+--- a/app/src/main/java/org/lineageos/aperture/models/Camera.kt
++++ b/app/src/main/java/org/lineageos/aperture/models/Camera.kt
+@@ -24,7 +24,9 @@ import androidx.core.util.toClosedRange
+ import androidx.lifecycle.asFlow
+ import org.lineageos.aperture.ext.getSupportedModes
+ import org.lineageos.aperture.repositories.OverlaysRepository
++import org.lineageos.aperture.utils.LensZoomRatioUtils
+ import java.util.SortedMap
++import kotlin.math.hypot
+ import kotlin.reflect.safeCast
+ 
+ /**
+@@ -40,6 +42,7 @@ class Camera private constructor(
+     val logicalZoomRatios: SortedMap<Float, Float>,
+     additionalVideoFrameRates: Map<Quality, Map<FrameRate, Boolean>>,
+     val supportedExtensionModes: Set<Int>,
++    mainCameraInfo: CameraInfo,
+ ) {
+     /**
+      * The [androidx.camera.core.CameraSelector] for this camera.
+@@ -72,6 +75,17 @@ class Camera private constructor(
+ 
+     val intrinsicZoomRatio = cameraInfo.intrinsicZoomRatio
+ 
++    /**
++     * The zoom ratio of this camera's lens to the main camera of its side, as its lens button
++     * shows it. It comes from the 35 mm-equivalent focal lengths and is snapped to a familiar
++     * ratio when it lies close to one. If the characteristics don't tell, it is
++     * [intrinsicZoomRatio].
++     */
++    val lensZoomRatio = LensZoomRatioUtils.getZoomRatio(
++        focalLengthPerDiagonal(cameraInfo),
++        focalLengthPerDiagonal(mainCameraInfo),
++    ) ?: intrinsicZoomRatio
++
+     private val imageCaptureCapabilities = ImageCapture.getImageCaptureCapabilities(cameraInfo)
+ 
+     val supportedPhotoOutputFormats = imageCaptureCapabilities.supportedOutputFormats.map {
+@@ -277,10 +291,35 @@ class Camera private constructor(
+     }.toSet()
+ 
+     companion object {
++        /**
++         * Get the focal length of the lens of a camera over the diagonal of its sensor.
++         *
++         * @return The value, or null if the characteristics of the camera don't tell
++         */
++        private fun focalLengthPerDiagonal(cameraInfo: CameraInfo): Float? {
++            val camera2CameraInfo = Camera2CameraInfo.from(cameraInfo)
++
++            val focalLength = camera2CameraInfo.getCameraCharacteristic(
++                CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS
++            )?.firstOrNull() ?: return null
++            val sensorSize = camera2CameraInfo.getCameraCharacteristic(
++                CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE
++            ) ?: return null
++
++            return focalLength / hypot(sensorSize.width, sensorSize.height)
++        }
++
++        /**
++         * Create a [Camera] from CameraX's camera info.
++         *
++         * @param mainCameraXCameraInfo The camera info of the main camera of the same side, which
++         *   the lens zoom ratio is relative to
++         */
+         fun fromCameraX(
+             cameraXCameraInfo: CameraInfo,
+             extensionsManager: ExtensionsManager,
+             overlaysRepository: OverlaysRepository,
++            mainCameraXCameraInfo: CameraInfo = cameraXCameraInfo,
+         ): Camera {
+             val cameraId = Camera2CameraInfo.from(cameraXCameraInfo).cameraId
+ 
+@@ -301,6 +340,7 @@ class Camera private constructor(
+                 logicalZoomRatios,
+                 additionalVideoFrameRates,
+                 supportedExtensionModes,
++                mainCameraXCameraInfo,
+             )
+         }
+     }
+diff --git a/app/src/main/java/org/lineageos/aperture/repositories/CameraRepository.kt b/app/src/main/java/org/lineageos/aperture/repositories/CameraRepository.kt
+index e47ac484c2c8d9ef4e3ddf8c1751872a77d53743..325b36f0b135ac7f2052927de70ac5065e1171c2 100644
+--- a/app/src/main/java/org/lineageos/aperture/repositories/CameraRepository.kt
++++ b/app/src/main/java/org/lineageos/aperture/repositories/CameraRepository.kt
+@@ -25,6 +25,7 @@ import kotlinx.coroutines.flow.shareIn
+ import org.lineageos.aperture.ext.permissionGranted
+ import org.lineageos.aperture.models.Camera
+ import org.lineageos.aperture.models.CameraFacing
++import org.lineageos.aperture.utils.LensZoomRatioUtils
+ 
+ /**
+  * Repository that provides camera devices.
+@@ -132,12 +133,26 @@ class CameraRepository(
+         }
+     }
+ 
+-    private fun List<CameraInfo>.mapToCamera() = map { it.toCamera() }.sortedBy { it.cameraId }
++    /**
++     * Map camera infos to cameras. The lens buttons of a side are relative to its main camera, the
++     * one with the lowest ID. All the external cameras are on one side.
++     */
++    private fun List<CameraInfo>.mapToCamera(): List<Camera> {
++        val mainCameraInfos = LensZoomRatioUtils.getMainCameras(
++            this,
++            { it.lensFacing },
++            { Camera2CameraInfo.from(it).cameraId },
++        )
++
++        return map { it.toCamera(mainCameraInfos.getValue(it.lensFacing)) }
++            .sortedBy { it.cameraId }
++    }
+ 
+-    private fun CameraInfo.toCamera() = Camera.fromCameraX(
++    private fun CameraInfo.toCamera(mainCameraInfo: CameraInfo) = Camera.fromCameraX(
+         this,
+         extensionsManager,
+         overlaysRepository,
++        mainCameraInfo,
+     )
+ 
+     private fun requireCameraPermission() = require(
+diff --git a/app/src/main/java/org/lineageos/aperture/repositories/OverlaysRepository.kt b/app/src/main/java/org/lineageos/aperture/repositories/OverlaysRepository.kt
+index 78d39a2ccccbdc00953e67e37f9e83ce6d430856..3318f2137b70c5a40871bbca57f4c2ea20a8588e 100644
+--- a/app/src/main/java/org/lineageos/aperture/repositories/OverlaysRepository.kt
++++ b/app/src/main/java/org/lineageos/aperture/repositories/OverlaysRepository.kt
+@@ -126,6 +126,11 @@ class OverlaysRepository(private val context: Context) {
+         a.key to a.value.toMap()
+     }.toMap()
+ 
++    /**
++     * @see R.bool.config_enableZoom
++     */
++    val enableZoom = getBoolean(R.bool.config_enableZoom)
++
+     /**
+      * @see R.bool.config_enableHighResolution
+      */
+diff --git a/app/src/main/java/org/lineageos/aperture/ui/views/LensSelectorLayout.kt b/app/src/main/java/org/lineageos/aperture/ui/views/LensSelectorLayout.kt
+index c15c0b3c19c82c85a2d1f87be6b78e0227e05ad3..bdb393649728e7c8ce415048d6a090b82b075953 100644
+--- a/app/src/main/java/org/lineageos/aperture/ui/views/LensSelectorLayout.kt
++++ b/app/src/main/java/org/lineageos/aperture/ui/views/LensSelectorLayout.kt
+@@ -72,7 +72,7 @@ class LensSelectorLayout @JvmOverloads constructor(
+                 buttonToApproximateZoomRatio[button] = approximateZoomRatio
+             }
+         } else {
+-            for (camera in availableCameras.sortedBy { it.intrinsicZoomRatio }) {
++            for (camera in availableCameras.sortedBy { it.lensZoomRatio }) {
+                 val button = inflateButton().apply {
+                     setOnClickListener {
+                         if (!isSelected) {
+@@ -81,12 +81,12 @@ class LensSelectorLayout @JvmOverloads constructor(
+                             onResetZoomRatioCallback()
+                         }
+                     }
+-                    text = formatZoomRatio(camera.intrinsicZoomRatio)
++                    text = formatZoomRatio(camera.lensZoomRatio)
+                 }
+ 
+                 addView(button)
+                 buttonToCamera[button] = camera
+-                buttonToApproximateZoomRatio[button] = camera.intrinsicZoomRatio
++                buttonToApproximateZoomRatio[button] = camera.lensZoomRatio
+             }
+         }
+ 
+diff --git a/app/src/main/java/org/lineageos/aperture/utils/LensZoomRatioUtils.kt b/app/src/main/java/org/lineageos/aperture/utils/LensZoomRatioUtils.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..364736a6508c7b9ef84b18b030d2aee8072c9803
+--- /dev/null
++++ b/app/src/main/java/org/lineageos/aperture/utils/LensZoomRatioUtils.kt
+@@ -0,0 +1,79 @@
++/*
++ * SPDX-FileCopyrightText: The LineageOS Project
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++package org.lineageos.aperture.utils
++
++import kotlin.math.abs
++
++/**
++ * Zoom ratios of lenses, as their lens buttons show them.
++ */
++object LensZoomRatioUtils {
++    /**
++     * The ratios a phone's lens buttons usually carry.
++     */
++    private val LABEL_RATIOS = floatArrayOf(0.5f, 1f, 2f, 2.5f, 3f, 4f, 5f)
++
++    /**
++     * How far a ratio may lie from a label ratio and still take it, relative to the label ratio.
++     */
++    private const val LABEL_TOLERANCE = 0.2f
++
++    /**
++     * Get the zoom ratio of a lens to the main lens, for its lens button.
++     *
++     * The focal length over the diagonal of the sensor is the 35 mm-equivalent focal length up
++     * to a factor that is the same for every camera, so the quotient of two of them is the
++     * ratio of the equivalent focal lengths. The result is snapped to the nearest label ratio
++     * when it lies within the tolerance of it.
++     *
++     * @param focalLengthPerDiagonal The focal length of the lens over the diagonal of its sensor
++     * @param mainFocalLengthPerDiagonal The same for the main lens
++     * @return The ratio, or null if either value is unknown
++     */
++    fun getZoomRatio(
++        focalLengthPerDiagonal: Float?,
++        mainFocalLengthPerDiagonal: Float?,
++    ): Float? {
++        if (
++            focalLengthPerDiagonal == null || mainFocalLengthPerDiagonal == null
++            || !focalLengthPerDiagonal.isFinite() || !mainFocalLengthPerDiagonal.isFinite()
++            || focalLengthPerDiagonal <= 0f || mainFocalLengthPerDiagonal <= 0f
++        ) {
++            return null
++        }
++
++        return snapToLabelRatio(focalLengthPerDiagonal / mainFocalLengthPerDiagonal)
++    }
++
++    /**
++     * Get the main camera of each side: of the cameras that face the same way, the one with the
++     * lowest ID. The external cameras all face the same side, so they share one main camera.
++     *
++     * @param cameras The cameras
++     * @param side The side a camera faces
++     * @param cameraId The ID of a camera
++     * @return The main camera of each side
++     */
++    fun <T, S> getMainCameras(
++        cameras: Collection<T>,
++        side: (T) -> S,
++        cameraId: (T) -> String,
++    ): Map<S, T> = cameras.groupBy(side).mapValues { (_, sameSideCameras) ->
++        sameSideCameras.minBy(cameraId)
++    }
++
++    /**
++     * Snap a zoom ratio to the nearest label ratio if it lies within the tolerance of it.
++     */
++    fun snapToLabelRatio(zoomRatio: Float): Float {
++        val labelRatio = LABEL_RATIOS.minBy { abs(it - zoomRatio) }
++
++        return when (abs(labelRatio - zoomRatio) <= LABEL_TOLERANCE * labelRatio) {
++            true -> labelRatio
++            false -> zoomRatio
++        }
++    }
++}
+diff --git a/app/src/main/java/org/lineageos/aperture/viewmodels/CameraViewModel.kt b/app/src/main/java/org/lineageos/aperture/viewmodels/CameraViewModel.kt
+index 2fc11c2d11fde1771722fae5079ba8a42033a19a..bc83de246e4288742eb3a6288bd4e66623dbefc4 100644
+--- a/app/src/main/java/org/lineageos/aperture/viewmodels/CameraViewModel.kt
++++ b/app/src/main/java/org/lineageos/aperture/viewmodels/CameraViewModel.kt
+@@ -78,6 +78,7 @@ import org.lineageos.aperture.models.DistortionCorrectionMode
+ import org.lineageos.aperture.models.EdgeMode
+ import org.lineageos.aperture.models.Event
+ import org.lineageos.aperture.models.FlashMode
++import org.lineageos.aperture.models.GestureAction
+ import org.lineageos.aperture.models.GridMode
+ import org.lineageos.aperture.models.HardwareKey
+ import org.lineageos.aperture.models.HotPixelMode
+@@ -139,7 +140,16 @@ class CameraViewModel(application: Application) : ApertureViewModel(application)
+     /**
+      * CameraX's [LifecycleCameraController].
+      */
+-    val cameraController = LifecycleCameraController(applicationContext)
++    val cameraController = LifecycleCameraController(applicationContext).apply {
++        isPinchToZoomEnabled = overlaysRepository.enableZoom
++    }
++
++    /**
++     * Whether the user can zoom freely.
++     *
++     * @see org.lineageos.aperture.repositories.OverlaysRepository.enableZoom
++     */
++    val enableZoom = overlaysRepository.enableZoom
+ 
+     /**
+      * Mutex used to rebind the camera.
+@@ -1568,7 +1578,11 @@ class CameraViewModel(application: Application) : ApertureViewModel(application)
+     /**
+      * Reset the zoom to 1.0x (value relative to the lens, not of the FOV).
+      */
+-    fun resetZoom() = smoothZoom(1f)
++    fun resetZoom() {
++        if (enableZoom) {
++            smoothZoom(1f)
++        }
++    }
+ 
+     /**
+      * Zoom in by a power of 2.
+@@ -1594,9 +1608,20 @@ class CameraViewModel(application: Application) : ApertureViewModel(application)
+ 
+     fun getHardwareKeyAction(
+         hardwareKey: HardwareKey,
+-    ) = preferencesRepository.hardwareKeyActionPreferences[
+-        hardwareKey
+-    ]?.value ?: hardwareKey.defaultAction
++    ): GestureAction {
++        val gestureAction = preferencesRepository.hardwareKeyActionPreferences[
++            hardwareKey
++        ]?.value ?: hardwareKey.defaultAction
++
++        return when {
++            enableZoom || gestureAction != GestureAction.ZOOM -> gestureAction
++
++            // A stored Zoom action is ignored when the user can't zoom
++            hardwareKey.defaultAction != GestureAction.ZOOM -> hardwareKey.defaultAction
++
++            else -> GestureAction.NOTHING
++        }
++    }
+ 
+     fun getHardwareKeyInvert(
+         hardwareKey: HardwareKey,
+diff --git a/app/src/main/res/values/config.xml b/app/src/main/res/values/config.xml
+index 72cd4c7ca3860f87ee7cb0441862389f72291303..33645a4587c9b5211bdea7df1856378a4fc54069 100644
+--- a/app/src/main/res/values/config.xml
++++ b/app/src/main/res/values/config.xml
+@@ -82,6 +82,11 @@
+         <!-- No configuration by default. -->
+     </string-array>
+ 
++    <!-- Whether the user can zoom freely: pinch to zoom, the zoom slider and the Zoom action of
++         the hardware keys. When false, the lens buttons are the only way to change the field of
++         view, and tapping the active one does nothing. -->
++    <bool name="config_enableZoom">true</bool>
++
+     <!-- Whether we should use high resolution output size or not.
+          See: StreamConfigurationMap.getHighResolutionOutputSizes() for more info. -->
+     <bool name="config_enableHighResolution">true</bool>

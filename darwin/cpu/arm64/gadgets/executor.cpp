@@ -1,10 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "executor.hpp"
+#if UML_AOT
+#include "cpu/arm64/aot/aot_runtime.hpp"
+#if UML_AOT_DIAGNOSTICS
+#include "cpu/arm64/aot/aot_diagnostics.hpp"
+#endif
+#endif
 
 #include "cpu/arm64/aarch32/breakpoint_immediate.hpp"
 #include "cpu/arm64/aarch32/guest_fetch.hpp"
 #include "cpu/arm64/aarch32/guest_key.hpp"
 #include "cpu/arm64/aarch32/guest_validation.hpp"
+#include "cpu/arm64/code_synchronization.hpp"
 #include "cpu/arm64/detail/floating_exception.hpp"
 #include "cpu/arm64/gadgets/a32/a32_builder.hpp"
 #include "cpu/gadget_body_arena.hpp"
@@ -75,7 +82,7 @@ constexpr std::size_t maximum_t32_validation_units =
  * is kept as it is; an AArch32 key keeps its 34 significant low bits under
  * two flags in the bits a PC of that width never uses, so no two canonical
  * keys share a compact form. A key outside both has none: it tags to a value
- * no slot holds, which is a miss. */
+ * no slot holds, which is a miss, and its translation is never stored. */
 constexpr std::uint64_t tag_key_mask =
 	(std::uint64_t{1} << gadget_cache::tag_owner_shift) - 1U;
 constexpr unsigned a64_key_bits = 47;
@@ -420,6 +427,11 @@ static_assert(std::is_trivially_destructible_v<Body>,
 static_assert(sizeof(Body) == 16 &&
 	sizeof(Body) % alignof(std::uintptr_t) == 0,
 	"the stream tail follows the body at pointer alignment");
+static_assert(sizeof(Body) == arm64::gadgets::block_header_bytes &&
+	offsetof(Body, guest_address) == 0 &&
+	offsetof(Body, instruction_count) ==
+		arm64::gadgets::block_header_count,
+	"a body is the header in front of the words its link record names");
 static_assert(maximum_t32_validation_units < 0x100U,
 	"a T32 translation's halfword count fits the narrow field");
 static_assert(block_instruction_count < 0xffU,
@@ -430,32 +442,27 @@ static_assert(block_instruction_count < 0xffU,
  * another's translation. Each address space therefore owns its own records,
  * which also keeps the key a single word.
  *
- * Translated code follows `link` with one `ldp` of its stream and count while
- * other vCPUs of the address space may retarget it, so the pair sits on a
- * sixteen-byte boundary and is only ever written whole (store_pair). An
- * unlinked record's stream is the link_exit word right in front of it, which
- * link_exit runs with its stream two words before the PC. Records are carved
- * thirty-two bytes apart, so that word is the last of the record before, or for
- * a chunk's first record the last of the chunk's prefix: each record's last
- * word holds link_exit for the next, and a released record keeps it. Only what
- * generated code reads is in the record; what the cache alone needs, the body
- * a miss may adopt and whether the record is listed, is its companion (see
- * gadget_cache::StableRecordTable).
+ * Translated code follows `link` with one `ldp` of its pair, the first entry
+ * of the body linked to and the stream behind it, while other vCPUs of the
+ * address space may retarget it, so the pair sits on a sixteen-byte boundary
+ * and is only ever written whole (store_pair). The count and the retirement
+ * PC come from the header in front of the stream: the body's own, or for an
+ * unlinked record, which names link_exit and its own stream word, the
+ * record's. Only what generated code reads is in the record; what the cache
+ * alone needs, the body a miss may adopt and whether the record is listed, is
+ * its companion (see gadget_cache::StableRecordTable).
  */
 struct alignas(16) LinkRecord final {
 	explicit LinkRecord(std::uint64_t pc) noexcept
-		: link{
-			.stream = fallback(),
-			.instruction_count = 0,
-			.guest_pc = pc,
-		  },
-		  next_fallback{exit_word()}
+		: link{.guest_pc = pc, .entry = exit_word()}
 	{
+		link.stream = arm64::gadgets::unlinked_stream(link);
 	}
 
 	void reset() noexcept
 	{
-		store_pair(&link, word_of(fallback()), 0);
+		store_pair(&link.entry, exit_word(),
+			word_of(arm64::gadgets::unlinked_stream(link)));
 	}
 
 	/* Retarget the record at a stored body. Its words were written before
@@ -463,19 +470,13 @@ struct alignas(16) LinkRecord final {
 	void link_to(const Body &body) noexcept
 	{
 		std::atomic_thread_fence(std::memory_order_release);
-		store_pair(&link, word_of(body.link_entry()),
-			body.instruction_count);
+		store_pair(&link.entry, *body.link_entry(),
+			word_of(body.link_entry() + 1));
 	}
 
 	[[nodiscard]] bool names(const Body &body) const noexcept
 	{
-		return link.stream == body.link_entry();
-	}
-
-	/* An unlinked record's stream: the word in front of it, link_exit. */
-	[[nodiscard]] const std::uintptr_t *fallback() const noexcept
-	{
-		return reinterpret_cast<const std::uintptr_t *>(this) - 1;
+		return link.stream == body.link_entry() + 1;
 	}
 
 	[[nodiscard]] static std::uintptr_t exit_word() noexcept
@@ -485,20 +486,6 @@ struct alignas(16) LinkRecord final {
 	}
 
 	arm64::gadgets::BlockLink link;
-	/* The next record's fallback, link_exit, whatever that record holds. */
-	std::uintptr_t next_fallback;
-
-	/* The chunk's prefix ends in its first record's fallback. */
-	static constexpr std::size_t chunk_prefix = 16;
-	static void prepare_chunk(std::byte *storage) noexcept
-	{
-		const auto word = exit_word();
-		std::memcpy(storage + chunk_prefix - sizeof(word), &word,
-			sizeof(word));
-	}
-	/* A released record keeps its next record's fallback. */
-	static constexpr std::size_t cleared_bytes =
-		sizeof(arm64::gadgets::BlockLink);
 
 	/* The newest body stored for this PC that some slot still holds, which
 	 * another executor's miss may adopt instead of translating, with bit 0
@@ -531,14 +518,9 @@ struct alignas(16) LinkRecord final {
 	};
 };
 
-static_assert(offsetof(LinkRecord, link) == 0 &&
-	offsetof(LinkRecord, next_fallback) ==
-		sizeof(arm64::gadgets::BlockLink) &&
-	sizeof(LinkRecord) == 32 &&
-	LinkRecord::chunk_prefix % alignof(LinkRecord) == 0,
-	"link_exit reads the PC two words past its stream word, the stream and "
-	"count are one aligned pair, and each record ends in the next one's "
-	"fallback");
+static_assert(offsetof(LinkRecord, link) == 0 && sizeof(LinkRecord) == 32 &&
+	offsetof(arm64::gadgets::BlockLink, entry) % 16 == 0,
+	"a record is its BlockLink, whose pair is one aligned access");
 
 struct LinkKey final {
 	[[nodiscard]] std::uint64_t operator()(
@@ -579,12 +561,8 @@ struct IndirectKey final {
  * each executor is made. */
 [[nodiscard]] bool shared_bodies_enabled() noexcept
 {
-#ifdef UML_APP_STORE_RUNTIME
-	return true;
-#else
 	const char *value = std::getenv("DARWIN_UML_GADGET_SHARED_BODIES");
 	return value == nullptr || std::strcmp(value, "0") != 0;
-#endif
 }
 
 /* A shared address space whose arena holds at least this many bytes that no
@@ -598,6 +576,7 @@ std::atomic<std::size_t> stress_renewal_floor{renewal_floor_bytes};
 std::atomic<unsigned> stress_renewal_period{64};
 std::atomic<std::size_t> stress_live_spaces{};
 std::atomic<std::uint64_t> stress_closes{};
+std::atomic<std::uint64_t> stress_limbo_pushes{};
 #endif
 
 [[nodiscard]] inline std::size_t renewal_floor() noexcept
@@ -684,8 +663,9 @@ public:
 	Space(const Space &) = delete;
 	Space &operator=(const Space &) = delete;
 
-	/* The unreachable guest PC an untrained indirect cell names; guest
-	 * targets are admitted only word-aligned, so none can collide. */
+	/* The vacant key an untrained indirect cell names, with a safe unlinked
+	 * fallback link beside it. A guest can branch there: no block begins at
+	 * it, since guest targets are admitted only word-aligned. */
 	static constexpr std::uint64_t empty_pc = ~std::uint64_t{};
 
 	[[nodiscard]] const SpaceKey &key() const noexcept { return key_; }
@@ -722,10 +702,37 @@ public:
 		return account_.shedding();
 	}
 
+	/* Whether no executor will run this space again once those holding it
+	 * have let go of it, which is certain for one that is private to its
+	 * cache, closed, or being shed, and stays so: none of these ever clears,
+	 * and a closed or shed space is not handed out again (SpaceRegistry).
+	 * Its storage goes with its last holder, so what an executor that lets go
+	 * of it does to tell the space about each body is lost on it: it has no
+	 * later use for a record, a held-bytes figure or a limbo. */
+	[[nodiscard]] bool doomed() const noexcept
+	{
+		return key_.owner != nullptr || closed() || shedding();
+	}
+
 	/* What the space charges the budget. */
 	[[nodiscard]] std::size_t charged() const noexcept
 	{
 		return account_.bytes();
+	}
+
+	/* An executor entered or switched to this address space in `epoch`:
+	 * the budget asks the spaces that ran least to shed first. */
+	void ran(std::uint64_t epoch) noexcept
+	{
+		account_.ran(epoch);
+	}
+
+	/* How the asking executor's window sees this address space at epoch
+	 * `now` (gadget_cache::place_use()). */
+	[[nodiscard]] gadget_cache::PlaceUse use(std::uint64_t now) const
+	{
+		return gadget_cache::place_use(attached_, account_, closed(),
+			now);
 	}
 
 #if UML_GADGET_SWEEP_STRESS
@@ -802,7 +809,7 @@ public:
 	{
 		train_target(target_pc, target);
 		/* Training is the only thing C++ does to move a site off its
-		 * empty cells, and empty_pc is unreachable as a guest target, so
+		 * empty cells, and empty_pc is never a trained target, so
 		 * a site still holding two empty cells is untrained since its
 		 * last reset -- which makes this the transition that enrols it.
 		 * Translated code trains cells too, without enrolling; such a
@@ -916,6 +923,9 @@ public:
 		 * them in limbo. */
 		if (record != nullptr && record->names(*body))
 			record->reset();
+#if UML_GADGET_SWEEP_STRESS
+		stress_limbo_pushes.fetch_add(1, std::memory_order_relaxed);
+#endif
 		limbo_.push(body);
 	}
 
@@ -933,7 +943,8 @@ public:
 		const auto number = known != 0 ? known :
 			shard.links.try_emplace_number(pc, pc).first;
 		auto *record = shard.links.record_at(number);
-		assert(record->link.guest_pc == pc);
+		/* A follow that exits reports the body's PC as the record's. */
+		assert(record->link.guest_pc == pc && body.guest_address == pc);
 		if (gate_.load(std::memory_order_seq_cst) != changes)
 			return {number, &record->link};
 		/* Only an activation links a record, and it lists the record
@@ -1499,7 +1510,9 @@ public:
 			for (auto &slot : slab->slots) {
 				if (slot.body() == nullptr)
 					continue;
-				space_of(slot).release(slot.body(), false);
+				auto &space = space_of(slot);
+				if (!space.doomed())
+					space.release(slot.body(), false);
 				slot.vacate();
 			}
 		}
@@ -1717,11 +1730,21 @@ public:
 		window_.current = nullptr;
 		auto &state = current();
 		touch(generation);
+		/* A switch to the address space is a run in it. */
+		state.space->ran(gadget_cache::epoch());
 		if (state.changes == changes)
 			return;
 		state.space->observe(changes);
 		state.changes = changes;
 		advance_epoch(state);
+	}
+
+	/* An executor enters translated code in the address space last bound,
+	 * in `epoch`. Nothing is bound after the space was let go of. */
+	void note_run(std::uint64_t epoch) noexcept
+	{
+		if (window_.current != nullptr)
+			window_.current->space->ran(epoch);
 	}
 
 	[[nodiscard]] std::optional<BuildResult> find(
@@ -1985,10 +2008,13 @@ public:
 		/* The stored translation is as current as the address space's
 		 * code is, which prepare() has been told. */
 		assert(state.changes == changes);
-		[[maybe_unused]] const auto tag = tag_of(pc);
-		/* Nothing is stored under a key with no compact form: such a
-		 * key names no fetchable code. */
-		assert(tag != unmatchable_tag);
+		const auto tag = tag_of(pc);
+		/* Nothing is stored under a key with no compact form, which no
+		 * slot can name. The callers build such a key unlinked and run
+		 * it once (build_uncached()), so this only refuses one that
+		 * arrives anyway: the copy it hands back owns its words. */
+		if (tag == unmatchable_tag)
+			return result;
 		auto *body = state.space->publish(result, validation,
 			arm64::aarch32::key_isa(pc));
 #if UML_GADGET_CACHE_CENSUS
@@ -2016,8 +2042,8 @@ public:
 		if (state.space->sweep_due())
 			sweep(state, diagnostics);
 		renew_if_due(*state.space);
-		/* Past the budget, the largest spaces are asked to shed; their
-		 * executors let go of them at their next entry. */
+		/* Past the budget, the spaces the guest runs least are asked to
+		 * shed; their executors let go of them at their next entry. */
 		if (gadget_cache::over_budget())
 			gadget_cache::relieve();
 		return slot.body()->result();
@@ -2042,14 +2068,16 @@ public:
 	}
 
 	/* Let go of every address space held here that has been closed, as the
-	 * window lets go of the least recently used one, and, with `dead`, of
-	 * every one whose generation the MMU has destroyed since the caller last
-	 * looked. A destroyed generation never runs again, so nothing it holds
-	 * can be looked up again. A closed space's generation leaves the window's
+	 * window lets go of the one it retires, and, with `dead`, of every one
+	 * whose generation the MMU has destroyed since the caller last looked.
+	 * A destroyed generation never runs again, so nothing it holds can be
+	 * looked up again. A closed space's generation leaves the window's
 	 * order; a destroyed one's number keeps its place in it as a tombstone,
-	 * which holds nothing and which the least-recently-used rule retires when
-	 * it reaches it, so the window keeps the live address spaces it would
-	 * have kept. Say whether the one last prepared was among those let go of.
+	 * which holds nothing and which the window retires in its turn, or
+	 * sooner in place of an address space another executor is running
+	 * (GenerationWindow::victim()), so the window keeps the live address
+	 * spaces it would have kept. Say whether
+	 * the one last prepared was among those let go of.
 	 * The caller runs no translated code of this cache from before this call
 	 * until after the next prepare(), which it must therefore make: a retired
 	 * space's successor is attached there, at the address space's current
@@ -2091,6 +2119,16 @@ public:
 			retire(generation, tombstone);
 		}
 		return left_current;
+	}
+
+	/* Whether an address space held here is closed or being shed, which
+	 * leave_gone() would let go of. */
+	[[nodiscard]] bool holds_gone() const noexcept
+	{
+		for (const auto &[generation, state] : window_.generations)
+			if (state.space->closed() || state.space->shedding())
+				return true;
+		return false;
 	}
 
 private:
@@ -2266,6 +2304,19 @@ private:
 	 * storing, so this is proportional to what it owned rather than to the
 	 * size of the cache.
 	 *
+	 * A space that is doomed (Space::doomed()) is let go of by emptying the
+	 * slots alone: nothing will run it again once its holders have let go,
+	 * and its storage goes with the last of them, so the cost of telling it
+	 * about each body (a lock, a hash probe, an atomic, a push to limbo, for
+	 * every body, behind the locks of every other executor doing the same)
+	 * buys nothing. The bodies stay as they are for the executors still
+	 * running the space, which may adopt one this cache held or release the
+	 * slot of one it shares; a count of holders above the slots that hold it
+	 * only keeps the body until the space goes. A space still open is let
+	 * go of body by body: it may stay in use and have its arena renewed,
+	 * which counts the bodies released. A generation the MMU destroyed is
+	 * never entered again, so its space is let go of like a doomed one.
+	 *
 	 * The generation's number leaves the window's order unless `tombstone`
 	 * keeps its place there (leave_gone). A number in the order that names
 	 * no address space is such a tombstone: retiring it only drops the
@@ -2278,26 +2329,27 @@ private:
 			return;
 		}
 		const auto id = owner->second.id;
+		auto *space = owner->second.space;
+		/* Everything that can fail comes before anything changes,
+		 * so that a failure leaves the address space held and
+		 * retirable again. */
+		window_.reserve_id();
+		const bool doomed = tombstone || space->doomed();
 		if (owner->second.slots_complete) {
 			for (const auto index : owner->second.slots)
-				release(slot_at(index), id);
+				release(slot_at(index), id, doomed);
 		} else {
 			for (auto &slab : slabs_) {
 				if (!slab)
 					continue;
 				for (auto &slot : slab->slots)
-					release(slot, id);
+					release(slot, id, doomed);
 			}
 		}
 		if (link_memo_)
 			for (auto &entry : *link_memo_)
 				if (entry.generation == generation)
 					entry = {};
-		auto *space = owner->second.space;
-		/* Everything that can fail comes before anything changes,
-		 * so that a failure leaves the address space held and
-		 * retirable again. */
-		window_.reserve_id();
 		/* Letting go of its slots may have left a shared space
 		 * mostly freed arena. This cache still holds the space,
 		 * which is what makes it safe to close. */
@@ -2320,7 +2372,10 @@ private:
 			SpaceRegistry::instance().close(&space);
 	}
 
-	void release(Slot &slot, std::uint16_t owner)
+	/* Let go of the translation in `slot` if it is one of the address space
+	 * `owner`'s: the slot is emptied and, unless the space is `doomed`
+	 * (retire()), the space is told. */
+	void release(Slot &slot, std::uint16_t owner, bool doomed)
 	{
 		if (slot.body() == nullptr || slot.owner() != owner)
 			return;
@@ -2329,7 +2384,8 @@ private:
 			body_digest(*slot.body()), body_bytes(*slot.body()),
 			census::Departure::retired);
 #endif
-		space_of(slot).release(slot.body(), false);
+		if (!doomed)
+			space_of(slot).release(slot.body(), false);
 		slot.vacate();
 	}
 
@@ -2411,8 +2467,9 @@ private:
 
 	/* The address space translation is currently running in, bound to its
 	 * space -- made, or shared with the other executors running it -- on
-	 * first sight, when the least recently current one beyond the resident
-	 * bound is retired.
+	 * first sight, when one beyond the resident bound is retired: the least
+	 * recently current, unless another executor is running it (the
+	 * window's victim()).
 	 *
 	 * prepare() sets this on every switch, but its caller may skip the call
 	 * when nothing changed, and on the very first entry there is nothing to
@@ -2437,12 +2494,19 @@ private:
 				},
 				state.changes, announcement_);
 			touch(window_.current_generation);
+			/* A place goes to make room: the least recently
+			 * current, unless another executor is running it,
+			 * which retiring here would free the code of
+			 * (GenerationWindow::victim()). */
 			window_.trim([this](unsigned long generation) {
 #if UML_GADGET_CACHE_CENSUS
 				if (!window_.generations.contains(generation))
 					++lru_tomb_;
 #endif
 				retire(generation);
+			},
+			[now = gadget_cache::epoch()](const Generation &held) {
+				return held.space->use(now);
 			});
 		}
 		window_.bind(*window_.current);
@@ -2544,7 +2608,9 @@ private:
 		}
 		/* The activation finds the record in the running address space,
 		 * which may not be the one that held the slot until now. */
-		slot.tag = tag_of(pc);
+		const auto tag = tag_of(pc);
+		assert(tag != unmatchable_tag);
+		slot.tag = tag;
 		slot.hold(body, window_.current_epoch);
 		activate(pc, slot);
 		return slot;
@@ -2558,6 +2624,10 @@ private:
 		StaticGuestMemory &memory, void *execution_context,
 		GadgetCacheDiagnostics &diagnostics)
 	{
+		/* No executor stored a key with no compact form, so no space
+		 * indexes a body for it. */
+		if (compact_tag_key(pc) == unmatchable_tag)
+			return std::nullopt;
 		auto &space = this->space();
 		auto *body = space.hold_indexed(pc);
 		if (body == nullptr)
@@ -2840,17 +2910,57 @@ private:
 	std::array<std::uint8_t, set_count> next_replacement_{};
 };
 
+#if UML_AOT
+struct GadgetExecutor::AotState final {
+	/* The one-instruction programs of the instructions rewritten code left
+	 * to the engine, by address; a program is a function of the address and
+	 * the instruction word alone. */
+	struct StepSlot final {
+		std::uint64_t pc{1};
+		std::uint32_t word{};
+		std::unique_ptr<arm64::gadgets::BuildResult> built;
+	};
+	static constexpr std::size_t step_slots = 2048;
+	arm64::aot::Binder binder;
+	std::array<StepSlot, step_slots> steps{};
+	/* The address of the last instruction the engine ran for rewritten code
+	 * and that faulted (1: none). The guest resumes at it once the fault is
+	 * handled, and the engine runs it again: a copy into fresh memory
+	 * faults once per page, and entering rewritten code at each resume costs
+	 * more than the page's copy. */
+	std::uint64_t retry_pc{1};
+	/* How many entries in a row at an address retired fewer instructions
+	 * than aot_short_entry, by address. */
+	struct ShortSlot final {
+		std::uint64_t pc{1};
+		std::uint8_t streak{};
+		std::uint8_t skipped{};
+	};
+	static constexpr std::size_t short_slots = 4096;
+	std::array<ShortSlot, short_slots> shorts{};
+	/* The learning_epoch retry_pc and shorts were learned in. */
+	std::uint64_t learning_epoch{};
+};
+#else
+struct GadgetExecutor::AotState final {};
+#endif
+
 GadgetExecutor::GadgetExecutor(arm64::gadgets::BuildOptions build_options)
 	: build_options_{build_options},
 	  sampling_{diagnostics::guest_sampling_register(*this)}
 {
 	tlb_.unaligned_atomics =
 		build_options_.host_capabilities.has(ArmFeature::lse2);
+#if UML_AOT
+	aot_selected_ = arm64::aot::enabled();
+#endif
 	/* Executors running one address space share its translations when
 	 * sharing is enabled, the host retargets a link pair in one access, and
 	 * a reclaimer can see whether this executor is running translated
 	 * code. */
 	announcement_ = acquire_announcement();
+	if (announcement_ != nullptr)
+		renew_ = &announcement_->renew;
 	share_translations_ = announcement_ != nullptr &&
 		build_options_.host_capabilities.has(ArmFeature::lse2) &&
 		shared_bodies_enabled();
@@ -2900,7 +3010,8 @@ constexpr std::uint64_t unprepared_changes = ~std::uint64_t{};
 } // namespace
 
 /* Let go of the address spaces another executor closed because they held
- * mostly freed arena (Space::renewal_due), and, when the MMU has destroyed a
+ * mostly freed arena (Space::renewal_due) or the budget asked to shed
+ * (Account::start_shedding), and, when the MMU has destroyed a
  * generation since this executor last looked, of those whose generation it
  * destroyed, which no vCPU can enter again. This executor runs no translated
  * code here, and its return ring empties at the first select_cpu() of the
@@ -2915,6 +3026,7 @@ void GadgetExecutor::leave_gone_spaces(std::uint64_t retirements) noexcept
 		announcement_->renew.exchange(false, std::memory_order_acquire);
 	if (!dead && !closed)
 		return;
+	renewal_stuck_ = false;
 	retirements_seen_ = retirements;
 	try {
 		if (programs_->leave_gone(dead)) {
@@ -2926,12 +3038,34 @@ void GadgetExecutor::leave_gone_spaces(std::uint64_t retirements) noexcept
 				mode.generation = no_generation;
 				mode.changes = unprepared_changes;
 			}
+		/* The closes above asked every executor attached to a space, this
+		 * one among them, to let go of it, though it has. The ask is
+		 * cleared and made again only if a space held here is still closed
+		 * or being shed, as another executor's close may have made it since:
+		 * it closes the space before it asks, so the check after the clear
+		 * finds it. Otherwise the next run would end at its first block for
+		 * an ask this run answered (renewal_pending()). */
+		if (announcement_ != nullptr) {
+			(void)announcement_->renew.exchange(false,
+				std::memory_order_acq_rel);
+			bool again = programs_->holds_gone();
+			for (const auto &mode : sme_caches_)
+				again = again || (mode.programs &&
+					mode.programs->holds_gone());
+			if (again)
+				announcement_->renew.store(true,
+					std::memory_order_relaxed);
+		}
 	} catch (...) {
 		/* Out of memory part way, so some may still be held: ask again at
 		 * the next entry, and prepare afresh meanwhile, since the one last
-		 * prepared may be among those let go of. */
-		if (announcement_ != nullptr)
+		 * prepared may be among those let go of. The ask stands, so the
+		 * runs do not end early for it (renewal_pending()) until a let-go
+		 * succeeds. */
+		if (announcement_ != nullptr) {
 			announcement_->renew.store(true, std::memory_order_relaxed);
+			renewal_stuck_ = true;
+		}
 		retirements_seen_ = retirements - 1U;
 		cache_generation_ = no_generation;
 		cache_changes_ = unprepared_changes;
@@ -2960,9 +3094,26 @@ bool GadgetExecutor::begin_execution(unsigned long generation,
 		return false;
 	if (announcement_ != nullptr)
 		announce_entry(*announcement_);
+	note_run(generation);
 	if (sampling_ != nullptr)
 		diagnostics::guest_sampling_enter(*sampling_);
 	return true;
+}
+
+/* An entry is a run in the address space this executor last prepared, when
+ * that is the one entered; a switch to another is stamped when the run
+ * prepares (ProgramCache::prepare). The stamp is one read of the host's
+ * counter and a load of the account's in each cache that holds the address
+ * space. */
+void GadgetExecutor::note_run(unsigned long generation) noexcept
+{
+	const auto epoch = gadget_cache::epoch();
+	if (cache_generation_ == generation)
+		programs_->note_run(epoch);
+	if (sme_caches_made_) [[unlikely]]
+		for (auto &mode : sme_caches_)
+			if (mode.programs && mode.generation == generation)
+				mode.programs->note_run(epoch);
 }
 
 void GadgetExecutor::end_execution() noexcept
@@ -3051,6 +3202,18 @@ std::optional<BuildResult> GadgetExecutor::find(
 
 namespace {
 
+/* The translation of a key no slot can name (compact_tag_key), built for one
+ * run: unlinked, so that it makes no link record or indirect site in its
+ * address space, which nothing would ever sweep or charge against the budget,
+ * and in memory of its own, which its caller drops with it. */
+[[nodiscard]] BuildResult build_uncached(std::uint64_t pc,
+	std::span<const std::uint32_t> window,
+	const arm64::gadgets::BuildOptions &options)
+{
+	return arm64::gadgets::Builder{}.build(pc, window, {},
+		std::pmr::get_default_resource(), {}, options);
+}
+
 /* A store whose link sweep released records may have released one the return
  * ring names. The ring only predicts, so it starts again empty. */
 void forget_returns(arm64::CpuState &cpu) noexcept
@@ -3100,6 +3263,8 @@ void note_exit_histogram(GadgetCacheDiagnostics &d, Programs &programs,
 BuildResult GadgetExecutor::translate(
 	std::uint64_t pc, std::span<const std::uint32_t> window)
 {
+	if (compact_tag_key(pc) == unmatchable_tag)
+		return build_uncached(pc, window, build_options_);
 	const auto decoded = arm64::gadgets::Builder{}.build(
 		pc, window,
 		[this](std::uint64_t target) {
@@ -3165,7 +3330,9 @@ GadgetExecutor::finish_block(ProgramCache &programs, const BuildResult &built,
 	return event;
 }
 
-::uml::cpu::EngineEvent GadgetExecutor::run_block(
+template<bool Aot>
+[[gnu::always_inline]] inline ::uml::cpu::EngineEvent
+GadgetExecutor::run_block_body(
 	arm64::CpuState &cpu, StaticGuestMemory &memory, unsigned long generation,
 	std::size_t &executed)
 {
@@ -3211,6 +3378,14 @@ GadgetExecutor::finish_block(ProgramCache &programs, const BuildResult &built,
 		cpu.gadget_return_top = 0;
 	}
 	prepare_cache(generation, sequences.code_changes);
+#if UML_AOT
+	if constexpr (Aot) {
+		if (const auto aot_event = run_aot(cpu, memory, generation,
+			    sequences.code_changes, sequences.mapping_changes,
+			    executed))
+			return *aot_event;
+	}
+#endif
 	auto selected = find(cpu.pc, sequences.code_changes, memory);
 #if UML_GADGET_EXECUTION_HISTOGRAM
 	++cache_diagnostics_.block_entries;
@@ -3238,8 +3413,276 @@ GadgetExecutor::finish_block(ProgramCache &programs, const BuildResult &built,
 	const auto event =
 		arm64::gadgets::execute_preserving_native_fp_environment(
 			built.program, cpu, tlb_, executed);
+#if UML_AOT && UML_AOT_DIAGNOSTICS
+	if constexpr (Aot) {
+		const auto result = finish_block(*programs_, built, event, cpu, executed);
+		arm64::aot::diagnostics::note_engine_run(executed);
+		return result;
+	}
+#endif
 	return finish_block(*programs_, built, event, cpu, executed);
 }
+
+::uml::cpu::EngineEvent GadgetExecutor::run_block(
+	arm64::CpuState &cpu, StaticGuestMemory &memory, unsigned long generation,
+	std::size_t &executed)
+{
+	return run_block_body<false>(cpu, memory, generation, executed);
+}
+
+#if UML_AOT
+::uml::cpu::EngineEvent GadgetExecutor::run_aot_block(
+	arm64::CpuState &cpu, StaticGuestMemory &memory, unsigned long generation,
+	std::size_t &executed)
+{
+	return run_block_body<true>(cpu, memory, generation, executed);
+}
+#endif
+
+#if UML_AOT
+/* One AOT call runs at most as many instructions as the engine chains
+ * between two returns to its dispatcher, which bounds how long a vCPU goes
+ * without polling for an interrupt. */
+constexpr std::uint64_t aot_entry_budget = 4096;
+/* Entering and leaving rewritten code costs about what the engine takes for
+ * half this many instructions, and an instruction in rewritten code still
+ * costs a fraction of an engine instruction, so an entry pays only above the
+ * break-even set here (chosen from a series at 48, 96 and 192). An address
+ * whose entries keep retiring fewer is left to the engine, except for one
+ * entry in aot_short_again, which tells whether it has become worth
+ * entering. */
+constexpr std::uint64_t aot_short_entry = 96;
+constexpr std::uint8_t aot_short_streak = 2;
+constexpr std::uint8_t aot_short_again = 64;
+
+::uml::cpu::EngineEvent GadgetExecutor::step_aot(
+	arm64::CpuState &cpu, StaticGuestMemory &memory, std::size_t &executed)
+{
+	std::uint32_t instruction = 0;
+	if (!memory.fetch(cpu.pc,
+		    std::as_writable_bytes(std::span{&instruction, 1})))
+		return fetch_fault(tlb_, memory);
+	/* A transaction (guest trap enables) and the illegal encodings are
+	 * the cold path's. */
+	if (arm64::detail::needs_floating_exception_transaction(
+		    cpu.effective_fpcr(), instruction))
+		return run_trap_enabled_instruction(cpu, memory, executed);
+	auto &slot = aot_->steps[(cpu.pc >> 2) % AotState::step_slots];
+	if (slot.pc != cpu.pc || slot.word != instruction ||
+	    slot.built == nullptr) {
+		auto options = build_options_;
+		options.svcr = 0;
+		auto built = arm64::gadgets::Builder{}.build(
+			cpu.pc, std::span{&instruction, 1}, {},
+			std::pmr::get_default_resource(), {}, options);
+		if (!built.complete || built.program.instruction_count() != 1)
+			return run_trap_enabled_instruction(cpu, memory, executed);
+		slot.built = std::make_unique<arm64::gadgets::BuildResult>(
+			std::move(built));
+		slot.pc = cpu.pc;
+		slot.word = instruction;
+	}
+	const auto &program = slot.built->program;
+	cpu.gadget_indirect_miss = nullptr;
+	cpu.gadget_target_tier = nullptr;
+	arm64::gadgets::restore_native_fp_environment(cpu);
+	const auto event = arm64::gadgets::execute(program, cpu, tlb_, executed);
+	correct_terminal_instruction_count(program, event, cpu.pc, executed);
+	cpu.gadget_indirect_miss = nullptr;
+	/* A one-instruction fallthrough ends in Builder's synthetic interrupt
+	 * gadget: a cold-mode boundary, not a guest-visible one. */
+	return event == ::uml::cpu::EngineEvent::interrupt ?
+		::uml::cpu::EngineEvent::continued : event;
+}
+
+std::optional<::uml::cpu::EngineEvent> GadgetExecutor::run_aot(
+	arm64::CpuState &cpu, StaticGuestMemory &memory, unsigned long generation,
+	std::uint64_t code_changes, std::uint64_t mapping_changes,
+	std::size_t &executed)
+{
+	if (!aot_)
+		aot_ = std::make_unique<AotState>();
+	if (aot_->learning_epoch != arm64::aot::learning_epoch()) {
+		aot_->learning_epoch = arm64::aot::learning_epoch();
+		aot_->retry_pc = 1;
+		aot_->shorts.fill(AotState::ShortSlot{});
+	}
+#if UML_AOT_DIAGNOSTICS
+	namespace diag = arm64::aot::diagnostics;
+	auto give_up = diag::EngineReason::no_progress;
+	unsigned finds = 0, entries = 0;
+#endif
+	if (cpu.pc == aot_->retry_pc) {
+#if UML_AOT_DIAGNOSTICS
+		diag::note_engine_dispatch(aot_->binder, generation, cpu.pc,
+			diag::EngineReason::retry);
+		diag::note_dispatch(0, 0);
+#endif
+		return std::nullopt;
+	}
+	aot_->retry_pc = 1;
+	/* The sequences are the ones run_block read: the lookups below
+	 * validate against them, the engine's ISB compares with them
+	 * (cpu.code_sequence_seen) and the loop leaves when either has moved
+	 * since, so a change published after that read cannot go unseen. */
+	arm64::aot::note_run_start();
+	std::size_t total = 0;
+	const auto first = cpu.pc;
+	for (;;) {
+		/* An open exclusive monitor (the JIT records it in
+		 * exclusive_size, the gadget engine in exclusive_key) is the
+		 * engine's to complete. The rewritten code ignores the top
+		 * address byte, as every Android process runs with, and keeps SP
+		 * 16-byte aligned, which the engine checks for every SP-based
+		 * access; a guest that has neither is the engine's alone. */
+		if (cpu.exclusive_size != 0U || cpu.exclusive_key != 0U) {
+			arm64::aot::note_refusal(
+				arm64::aot::Refusal::exclusive_monitor);
+#if UML_AOT_DIAGNOSTICS
+			give_up = diag::EngineReason::exclusive_monitor;
+#endif
+			break;
+		}
+		if (!cpu.tbi_enabled) {
+			arm64::aot::note_refusal(arm64::aot::Refusal::tbi_disabled);
+#if UML_AOT_DIAGNOSTICS
+			give_up = diag::EngineReason::tbi_disabled;
+#endif
+			break;
+		}
+		if ((cpu.sp & 0xfU) != 0U) {
+			arm64::aot::note_refusal(arm64::aot::Refusal::sp_misaligned);
+#if UML_AOT_DIAGNOSTICS
+			give_up = diag::EngineReason::sp_misaligned;
+#endif
+			break;
+		}
+		/* FPCR.FIZ, AH and NEP change what an FP instruction computes
+		 * beyond what the host does under the same rounding mode,
+		 * flush-to-zero and default-NaN bits; the engine's twin gadgets
+		 * cover them, rewritten code does not. A state the runtime has
+		 * not loaded yet keeps its FPCR aside. */
+		if ((cpu.effective_fpcr() & arm64::fpcr_afp_controls) != 0U) {
+			arm64::aot::note_refusal(arm64::aot::Refusal::fp_environment);
+#if UML_AOT_DIAGNOSTICS
+			give_up = diag::EngineReason::fp_environment;
+#endif
+			break;
+		}
+		auto &shorty = aot_->shorts[(cpu.pc >> 2) % AotState::short_slots];
+		if (shorty.pc == cpu.pc && shorty.streak >= aot_short_streak &&
+		    ++shorty.skipped % aot_short_again != 0U) {
+			arm64::aot::note_refusal(arm64::aot::Refusal::short_entry);
+#if UML_AOT_DIAGNOSTICS
+			give_up = diag::EngineReason::short_entry;
+#endif
+			break;
+		}
+#if UML_AOT_DIAGNOSTICS
+		++finds;
+#endif
+		const auto hit = aot_->binder.find(memory, execution_context_,
+			generation, code_changes, cpu.pc);
+		if (hit.native == nullptr) {
+#if UML_AOT_DIAGNOSTICS
+			give_up = diag::find_reason();
+#endif
+			break;
+		}
+#if UML_AOT_DIAGNOSTICS
+		++entries;
+#endif
+		const auto start = cpu.pc;
+		/* Rewritten code reads and writes the vector registers in place. */
+		cpu.access_fp_state();
+		cpu.gadget_indirect_miss = nullptr;
+		const auto result = arm64::aot::enter(cpu, tlb_, hit,
+			aot_entry_budget - total,
+			aot_->binder.cross(generation, code_changes));
+		total += static_cast<std::size_t>(result.retired);
+		if (shorty.pc != start) {
+			shorty.pc = start;
+			shorty.streak = 0;
+			shorty.skipped = 0;
+		}
+		if (result.retired < aot_short_entry &&
+		    result.reason != arm64::aot::Reason::step) {
+			if (shorty.streak < 255U)
+				++shorty.streak;
+		} else {
+			shorty.streak = 0;
+		}
+		if (result.reason == arm64::aot::Reason::step) {
+			/* The engine runs the one instruction the rewritten code
+			 * left to it: it needs the guest's floating-point
+			 * environment the way a stepped instruction does, and
+			 * reports faults and system calls as any block does. */
+			std::size_t stepped = 0;
+			const auto began = arm64::aot::step_begin();
+			const auto event = step_aot(cpu, memory, stepped);
+			arm64::aot::step_end(began);
+			total += stepped;
+			if (event != ::uml::cpu::EngineEvent::continued) {
+				if (event == ::uml::cpu::EngineEvent::memory_fault)
+					aot_->retry_pc = cpu.pc;
+				executed = total;
+#if UML_AOT_DIAGNOSTICS
+				diag::note_dispatch(finds, entries);
+#endif
+				return event;
+			}
+			/* An IC IVAU at an address the address space maps nothing at
+			 * faults like a load, and the entry loop reports it at the
+			 * instruction (the one before the PC) from the note the
+			 * helper left. No instruction may run after it, or the loop
+			 * would report the fault at whatever instruction the run
+			 * stopped after. The kernel maps the page and the
+			 * instruction runs again, in the engine. */
+			if (arm64::has_unmapped_code_synchronization()) [[unlikely]] {
+				aot_->retry_pc = cpu.pc - sizeof(std::uint32_t);
+				executed = total;
+#if UML_AOT_DIAGNOSTICS
+				diag::note_dispatch(finds, entries);
+#endif
+				return ::uml::cpu::EngineEvent::continued;
+			}
+		} else if (cpu.pc == start && result.retired == 0) {
+#if UML_AOT_DIAGNOSTICS
+			give_up = diag::EngineReason::no_progress;
+#endif
+			break;
+		}
+		/* What run_block checks on entry is rechecked here before the
+		 * next entry; any change returns to it. */
+		const auto now = darwin_uml_static_vm_execution_context_sequences(
+			execution_context_);
+		if (total >= aot_entry_budget || single_step_ ||
+		    now.execution_interrupt != 0U ||
+		    now.code_changes != code_changes ||
+		    now.mapping_changes != mapping_changes ||
+		    cpu.svcr != 0U ||
+		    (cpu.effective_fpcr() &
+		     arm64::detail::fpcr_exception_enable_mask) != 0U)
+			break;
+	}
+	if (total == 0) {
+		if (cpu.pc == first) {
+#if UML_AOT_DIAGNOSTICS
+			diag::note_engine_dispatch(aot_->binder, generation, first,
+				give_up);
+			diag::note_dispatch(finds, entries);
+#endif
+			return std::nullopt;
+		}
+		total = 1;
+	}
+	executed = total;
+#if UML_AOT_DIAGNOSTICS
+	diag::note_dispatch(finds, entries);
+#endif
+	return ::uml::cpu::EngineEvent::continued;
+}
+#endif
 
 /* The SME modes' run_block. Its cache, links and target table are the
  * mode's own, so everything the program can reach was translated for the
@@ -3266,9 +3709,11 @@ GadgetExecutor::finish_block(ProgramCache &programs, const BuildResult &built,
 	if (streaming && !build_options_.host_capabilities.sme_hardware)
 		return ::uml::cpu::EngineEvent::fatal;
 	auto &state = sme_caches_[mode - 1U];
-	if (!state.programs)
+	if (!state.programs) {
 		state.programs = std::make_unique<ProgramCache>(build_options_,
 			mode, announcement_, share_translations_);
+		sme_caches_made_ = true;
+	}
 	auto &programs = *state.programs;
 	if (state.generation != generation) {
 		cpu.gadget_return_stack = {};
@@ -3297,21 +3742,25 @@ GadgetExecutor::finish_block(ProgramCache &programs, const BuildResult &built,
 		++cache_diagnostics_.translations;
 		auto options = build_options_;
 		options.svcr = mode;
-		const auto decoded = arm64::gadgets::Builder{}.build(
-			cpu.pc, window,
-			[&programs](std::uint64_t target) {
-				return programs.link(target);
-			},
-			programs.program_storage(),
-			[&programs](std::uint64_t source_pc) {
-				return programs.indirect_link(source_pc);
-			},
-			options);
-		const auto sweeps = cache_diagnostics_.link_sweeps;
-		selected.emplace(programs.store(cpu.pc, decoded, window,
-			code_changes, cache_diagnostics_));
-		if (cache_diagnostics_.link_sweeps != sweeps)
-			forget_returns(cpu);
+		if (compact_tag_key(cpu.pc) == unmatchable_tag) {
+			selected.emplace(build_uncached(cpu.pc, window, options));
+		} else {
+			const auto decoded = arm64::gadgets::Builder{}.build(
+				cpu.pc, window,
+				[&programs](std::uint64_t target) {
+					return programs.link(target);
+				},
+				programs.program_storage(),
+				[&programs](std::uint64_t source_pc) {
+					return programs.indirect_link(source_pc);
+				},
+				options);
+			const auto sweeps = cache_diagnostics_.link_sweeps;
+			selected.emplace(programs.store(cpu.pc, decoded, window,
+				code_changes, cache_diagnostics_));
+			if (cache_diagnostics_.link_sweeps != sweeps)
+				forget_returns(cpu);
+		}
 	}
 	const auto &built = *selected;
 	if (built.program.instruction_count() == 0) {
@@ -3748,6 +4197,11 @@ std::size_t live_spaces() noexcept
 std::uint64_t closes() noexcept
 {
 	return stress_closes.load(std::memory_order_relaxed);
+}
+
+std::uint64_t limbo_pushes() noexcept
+{
+	return stress_limbo_pushes.load(std::memory_order_relaxed);
 }
 
 void set_renewal_period(unsigned stores) noexcept

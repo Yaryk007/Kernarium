@@ -170,9 +170,12 @@ The x86-family syscall dispatch is generated from the pinned Linux 6.18
 entry path provides syscall-user-dispatch so Wine can interpose its NT syscall
 range. The slice's topics (the dedicated slice, i386 tasks, `/proc/cpuinfo`
 for the emulated CPU, `modify_ldt()`, CS/SS through signals, `RFLAGS.TF`
-single-step, x86 ptrace layouts, and the page-fault P bit) live only in its
-overlay because only x86 tasks have an LDT, selectors, or those layouts; the
-arm64 kernels and Android build none of them.
+single-step, x86 ptrace layouts, the page-fault P bit, and the
+`flush_dcache_folio()` hook) live only in its overlay because only x86 tasks
+have an LDT, selectors, or those layouts, and only an x86 core runs the new
+bytes of a page-cache or anonymous frame after a kernel write, where arm64 needs the
+program's own cache maintenance; the arm64 kernels and Android build none of
+them.
 
 ## Android product
 
@@ -198,9 +201,9 @@ the product sets `sys.use_memfd`, and the recovery image must set it itself.
 Boot keeps RCU grace periods expedited until it completes, as the
 [LineageOS README](../../android/lineage-24/README.md#android-product) states.
 
-Ten topics in this line's overlay change behavior only when the Android overlay
-switches them on, or only under Android's SELinux policy. Each stays out of the
-shared series because it depends on the guest OS:
+Eleven topics in this line's overlay change behavior only when the Android
+overlay switches them on, or only under Android's SELinux policy. Each stays out
+of the shared series because it depends on the guest OS:
 
 - `CONFIG_UML_VNC_INPUT_TOUCHSCREEN`: Android and its recovery treat an absolute
   pointer that reports mouse buttons as a mouse; a desktop guest needs the
@@ -217,6 +220,10 @@ shared series because it depends on the guest OS:
   groups without being root; Linux keeps upstream's check.
 - `CONFIG_FUSE_CANONICAL_PATH`: an app's `FileObserver` on shared storage needs
   FUSE to name the underlying file; desktop FUSE servers do not implement it.
+- `CONFIG_FUSE_PASSTHROUGH_ANDROID`: MediaProvider serves shared storage with
+  FUSE passthrough, the writeback cache and no `CAP_SYS_ADMIN`, and opens one
+  file both ways at once, each of which upstream refuses; a desktop FUSE server
+  keeps upstream's rules, and the option compiles the change out.
 - `CONFIG_NETFILTER_XT_MATCH_QUOTA2` and its alert option: netd's bandwidth
   controller; Linux has the per-CPU `quota` match.
 - `CONFIG_NETFILTER_XT_TARGET_IDLETIMER_NL_MSG`: netd passes `--send_nl_msg`,
@@ -227,11 +234,19 @@ shared series because it depends on the guest OS:
   nl80211 interface; a desktop guest has no Wi-Fi manager, and the code adds
   about 1.5 MB to `vmlinux` and a phy nothing uses.
 
+A game controller of the host reaches the Android guest as a uhid device, which
+the kernel's own driver binds and drives for force feedback: the Android overlay
+builds `HID_PLAYSTATION` for a DualSense or DualShock 4 and `HID_MICROSOFT` for
+an Xbox controller. Only this configuration has UHID and a relay to feed it, so
+the Linux overlay builds neither.
+
 The cgroup, FUSE, `quota2`, `IDLETIMER`, and Incremental file system topics come
 from the Android common kernel. The shared series also carries topics only the
 Android product exercises, each inert in a Linux guest: the `XFRM_SPI_PER_DESTINATION`
 option, the per-device autoconf route table (`accept_ra_rt_table`), and
-virt_wifi's off-channel operation and address-list propagation.
+virt_wifi's off-channel operation, address-list propagation, lockdep
+classes and wake-on-WLAN default, which keeps its station joined through a
+system suspend.
 
 The iOS runtime framework for this product is `KRuntime_Android_6_18_4K`;
 [Kernarium](../../Kernarium/README.md#runtimes-and-runs) owns its packaging.

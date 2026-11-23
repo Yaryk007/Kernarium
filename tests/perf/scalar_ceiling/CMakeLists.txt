@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 if(UML_TARGET_MACOS)
+    get_property(_uml_perf_static_mmu GLOBAL PROPERTY UML_STATIC_MMU_TARGET)
     add_executable(uml_scalar_ceiling_bench EXCLUDE_FROM_ALL
         bench.cpp workloads.S
-        $<TARGET_OBJECTS:uml_static_mmu>
+        $<TARGET_OBJECTS:${_uml_perf_static_mmu}>
         $<TARGET_OBJECTS:uml_arm64_gadgets>
         $<TARGET_OBJECTS:uml_arm64_aarch32_decoder>
         $<TARGET_OBJECTS:uml_arm64_aarch32_semantics>

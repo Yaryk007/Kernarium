@@ -783,6 +783,23 @@ bool host_range_kept(const void *address, std::size_t length) noexcept
 	return false;
 }
 
+bool host_range_kept_within(const void *address, std::size_t length) noexcept
+{
+	const auto begin = reinterpret_cast<std::uintptr_t>(address);
+	if (length == 0 ||
+	    begin > std::numeric_limits<std::uintptr_t>::max() - length)
+		return false;
+	const std::uintptr_t end = begin + length;
+	const std::size_t count =
+		kept_host_ranges.count.load(std::memory_order_acquire);
+	for (std::size_t index = 0; index < count; ++index) {
+		const auto &range = kept_host_ranges.ranges[index];
+		if (range.begin < end && range.end > begin)
+			return true;
+	}
+	return false;
+}
+
 void *map_shared_backing(void *address, std::size_t length,
 	int protection, int flags, int fd, std::uint64_t offset) noexcept
 {

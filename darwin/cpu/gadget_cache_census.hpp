@@ -43,23 +43,14 @@ inline constexpr std::uint64_t digest_seed = 0xcbf29ce484222325ULL;
 
 [[nodiscard]] inline const char *path() noexcept
 {
-#ifdef UML_APP_STORE_RUNTIME
-	return nullptr;
-#else
 	const char *value = std::getenv("DARWIN_UML_GADGET_CACHE_CENSUS");
 	return value != nullptr && *value != '\0' ? value : nullptr;
-#endif
 }
 
 /* Read once: a positive count of seconds, or zero. */
 [[nodiscard]] inline std::uint64_t environment_count(const char *name) noexcept
 {
-#ifdef UML_APP_STORE_RUNTIME
-	(void)name;
-	const char *value = nullptr;
-#else
 	const char *value = std::getenv(name);
-#endif
 	if (value == nullptr)
 		return 0;
 	char *end = nullptr;

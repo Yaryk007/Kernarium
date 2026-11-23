@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# The GNSS HAL runs on every device: the guest has a receiver node on every
+# device, and the HAL opens it only while the framework asks for positions.
+service vendor.gnss-andarium /vendor/bin/hw/android.hardware.gnss-service.andarium
+    interface aidl android.hardware.gnss.IGnss/default
+    class hal
+    user gps
+    group gps

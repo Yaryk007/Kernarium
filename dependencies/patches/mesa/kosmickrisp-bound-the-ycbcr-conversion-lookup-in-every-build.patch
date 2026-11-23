@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 03:24:05 +0900
+Subject: [PATCH] kosmickrisp: bound the ycbcr conversion lookup in every build
+
+lookup_ycbcr_conversion() asserted that the set, and the binding in it,
+exist in the pipeline layouts, and read the binding's immutable samplers
+through them. The asserts compile out of a release build, which then
+read past the layout's bindings for a binding it does not hold and used
+what it found as a sampler pointer.
+
+Return no conversion for a set or binding the layouts do not hold.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/kosmickrisp/vulkan/kk_shader.c | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/src/kosmickrisp/vulkan/kk_shader.c b/src/kosmickrisp/vulkan/kk_shader.c
+index cf85c52ee535220910bd324947911a2eca139aab..c8399f59c1d7874ff0a14c39b3f323efd9c05a49 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.c
++++ b/src/kosmickrisp/vulkan/kk_shader.c
+@@ -253,11 +253,17 @@ lookup_ycbcr_conversion(const void *_state, uint32_t set, uint32_t binding,
+                         uint32_t array_index)
+ {
+    const struct lower_ycbcr_state *state = _state;
+-   assert(set < state->set_layout_count);
+-   assert(state->set_layouts[set] != NULL);
++
++   /* A binding the layouts do not hold has no conversion. The bounds are
++    * checked in every build: an assert compiles out of a release build, which
++    * then reads the immutable samplers of a binding past the layout's. */
++   if (set >= state->set_layout_count || state->set_layouts[set] == NULL)
++      return NULL;
++
+    const struct kk_descriptor_set_layout *set_layout =
+       vk_to_kk_descriptor_set_layout(state->set_layouts[set]);
+-   assert(binding < set_layout->binding_count);
++   if (binding >= set_layout->binding_count)
++      return NULL;
+ 
+    const struct kk_descriptor_set_binding_layout *bind_layout =
+       &set_layout->binding[binding];

@@ -27,7 +27,8 @@ std::unique_ptr<Display> makeDisplay(
     uml::input::vnc::PointerMode pointerMode,
     std::uint32_t maximumDimension,
     bool autoResizeGuest,
-    OffscreenDisplayOptions offscreen)
+    OffscreenDisplayOptions offscreen,
+    std::uint32_t refreshRate)
 {
 #if !UML_GPU_HAS_OFFSCREEN
     (void)offscreen;
@@ -37,6 +38,9 @@ std::unique_ptr<Display> makeDisplay(
     (void)vncPort;
     (void)vncPassword;
 #endif
+    /* Only the native display of a device with a display link has a mode
+     * other than 60 Hz to give the guest. */
+    (void)refreshRate;
     switch (mode) {
     case DisplayMode::vnc:
 #if UML_GPU_HAS_VNC
@@ -60,7 +64,8 @@ std::unique_ptr<Display> makeDisplay(
             nativeView,
             pointerMode,
             maximumDimension,
-            autoResizeGuest);
+            autoResizeGuest,
+            refreshRate);
     case DisplayMode::offscreen:
 #if UML_GPU_HAS_OFFSCREEN
         return std::make_unique<NativeDisplay>(makeOffscreenDisplayState(

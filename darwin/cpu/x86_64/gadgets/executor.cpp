@@ -8,6 +8,7 @@
 #include "cpu/gadget_cache_census.hpp"
 #endif
 #include "cpu/x86_64/code_page_registry.hpp"
+#include "cpu/x86_64/registration_memo.hpp"
 
 #include "native_entry.hpp"
 #include "native_symbols.hpp"
@@ -143,6 +144,30 @@ enum class ProgramSourceComparison {
 	fault,
 };
 
+/* Calls visit(page) once for each page of the guest range `program` was read
+ * from, in order. */
+template <typename Visit>
+void for_each_program_page(const Program &program, Visit &&visit)
+{
+	auto address = program.address();
+	auto remaining = program.byte_count();
+	auto previous_page = ~std::uint64_t{};
+	while (remaining != 0) {
+		const auto page = address &
+			~std::uint64_t{DARWIN_UML_GUEST_PAGE_SIZE - 1U};
+		if (page != previous_page) {
+			visit(page);
+			previous_page = page;
+		}
+		const auto count = std::min<std::size_t>(remaining,
+			DARWIN_UML_GUEST_PAGE_SIZE -
+				(address & (DARWIN_UML_GUEST_PAGE_SIZE - 1U)));
+		remaining -= count;
+		address = advance_instruction_pointer(
+			program.execution_mode(), address, count);
+	}
+}
+
 /* A page stamp certifies only the bytes read after it was taken: a store that
  * lands later moves the stamp, and one that landed earlier is already visible
  * in the bytes. Every caller therefore takes the stamp before the source it
@@ -152,6 +177,9 @@ enum class ProgramSourceComparison {
 	void *execution_context) noexcept
 {
 	ProgramCodeStamps result;
+	/* Before the page stamps: a walk of the generation moves the serial, and
+	 * a stamp recorded under another serial never stamp-hits. */
+	result.flush_serial = memory.flush_serial(execution_context);
 	auto address = program.address();
 	auto remaining = program.byte_count();
 	auto previous_page = ~std::uint64_t{};
@@ -278,15 +306,22 @@ struct CodePageRegistries final {
 	std::shared_ptr<CodePageRegistry> current;
 	std::uint64_t current_generation{};
 	CodePageRegistry::Participant participant;
+	/* The frame registrations that settled, for the generation the executor
+	 * last prepared (Executor::prepare ends the memo's epoch at every change
+	 * of mapping and of generation). */
+	RegistrationMemo memo;
 
 	~CodePageRegistries() { unbind(); }
 
 	[[nodiscard]] CodePageRegistry &of(std::uint64_t generation)
 	{
-		auto [entry, inserted] = held.try_emplace(generation);
-		if (inserted)
-			entry->second = CodePageRegistry::acquire(generation);
-		return *entry->second;
+		if (const auto found = held.find(generation); found != held.end())
+			return *found->second;
+		/* Acquiring can throw, and nothing is entered before it returns: an
+		 * entry that stayed empty would be found, and dereferenced, by the
+		 * next ask for the generation. */
+		auto registry = CodePageRegistry::acquire(generation);
+		return *held.emplace(generation, std::move(registry)).first->second;
 	}
 
 	void bind(std::uint64_t generation)
@@ -321,6 +356,27 @@ struct CodePageRegistries final {
 	}
 };
 
+/* Registers the frame the page at `page` maps as held by this generation
+ * (register_frame), all before the caller reads a byte of the page, unless
+ * the executor's memo says the last registration of the page still stands.
+ * `serial` is the generation's flush serial, read before the call. */
+[[nodiscard]] FrameRegistration hold_frame(
+	::uml::memory::GuestAddressSpace &memory, void *execution_context,
+	CodePageRegistries *registries, std::uint64_t page, std::uint64_t serial,
+	ProgramCacheDiagnostics &diagnostics) noexcept
+{
+	if (registries != nullptr && registries->memo.holds(memory, page, serial)) {
+		++diagnostics.registration_memo_hits;
+		return FrameRegistration::settled;
+	}
+	++diagnostics.holder_registrations;
+	const auto outcome = register_frame(memory, execution_context,
+		registries != nullptr ? &registries->participant : nullptr, page);
+	if (registries != nullptr)
+		registries->memo.remember(page, serial, outcome);
+	return outcome.status;
+}
+
 /* Holds a translation's possible pages in the registry while their bytes are
  * read, so any store another executor has already translated for them lands
  * first. A cached program is at most maximum_cached_source_bytes long, so a
@@ -329,7 +385,9 @@ struct CodePageRegistries final {
  * pages the program turns out to cover. */
 class CodePageHold final {
 public:
-	CodePageHold(CodePageRegistries *registries, std::uint64_t address,
+	CodePageHold(CodePageRegistries *registries,
+		::uml::memory::GuestAddressSpace &memory, void *execution_context,
+		ProgramCacheDiagnostics &diagnostics, std::uint64_t address,
 		ExecutionMode mode) noexcept
 	{
 		pages_[count_++] = address &
@@ -341,11 +399,23 @@ public:
 			~std::uint64_t{DARWIN_UML_GUEST_PAGE_SIZE - 1U};
 		if (last != pages_[0])
 			pages_[count_++] = last;
-		if (registries == nullptr || !registries->current)
-			return;
-		registry_ = registries->current.get();
-		for (std::size_t index = 0; index < count_; ++index)
-			registry_->add(pages_[index], &registries->participant);
+		if (registries != nullptr && registries->current) {
+			registry_ = registries->current.get();
+			for (std::size_t index = 0; index < count_; ++index)
+				if (!registry_->add(pages_[index], &registries->participant)
+					    .settled)
+					settled_ = false;
+		}
+		/* The frame of each page, registered whether or not the cache can
+		 * hold the translation, so that a store through any alias of it
+		 * reaches this generation. */
+		const auto serial = memory.flush_serial(execution_context);
+		for (std::size_t index = 0; index < count_; ++index) {
+			frames_[index] = hold_frame(memory, execution_context, registries,
+				pages_[index], serial, diagnostics);
+			if (frames_[index] == FrameRegistration::unsettled)
+				settled_ = false;
+		}
 	}
 	~CodePageHold()
 	{
@@ -362,10 +432,31 @@ public:
 		return {pages_.data(), count_};
 	}
 
+	/* Whether every page's gain is settled: no participant that could still
+	 * land a store through a write translation retired for these pages is
+	 * stuck inside the engine. A translation read while it is not is used
+	 * once and never cached. */
+	[[nodiscard]] bool settled() const noexcept { return settled_; }
+
+	/* The registration of the frame of page `index` of pages(). */
+	[[nodiscard]] FrameRegistration frame(std::size_t index) const noexcept
+	{
+		return frames_[index];
+	}
+	/* Whether the page was registered without being held: refused or failed,
+	 * so a program that covers it has no holder there. */
+	[[nodiscard]] bool unheld(std::size_t index) const noexcept
+	{
+		return frames_[index] == FrameRegistration::refused ||
+			frames_[index] == FrameRegistration::failed;
+	}
+
 private:
 	std::array<std::uint64_t, 2> pages_{};
+	std::array<FrameRegistration, 2> frames_{};
 	std::size_t count_{};
 	CodePageRegistry *registry_{};
+	bool settled_{true};
 };
 
 /* The stamp of every page a block can span, read before the decoder reads a
@@ -376,6 +467,7 @@ private:
 struct HeldCodeStamps final {
 	std::array<::uml::memory::CodePageStamp, 2> stamps{};
 	std::array<bool, 2> present{};
+	std::uint64_t flush_serial{};
 };
 
 [[nodiscard]] HeldCodeStamps capture_held_code_stamps(
@@ -383,6 +475,8 @@ struct HeldCodeStamps final {
 	std::span<const std::uint64_t> pages, void *execution_context) noexcept
 {
 	HeldCodeStamps result;
+	/* Before the page stamps, as in capture_program_code_stamps. */
+	result.flush_serial = memory.flush_serial(execution_context);
 	for (std::size_t index = 0; index < pages.size(); ++index)
 		result.present[index] = memory.code_page_stamp(
 			pages[index], execution_context, result.stamps[index]);
@@ -406,6 +500,7 @@ struct HeldCodeStamps final {
 	const HeldCodeStamps &held) noexcept
 {
 	ProgramCodeStamps result;
+	result.flush_serial = held.flush_serial;
 	auto address = program.address();
 	auto remaining = program.byte_count();
 	auto previous_page = ~std::uint64_t{};
@@ -656,18 +751,27 @@ public:
 		window_.current = &state;
 		window_.bind(state);
 		touch(generation);
+		/* A switch to the address space is a run in it. */
+		state.space->account().ran(gadget_cache::epoch());
 		if (inserted) {
 			state.changes = changes;
 			/* A space another executor made may be behind the code
 			 * this one is at. */
 			state.space->observe(changes, code_change_reader_,
 				code_change_context_);
+			/* A place goes to make room: the least recently
+			 * current, unless another executor is running it,
+			 * which retiring here would free the code of
+			 * (GenerationWindow::victim()). */
 			window_.trim([this](std::uint64_t retiring) {
 #if UML_GADGET_CACHE_CENSUS
 				if (!window_.generations.contains(retiring))
 					++lru_tomb_;
 #endif
 				retire(retiring);
+			},
+			[now = gadget_cache::epoch()](const Generation &held) {
+				return held.space->use(now);
 			});
 			return;
 		}
@@ -680,12 +784,22 @@ public:
 		advance_epoch(state);
 	}
 
+	/* A run enters translated code in the address space last prepared, in
+	 * `epoch`: the budget asks the spaces the guest runs least to shed
+	 * first. Nothing is bound after the space was let go of. */
+	void note_run(std::uint64_t epoch) noexcept
+	{
+		if (window_.current != nullptr)
+			window_.current->space->account().ran(epoch);
+	}
+
 	/* Let go of every address space held here whose generation `live`
 	 * reports destroyed, and say whether the one last prepared was among
 	 * them. The generation's number keeps its place in the order the
 	 * window retires in, a tombstone that holds nothing and that the
-	 * least-recently-used rule drops when it reaches it, so the window
-	 * keeps the live address spaces it would have kept. An answer `live`
+	 * window drops in its turn, or sooner in place of an address space
+	 * another executor is running (GenerationWindow::victim()), so the
+	 * window keeps the live address spaces it would have kept. An answer `live`
 	 * cannot give (negative) keeps the address space. Out of memory part
 	 * way, what was not let go of is still held, and the caller asks
 	 * again. */
@@ -1043,10 +1157,11 @@ public:
 		 * outside what a sweep reads names a record it made. */
 		if (!state.space->shared() && state.space->sweep_due())
 			sweep(state, diagnostics);
-		/* Past the budget, the largest address spaces are asked to shed;
-		 * their caches let go of them at their next run. This is on the
-		 * carrier thread with no space, page or registry lock held, which
-		 * relieve(), waiting for the budget's own lock, requires. */
+		/* Past the budget, the address spaces the guest runs least are
+		 * asked to shed; their caches let go of them at their next run.
+		 * This is on the carrier thread with no space, page or registry
+		 * lock held, which relieve(), waiting for the budget's own lock,
+		 * requires. */
 		if (gadget_cache::over_budget())
 			gadget_cache::relieve();
 		return &slot.body->program;
@@ -2022,6 +2137,37 @@ private:
 			++diagnostics.validation_hits;
 			return Validation::valid;
 		}
+		if (recorded.complete && current_stamps.complete &&
+		    recorded.flush_serial != current_stamps.flush_serial &&
+		    recorded.count == current_stamps.count &&
+		    recorded.pages == current_stamps.pages) {
+			++diagnostics.flush_serial_misses;
+			note_flush_serial_miss();
+		}
+
+		/* The body may run only where its pages are registered holders of
+		 * their frames: register them now, before a byte of the source is
+		 * read, so a store through any alias either lands before the
+		 * comparison or publishes here. A registration that is unsettled or
+		 * failed leaves the body undecided; one that is refused means the
+		 * body cannot run at this location. */
+		FrameRegistration registered = FrameRegistration::settled;
+		const auto serial = memory.flush_serial(execution_context);
+		for_each_program_page(program, [&](std::uint64_t page) {
+			const auto result = hold_frame(memory, execution_context,
+				registries_, page, serial, diagnostics);
+			/* settled < unsettled < failed < refused */
+			if (result > registered)
+				registered = result;
+		});
+		if (registered == FrameRegistration::refused) {
+			++diagnostics.walked_refusals;
+			return Validation::stale;
+		}
+		if (registered != FrameRegistration::settled) {
+			++diagnostics.validation_registration_races;
+			return Validation::race;
+		}
 
 		switch (compare_program_source(memory, program,
 			program.source())) {
@@ -2237,6 +2383,10 @@ void Executor::prepare(::uml::memory::GuestAddressSpace &memory,
 		storage_->code_changes != code_changes;
 	storage_->mapping_change_reader = mapping_change_reader;
 	if (mapping_changed) {
+		/* A holder leaves its frame with the page's mapping, so no
+		 * remembered registration outlives a change of mapping or a move to
+		 * another generation. */
+		storage_->registries.memo.clear();
 		/* The address space hands a reader the ranges it has not seen, so a
 		 * reader only a few changes behind retires exactly those pages
 		 * instead of every entry it holds. Anything it cannot describe, and
@@ -2290,8 +2440,11 @@ void Executor::prepare(::uml::memory::GuestAddressSpace &memory,
 	storage_->programs.set_code_change_reader(
 		code_change_reader, execution_context);
 	storage_->prepared = true;
-	if (!cache_binding_changed && storage_->cache_ready)
+	if (!cache_binding_changed && storage_->cache_ready) {
+		/* Every run prepares at its first block: this is its entry. */
+		storage_->programs.note_run(gadget_cache::epoch());
 		return;
+	}
 	try {
 		storage_->programs.prepare(generation, code_changes);
 		storage_->cache_ready = true;
@@ -2465,8 +2618,8 @@ ProgramSelection Executor::select_program(
 		};
 	}
 	const CodePageHold hold{
-		storage_->cache_ready ? &storage_->registries : nullptr, address,
-		mode};
+		storage_->cache_ready ? &storage_->registries : nullptr, memory,
+		storage_->execution_context, storage_->diagnostics, address, mode};
 	/* The address space counts the stores that land on these pages from
 	 * here until the program is stored, so that a build a store landed
 	 * across is not kept for others to adopt. After the hold, so that every
@@ -2483,8 +2636,12 @@ ProgramSelection Executor::select_program(
 	 * ahead of the read or moves the stamp this reads. */
 	const auto held_stamps = capture_held_code_stamps(
 		memory, hold.pages(), storage_->execution_context);
-	auto built = build(memory, address, mode, maximum_instructions, links,
-		storage_->checked);
+	/* A first page without a holder runs one instruction at a time: no byte
+	 * a program fetches then lies after a store it performs, which is what
+	 * a holder would have guaranteed. */
+	const bool first_unheld = hold.unheld(0);
+	auto built = build(memory, address, mode,
+		first_unheld ? 1U : maximum_instructions, links, storage_->checked);
 	if (built.status != BuildStatus::built) {
 		storage_->programs.cancel_selection();
 		return {
@@ -2505,7 +2662,38 @@ ProgramSelection Executor::select_program(
 			.cache_hit = false,
 		};
 	};
-	if (!storage_->cache_ready || !pinned ||
+	/* A page the program covers that was registered without being held (the
+	 * second page of a block that crosses into it) makes the program
+	 * transient and one instruction long, like the first page's. */
+	bool covers_unheld = first_unheld;
+	bool covers_refused = hold.frame(0) == FrameRegistration::refused;
+	for_each_program_page(built.program, [&](std::uint64_t page) {
+		for (std::size_t index = 0; index < hold.pages().size(); ++index)
+			if (hold.pages()[index] == page && hold.unheld(index)) {
+				covers_unheld = true;
+				covers_refused = covers_refused ||
+					hold.frame(index) == FrameRegistration::refused;
+			}
+	});
+	if (covers_unheld) {
+		++storage_->diagnostics.unregistered_transients;
+		if (covers_refused)
+			++storage_->diagnostics.walked_refusals;
+		if (!first_unheld) {
+			built = build(memory, address, mode, 1U, links, storage_->checked);
+			if (built.status != BuildStatus::built) {
+				storage_->programs.cancel_selection();
+				return {
+					.status = built.status,
+					.program = nullptr,
+					.fault_address = built.fault_address,
+					.cache_hit = false,
+				};
+			}
+		}
+		return use_transient();
+	}
+	if (!storage_->cache_ready || !pinned || !hold.settled() ||
 		built.program.byte_count() == 0 ||
 		built.program.byte_count() > maximum_cached_source_bytes)
 		return use_transient();
@@ -2520,6 +2708,8 @@ ProgramSelection Executor::select_program(
 			pinned->pins(), storage_->diagnostics);
 		if (stored == nullptr)
 			return use_transient();
+		if (!hold.settled())
+			++storage_->diagnostics.unheld_runnable;
 		return {
 			.status = BuildStatus::built,
 			.program = stored,

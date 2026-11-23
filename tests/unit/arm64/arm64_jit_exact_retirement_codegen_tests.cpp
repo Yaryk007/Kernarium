@@ -6,7 +6,9 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <span>
+#include <vector>
 
 using uml::emulator::tests::require;
 
@@ -259,7 +261,123 @@ void compare_retry_region_uses_native_exclusives() {
   }));
 }
 
-void tracked_compare_retry_region_uses_the_semantic_path() {
+/* Whether `word` is the host's load-exclusive or store-exclusive on x21, the
+ * translated address the run keeps. */
+[[nodiscard]] bool native_load_exclusive(std::uint32_t word) {
+  return (word & 0x3fe0'0000U) == 0x0840'0000U && ((word >> 5) & 31U) == 21U;
+}
+[[nodiscard]] bool native_store_exclusive(std::uint32_t word) {
+  return (word & 0x3fe0'0000U) == 0x0800'0000U && ((word >> 5) & 31U) == 21U;
+}
+/* A word that touches no memory: data processing (immediate or register) or
+ * a conditional branch, the only words a run's interval may hold. */
+[[nodiscard]] bool register_only_or_branch(std::uint32_t word) {
+  const auto group = (word >> 25) & 15U;
+  const bool data_processing = group == 8U || group == 9U || group == 5U ||
+                               group == 13U;
+  const bool branch = (word & 0xff00'0010U) == 0x5400'0000U ||
+                      (word & 0x7e00'0000U) == 0x3400'0000U ||
+                      (word & 0x7e00'0000U) == 0x3600'0000U;
+  return data_processing || branch;
+}
+
+/* The fused run in `compiled`: exactly one host load-exclusive and one
+ * store-exclusive, and between them nothing but register work and branches
+ * (to the rollback), whatever the variant. Returns the store's position. */
+[[nodiscard]] std::size_t
+require_fused_interval(const jit_test::CompiledCode &compiled) {
+  const auto code = hot(compiled);
+  require(std::ranges::count_if(code, native_load_exclusive) == 1);
+  require(std::ranges::count_if(code, native_store_exclusive) == 1);
+  const auto load = static_cast<std::size_t>(
+      std::ranges::find_if(code, native_load_exclusive) - code.begin());
+  const auto store = static_cast<std::size_t>(
+      std::ranges::find_if(code, native_store_exclusive) - code.begin());
+  require(load < store);
+  for (std::size_t index = load + 1; index < store; ++index)
+    require(register_only_or_branch(code[index]));
+  return store;
+}
+
+[[nodiscard]] std::ptrdiff_t sign_extend_19(std::uint32_t word) {
+  auto value = static_cast<std::int32_t>((word >> 5) & 0x7ffffU);
+  if ((value & 0x40000) != 0)
+    value -= 0x80000;
+  return value;
+}
+
+/* After the store, the tracked variant records the store's range only if the
+ * host store succeeded: a cbnz on the store's status register guards the
+ * record's first word (a store of x21 through the chain's range table), and
+ * nothing of the record comes before the store. */
+void require_record_after_a_successful_store(
+    const jit_test::CompiledCode &compiled, std::size_t store, bool tracked) {
+  const auto code = hot(compiled);
+  const auto status = (code[store] >> 16) & 31U;
+  require(status != 31U);
+  constexpr std::uint32_t record_address = 0xf900'0000U | (3U << 5) | 21U;
+  const auto is_record = [](std::uint32_t word) {
+    return (word & 0xffc0'03ffU) == record_address;
+  };
+  require(std::none_of(code.begin(), code.begin() + store + 1, is_record));
+  const auto after = std::ranges::find_if(code.begin() + store + 1, code.end(),
+                                          is_record);
+  if (!tracked) {
+    require(after == code.end());
+    return;
+  }
+  require(after != code.end());
+  const auto cbnz = code[store + 1];
+  require((cbnz & 0xff00'001fU) == (0x3500'0000U | status));
+  const auto skipped =
+      static_cast<std::ptrdiff_t>(sign_extend_19(cbnz));
+  require(static_cast<std::ptrdiff_t>(after - code.begin()) <
+          static_cast<std::ptrdiff_t>(store + 1) + skipped);
+}
+
+void fused_runs_have_one_interval_in_both_variants() {
+  struct Shape {
+    std::vector<std::uint32_t> guest;
+    std::uint64_t pc;
+  };
+  const std::array<Shape, 4> shapes{{
+      {{0xc85f'7c23U, // ldxr x3, [x1]
+        0xc805'7c23U, // stxr w5, x3, [x1]
+        0x35ff'ffe5U},
+       0x5b08'0000U},
+      {{0xc85f'7c23U, // ldxr x3, [x1]
+        0x9100'0463U, // add x3, x3, #1
+        0xc805'7c23U, // stxr w5, x3, [x1]
+        0x35ff'ff85U},
+       0x5b09'0000U},
+      {{0xc85f'7c23U, // ldxr x3, [x1]
+        0xeb04'007fU, // cmp x3, x4
+        0x5400'0061U, // b.ne pc + 12
+        0xc805'7c22U, // stxr w5, x2, [x1]
+        0x35ff'ff85U},
+       0x5b0a'0000U},
+      /* The status is the zero register: it gets a scratch of its own. */
+      {{0xc85f'7c23U, // ldxr x3, [x1]
+        0x9100'0463U, // add x3, x3, #1
+        0xc81f'7c23U, // stxr wzr, x3, [x1]
+        0x35ff'ff9fU},
+       0x5b0b'0000U},
+  }};
+  for (const auto &shape : shapes) {
+    for (const bool tracked : {false, true}) {
+      const auto compiled = tracked
+          ? jit_test::compile_tracked_block(shape.pc, shape.guest)
+          : jit_test::compile_block(shape.pc, shape.guest);
+      require(compiled.guest_instructions == shape.guest.size());
+      const auto store = require_fused_interval(compiled);
+      require_record_after_a_successful_store(compiled, store, tracked);
+      require(compiled.direct_memory_write_mask ==
+              (std::uint64_t{1} << (shape.guest.size() - 2U)));
+    }
+  }
+}
+
+void tracked_compare_retry_region_uses_native_exclusives() {
   constexpr std::array guest{
       0xc85f'7c23U, // ldxr x3, [x1]
       0xeb04'007fU, // cmp x3, x4
@@ -269,16 +387,12 @@ void tracked_compare_retry_region_uses_the_semantic_path() {
   };
   const auto compiled =
       jit_test::compile_tracked_block(0x5b06'0000U, guest);
-  require(!compiled.words.empty());
-  require(compiled.guest_instructions != 0);
-  require(compiled.guest_instructions <= guest.size());
-  require(compiled.direct_memory_write_mask == 0);
-  require(std::ranges::none_of(hot(compiled), [](std::uint32_t word) {
-    return (word & ~((31U << 16) | 31U)) == 0xc800'7ea0U;
-  }));
+  require(compiled.guest_instructions == guest.size());
+  require(compiled.direct_memory_write_mask == (std::uint64_t{1} << 3U));
+  (void)require_fused_interval(compiled);
 }
 
-void compare_retry_with_shared_result_and_status_is_not_fused() {
+void compare_retry_with_shared_result_and_status_is_fused() {
   constexpr std::array guest{
       0x885f'fc9bU, // ldxr w27, [x4]
       0x6b02'037fU, // cmp w27, w2
@@ -286,12 +400,58 @@ void compare_retry_with_shared_result_and_status_is_not_fused() {
       0x881b'fc83U, // stxr w27, w3, [x4]
       0xb5ff'ff9bU, // cbnz x27, pc - 16
   };
-  const auto compiled = jit_test::compile_block(0x5b07'0000U, guest);
-  require(!compiled.words.empty());
-  require(compiled.guest_instructions != 0);
-  require(std::ranges::none_of(hot(compiled), [](std::uint32_t word) {
-    return (word & 0x3fa0'fc00U) == 0x08a0'7c00U;
-  }));
+  /* The status is the load's destination: the host store writes it, and the
+   * guest's register takes the status after the compare has read the load. */
+  for (const bool tracked : {false, true}) {
+    const auto compiled = tracked
+        ? jit_test::compile_tracked_block(0x5b0c'0000U, guest)
+        : jit_test::compile_block(0x5b0c'0000U, guest);
+    require(compiled.guest_instructions == guest.size());
+    const auto store = require_fused_interval(compiled);
+    require_record_after_a_successful_store(compiled, store, tracked);
+  }
+}
+
+/* What a run may not be: a register read before the run writes it, the base
+ * written, the status the data or the base, SP or a reserved encoding named,
+ * a side exit into the run, more than four words between the pair, or more
+ * registers than the pool. Each declines to one semantic instruction. */
+void runs_that_cannot_be_fused_decline() {
+  constexpr std::uint32_t load = 0xc85f'7c23U;  // ldxr x3, [x1]
+  constexpr std::uint32_t store = 0xc805'7c23U; // stxr w5, x3, [x1]
+  constexpr std::uint32_t retry = 0x35ff'ff85U;
+  const auto declines = [&](std::initializer_list<std::uint32_t> words,
+                            std::uint64_t pc) {
+    const std::vector<std::uint32_t> guest{words};
+    for (const bool tracked : {false, true}) {
+      const auto compiled = tracked
+          ? jit_test::compile_tracked_block(pc, guest)
+          : jit_test::compile_block(pc, guest);
+      require(compiled.guest_instructions == 1U);
+      require(std::ranges::none_of(hot(compiled), native_store_exclusive));
+    }
+  };
+  declines({load, 0x9100'0442U /* add x2, x2, #1: live-in written */, store,
+            retry}, 0x5b10'0000U);
+  declines({load, 0x9100'0421U /* add x1, x1, #1: the base */, store, retry},
+           0x5b11'0000U);
+  declines({load, 0x9100'03e3U /* add x3, sp, #0 */, store, retry},
+           0x5b12'0000U);
+  declines({load, 0x9100'0463U, 0xc803'7c23U /* stxr w3, x3, [x1] */, retry},
+           0x5b13'0000U);
+  declines({load, 0x9100'0463U, 0xc801'7c23U /* stxr w1, x3, [x1] */, retry},
+           0x5b14'0000U);
+  declines({load, 0x5400'006eU /* b.al */, store, retry}, 0x5b15'0000U);
+  declines({load, 0x5400'0041U /* b.ne to the store: pc + 8 */, 0xd280'0027U,
+            store, retry}, 0x5b16'0000U);
+  declines({load, 0x9100'0463U, 0x9100'0463U, 0x9100'0463U, 0x9100'0463U,
+            0x9100'0463U, store, retry}, 0x5b17'0000U);
+  declines({load, 0x9341'0063U /* a bitfield: not a run word */, store,
+            retry}, 0x5b18'0000U);
+  declines({load, 0x1200'7c20U /* and w0, w1, #imms=31: reserved */, store,
+            retry}, 0x5b19'0000U);
+  declines({load, 0x0bc4'0060U /* add w0, w3, w4, shift type 3: reserved */,
+            store, retry}, 0x5b1a'0000U);
 }
 
 } // namespace
@@ -305,7 +465,9 @@ int main() {
   exclusive_counter_loop_retains_one_translated_address();
   profiled_exclusive_integer_shapes_remain_native();
   compare_retry_region_uses_native_exclusives();
-  tracked_compare_retry_region_uses_the_semantic_path();
-  compare_retry_with_shared_result_and_status_is_not_fused();
+  tracked_compare_retry_region_uses_native_exclusives();
+  fused_runs_have_one_interval_in_both_variants();
+  compare_retry_with_shared_result_and_status_is_fused();
+  runs_that_cannot_be_fused_decline();
   return 0;
 }

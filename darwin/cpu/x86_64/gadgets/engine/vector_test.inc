@@ -68,8 +68,7 @@ gadget vector_test_\width\()_\stride\()_rr
 gadget vector_test_\width\()_\stride\()_rm
 	effective_address
 	mov x25, x7
-	page_cross_check (\width / 8), Lx86_vector_test_cross\@
-	translate 0, UML_X86_64_TLB_READ_PAGE, (\width / 8)
+	translate 0, UML_X86_64_TLB_READ_PAGE, (\width / 8), cross=Lx86_vector_test_cross\@
 	mov x25, x7
 	b Lx86_vector_test_loaded\@
 Lx86_vector_test_cross\@:

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- The application has one component, a service that no application can start: the holder of vsock port 5560
+     starts it, as the system user, when a request from the host waits, and the service takes the port from the
+     holder and ends with the last message. It is not persistent, so it costs nothing in between. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="android.kernarium.sms"
+    android:sharedUserId="android.uid.system">
+
+    <application
+        android:label="Andarium SMS"
+        android:allowBackup="false">
+        <service
+            android:name=".HostService"
+            android:exported="false" />
+    </application>
+</manifest>

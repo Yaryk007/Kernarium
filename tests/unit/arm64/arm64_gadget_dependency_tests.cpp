@@ -32,6 +32,7 @@ constexpr bool is_immediate(std::uint32_t word)
 }
 
 using uml::emulator::tests::address;
+using uml::emulator::tests::LinkedBlock;
 
 /* Runs a program that ends in SVC through the test-local reference. */
 void run_reference(a::CpuState &cpu, std::span<const std::uint32_t> code,
@@ -312,9 +313,11 @@ void linked_counts()
 {
 	constexpr std::uint64_t pc = 0x1000;
 	constexpr std::uint64_t iterations = 17;
-	std::array<std::uintptr_t, 2> terminal{address(uml_arm64_gadget_interrupt), pc + 20};
+	const std::array<std::uintptr_t, 2> terminal{address(uml_arm64_gadget_interrupt), pc + 20};
+	const LinkedBlock end_block{pc + 20, 0, terminal};
 	g::BlockLink loop{.guest_pc = pc};
-	g::BlockLink end{.stream = terminal.data(), .instruction_count = 0, .guest_pc = pc + 20};
+	g::BlockLink end{.guest_pc = pc + 20};
+	end_block.link(end);
 	const std::array instructions{0x9100'0400U, 0x9100'0801U, 0x8b00'0022U,
 		0xf100'0463U, 0x54ff'ff81U};
 	auto built = g::Builder{}.build(pc, instructions,
@@ -324,8 +327,8 @@ void linked_counts()
 			return &end;
 		});
 	require(built.complete && built.program.instruction_count() == 5);
-	loop.stream = built.program.words().data();
-	loop.instruction_count = 5;
+	const LinkedBlock loop_block{built.program};
+	loop_block.link(loop);
 	a::CpuState cpu{};
 	cpu.registers[3] = iterations;
 	auto tlb = std::make_unique<uml::memory::Tlb>();
@@ -340,8 +343,10 @@ void linked_counts()
 void taken_prefix()
 {
 	constexpr std::uint64_t pc = 0x2000, target = pc + 0x100;
-	std::array<std::uintptr_t, 2> terminal{address(uml_arm64_gadget_interrupt), target};
-	g::BlockLink end{.stream = terminal.data(), .instruction_count = 0, .guest_pc = target};
+	const std::array<std::uintptr_t, 2> terminal{address(uml_arm64_gadget_interrupt), target};
+	const LinkedBlock end_block{target, 0, terminal};
+	g::BlockLink end{.guest_pc = target};
+	end_block.link(end);
 	const std::array instructions{0x9100'0400U,
 		0xb400'0004U | (63U << 5), 0x9100'0801U};
 	auto built = g::Builder{}.build(pc, instructions,

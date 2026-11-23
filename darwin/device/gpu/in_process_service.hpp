@@ -26,8 +26,23 @@ struct InProcessGpuOptions {
         uml::input::vnc::PointerMode::mouse};
     void* nativeView {};
     bool autoResizeGuest {true};
+    /* The refresh rate of the one mode the guest sees: 60, or 120 on the iOS
+     * native display of a device whose screen can show it
+     * (Display::refreshRate). */
+    std::uint32_t refreshRate {60};
     /* What the windowless display (DisplayMode::offscreen) presents into. */
     OffscreenDisplayOptions offscreen {};
+    /* Where the display's keys and pointer go instead of the guest's
+     * touchscreen and side keys, when set: the sink is called on the
+     * display's input thread, with the events a VNC or native display sends
+     * the touchscreen (uml::input::vnc), and must return promptly. The input
+     * endpoint of the connection is then never written to. */
+    uml::input::vnc::VncInputSink inputRedirect;
+    /* Told how many clients a VNC display has whenever that changes
+     * (Display::setClientObserver); a display without clients never calls
+     * it. It outlives the display's first client, so it may be called from the
+     * display's thread until stop() returns. */
+    Display::ClientObserver clientObserver;
     /* Shared with the other backends of the same guest. This service
      * publishes every host-visible blob range it maps there, so a device
      * whose guest names a buffer inside the region can resolve it. */
@@ -137,6 +152,13 @@ public:
      * before the display exists, which the first connection makes. */
     [[nodiscard]] std::optional<bool> guestScanoutActive() const noexcept;
 
+    /* The size in pixels of the guest's primary scanout: the area a
+     * display's pointer position is relative to (Display::guestScanoutMode).
+     * Any thread, and nothing while the guest has no scanout, before the
+     * display exists and once stop() has let it go. */
+    [[nodiscard]] std::optional<Display::GuestScanoutMode> guestScanoutMode()
+        const noexcept;
+
     /* The display's frame counters (Display::statistics): the frames the guest
      * offered and the frames that reached the screen, since the display was
      * made, which a guest that restarts does not reset. The display counts
@@ -144,6 +166,12 @@ public:
      * the call alone. Any thread, whether or not requests are held. Nothing
      * once stop() has let the display go. */
     [[nodiscard]] std::optional<DisplayStatistics> displayStatistics()
+        const noexcept;
+
+    /* The rate the host granted the display's mode (Display::refreshRate): 60,
+     * or 120 for a run granted the 120 Hz display. Nothing once stop() has let
+     * the display go. Any thread. */
+    [[nodiscard]] std::optional<std::uint32_t> displayRefreshRate()
         const noexcept;
 
     /* How many times the device answered the guest that the host GPU had no

@@ -1,0 +1,43 @@
+{
+  "acceptance": "unsigned-proof",
+  "android": {
+    "build_id": "CP2A.260101.001",
+    "build_number": 29,
+    "fingerprint": "Andarium/lineage_andarium/andarium:17/CP2A.260101.001/29:user/test-keys",
+    "major": 17,
+    "security_patch": "2026-10-01",
+    "signed": false
+  },
+  "directory_name": "lineage24-mainline6.18-4k-unsigned-proof-ff1",
+  "inventory": [],
+  "kernel": {
+    "page_size": 4096,
+    "release": "6.18.99-gfeedface0000"
+  },
+  "outer": {
+    "dirty": false,
+    "revision": "cccccccccccccccccccccccccccccccccccccccc"
+  },
+  "producer": {
+    "entry_point": "proof.sh",
+    "limit": "Built from the unsigned target files.",
+    "proof_for_release_id": "ff1",
+    "target_files_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  },
+  "product_family": "lineage-24-mainline-6.18-4k",
+  "proof_staging": {
+    "derived": [
+      "android.major",
+      "kernel.page_size",
+      "kernel.release"
+    ],
+    "from": [
+      "android/lineage-24/metadata/lineage.env",
+      "kernel/mainline-6.18/artifacts/accepted-android-4k.env"
+    ]
+  },
+  "published_at_utc": "2026-11-18T00:00:00Z",
+  "release_id": "unsigned-proof-ff1",
+  "schema_version": 0,
+  "source": {}
+}

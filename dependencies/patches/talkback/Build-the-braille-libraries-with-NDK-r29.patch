@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Abdulmajeed Almarzoqi <abdulmjad01@gmail.com>
+Date: Tue, 10 Nov 2026 06:31:41 +0300
+Subject: [PATCH] Build the braille libraries with NDK r29
+
+NDK r21 has no Apple silicon host, so ndk-build stops with "Unknown host
+CPU architecture: arm64". NDK r29 builds the same brltty and liblouis
+sources on both hosts.
+---
+ braille/brltty/build.gradle    | 2 +-
+ braille/translate/build.gradle | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/braille/brltty/build.gradle b/braille/brltty/build.gradle
+index e4a4865e277d66d4501c4a0d528396fc4dbfb23d..56fb5e85d308e2b35c5dd802d0d813470ff7568d 100644
+--- a/braille/brltty/build.gradle
++++ b/braille/brltty/build.gradle
+@@ -3,7 +3,7 @@ apply from: "../../shared.gradle"
+ 
+ android {
+     namespace "com.google.android.accessibility.braille.brltty"
+-    ndkVersion "21.4.7075529"
++    ndkVersion "29.0.14206865"
+     externalNativeBuild {
+         ndkBuild {
+             path file('src/phone/jni/Android.mk')
+diff --git a/braille/translate/build.gradle b/braille/translate/build.gradle
+index 0b32e6a8cc872752f6c28aa1dfb5fce1dda4f151..4825bb58001f2f21f28422287b783d04be0fa599 100644
+--- a/braille/translate/build.gradle
++++ b/braille/translate/build.gradle
+@@ -3,7 +3,7 @@ apply from: "../../shared.gradle"
+ 
+ android {
+     namespace "com.google.android.accessibility.braille.translate"
+-    ndkVersion "21.4.7075529"
++    ndkVersion "29.0.14206865"
+     externalNativeBuild {
+         ndkBuild {
+             path file('src/phone/jni/Android.mk')

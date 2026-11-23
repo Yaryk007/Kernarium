@@ -2,8 +2,38 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+#ifdef FOLLOW_X
+	<key>AndariumFollowXHandle</key>
+	<string>$(FOLLOW_X_HANDLE)</string>
+#endif
+#ifdef UPDATE_NOTICE
+	<key>LSApplicationQueriesSchemes</key>
+	<array>
+		<string>altstore</string>
+		<string>sidestore</string>
+	</array>
+	<key>UpdateAppIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>UpdateLinkHosts</key>
+	<string>$(UPDATE_LINK_HOSTS)</string>
+	<key>UpdateSourceHost</key>
+	<string>$(UPDATE_SOURCE_HOST)</string>
+	<key>UpdateSourcePath</key>
+	<string>$(UPDATE_SOURCE_PATH)</string>
+#endif
+	<key>CADisableMinimumFrameDurationOnPhone</key>
+	<true/>
+	<key>GCSupportedGameControllers</key>
+	<array>
+		<dict>
+			<key>ProfileName</key>
+			<string>ExtendedGamepad</string>
+		</dict>
+	</array>
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
+	<key>LSMinimumSystemVersion</key>
+	<string>27.0</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

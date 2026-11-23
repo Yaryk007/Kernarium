@@ -21,14 +21,16 @@ set_source_files_properties(arm64_jit_chain_abi_probe.S arm64-neon-inventory.s
 # composed with the static MMU and gadget engine objects (or OBJECTS instead,
 # or none for NO_OBJECTS) and linked to the engine test harness unless
 # WITHOUT_HARNESS, then registers it as arm64-<stem with dashes>, or as NAME,
-# with any ARGS as its command-line arguments.
+# with any ARGS as its command-line arguments and the TIMEOUT it needs where
+# the default bound is too short.
 function(uml_add_arm64_unit_test STEM)
     cmake_parse_arguments(PARSE_ARGV 1 _arm64_test "WITHOUT_HARNESS;NO_OBJECTS"
-        "NAME" "SOURCES;OBJECTS;LABELS;ARGS")
+        "NAME;TIMEOUT" "SOURCES;OBJECTS;LABELS;ARGS")
     set(_target uml_arm64_${STEM}_tests)
     if(NOT DEFINED _arm64_test_OBJECTS AND NOT _arm64_test_NO_OBJECTS)
+        get_property(_uml_static_mmu GLOBAL PROPERTY UML_STATIC_MMU_TARGET)
         set(_arm64_test_OBJECTS
-            $<TARGET_OBJECTS:uml_static_mmu>
+            $<TARGET_OBJECTS:${_uml_static_mmu}>
             $<TARGET_OBJECTS:uml_arm64_gadgets>
             $<TARGET_OBJECTS:uml_arm64_aarch32_decoder>
             $<TARGET_OBJECTS:uml_arm64_aarch32_semantics>
@@ -55,8 +57,12 @@ function(uml_add_arm64_unit_test STEM)
     if(DEFINED _arm64_test_LABELS)
         set(_labels LABELS ${_arm64_test_LABELS})
     endif()
+    set(_timeout)
+    if(DEFINED _arm64_test_TIMEOUT)
+        set(_timeout TIMEOUT ${_arm64_test_TIMEOUT})
+    endif()
     uml_add_unit_test(NAME ${_arm64_test_NAME}
-        COMMAND ${_target} ${_arm64_test_ARGS} ${_labels})
+        COMMAND ${_target} ${_arm64_test_ARGS} ${_labels} ${_timeout})
 endfunction()
 
 include("${CMAKE_CURRENT_LIST_DIR}/engine.cmake")
@@ -76,6 +82,11 @@ uml_add_arm64_unit_test(no_sve WITHOUT_HARNESS
 # The SM = 0 vector-length family the virtual CPU (FEAT_SME, no FEAT_SVE)
 # executes: its definition and the words both engines translate from.
 uml_add_arm64_unit_test(sm0_vector_length WITHOUT_HARNESS)
+
+# The verdict table the ahead-of-time component's address spaces would share
+# and the decision around it, against a stub of the memory layer's stamp
+# (header only; sharing is not enabled).
+uml_add_arm64_unit_test(aot_verdicts WITHOUT_HARNESS NO_OBJECTS)
 
 # The AArch32 foundation: the state CpuState appends, the engines' levels,
 # the AArch32 identification registers and compat HWCAPs, and the engines'
@@ -153,6 +164,30 @@ uml_add_arm64_unit_test(exclusive_events)
 # After an ISB, both engines run the code another vCPU changed and
 # synchronized, in A64 and A32.
 uml_add_arm64_unit_test(isb_code_change)
+# Code one process changed and synchronized on a page another process
+# translated runs in both, on both engines.
+uml_add_arm64_unit_test(cross_generation_code_change)
+# IC IVAU faults at an address nothing maps, as hardware does, so the kernel
+# maps the page and the instruction reaches the frame it means.
+uml_add_arm64_unit_test(code_synchronize_fault)
+# A change published again and again, and to more generations than a frame's
+# holder word names, reaches every process that runs the page.
+uml_add_arm64_unit_test(cross_generation_publication)
+# A publication that begins while another has taken a frame's holder word and
+# not published yet still reaches every process that translated the frame,
+# the target of a kernel write among them. Built on the memory domain's test
+# variant, whose checkpoint holds the first publisher.
+uml_add_arm64_unit_test(cross_generation_overlap
+    OBJECTS
+        $<TARGET_OBJECTS:uml_static_mmu_test_variant>
+        $<TARGET_OBJECTS:uml_arm64_gadgets>
+        $<TARGET_OBJECTS:uml_arm64_aarch32_decoder>
+        $<TARGET_OBJECTS:uml_arm64_aarch32_semantics>
+        $<TARGET_OBJECTS:uml_arm64_execution_helpers>)
+target_compile_definitions(uml_arm64_cross_generation_overlap_tests PRIVATE
+    UML_MEMORY_ALLOCATION_TESTING=1)
+target_include_directories(uml_arm64_cross_generation_overlap_tests PRIVATE
+    ${PROJECT_SOURCE_DIR}/darwin/memory/mmu)
 uml_add_arm64_unit_test(simd_ordinary_memory_gadget)
 uml_add_arm64_unit_test(simd_structure_gadget)
 uml_add_arm64_unit_test(simd_baseline_inventory WITHOUT_HARNESS

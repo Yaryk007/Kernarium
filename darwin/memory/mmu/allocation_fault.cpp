@@ -15,7 +15,14 @@ namespace {
 std::atomic<AllocationSite> failure_site{};
 std::atomic_size_t failure_occurrence{};
 std::atomic_size_t backing_mappings{};
+std::atomic_size_t count_anomaly_total{};
 std::atomic<AllocationObserver> allocation_observer{};
+std::atomic_size_t stripe_allocations{};
+std::atomic<std::ptrdiff_t> frame_bytes{};
+thread_local unsigned stripe_depth{};
+thread_local bool refusing{};
+std::atomic_size_t refusals{};
+std::atomic_size_t locked_walks{};
 std::array<std::atomic_size_t,
 	static_cast<std::size_t>(AllocationSite::count)> allocation_attempts{};
 
@@ -47,6 +54,8 @@ void set_allocation_observer(const AllocationObserver observer) noexcept
 
 void allocation_checkpoint(const AllocationSite site)
 {
+	if (allocator_probe())
+		throw std::bad_alloc{};
 	if (const auto observer =
 		    allocation_observer.load(std::memory_order_acquire))
 		observer(site);
@@ -81,6 +90,70 @@ std::size_t allocation_attempt_count(const AllocationSite site) noexcept
 	const auto site_index = static_cast<std::size_t>(site);
 	return site_index < allocation_attempts.size() ?
 		allocation_attempts[site_index].load(std::memory_order_relaxed) : 0;
+}
+
+void count_anomaly() noexcept
+{
+	count_anomaly_total.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::size_t count_anomalies() noexcept
+{
+	return count_anomaly_total.load(std::memory_order_relaxed);
+}
+
+void stripe_lock_entered() noexcept
+{
+	++stripe_depth;
+}
+
+void stripe_lock_left() noexcept
+{
+	--stripe_depth;
+}
+
+bool allocator_probe() noexcept
+{
+	if (stripe_depth != 0)
+		stripe_allocations.fetch_add(1, std::memory_order_relaxed);
+	if (refusing)
+		refusals.fetch_add(1, std::memory_order_relaxed);
+	return refusing;
+}
+
+void retire_walk_under_lock() noexcept
+{
+	locked_walks.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::size_t retire_walks_under_lock() noexcept
+{
+	return locked_walks.load(std::memory_order_relaxed);
+}
+
+void refuse_allocations(const bool refuse) noexcept
+{
+	refusing = refuse;
+}
+
+std::size_t refused_allocations() noexcept
+{
+	return refusals.load(std::memory_order_relaxed);
+}
+
+void frame_bytes_changed(const std::ptrdiff_t delta) noexcept
+{
+	frame_bytes.fetch_add(delta, std::memory_order_relaxed);
+}
+
+std::size_t frame_metadata_bytes() noexcept
+{
+	return static_cast<std::size_t>(frame_bytes.load(std::memory_order_relaxed));
+}
+
+std::size_t allocations_under_stripe_lock() noexcept
+{
+	return stripe_allocations.load(std::memory_order_relaxed);
 }
 
 void backing_mapping_created() noexcept

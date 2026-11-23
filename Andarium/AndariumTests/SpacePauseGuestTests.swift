@@ -21,7 +21,7 @@ import UIKit
 @MainActor
 struct SpacePauseGuestTests {
     /// The device's free space as the test states it.
-    private final class FreeSpace: @unchecked Sendable {
+    private nonisolated final class FreeSpace: @unchecked Sendable {
         private let lock = NSLock()
         private var bytes: UInt64
         init(_ bytes: UInt64) { self.bytes = bytes }
@@ -60,7 +60,7 @@ struct SpacePauseGuestTests {
         let driver = try #require(model.driver)
 
         let identity = try entry.adbKeyStore.loadOrCreate()
-        let operations = AdbGuestOperations(identity: identity, clock: GuestRunClock(), device: "device")
+        let operations = AdbGuestOperations(identity: identity, clock: GuestRunClock(), device: "device", run: GuestRunMark.random())
         model.start(.normal)
         try await bootCompleted(model, operations)
         print("SPACE_PAUSE: Android booted; free space \(Formats.size(bytes: free.value))")

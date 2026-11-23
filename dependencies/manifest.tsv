@@ -32,3 +32,6 @@ musl-obstack	1.2.3	kernel-host-tools	https://github.com/void-linux/musl-obstack.
 elfutils	0.197	kernel-host-tools	https://sourceware.org/git/elfutils.git	d1e04729ece4d4fa4097a83dbbad541edaf149f7	.	patches/elfutils/series.tsv
 libbpf	1.8.0	kernel-host-tools	https://github.com/libbpf/libbpf.git	85c0d575a447651bbeb8e2376eacd64c30dce9a6	.	patches/libbpf/series.tsv
 dwarves	1.32	kernel-host-tools	https://git.kernel.org/pub/scm/devel/pahole/pahole.git	fa725d687ce3a712ef296b46bc63ea57ef466014	.	patches/dwarves/series.tsv
+talkback	16.2	andarium-accessibility	https://github.com/google/talkback.git	229212fdf5842191d0a93fc95d9ca1423b346866	.	patches/talkback/series.tsv
+espeak-ng	1.53.0-688cb603	andarium-accessibility	https://github.com/espeak-ng/espeak-ng.git	688cb60368d6e0998f3632af8d1c3c2ad4191fc2	.	patches/espeak-ng/series.tsv
+sonic	fbf75c3d	andarium-accessibility	https://github.com/waywardgeek/sonic.git	fbf75c3d6d846bad3bb3d456cbc5d07d9fd8c104	.	-

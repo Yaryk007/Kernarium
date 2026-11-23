@@ -27,6 +27,9 @@ CONFIG_RD_GZIP=y
 CONFIG_IKCONFIG=y
 CONFIG_IKCONFIG_PROC=y
 CONFIG_PRINTK_TIME=y
+# Every message names the task or CPU that printed it ([T123] or [C0]), so a
+# guest log of several vCPUs says which thread of the guest wrote a line.
+CONFIG_PRINTK_CALLER=y
 CONFIG_DEVTMPFS=y
 CONFIG_DEVTMPFS_MOUNT=y
 # The kernel writes the SMBIOS tables firmware writes elsewhere (the shared
@@ -475,6 +478,13 @@ CONFIG_SSL_CHAN="fd:0,fd:1"
 # CONFIG_STDERR_CONSOLE is not set
 # logind grants session access to DRM and input devices through tmpfs ACLs.
 CONFIG_TMPFS_POSIX_ACL=y
+
+# --- Location ---------------------------------------------------------------
+# The host's location as a GNSS receiver (/dev/gnssN, type NMEA) behind a local
+# experimental Virtio device. The node exists only where the host provides the
+# device, so a Linux guest without one is unchanged.
+CONFIG_GNSS=y
+CONFIG_GNSS_KERNARIUM_VIRTIO=y
 
 # --- Tracing and diagnostics ------------------------------------------------
 CONFIG_MAGIC_SYSRQ=y

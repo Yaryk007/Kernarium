@@ -1,0 +1,82 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 16:50:16 +0900
+Subject: [PATCH] um: walk the mconsole's console clients under their lock
+
+A management-console command that runs through with_console(), "sysrq"
+or "stack", adds an entry from its own stack to the console's client
+list and removes it when the command is done, both under client_lock.
+The console's write() walked the list without the lock. On an SMP
+guest another CPU that owns the console keeps printing while the
+command runs on the CPU that took the console's interrupt: when that
+CPU removes its entry and returns, the walk still holds the entry,
+whose stack slot the next frame zeroes, reads a NULL next pointer and
+faults at address 0x10 in console_write(). A host that asks for
+"sysrq s" while the guest prints panics it.
+
+Hold client_lock across the walk, which also serializes the shared
+console_buf. Interrupts are already off there, and nothing in it
+waits for the CPU that holds the lock. While an oops or a panic is in
+progress the CPU holding it may have stopped, so the console only tries
+the lock and writes nothing without it. with_console() now removes its
+entry before the final reply, so no console text follows that reply.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ arch/um/drivers/mconsole_kern.c | 21 +++++++++++++++++++--
+ 1 file changed, 19 insertions(+), 2 deletions(-)
+
+diff --git a/arch/um/drivers/mconsole_kern.c b/arch/um/drivers/mconsole_kern.c
+index 6ff80357a47ff93f6459f0a4515610e695d59f7a..3f7d0caf9915a4fc6ebf4a87e992a1d59467a9f7 100644
+--- a/arch/um/drivers/mconsole_kern.c
++++ b/arch/um/drivers/mconsole_kern.c
+@@ -694,11 +694,25 @@ static void console_write(struct console *console, const char *string,
+ 			  unsigned int len)
+ {
+ 	struct list_head *ele;
++	unsigned long flags;
+ 	int n;
+ 
+ 	if (list_empty(&clients))
+ 		return;
+ 
++	/*
++	 * An entry lives on the stack of a with_console() that may run on
++	 * another CPU, so only client_lock keeps it there while the walk
++	 * replies to it. A CPU that an oops or a panic stopped may hold the
++	 * lock; the console then writes nothing rather than wait for it.
++	 */
++	if (oops_in_progress) {
++		if (!spin_trylock_irqsave(&client_lock, flags))
++			return;
++	} else {
++		spin_lock_irqsave(&client_lock, flags);
++	}
++
+ 	while (len > 0) {
+ 		n = min((size_t) len, ARRAY_SIZE(console_buf));
+ 		memcpy(console_buf, string, n);
+@@ -712,6 +726,8 @@ static void console_write(struct console *console, const char *string,
+ 			mconsole_reply_len(entry->req, console_buf, n, 0, 1);
+ 		}
+ 	}
++
++	spin_unlock_irqrestore(&client_lock, flags);
+ }
+ 
+ static struct console mc_console = { .name	= "mc",
+@@ -740,11 +756,12 @@ static void with_console(struct mc_request *req, void (*proc)(void *),
+ 
+ 	(*proc)(arg);
+ 
+-	mconsole_reply_len(req, "", 0, 0, 0);
+-
++	/* No console text follows the final reply. */
+ 	spin_lock_irqsave(&client_lock, flags);
+ 	list_del(&entry.list);
+ 	spin_unlock_irqrestore(&client_lock, flags);
++
++	mconsole_reply_len(req, "", 0, 0, 0);
+ }
+ 
+ #ifdef CONFIG_MAGIC_SYSRQ

@@ -51,7 +51,7 @@ WORKLOAD_GUEST_PATH = "/usr/local/libexec/uml-workload"
 # What the device plumbing needs to know about Kernarium: a launch clears the
 # inherited KERNARIUM_ settings, and a run ends at the runtime-result line.
 APPLICATION = ios_device.Application(
-    BUNDLE_ID, ("KERNARIUM_",), RUNTIME_RESULT
+    BUNDLE_ID, ("KERNARIUM_",), RUNTIME_RESULT, "Kernarium"
 )
 
 

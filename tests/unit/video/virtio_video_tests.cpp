@@ -20,6 +20,8 @@
 #include <stdexcept>
 #include <string>
 #include <memory>
+#include <optional>
+#include <poll.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <utility>
@@ -189,6 +191,13 @@ std::uint8_t scriptedLuma(unsigned picture, std::uint32_t row, std::uint32_t col
 struct ScriptedState {
     unsigned discards {};
     unsigned submitted {};
+    // Pictures [dropFrom, dropTo) are never shown, as when the platform
+    // decoder loses its session and goes on at the next sync picture.
+    unsigned dropFrom {};
+    unsigned dropTo {};
+    // The packet with this number is refused once, as the platform decoder
+    // refuses a corrupt one.
+    unsigned refuse {};
 };
 class ScriptedDecoder final : public VideoDecoder {
 public:
@@ -197,9 +206,14 @@ public:
     void inspect(std::span<const std::uint8_t>) override { format_ = {sizes_.front(), sizes_.front(), 8}; }
     void submit(std::span<const std::uint8_t>, std::uint64_t timestamp) override
     {
+        if (state_->refuse && state_->submitted + 1 == state_->refuse) {
+            state_->refuse = 0;
+            throw std::runtime_error("the decoder refused the packet");
+        }
         const auto size = sizes_[std::min<std::size_t>(state_->submitted, sizes_.size() - 1)];
         const auto picture = ++state_->submitted;
         format_ = {size, size, 8};
+        if (picture >= state_->dropFrom && picture < state_->dropTo) return;
         DecodedVideoFrame frame;
         frame.format = format_;
         frame.timestamp = timestamp;
@@ -241,6 +255,8 @@ struct VideoFixture final {
     }
     VideoFixture(const VideoFixture&) = delete;
     VideoFixture& operator=(const VideoFixture&) = delete;
+    // The coded format createStream() opens the stream with.
+    std::uint32_t codedFormat {VIRTIO_VIDEO_FORMAT_H264};
 
     template<class T> VhostUserQueueResult command(const T& value)
     {
@@ -257,7 +273,7 @@ struct VideoFixture final {
     {
         virtio_video_stream_create create {};
         create.hdr = {VIRTIO_VIDEO_CMD_STREAM_CREATE, stream};
-        create.coded_format = VIRTIO_VIDEO_FORMAT_H264;
+        create.coded_format = codedFormat;
         ok(create, location);
     }
     VhostUserQueueResult attach(unsigned queue, unsigned id, const Planes& planes)
@@ -305,6 +321,33 @@ struct VideoFixture final {
                 "input attach failed", location);
     }
 
+    /* The event queue's next buffer. The device answers it with the event it
+     * has for the guest; with none it leaves the buffer in the guest's ring
+     * (retry) and holds nothing. */
+    std::optional<virtio_video_event> takeEvent(std::source_location location = std::source_location::current())
+    {
+        const auto result = device.processQueue(1, 0xe0000, {}, sizeof(virtio_video_event));
+        if (result.action == VhostUserQueueAction::retry) return std::nullopt;
+        require(result.action == VhostUserQueueAction::complete, "an event buffer was held by the device", location);
+        return load<virtio_video_event>(result.response);
+    }
+    /* The source change every decode session raises first, taken off the queue. */
+    void expectSourceChange(std::source_location location = std::source_location::current())
+    {
+        const auto event = takeEvent(location);
+        require(event.has_value(), "missing source event", location);
+        require(event->event_type == VIRTIO_VIDEO_EVENT_DECODER_RESOLUTION_CHANGED && event->stream_id == stream,
+                "incorrect source event", location);
+    }
+
+    /* Whether the device's wake-up descriptor is readable, which is how the
+     * transport learns that an event waits for a buffer. */
+    bool awake() const
+    {
+        pollfd descriptor {device.eventDescriptor(), POLLIN, 0};
+        return ::poll(&descriptor, 1, 0) == 1 && (descriptor.revents & POLLIN);
+    }
+
     VirtioVideoDevice device;
     std::vector<std::uint8_t> memory;
     std::uint32_t stream;
@@ -318,7 +361,7 @@ void exercise(unsigned format)
         {{VideoCodec::h264, ten ? VideoProfile::h264High10 : VideoProfile::h264High, 4096, 2304, 51,
           ten ? 10u : 8u}});
     video.createStream();
-    require(video.device.processQueue(1, 1000, {}, sizeof(virtio_video_event)).action == VhostUserQueueAction::defer, "event not deferred");
+    require(!video.takeEvent(), "an event was raised before the stream decoded anything");
     video.setOutputFormat(format);
     const auto input = VIRTIO_VIDEO_QUEUE_TYPE_INPUT;
     const auto output = VIRTIO_VIDEO_QUEUE_TYPE_OUTPUT;
@@ -339,8 +382,8 @@ void exercise(unsigned format)
     const auto packet = video.queueCommand(input, 1, 5, 7654321);
     require(load<virtio_video_resource_queue_resp>(video.command(packet).response).flags == 0, "decode input failed");
     VhostUserQueueCompletion completion;
-    require(video.device.takeQueueCompletion(completion) && completion.requestId == 1000, "missing source event");
-    require(load<virtio_video_event>(completion.response).event_type == VIRTIO_VIDEO_EVENT_DECODER_RESOLUTION_CHANGED, "incorrect source event");
+    video.expectSourceChange();
+    require(!video.takeEvent(), "the source change was delivered twice");
     require(video.device.takeQueueCompletion(completion) && completion.requestId == captureRequest, "missing capture completion");
     const auto result = load<virtio_video_resource_queue_resp>(completion.response);
     require(result.flags == 0 && result.timestamp == packet.timestamp && result.data_sizes[0] == sizes[0], "incorrect frame completion");
@@ -361,9 +404,12 @@ void exercise(unsigned format)
     video.ok(virtio_video_stream_destroy{{VIRTIO_VIDEO_CMD_STREAM_DESTROY, 7}});
     video.device.reset();
     require(!video.device.takeQueueCompletion(completion), "reset retained completions");
+    /* Any number of event buffers can be offered with no event waiting: each
+     * stays in the guest's ring, and the device holds none. */
     for (unsigned i = 0; i < 256; ++i)
-        require(video.device.processQueue(1, 2000 + i, {}, sizeof(virtio_video_event)).action == VhostUserQueueAction::defer, "event descriptor was completed without an event");
-    require(video.device.processQueue(1, 3000, {}, sizeof(virtio_video_event)).action == VhostUserQueueAction::retry, "full event queue did not apply backpressure");
+        require(video.device.processQueue(1, 2000 + i, {}, sizeof(virtio_video_event)).action == VhostUserQueueAction::retry,
+                "an event buffer was held with no event to give");
+    require(!video.device.takeQueueCompletion(completion), "an event buffer produced a completion");
     video.device.reset();
 
 }
@@ -409,6 +455,48 @@ void h264ProfileControls()
                 "an H.264 profile is missing from the wire list");
 }
 
+/* The profile menu a guest driver publishes for VP9 is the list of capabilities
+ * the host decodes: Profile 0, and Profile 2 only where the hardware decodes it.
+ * The stream's current profile is the first of them. */
+void vp9ProfileControls()
+{
+    for (const bool ten : {false, true}) {
+        std::vector<VideoDecodeCapability> capabilities {{VideoCodec::vp9, VideoProfile::vp9Profile0, 4096, 4096, 0, 8}};
+        if (ten) capabilities.push_back({VideoCodec::vp9, VideoProfile::vp9Profile2, 4096, 4096, 0, 10});
+        VirtioVideoDevice device(capabilities, [](auto) { return std::make_unique<Decoder>(false); });
+        std::vector<std::uint8_t> request;
+        append(request, virtio_video_query_control{{VIRTIO_VIDEO_CMD_QUERY_CONTROL, 0}, VIRTIO_VIDEO_CONTROL_PROFILE, {}});
+        append(request, virtio_video_query_control_profile{VIRTIO_VIDEO_FORMAT_VP9, {}});
+        const auto result = device.processQueue(0, 3, request, 256);
+        const auto header = load<virtio_video_cmd_hdr>(result.response);
+        require(header.type == VIRTIO_VIDEO_RESP_OK_QUERY_CONTROL, "the VP9 profile query failed");
+        const auto bytes = std::span(result.response).subspan(sizeof(header));
+        std::vector<std::uint32_t> wanted {VIRTIO_VIDEO_PROFILE_VP9_PROFILE0};
+        if (ten) wanted.push_back(VIRTIO_VIDEO_PROFILE_VP9_PROFILE2);
+        require(load<virtio_video_query_control_resp_profile>(bytes).num == wanted.size(),
+                "the VP9 profile list has the wrong length");
+        for (std::size_t i = 0; i < wanted.size(); ++i)
+            require(load<std::uint32_t>(bytes.subspan(sizeof(virtio_video_query_control_resp_profile) + 4 * i)) == wanted[i],
+                    "a VP9 profile is missing from the wire list");
+        // A stream of it starts at the first profile.
+        virtio_video_stream_create create {};
+        create.hdr = {VIRTIO_VIDEO_CMD_STREAM_CREATE, 1};
+        create.coded_format = VIRTIO_VIDEO_FORMAT_VP9;
+        request.clear();
+        append(request, create);
+        require(load<virtio_video_cmd_hdr>(device.processQueue(0, 4, request, 128).response).type ==
+                VIRTIO_VIDEO_RESP_OK_NODATA, "the VP9 stream was not created");
+        request.clear();
+        append(request, virtio_video_get_control{{VIRTIO_VIDEO_CMD_GET_CONTROL, 1}, VIRTIO_VIDEO_CONTROL_PROFILE, {}});
+        const auto current = device.processQueue(0, 5, request, 128);
+        require(load<virtio_video_cmd_hdr>(current.response).type == VIRTIO_VIDEO_RESP_OK_GET_CONTROL,
+                "the VP9 profile control failed");
+        require(load<virtio_video_control_val_profile>(std::span(current.response).subspan(sizeof(header))).profile ==
+                    VIRTIO_VIDEO_PROFILE_VP9_PROFILE0,
+                "the VP9 stream does not start at Profile 0");
+    }
+}
+
 /* The levels a stream may carry are the ones the capability states. The
  * device neither claims a level the hardware refuses nor withholds one it
  * decodes, and the current level is the highest. */
@@ -420,10 +508,13 @@ void codecLevelControls()
                           Case {VideoCodec::h264, 62, VIRTIO_VIDEO_LEVEL_H264_6_2, 19},
                           Case {VideoCodec::hevc, 186, VIRTIO_VIDEO_LEVEL_HEVC_6_2, 13},
                           Case {VideoCodec::hevc, 153, VIRTIO_VIDEO_LEVEL_HEVC_5_1, 9},
-                          Case {VideoCodec::jpeg, 0, 0, 0}}) {
+                          Case {VideoCodec::jpeg, 0, 0, 0},
+                          // VP9 has a profile menu and no levels: Android states those itself.
+                          Case {VideoCodec::vp9, 0, 0, 0}}) {
         const auto codec = c.codec;
         VirtioVideoDevice device({{codec, codec == VideoCodec::hevc ? VideoProfile::hevcMain :
-            codec == VideoCodec::jpeg ? VideoProfile::jpegBaseline : VideoProfile::h264High,
+            codec == VideoCodec::jpeg ? VideoProfile::jpegBaseline :
+            codec == VideoCodec::vp9 ? VideoProfile::vp9Profile0 : VideoProfile::h264High,
             4096, 2304, c.maximum, 8}}, [](auto) { return std::make_unique<Decoder>(false); });
         virtio_video_stream_create create {};
         create.hdr = {VIRTIO_VIDEO_CMD_STREAM_CREATE, 1};
@@ -437,9 +528,9 @@ void codecLevelControls()
         const auto result = device.processQueue(0, 2, request, 128);
         const auto header = load<virtio_video_cmd_hdr>(result.response);
         const auto levels = levelsOf(device, wireCodec(codec));
-        if (codec == VideoCodec::jpeg) {
-            require(header.type == VIRTIO_VIDEO_RESP_ERR_UNSUPPORTED_CONTROL, "JPEG exposed a coded level");
-            require(levels.empty(), "JPEG listed coded levels");
+        if (codec == VideoCodec::jpeg || codec == VideoCodec::vp9) {
+            require(header.type == VIRTIO_VIDEO_RESP_ERR_UNSUPPORTED_CONTROL, "a codec without levels exposed a coded level");
+            require(levels.empty(), "a codec without levels listed coded levels");
         } else {
             require(header.type == VIRTIO_VIDEO_RESP_OK_GET_CONTROL, "level control failed");
             const auto value = load<virtio_video_control_val_level>(std::span(result.response).subspan(sizeof(header)));
@@ -451,6 +542,95 @@ void codecLevelControls()
                 VIRTIO_VIDEO_LEVEL_HEVC_1), "the level list starts at the wrong level");
         }
     }
+}
+
+/* VP9 is one coded format whose size range is the rectangle the host decodes.
+ * The guest driver gives Android a profile menu for it but no level control, so
+ * Android states levels 1 to 5 and sizes up to 4096 x 4096 on its own, and the
+ * range the host states has to be that square, from 64 on each axis, which
+ * SET_PARAMS holds a stream to as it does the maximum. A stream of it is decoded
+ * as the others are: the packet in the coded buffer reaches the decoder whole
+ * (a superframe among them) and the picture comes back from the decoder alone. */
+void vp9Stream()
+{
+    const std::vector<VideoDecodeCapability> capabilities {
+        {VideoCodec::vp9, VideoProfile::vp9Profile0, 4096, 4096, 0, 8}};
+    std::vector<VideoCodec> made;
+    VideoFixture video(7, 8 * page, [&made](auto codec) {
+        made.push_back(codec);
+        return std::make_unique<Decoder>(false);
+    }, capabilities);
+
+    std::vector<std::uint8_t> request;
+    append(request, virtio_video_query_capability{{VIRTIO_VIDEO_CMD_QUERY_CAPABILITY, 0},
+                                                  VIRTIO_VIDEO_QUEUE_TYPE_INPUT, {}});
+    const auto reply = video.device.processQueue(0, 90, request, 4096).response;
+    require(load<virtio_video_query_capability_resp>(reply).num_descs == 1, "VP9 alone is not one coded format");
+    const auto desc = load<virtio_video_format_desc>(std::span(reply).subspan(sizeof(virtio_video_query_capability_resp)));
+    require(desc.format == VIRTIO_VIDEO_FORMAT_VP9 && desc.num_frames == 1, "the coded format is not VP9");
+    const auto range = load<virtio_video_format_frame>(
+        std::span(reply).subspan(sizeof(virtio_video_query_capability_resp) + sizeof(virtio_video_format_desc)));
+    require(range.width.min == 64 && range.height.min == 64 && range.width.max == 4096 && range.height.max == 4096,
+            "the VP9 size range is not the symmetric rectangle the host decodes");
+
+    virtio_video_stream_create create {};
+    create.hdr = {VIRTIO_VIDEO_CMD_STREAM_CREATE, 7};
+    create.coded_format = VIRTIO_VIDEO_FORMAT_VP9;
+    video.ok(create);
+    require(made.size() == 1 && made.back() == VideoCodec::vp9, "the stream did not get a VP9 decoder");
+
+    // Every size inside the rectangle is accepted and none beyond it.
+    virtio_video_set_params set {};
+    set.hdr = {VIRTIO_VIDEO_CMD_SET_PARAMS, 7};
+    set.params.queue_type = VIRTIO_VIDEO_QUEUE_TYPE_INPUT;
+    set.params.format = VIRTIO_VIDEO_FORMAT_VP9;
+    for (const auto& [width, height] : {std::pair {4096u, 4096u}, std::pair {2304u, 4096u}, std::pair {64u, 4096u}}) {
+        set.params.frame_width = width; set.params.frame_height = height;
+        video.ok(set);
+    }
+    for (const auto& [width, height] : {std::pair {4097u, 64u}, std::pair {64u, 4097u}, std::pair {4112u, 2304u}}) {
+        set.params.frame_width = width; set.params.frame_height = height;
+        require(load<virtio_video_cmd_hdr>(video.command(set).response).type == VIRTIO_VIDEO_RESP_ERR_INVALID_PARAMETER,
+                "a VP9 size beyond the rectangle was accepted");
+    }
+    // Below the minimum on either axis is refused, on the coded queue and on the picture queue.
+    for (const auto& [width, height] : {std::pair {63u, 64u}, std::pair {64u, 63u}, std::pair {32u, 4096u},
+                                        std::pair {4096u, 1u}}) {
+        set.params.frame_width = width; set.params.frame_height = height;
+        require(load<virtio_video_cmd_hdr>(video.command(set).response).type == VIRTIO_VIDEO_RESP_ERR_INVALID_PARAMETER,
+                "a VP9 size below the rectangle was accepted");
+        auto picture = set;
+        picture.params.queue_type = VIRTIO_VIDEO_QUEUE_TYPE_OUTPUT;
+        picture.params.format = VIRTIO_VIDEO_FORMAT_NV12;
+        require(load<virtio_video_cmd_hdr>(video.command(picture).response).type == VIRTIO_VIDEO_RESP_ERR_INVALID_PARAMETER,
+                "a VP9 picture size below the rectangle was accepted");
+    }
+    set.params.frame_width = 64; set.params.frame_height = 64;
+    video.ok(set);
+    video.setOutputFormat(VIRTIO_VIDEO_FORMAT_NV12);
+
+    // One packet in, one picture out, with the packet's timestamp.
+    const auto input = VIRTIO_VIDEO_QUEUE_TYPE_INPUT;
+    const auto output = VIRTIO_VIDEO_QUEUE_TYPE_OUTPUT;
+    video.attachEncodedInput();
+    Planes planes;
+    const unsigned sizes[] = {4096u, 2048u};
+    for (unsigned i = 0; i < 2; ++i) planes.push_back({{(3 + i) * page, sizes[i], {}}});
+    require(load<virtio_video_cmd_hdr>(video.attach(output, 2, planes).response).type == VIRTIO_VIDEO_RESP_OK_NODATA,
+            "output attach failed");
+    const auto capture = video.queueCommand(output, 2);
+    const auto captureRequest = video.next;
+    require(video.command(capture).action == VhostUserQueueAction::defer, "capture did not wait for input");
+    const auto packet = video.queueCommand(input, 1, 5, 4242);
+    require(load<virtio_video_resource_queue_resp>(video.command(packet).response).flags == 0, "VP9 input failed");
+    video.expectSourceChange();
+    VhostUserQueueCompletion completion;
+    require(video.device.takeQueueCompletion(completion) && completion.requestId == captureRequest,
+            "a VP9 packet produced no picture");
+    const auto result = load<virtio_video_resource_queue_resp>(completion.response);
+    require(result.flags == 0 && result.timestamp == packet.timestamp && result.data_sizes[0] == sizes[0],
+            "the VP9 picture is wrong");
+    video.ok(virtio_video_stream_destroy{{VIRTIO_VIDEO_CMD_STREAM_DESTROY, 7}});
 }
 
 /* The encoder's commands share this header, but a decoder never offers
@@ -574,7 +754,7 @@ void activityLog()
      * close line can name the one that decoded. */
     std::vector<VideoDecodeCapability> both {
         {VideoCodec::h264, VideoProfile::h264High, 4096, 2304, 51, 8},
-        {VideoCodec::vp9, VideoProfile::vp9Profile0, 4096, 2304, 0, 8}};
+        {VideoCodec::vp9, VideoProfile::vp9Profile0, 4096, 4096, 0, 8}};
     ::setenv("UML_VIDEO_ACTIVITY_LOG", path.c_str(), 1);
     {
         VirtioVideoDevice device(both, [](auto) { return std::make_unique<Decoder>(false); });
@@ -932,8 +1112,6 @@ void lateNegotiation()
     const auto input = VIRTIO_VIDEO_QUEUE_TYPE_INPUT;
     const auto output = VIRTIO_VIDEO_QUEUE_TYPE_OUTPUT;
     video.createStream();
-    require(video.device.processQueue(1, 900, {}, sizeof(virtio_video_event)).action == VhostUserQueueAction::defer,
-            "event not deferred");
     video.attachEncodedInput();
 
     /* Settle on planar first, so that pictures are delivered before the
@@ -946,9 +1124,7 @@ void lateNegotiation()
     auto packet = video.queueCommand(input, 1, 5, 11);
     require(load<virtio_video_resource_queue_resp>(video.command(packet).response).flags == 0, "decode input failed");
     VhostUserQueueCompletion completion;
-    require(video.device.takeQueueCompletion(completion) && completion.requestId == 900, "missing source event");
-    require(load<virtio_video_event>(completion.response).event_type == VIRTIO_VIDEO_EVENT_DECODER_RESOLUTION_CHANGED,
-            "incorrect source event");
+    video.expectSourceChange();
 
     // Only now does the client choose packed capture.
     video.setOutputFormat(VIRTIO_VIDEO_FORMAT_BGRA8888);
@@ -1004,8 +1180,6 @@ void planarAfterSourceChange()
     const auto input = VIRTIO_VIDEO_QUEUE_TYPE_INPUT;
     const auto output = VIRTIO_VIDEO_QUEUE_TYPE_OUTPUT;
     video.createStream();
-    require(video.device.processQueue(1, 901, {}, sizeof(virtio_video_event)).action == VhostUserQueueAction::defer,
-            "event not deferred");
     video.attachEncodedInput();
 
     /* The client's first act: queue a packet. Its headers say how big the
@@ -1016,9 +1190,7 @@ void planarAfterSourceChange()
     require(video.command(packet).action == VhostUserQueueAction::defer,
             "the packet was decoded before the client chose a capture format");
     VhostUserQueueCompletion completion;
-    require(video.device.takeQueueCompletion(completion) && completion.requestId == 901, "missing source event");
-    require(load<virtio_video_event>(completion.response).event_type ==
-            VIRTIO_VIDEO_EVENT_DECODER_RESOLUTION_CHANGED, "incorrect source event");
+    video.expectSourceChange();
     require(!video.device.takeQueueCompletion(completion),
             "an encoded buffer came back before the capture format settled");
 
@@ -1147,8 +1319,6 @@ void unsettledHoldIsBounded()
     const auto input = VIRTIO_VIDEO_QUEUE_TYPE_INPUT;
     const auto output = VIRTIO_VIDEO_QUEUE_TYPE_OUTPUT;
     video.createStream();
-    require(video.device.processQueue(1, 950, {}, sizeof(virtio_video_event)).action == VhostUserQueueAction::defer,
-            "event not deferred");
     /* One encoded buffer more than the device will hold unanswered, each with
      * its own identifier because a held one stays queued. */
     const unsigned packets = 33;
@@ -1172,12 +1342,8 @@ void unsettledHoldIsBounded()
     }
     VhostUserQueueCompletion completion;
     unsigned released = 0;
+    video.expectSourceChange();
     while (video.device.takeQueueCompletion(completion)) {
-        if (completion.requestId == 950) {
-            require(load<virtio_video_event>(completion.response).event_type ==
-                    VIRTIO_VIDEO_EVENT_DECODER_RESOLUTION_CHANGED, "incorrect source event");
-            continue;
-        }
         require(!waiting.empty() && completion.requestId == waiting.front(),
                 "an encoded buffer came back out of order");
         waiting.pop_front();
@@ -1294,8 +1460,6 @@ void captureMinimumFollowsReorder(unsigned reorder)
         return std::make_unique<Decoder>(false, true, false, 64, 64, false, reorder);
     });
     video.createStream();
-    require(video.device.processQueue(1, 920, {}, sizeof(virtio_video_event)).action == VhostUserQueueAction::defer,
-            "event not deferred");
     video.attachEncodedInput();
     const auto minimum = [&video] {
         std::vector<std::uint8_t> request;
@@ -1311,8 +1475,7 @@ void captureMinimumFollowsReorder(unsigned reorder)
     // The packet's headers announce the size, and with it the reorder depth.
     const auto packet = video.queueCommand(input, 1, 5, 31);
     require(video.command(packet).action == VhostUserQueueAction::defer, "the packet was decoded early");
-    VhostUserQueueCompletion completion;
-    require(video.device.takeQueueCompletion(completion) && completion.requestId == 920, "missing source event");
+    video.expectSourceChange();
     const unsigned expected = std::max(4u, reorder + 1);
     require(minimum() == expected, "the announced capture minimum does not follow the reorder depth");
 
@@ -1393,9 +1556,6 @@ void resolutionChange(Renegotiation how)
     const auto input = VIRTIO_VIDEO_QUEUE_TYPE_INPUT;
     const auto output = VIRTIO_VIDEO_QUEUE_TYPE_OUTPUT;
     video.createStream();
-    for (unsigned id = 0; id < 2; ++id)
-        require(video.device.processQueue(1, 910 + id, {}, sizeof(virtio_video_event)).action == VhostUserQueueAction::defer,
-                "event not deferred");
     video.setOutputFormat(VIRTIO_VIDEO_FORMAT_NV12);
     for (unsigned id = 1; id <= 4; ++id) video.attachEncodedInput(id);
     const std::uint64_t big = 3 * page, small = 6 * page;
@@ -1424,11 +1584,8 @@ void resolutionChange(Renegotiation how)
         require(load<virtio_video_resource_queue_resp>(
                     video.command(video.queueCommand(input, picture, 5, 100 + picture)).response).flags == 0,
                 "decode input failed");
-        if (picture == 1) {
-            require(video.device.takeQueueCompletion(completion) && completion.requestId == 910 &&
-                    load<virtio_video_event>(completion.response).event_type == VIRTIO_VIDEO_EVENT_DECODER_RESOLUTION_CHANGED,
-                    "the first size was not announced");
-        }
+        if (picture == 1) video.expectSourceChange();
+        else require(!video.takeEvent(), "the first size was announced again");
         require(video.device.takeQueueCompletion(completion) && completion.requestId == request,
                 "missing capture completion");
         const auto result = load<virtio_video_resource_queue_resp>(completion.response);
@@ -1455,9 +1612,8 @@ void resolutionChange(Renegotiation how)
     require(video.device.takeQueueCompletion(completion) && completion.requestId == last, "missing last buffer");
     const auto marker = load<virtio_video_resource_queue_resp>(completion.response);
     require(marker.flags == VIRTIO_VIDEO_DEQUEUE_FLAG_EOS && marker.data_sizes[0] == 0, "the last buffer is not empty and last");
-    require(video.device.takeQueueCompletion(completion) && completion.requestId == 911 &&
-            load<virtio_video_event>(completion.response).event_type == VIRTIO_VIDEO_EVENT_DECODER_RESOLUTION_CHANGED,
-            "the new size was not announced after the last buffer");
+    video.expectSourceChange();
+    require(!video.takeEvent(), "the new size was announced twice");
     require(!video.device.takeQueueCompletion(completion), "an extra completion after the change");
     require(size(output) == 32, "the new size is not reported");
 
@@ -1536,9 +1692,6 @@ void changeInsideDrain(bool markerFirst)
     const auto input = VIRTIO_VIDEO_QUEUE_TYPE_INPUT;
     const auto output = VIRTIO_VIDEO_QUEUE_TYPE_OUTPUT;
     video.createStream();
-    for (unsigned id = 0; id < 2; ++id)
-        require(video.device.processQueue(1, 930 + id, {}, sizeof(virtio_video_event)).action == VhostUserQueueAction::defer,
-                "event not deferred");
     video.setOutputFormat(VIRTIO_VIDEO_FORMAT_NV12);
     for (unsigned id = 1; id <= 4; ++id) video.attachEncodedInput(id);
     const auto attach = [&video](unsigned resource, std::uint64_t base, std::uint32_t luma, std::uint32_t chroma,
@@ -1564,8 +1717,7 @@ void changeInsideDrain(bool markerFirst)
         require(load<virtio_video_resource_queue_resp>(
                     video.command(video.queueCommand(input, picture, 5, 100 + picture)).response).flags == 0,
                 "decode input failed");
-        if (picture == 1)
-            require(video.device.takeQueueCompletion(completion) && completion.requestId == 930, "the first size was not announced");
+        if (picture == 1) video.expectSourceChange();
         require(video.device.takeQueueCompletion(completion) && completion.requestId == (picture == 1 ? firstOld : secondOld) &&
                 flagsOf(completion) == 0 && load<virtio_video_resource_queue_resp>(completion.response).timestamp == 100 + picture,
                 "incorrect first-size picture");
@@ -1577,21 +1729,23 @@ void changeInsideDrain(bool markerFirst)
     if (markerFirst) {
         require(video.device.takeQueueCompletion(completion) && completion.requestId == spare &&
                 flagsOf(completion) == VIRTIO_VIDEO_DEQUEUE_FLAG_EOS, "the old size did not end in a last buffer");
-        require(video.device.takeQueueCompletion(completion) && completion.requestId == 931, "the new size was not announced");
+        video.expectSourceChange();
     }
     require(load<virtio_video_resource_queue_resp>(
                 video.command(video.queueCommand(input, 4, 5, 104)).response).flags == 0, "decode input failed");
     require(!video.device.takeQueueCompletion(completion), "a size change was announced ahead of the drain");
+    require(!video.takeEvent(), "a size change was announced ahead of the drain");
 
     video.ok(virtio_video_stream_drain{{VIRTIO_VIDEO_CMD_STREAM_DRAIN, 12}});
-    bool released = false, announced = markerFirst;
+    bool released = false;
     while (video.device.takeQueueCompletion(completion)) {
         if (completion.requestId == changing) released = true;
-        else if (completion.requestId == 931 && !markerFirst) announced = true;
         else require(false, "a drain inside which the size changes completed a buffer before the pictures of the new size");
     }
     require(released, "the drain did not give back the coded buffer of the change");
-    require(announced, "the new size was not announced without a buffer to end the old one");
+    // Announced without a buffer to end the old size, unless that buffer did.
+    if (!markerFirst) video.expectSourceChange();
+    require(!video.takeEvent(), "the new size was announced twice");
 
     /* The client sets its capture queue up for the new size, which returns the
      * buffer of the old size it still holds; the pictures follow, then the
@@ -1623,6 +1777,73 @@ void changeInsideDrain(bool markerFirst)
     video.device.reset();
 }
 
+/* A coded buffer the device holds, because two pictures wait for the client's
+ * capture buffers, is decoded when a capture buffer is queued. When the
+ * decoder refuses that packet the buffer is returned once, with the error
+ * flag, and the stream goes on with what the client queues next: the buffer is
+ * neither lost nor completed twice. */
+void refusedHeldInput()
+{
+    auto state = std::make_shared<ScriptedState>();
+    state->refuse = 3;
+    VideoFixture video(11, 8 * page, [state](auto) {
+        return std::make_unique<ScriptedDecoder>(std::vector<std::uint32_t> {64}, state);
+    });
+    const auto input = VIRTIO_VIDEO_QUEUE_TYPE_INPUT;
+    const auto output = VIRTIO_VIDEO_QUEUE_TYPE_OUTPUT;
+    video.createStream();
+    video.setOutputFormat(VIRTIO_VIDEO_FORMAT_NV12);
+    for (unsigned id = 1; id <= 4; ++id) video.attachEncodedInput(id);
+    require(load<virtio_video_cmd_hdr>(video.attach(output, 2, {{{3 * page, 4096, {}}}, {{4 * page, 2048, {}}}}).response).type
+            == VIRTIO_VIDEO_RESP_OK_NODATA, "capture attach failed");
+    VhostUserQueueCompletion completion;
+    const auto flagsOf = [](const VhostUserQueueCompletion& done) {
+        return load<virtio_video_resource_queue_resp>(done.response).flags;
+    };
+
+    // Two packets decode into pictures nobody has a buffer for yet.
+    for (unsigned id = 1; id <= 2; ++id) {
+        require(load<virtio_video_resource_queue_resp>(
+                    video.command(video.queueCommand(input, id, 5, 100 + id)).response).flags == 0,
+                "decode input failed");
+        if (id == 1) video.expectSourceChange();
+    }
+    // The third waits behind them.
+    const auto held = video.next;
+    require(video.command(video.queueCommand(input, 3, 5, 103)).action == VhostUserQueueAction::defer,
+            "a coded buffer was taken with two pictures waiting");
+    require(!video.device.takeQueueCompletion(completion), "a held coded buffer was completed early");
+
+    // The capture buffer takes the first picture and releases the held packet, which the decoder refuses.
+    const auto capture = video.command(video.queueCommand(output, 2));
+    require(capture.action == VhostUserQueueAction::complete &&
+            load<virtio_video_resource_queue_resp>(capture.response).flags == VIRTIO_VIDEO_DEQUEUE_FLAG_ERR,
+            "a refused held packet did not fail the request that released it");
+    unsigned returned = 0;
+    while (video.device.takeQueueCompletion(completion))
+        if (completion.requestId == held) {
+            ++returned;
+            require(flagsOf(completion) == VIRTIO_VIDEO_DEQUEUE_FLAG_ERR, "the refused coded buffer came back without the error");
+        }
+    require(returned == 1, "a refused held coded buffer was not returned exactly once");
+    const auto event = video.takeEvent();
+    require(event && event->event_type == VIRTIO_VIDEO_EVENT_ERROR && event->stream_id == video.stream,
+            "a refused held packet raised no error event");
+
+    // The stream takes the next packet, and the picture still waiting is delivered.
+    require(load<virtio_video_resource_queue_resp>(
+                video.command(video.queueCommand(input, 4, 5, 104)).response).flags == 0, "the stream refused the packet after the error");
+    const auto request = video.next;
+    require(video.command(video.queueCommand(output, 2)).action == VhostUserQueueAction::defer,
+            "capture was not deferred after the error");
+    require(video.device.takeQueueCompletion(completion) && completion.requestId == request && flagsOf(completion) == 0 &&
+            load<virtio_video_resource_queue_resp>(completion.response).timestamp == 102,
+            "the picture that was waiting was not delivered after the error");
+    require(!video.device.takeQueueCompletion(completion), "an extra completion after the error");
+    video.ok(virtio_video_stream_destroy{{VIRTIO_VIDEO_CMD_STREAM_DESTROY, 11}});
+    video.device.reset();
+}
+
 /* A seek throws away what was decoded and nothing else: the decoder keeps the
  * stream's parameter sets, and the client is not told a size it already has. */
 void seekKeepsTheFormat()
@@ -1634,9 +1855,6 @@ void seekKeepsTheFormat()
     const auto input = VIRTIO_VIDEO_QUEUE_TYPE_INPUT;
     const auto output = VIRTIO_VIDEO_QUEUE_TYPE_OUTPUT;
     video.createStream();
-    for (unsigned id = 0; id < 2; ++id)
-        require(video.device.processQueue(1, 920 + id, {}, sizeof(virtio_video_event)).action == VhostUserQueueAction::defer,
-                "event not deferred");
     video.setOutputFormat(VIRTIO_VIDEO_FORMAT_NV12);
     for (unsigned id = 1; id <= 2; ++id) video.attachEncodedInput(id);
     require(load<virtio_video_cmd_hdr>(video.attach(output, 2, {{{3 * page, 4096, {}}}, {{4 * page, 2048, {}}}}).response).type
@@ -1652,14 +1870,15 @@ void seekKeepsTheFormat()
         return request;
     };
     decodeOne(1, 201);
-    require(video.device.takeQueueCompletion(completion) && completion.requestId == 920, "missing source event");
+    video.expectSourceChange();
     require(video.device.takeQueueCompletion(completion), "missing capture completion");
     video.ok(virtio_video_queue_clear{{VIRTIO_VIDEO_CMD_QUEUE_CLEAR, 10}, input, {}});
     require(state->discards == 1, "a seek did not discard the decoder's state");
     require(!video.device.takeQueueCompletion(completion), "a seek completed something");
     const auto request = decodeOne(2, 202);
     require(video.device.takeQueueCompletion(completion) && completion.requestId == request,
-            "the first picture after a seek was not delivered, or the format was announced again");
+            "the first picture after a seek was not delivered");
+    require(!video.takeEvent(), "the format was announced again after a seek");
     const auto result = load<virtio_video_resource_queue_resp>(completion.response);
     require(result.flags == 0 && result.timestamp == 202, "incorrect picture after a seek");
     require(!video.device.takeQueueCompletion(completion), "an extra completion after a seek");
@@ -1670,15 +1889,19 @@ void seekKeepsTheFormat()
 /* A 10-bit stream is offered 8-bit planar capture, which Android asks for by
  * default, and still P010. A client that wants P010 from an 8-bit stream is
  * refused: the samples would be a lie. */
-void tenBitStreamToNv12(unsigned format)
+void tenBitStreamToNv12(unsigned format, bool vp9 = false)
 {
-    VideoFixture video(11, 8 * page, [](auto) { return std::make_unique<Decoder>(true); },
-        {{VideoCodec::h264, VideoProfile::h264High10, 4096, 2304, 51, 10}});
+    /* VP9 Profile 2 is advertised beside Profile 0, as the host does, and its
+     * pictures reach the client by the same narrowing as H.264 High 10. */
+    std::vector<VideoDecodeCapability> capabilities = vp9
+        ? std::vector<VideoDecodeCapability> {{VideoCodec::vp9, VideoProfile::vp9Profile0, 4096, 4096, 0, 8},
+                                              {VideoCodec::vp9, VideoProfile::vp9Profile2, 4096, 4096, 0, 10}}
+        : std::vector<VideoDecodeCapability> {{VideoCodec::h264, VideoProfile::h264High10, 4096, 2304, 51, 10}};
+    VideoFixture video(11, 8 * page, [](auto) { return std::make_unique<Decoder>(true); }, std::move(capabilities));
     const auto input = VIRTIO_VIDEO_QUEUE_TYPE_INPUT;
     const auto output = VIRTIO_VIDEO_QUEUE_TYPE_OUTPUT;
+    if (vp9) video.codedFormat = VIRTIO_VIDEO_FORMAT_VP9;
     video.createStream();
-    require(video.device.processQueue(1, 930, {}, sizeof(virtio_video_event)).action == VhostUserQueueAction::defer,
-            "event not deferred");
     video.setOutputFormat(format);
     video.attachEncodedInput();
     const bool nv12 = format == VIRTIO_VIDEO_FORMAT_NV12;
@@ -1692,7 +1915,7 @@ void tenBitStreamToNv12(unsigned format)
     require(load<virtio_video_resource_queue_resp>(
                 video.command(video.queueCommand(input, 1, 5, 31)).response).flags == 0, "decode input failed");
     VhostUserQueueCompletion completion;
-    require(video.device.takeQueueCompletion(completion), "missing source event");
+    video.expectSourceChange();
     require(video.device.takeQueueCompletion(completion) && completion.requestId == request, "missing capture completion");
     const auto result = load<virtio_video_resource_queue_resp>(completion.response);
     require(result.flags == 0, "the picture was failed");
@@ -1729,13 +1952,15 @@ void tenBitStreamToNv12(unsigned format)
  * offers its client exactly the formats the bits select. This checks both
  * directions against the lists actually sent, so a raw format added in the
  * middle of the list cannot silently stop being reachable. */
-void capabilityMasks()
+void capabilityMasks(bool vp9Ten)
 {
     std::vector<VideoDecodeCapability> caps {
-        {VideoCodec::vp9, VideoProfile::vp9Profile0, 4096, 2304, 0, 8},
+        {VideoCodec::vp9, VideoProfile::vp9Profile0, 4096, 4096, 0, 8},
         {VideoCodec::hevc, VideoProfile::hevcMain, 8192, 4320, 0, 8},
         {VideoCodec::hevc, VideoProfile::hevcMain10, 8192, 4320, 0, 10},
     };
+    // VP9 Profile 2 is a second capability of the same coded format, 10-bit.
+    if (vp9Ten) caps.push_back({VideoCodec::vp9, VideoProfile::vp9Profile2, 4096, 4096, 0, 10});
     VirtioVideoDevice device(caps, [](auto) { return std::make_unique<Decoder>(false); });
     std::uint64_t next = 1;
     auto formats = [&](std::uint32_t queue) {
@@ -1805,8 +2030,8 @@ void capabilityMasks()
     };
 
     for (const auto& [format, mask] : coded) {
-        // VP9 is 8-bit here, HEVC has both an 8-bit and a 10-bit capability.
-        const auto expected = format == VIRTIO_VIDEO_FORMAT_VP9
+        // VP9 is 8-bit unless Profile 2 is listed; HEVC has both an 8-bit and a 10-bit capability.
+        const auto expected = format == VIRTIO_VIDEO_FORMAT_VP9 && !vp9Ten
             ? sorted({VIRTIO_VIDEO_FORMAT_NV12, VIRTIO_VIDEO_FORMAT_YUV420,
                       VIRTIO_VIDEO_FORMAT_BGRA8888})
             : sorted({VIRTIO_VIDEO_FORMAT_NV12, VIRTIO_VIDEO_FORMAT_YUV420,
@@ -1815,7 +2040,7 @@ void capabilityMasks()
     }
     for (const auto& [format, mask] : raw) {
         const auto expected = format == VIRTIO_VIDEO_FORMAT_P010
-            ? sorted({VIRTIO_VIDEO_FORMAT_HEVC})
+            ? (vp9Ten ? sorted({VIRTIO_VIDEO_FORMAT_VP9, VIRTIO_VIDEO_FORMAT_HEVC}) : sorted({VIRTIO_VIDEO_FORMAT_HEVC}))
             : sorted({VIRTIO_VIDEO_FORMAT_VP9, VIRTIO_VIDEO_FORMAT_HEVC});
         require(selected(coded, mask) == expected, "a capture format names the wrong codecs");
     }
@@ -1888,9 +2113,6 @@ void provisionalCaptureFormat(bool pictureFirst)
     const auto input = VIRTIO_VIDEO_QUEUE_TYPE_INPUT;
     const auto output = VIRTIO_VIDEO_QUEUE_TYPE_OUTPUT;
     video.createStream();
-    for (unsigned id = 0; id < 2; ++id)
-        require(video.device.processQueue(1, 940 + id, {}, sizeof(virtio_video_event)).action == VhostUserQueueAction::defer,
-                "event not deferred");
     video.setOutputFormat(VIRTIO_VIDEO_FORMAT_NV12, 64, 64);
     video.attachEncodedInput(1);
     video.attachEncodedInput(2);
@@ -1902,9 +2124,7 @@ void provisionalCaptureFormat(bool pictureFirst)
     require(video.command(video.queueCommand(input, 1, 5, 0)).action == VhostUserQueueAction::defer,
             "the packet that declared the size came back before the capture queue was set up for it");
     VhostUserQueueCompletion completion;
-    require(video.device.takeQueueCompletion(completion) && completion.requestId == 940 &&
-            load<virtio_video_event>(completion.response).event_type == VIRTIO_VIDEO_EVENT_DECODER_RESOLUTION_CHANGED,
-            "size not announced");
+    video.expectSourceChange();
     const auto picture = [&] {
         require(load<virtio_video_resource_queue_resp>(video.command(video.queueCommand(input, 2, 5, 77)).response).flags == 0,
                 "picture packet failed");
@@ -1925,7 +2145,8 @@ void provisionalCaptureFormat(bool pictureFirst)
             "missing capture completion");
     const auto result = load<virtio_video_resource_queue_resp>(completion.response);
     require(result.flags == 0 && result.timestamp == 77, "the picture did not reach the P010 client");
-    require(!video.device.takeQueueCompletion(completion), "the size was announced again");
+    require(!video.device.takeQueueCompletion(completion), "an extra completion after the drain");
+    require(!video.takeEvent(), "the size was announced again");
     video.ok(virtio_video_stream_destroy{{VIRTIO_VIDEO_CMD_STREAM_DESTROY, 21}});
     video.device.reset();
 }
@@ -1942,8 +2163,6 @@ void provisionalCaptureBuffers(bool drainFirst)
     const auto input = VIRTIO_VIDEO_QUEUE_TYPE_INPUT;
     const auto output = VIRTIO_VIDEO_QUEUE_TYPE_OUTPUT;
     video.createStream();
-    require(video.device.processQueue(1, 940, {}, sizeof(virtio_video_event)).action == VhostUserQueueAction::defer,
-            "event not deferred");
     video.setOutputFormat(VIRTIO_VIDEO_FORMAT_NV12, 64, 64);
     video.attachEncodedInput(1);
     video.attachEncodedInput(2);
@@ -1961,17 +2180,16 @@ void provisionalCaptureBuffers(bool drainFirst)
             "picture packet failed");
     if (drainFirst) video.ok(virtio_video_stream_drain{{VIRTIO_VIDEO_CMD_STREAM_DRAIN, 21}});
     VhostUserQueueCompletion completion;
-    bool announced = false, declared = false;
+    bool declared = false;
     const auto noPictureYet = [&] {
         while (video.device.takeQueueCompletion(completion)) {
-            if (completion.requestId == 940) { announced = true; continue; }
             if (completion.requestId == declaring) { declared = true; continue; }
             require(load<virtio_video_resource_queue_resp>(completion.response).timestamp != 77,
                     "the picture went into a buffer set up for the provisional size");
         }
     };
+    video.expectSourceChange();
     noPictureYet();
-    require(announced, "size not announced");
     /* A drain gives the packet back, since a client that drains is not waiting
      * for it. */
     require(declared == drainFirst, "the packet that declared the size came back before the client stopped its capture queue");
@@ -1991,14 +2209,119 @@ void provisionalCaptureBuffers(bool drainFirst)
     video.ok(virtio_video_stream_destroy{{VIRTIO_VIDEO_CMD_STREAM_DESTROY, 21}});
     video.device.reset();
 }
+
+/* A guest suspends by disabling its rings, and a codec stream outlives it: the
+ * device asks the transport to leave it alone at a ring's disable and to keep
+ * the request buffers a ring is given meanwhile (vhost_user_device.hpp). */
+void streamsOutliveASuspend()
+{
+    VideoFixture video(15, 8 * page, [](auto) { return std::make_unique<Decoder>(false); });
+    require(video.device.keepsDeferredRequestsWhileDisabled(),
+            "a ring disable resets the decoder, which drops the stream a suspend must keep");
+    require(video.device.keepsRequestsOnDisabledRing(),
+            "a request posted as the guest suspends is dropped by the decoder's transport");
+}
+
+/* The event queue never holds a buffer of the guest's. With no event waiting a
+ * buffer offered stays in the guest's ring, however many are offered, and the
+ * device does not wake the transport; an event raised later does, and the next
+ * buffer takes it. An event nobody took is dropped by a reset. */
+void eventsWaitForABuffer()
+{
+    VideoFixture video(15, 8 * page, [](auto) { return std::make_unique<Decoder>(false); });
+    const auto input = VIRTIO_VIDEO_QUEUE_TYPE_INPUT;
+    require(video.device.eventDescriptor() >= 0, "the device has no wake-up descriptor");
+    video.createStream();
+    video.attachEncodedInput();
+    video.setOutputFormat(VIRTIO_VIDEO_FORMAT_NV12);
+    require(!video.awake(), "the device woke the transport with no event");
+    for (unsigned i = 0; i < 256; ++i)
+        require(video.device.processQueue(1, 100 + i, {}, sizeof(virtio_video_event)).action == VhostUserQueueAction::retry,
+                "the device held an event buffer with no event to give");
+    require(video.device.processQueue(1, 1, {}, 4).response.empty(), "an event buffer too small");
+
+    // The first packet raises the source change.
+    require(load<virtio_video_resource_queue_resp>(
+                video.command(video.queueCommand(input, 1, 5, 41)).response).flags == 0, "decode input failed");
+    require(video.awake(), "an event was raised and the transport was not woken");
+    video.device.drainEventSource();
+    require(!video.awake(), "draining the wake-up left the descriptor readable");
+    video.expectSourceChange();
+    require(!video.takeEvent(), "the event was delivered twice");
+
+    // An event nobody took is dropped by a reset.
+    VideoFixture other(16, 8 * page, [](auto) { return std::make_unique<Decoder>(false); });
+    other.createStream();
+    other.attachEncodedInput();
+    other.setOutputFormat(VIRTIO_VIDEO_FORMAT_NV12);
+    require(load<virtio_video_resource_queue_resp>(
+                other.command(other.queueCommand(input, 1, 5, 42)).response).flags == 0, "decode input failed");
+    other.device.reset();
+    require(!other.takeEvent(), "an event survived the reset");
+}
+
+/* A decoder that lost its platform session shows nothing until its next sync
+ * picture and says nothing about it. The device treats that gap as the ordinary
+ * absence of pictures: every coded buffer is given back unharmed, no error
+ * reaches the guest, and the capture buffer waiting through the gap takes the
+ * first picture after it. */
+void gapInThePictures()
+{
+    auto state = std::make_shared<ScriptedState>();
+    state->dropFrom = 3;
+    state->dropTo = 5;
+    VideoFixture video(14, 16 * page, [state](auto) {
+        return std::make_unique<ScriptedDecoder>(std::vector<std::uint32_t> {64}, state);
+    });
+    const auto input = VIRTIO_VIDEO_QUEUE_TYPE_INPUT;
+    const auto output = VIRTIO_VIDEO_QUEUE_TYPE_OUTPUT;
+    video.createStream();
+    video.setOutputFormat(VIRTIO_VIDEO_FORMAT_NV12);
+    for (unsigned id = 1; id <= 5; ++id) video.attachEncodedInput(id);
+    const std::uint64_t base = 3 * page;
+    require(load<virtio_video_cmd_hdr>(video.attach(output, 2, {{{base, 4096, {}}}, {{base + page, 2048, {}}}}).response).type
+            == VIRTIO_VIDEO_RESP_OK_NODATA, "capture attach failed");
+    VhostUserQueueCompletion completion;
+    std::uint64_t waiting = 0;
+    for (unsigned picture = 1; picture <= 5; ++picture) {
+        if (!waiting) {
+            waiting = video.next;
+            require(video.command(video.queueCommand(output, 2)).action == VhostUserQueueAction::defer,
+                    "capture was not deferred");
+        }
+        require(load<virtio_video_resource_queue_resp>(
+                    video.command(video.queueCommand(input, picture, 5, 100 + picture)).response).flags == 0,
+                "a coded buffer was failed instead of given back");
+        if (picture == 1) video.expectSourceChange();
+        if (picture == 3 || picture == 4) {
+            require(!video.device.takeQueueCompletion(completion), "a picture the lost session was to decode was shown");
+            continue;
+        }
+        require(video.device.takeQueueCompletion(completion) && completion.requestId == waiting,
+                "the picture did not reach the waiting capture buffer");
+        const auto result = load<virtio_video_resource_queue_resp>(completion.response);
+        require(result.flags == 0 && result.timestamp == 100 + picture, "incorrect picture around a gap");
+        waiting = 0;
+    }
+    require(!video.takeEvent(), "a gap in the pictures was reported to the guest");
+    require(!video.device.takeQueueCompletion(completion), "an extra completion around a gap");
+    video.ok(virtio_video_stream_destroy{{VIRTIO_VIDEO_CMD_STREAM_DESTROY, 14}});
+    video.device.reset();
+}
 }
 int main()
 {
     try {
+        streamsOutliveASuspend();
+        eventsWaitForABuffer();
+        gapInThePictures();
         h264ProfileControls();
+        vp9ProfileControls();
         codecLevelControls();
         decoderRejectsEncoderCommands();
-        capabilityMasks();
+        vp9Stream();
+        capabilityMasks(false);
+        capabilityMasks(true);
         sharedMemoryCapture();
         for (const bool decoderPacks : {true, false})
             packedCapture(decoderPacks);
@@ -2027,8 +2350,9 @@ int main()
             resolutionChange(how);
         for (const bool markerFirst : {false, true}) changeInsideDrain(markerFirst);
         seekKeepsTheFormat();
+        refusedHeldInput();
         for (const auto format : {VIRTIO_VIDEO_FORMAT_NV12, VIRTIO_VIDEO_FORMAT_P010})
-            tenBitStreamToNv12(format);
+            for (const bool vp9 : {false, true}) tenBitStreamToNv12(format, vp9);
         provisionalCaptureFormat(false);
         provisionalCaptureFormat(true);
         provisionalCaptureBuffers(false);

@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# When an activity covers the camera preview's surface, the last preview buffers
+# come back with the display composer's own present fence, and cameraserver
+# passes that fence to the camera HAL with the next capture request. The
+# platform lets cameraserver use the composer HAL's descriptors (the attribute
+# hal_graphics_composer names its server domains) and the camera HAL only those
+# of applications and SurfaceFlinger, so without this rule binder refuses the
+# request and the session fails with ERROR_CAMERA_DEVICE.
+allow hal_camera_default hal_graphics_composer:fd use;

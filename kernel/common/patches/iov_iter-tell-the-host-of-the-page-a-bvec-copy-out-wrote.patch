@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 15:36:38 +0900
+Subject: [PATCH] iov_iter: tell the host of the page a bvec copy-out wrote
+
+A copy into an ITER_BVEC destination (a loop device's read of its
+backing file, an io_uring fixed-buffer read of a buffered file, nbd,
+nfsd, sunrpc) writes each page through the kernel's alias, and the
+page may be one a process runs: on x86-64 the host translates the
+code of such a page and has to hear of the write, which the flush at
+the pin, before the copy, did not tell it. End each destination step
+with flush_dcache_page(), as memcpy_to_page() and memzero_page() do.
+The call is empty where the architecture has no hook. The x86-64
+hook costs a barrier and a bit test for a page no process runs,
+names the frame of one a process does, and warns once and drops the
+announcement in a context that is not a task, as it always has.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ include/linux/iov_iter.h | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/include/linux/iov_iter.h b/include/linux/iov_iter.h
+index f9a17fbbd3980b1fec5f9a7fde812aebef6728d5..20568cbbec5eceb2cd85245ad03c58d1778fd477 100644
+--- a/include/linux/iov_iter.h
++++ b/include/linux/iov_iter.h
+@@ -123,6 +123,14 @@ size_t iterate_bvec(struct iov_iter *iter, size_t len, void *priv, void *priv2,
+ 		remain = step(kaddr + offset % PAGE_SIZE, progress, part, priv, priv2);
+ 		kunmap_local(kaddr);
+ 		consumed = part - remain;
++		/*
++		 * A copy into a destination page writes it through the kernel's
++		 * alias, as a driver that fills pages itself does, and the page
++		 * may be one a process runs: end the write with
++		 * flush_dcache_page() where the architecture has a hook for it.
++		 */
++		if (consumed && !iter->data_source)
++			flush_dcache_page(p->bv_page + offset / PAGE_SIZE);
+ 		len -= consumed;
+ 		progress += consumed;
+ 		skip += consumed;

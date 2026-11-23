@@ -4,6 +4,7 @@ import Darwin
 import Foundation
 import Testing
 @testable import AndariumCore
+import AndariumCoreTestSupport
 
 // SI conversion of a sample and its wire form, the mount's axes as the window
 // and the owner of rotation change, the saved choice (unset follows the
@@ -87,10 +88,11 @@ struct MotionTests {
         mount.begin(interface: .portrait)
         var restart = restarts(&mount, .guest, .landscapeLeft)
         #expect(restart && mount.axes == .landscapeLeft)
-        // UIKit holds the locked orientation; a differing reading is ignored.
+        // UIKit holds the orientation; a differing reading is ignored.
         restart = restarts(&mount, .guest, .portrait)
         #expect(!restart && mount.axes == .landscapeLeft)
-        // Returning to a locked scene mounts the orientation now held, once.
+        // When the host owns rotation again the mount follows the interface,
+        // once.
         restart = restarts(&mount, .host, .portrait)
         #expect(restart && mount.axes == .portrait)
         restart = restarts(&mount, .guest, .landscapeRight)
@@ -110,35 +112,23 @@ struct MotionTests {
         #expect(!restart && mount.axes == .landscapeLeft)
     }
 
-    @Test func theGyroscopeFollowsTheDeviceUntilThePersonChooses() throws {
-        // No choice is stored: a record without the field is unset, and unset
-        // is on wherever the device has sensors to share.
-        let unset = Data(#"{"cores":2,"memoryMiB":1024,"capacityGiB":8,"microphone":false,"includeInBackups":false}"#.utf8)
-        let guest = try JSONDecoder().decode(Guest.self, from: unset)
-        #expect(guest.motionChoice == nil)
-        #expect(guest.motionSensorsOn(available: true))
-        // Without sensors it is off, as the switch shows it.
-        #expect(!guest.motionSensorsOn(available: false))
+    @Test func aGuestStoredWithTheOldMotionChoiceIsReadAndSavedWithoutIt() throws {
+        // An older build stored the Gyroscope switch as `motionSensors`; the
+        // choice is gone, whatever it was, and nothing asks about it.
+        for stored in ["true", "false"] {
+            let old = Data(
+                #"{"cores":2,"memoryMiB":1024,"capacityGiB":8,"microphone":true,"includeInBackups":false,"motionSensors":\#(stored)}"#
+                    .utf8)
+            let guest = try JSONDecoder().decode(Guest.self, from: old)
+            #expect(guest.cores == 2 && guest.microphone && guest.haptics && !guest.location)
+            let saved = String(decoding: try JSONEncoder().encode(guest.erased), as: UTF8.self)
+            #expect(!saved.contains("motionSensors"))
+            #expect(try JSONDecoder().decode(Guest.self, from: Data(saved.utf8)) == guest.erased)
+        }
         let host = HostDevice(
             name: "iPad", processorCount: 6, memory: MemoryPolicy(maximumsMiB: [4096]), freeStorageBytes: 40_000_000_000
         )
-        #expect(Guest.fresh(on: host).motionChoice == nil)
-        #expect(String(decoding: try JSONEncoder().encode(guest), as: UTF8.self).contains("motionSensors") == false)
-    }
-
-    @Test func aChoiceSticksThroughEraseAndReload() throws {
-        let off = Data(
-            #"{"cores":2,"memoryMiB":1024,"capacityGiB":8,"microphone":false,"includeInBackups":false,"motionSensors":false}"#.utf8)
-        var guest = try JSONDecoder().decode(Guest.self, from: off)
-        #expect(guest.motionChoice == false)
-        #expect(!guest.motionSensorsOn(available: true))
-        let savedOff = try JSONEncoder().encode(guest.erased)
-        #expect(try JSONDecoder().decode(Guest.self, from: savedOff).motionChoice == false)
-        guest.motionChoice = true
-        let savedOn = try JSONEncoder().encode(guest.erased)
-        let reloaded = try JSONDecoder().decode(Guest.self, from: savedOn)
-        #expect(reloaded.motionChoice == true && reloaded.motionSensorsOn(available: true))
-        #expect(!reloaded.motionSensorsOn(available: false))
+        #expect(!String(decoding: try JSONEncoder().encode(Guest.fresh(on: host)), as: UTF8.self).contains("motionSensors"))
     }
 
     private final class Opener: GuestStreamOpener, @unchecked Sendable {
@@ -235,6 +225,33 @@ struct MotionTests {
         #expect(poll(&descriptor, 1, 2000) > 0)
         var byte: UInt8 = 0
         #expect(recv(sockets[1], &byte, 1, MSG_DONTWAIT) == 0)
+    }
+
+    private final class Changes: @unchecked Sendable {
+        private let lock = NSLock()
+        private var list: [Bool] = []
+        func add(_ value: Bool) { lock.withLock { list.append(value) } }
+        var all: [Bool] { lock.withLock { list } }
+    }
+
+    @Test func aGuestThatReadsNothingNeverHoldsTheCallerAndTheConnectionIsClosed() throws {
+        let sockets = try pair()
+        let opener = Opener(descriptor: sockets[0])
+        let changes = Changes()
+        let stream = MotionStream(opener: opener, connectionChanged: { changes.add($0) })
+        let epoch = stream.start()
+        // The peer is closed first, which also frees a send that a regression would leave blocked.
+        defer { stream.stop() }
+        defer { close(sockets[1]) }
+        #expect(opener.entered.wait(timeout: .now() + 2) == .success)
+        let sample = MotionSample(sensor: .gyroscope, x: 1, y: 2, z: 3)
+        let finished = returnsWithoutWaiting {
+            // A record is 20 bytes and the socket holds a few hundred: far more than it takes.
+            for _ in 0..<2_000 { stream.submit(sample, epoch: epoch) }
+        }
+        #expect(finished, "a submit waited for a guest that reads nothing")
+        // The record that did not fit closed the connection, as the stream says.
+        #expect(changes.all.contains(false))
     }
 
     @Test func aClosedPeerCannotRaiseSigpipe() throws {

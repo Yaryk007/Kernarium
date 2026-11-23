@@ -25,6 +25,7 @@ script below; per-platform contracts are under [`platforms/`](platforms).
 | `ios-compression` | `build-ios-zstd.sh` |
 | `kernel-host-tools` | `build-kernel-host-tools.sh`, after `prepare.sh --archive-manifest kernel-host-tools/archives.tsv` |
 | `x86-conformance` | none: prepared only |
+| `andarium-accessibility` | none: prepared only |
 
 - `macos`: non-graphics static host libraries at
   `.build/dependencies/macos-arm64-27`. It also carries FEXCore for the
@@ -49,6 +50,14 @@ script below; per-platform contracts are under [`platforms/`](platforms).
 - `kernel-host-tools`: pahole and the static libelf the Darwin kernel build
   uses for BTF, at `.build/dependencies/kernel-host-tools`; patch-managed
   Darwin ports that run only on the build host.
+- `andarium-accessibility`: the sources of TalkBack, eSpeak NG and libsonic,
+  the screen reader and the voice the LineageOS image carries, as topic
+  checkouts for their series. The image build compiles them: the
+  [Android producer](../android/lineage-24/README.md#accessibility) pins the
+  same commits and materializes them with these series
+  ([`patches/talkback`](patches/talkback/series.tsv),
+  [`patches/espeak-ng`](patches/espeak-ng/series.tsv)), which carry the Soong
+  build, and a pin moves in `manifest.tsv` and in its metadata together.
 - `x86-conformance`: the test-only FEX and K x86-64 corpora and their pinned
   producer inputs, used to generate the checked-in x86 unit corpus (see
   [`../tools/fex-tests/README.md`](../tools/fex-tests/README.md)).
@@ -91,8 +100,8 @@ build the new one beside it. Prefix verification checks the manifest rows, the
 patched sources' trees in `share/uml-dependencies/source-trees.tsv`, platform
 and deployment target, expected payloads, framework install names, and the
 absence of undeclared or legacy providers. Every macOS and iOS product prefix
-builds and verifies at a 27.0 deployment target; the kernel host tools are the
-exception. A prefix compares only the manifest rows its product consumes, so a
+builds and verifies at its platform's deployment target, 27.0 for macOS and
+26.0 for iOS; the kernel host tools are the exception. A prefix compares only the manifest rows its product consumes, so a
 change to another product's row does not invalidate it, while a change to one
 of its own rows requires a rebuild.
 
@@ -110,10 +119,10 @@ The builders configure each library whose code derives directories from its
 prefix (GLib, Mesa's OpenGL libraries, virglrenderer, FEXCore) for
 `NO_HOST_PREFIX` (see [`build-common.sh`](build-common.sh)) and install it with
 `DESTDIR`, so a prefix can be built beside another and renamed into place.
-`Andarium/scripts/check-app-store-bundle.py` refuses a home, volume or
-temporary path in the host code of the application and its frameworks. The
-platform contracts' `common_recipe` is the recipe identity a prefix was made
-with.
+`Andarium/scripts/check-release-archive.py` refuses a home, volume or
+temporary path in the host code of the application and its frameworks when
+Release is archived. The platform contracts' `common_recipe` is the recipe
+identity a prefix was made with.
 
 ## Apple GPU prefix
 

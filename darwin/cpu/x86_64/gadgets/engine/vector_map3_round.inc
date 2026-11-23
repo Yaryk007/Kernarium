@@ -315,6 +315,9 @@ gadget vector_map3_half_\width\()_r
 	retire_and_next
 .endm
 
+/* The narrowing raises its flags in the host's FPSR ahead of a store that may
+ * still fault, and a faulting instruction changes nothing: x26 keeps the FPSR
+ * the instruction found, and the fault exit puts it back. */
 .macro vector_map3_half_memory width, output_size
 gadget vector_map3_half_\width\()_m
 	effective_address
@@ -326,16 +329,23 @@ gadget vector_map3_half_\width\()_m
 	.if \width == 256
 	ldr q3, [x10, #16]
 	.endif
+	mrs x26, fpsr
 	vector_map3_half_body \width
 	add x9, x25, #(\output_size - 1)
 	eor x9, x9, x25
 	tbnz x9, #12, Lx86_vector_map3_half_cross\@
+	/* A translation that misses calls out, which may leave anything in the
+	 * caller-saved vector registers: the result waits in x24 and x27. */
+	fmov x24, d4
+	.if \output_size == 16
+	mov x27, v4.d[1]
+	.endif
 	mov x7, x25
-	translate 1, UML_X86_64_TLB_WRITE_PAGE, \output_size
+	translate 1, UML_X86_64_TLB_WRITE_PAGE, \output_size, 0, Lx86_vector_map3_half_fault\@
 	.if \output_size == 8
-	str d4, [x7]
+	str x24, [x7]
 	.else
-	str q4, [x7]
+	stp x24, x27, [x7]
 	.endif
 	finish_store \output_size
 Lx86_vector_map3_half_cross\@:
@@ -345,7 +355,7 @@ Lx86_vector_map3_half_cross\@:
 	fmov x2, d4
 	mov w3, #8
 	helper_call uml_x86_64_gadget_cross_page_store
-	cbz w0, Lx86_memory_fault
+	cbz w0, Lx86_vector_map3_half_fault\@
 	.else
 	sub sp, sp, #16
 	str q4, [sp]
@@ -355,9 +365,12 @@ Lx86_vector_map3_half_cross\@:
 	mov w3, #16
 	helper_call uml_x86_64_gadget_cross_page_vector_store
 	add sp, sp, #16
-	cbz w0, Lx86_memory_fault
+	cbz w0, Lx86_vector_map3_half_fault\@
 	.endif
 	finish_store \output_size
+Lx86_vector_map3_half_fault\@:
+	msr fpsr, x26
+	b Lx86_memory_fault
 .endm
 
 vector_map3_half_register 128

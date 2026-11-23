@@ -27,7 +27,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
  1 file changed, 22 insertions(+), 14 deletions(-)
 
 diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
-index 88f8076b4389004eec8d17423e3b867596366a3a..2a95dd698b606e98104908c017e9d16cc032c52a 100644
+index 777e9611f2eecadd9423ebb0b0d31fd8711abcac..68b18d537b7cb1a8e96192574a5b9873caf7ffbb 100644
 --- a/src/vrend/vrend_renderer.c
 +++ b/src/vrend/vrend_renderer.c
 @@ -9175,19 +9175,29 @@ static void iov_buffer_upload(void *cookie, uint32_t doff, void *src, int len)

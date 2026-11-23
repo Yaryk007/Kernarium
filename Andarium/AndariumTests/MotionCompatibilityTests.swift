@@ -79,9 +79,9 @@ struct MotionCompatibilityTests {
 
     /// Which of the guest's own users keep a sensor active: Android's
     /// auto-rotation setting, the window manager's rotation mode and the
-    /// sensor service's active connections, with host-driven rotation (as in a
-    /// window) and then with free rotation and auto-rotate on (as in a locked
-    /// full-screen scene, where Android alone rotates its display).
+    /// sensor service's active connections, with host-driven rotation (as in an
+    /// iPad session) and then with free rotation and auto-rotate on (as on an
+    /// iPhone, where Android alone rotates its display).
     private func report(_ operations: AdbGuestOperations) async throws {
         func show(_ title: String, _ command: String) async throws {
             let result = try await operations.shell(command, limit: .seconds(30))
@@ -112,11 +112,9 @@ struct MotionCompatibilityTests {
             let device = SyntheticDevice()
             device.run()
             defer { device.finish() }
-            let session = MotionSession(opener: Connector(), device: device) { problem in
-                print("MOTION compat: problem \(String(describing: problem))")
-            }
-            session.update(enabled: true, foreground: true, axes: .portrait)
-            defer { session.update(enabled: false, foreground: false, axes: .portrait) }
+            let session = MotionSession(opener: Connector(), device: device)
+            session.update(foreground: true, axes: .portrait)
+            defer { session.update(foreground: false, axes: .portrait) }
             // Connected: a legacy service never speaks, so the sensors start and read continuously. An on-demand
             // service speaks on connect, and its demand is empty when no guest process uses a sensor: the plan
             // then stays off, and the demand frame is the sign of the connection.

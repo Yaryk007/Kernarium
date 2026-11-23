@@ -117,8 +117,7 @@ Lx86_bit_split\@:
 	retire_and_next
 	.else
 	mov x7, x25
-	page_cross_check (\width / 8), Lx86_bit_write_cross\@
-	translate 1, UML_X86_64_TLB_WRITE_PAGE, (\width / 8)
+	translate 1, UML_X86_64_TLB_WRITE_PAGE, (\width / 8), cross=Lx86_bit_write_cross\@
 	\store \host_register\()27, [x7]
 	b Lx86_bit_written\@
 Lx86_bit_write_cross\@:

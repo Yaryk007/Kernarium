@@ -38,6 +38,9 @@ DEVICE = "fake-device"
 EXISTING = {"keep.txt": b"the owner's file", "rootfs.erofs": b"x" * 64}
 DEVICECTL_ALLOWED = (
     ["device", "info", "lockState"],
+    ["device", "info", "files"],
+    ["device", "info", "details"],
+    ["device", "copy", "from"],
     ["device", "install", "app"],
     ["device", "process", "launch"],
 )
@@ -106,7 +109,8 @@ class Scratch:
             (self.documents / name).write_bytes(contents)
         bin_dir = root / "bin"
         bin_dir.mkdir()
-        for tool in ("xcrun", "iproxy", "adb", "codesign"):
+        for tool in ("xcrun", "iproxy", "adb", "codesign",
+                     "idevicecrashreport"):
             wrapper = bin_dir / tool
             wrapper.write_text(
                 f"#!/bin/sh\nexec {sys.executable} -S -B "
@@ -137,9 +141,15 @@ class Scratch:
         host_port = free_port()
         self.runs += 1
         artifacts = self.root / f"artifacts-{self.runs}"
+        (self.root / "home").mkdir(exist_ok=True)
         variables = {
-            "PATH": f"{self.bin}{os.pathsep}{os.environ['PATH']}",
+            # The fakes first, then only the system tools their wrappers
+            # need: nothing of the ambient PATH, so the fake idevicecrashreport
+            # is the one the run finds.
+            "PATH": os.pathsep.join([str(self.bin), "/usr/bin", "/bin"]),
             "FAKE_STATE": str(self.state),
+            # Reports a run moves go under the user's home.
+            "HOME": str(self.root / "home"),
             **(environment or {}),
         }
         argv = ["--device", DEVICE, "--poll-interval", "0.05",
@@ -165,7 +175,9 @@ class AndroidRunnerTests(unittest.TestCase):
     def setUp(self) -> None:
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
-        self.scratch = Scratch(pathlib.Path(directory.name))
+        # Resolved: a report directory's path may hold no symlink, and the
+        # system temporary directory is one on macOS.
+        self.scratch = Scratch(pathlib.Path(directory.name).resolve())
 
     def run_android(self, *arguments: str, **keywords: object) -> Outcome:
         return self.scratch.run(*arguments, **keywords)
@@ -191,6 +203,102 @@ class AndroidRunnerTests(unittest.TestCase):
         first_adb = order.index("adb")
         self.assertIn("launch", order[:first_adb])
         self.assertIn("iproxy", order[:first_adb])
+
+    def hold_reports(self, count: int) -> None:
+        """The device holds this many (invented) JetsamEvent reports."""
+        names = [f"JetsamEvent-2026-01-{day + 1:02d}-0{day:05d}.ips"
+                 for day in range(count)]
+        (self.scratch.state / "crash-logs.txt").write_text(
+            "\n".join(names) + "\n")
+
+    def test_a_short_report_store_is_moved_before_anything_is_installed(
+        self
+    ) -> None:
+        self.hold_reports(23)
+        outcome = self.run_android(
+            "--app", str(self.scratch.app(automation=True)),
+            "--script", str(self.scratch.script))
+        self.assertEqual(outcome.status, 0, outcome.err)
+        self.assert_only_allowed_devicectl(outcome)
+        steps = [
+            "devicectl " + " ".join(c["args"][:3]) if c["tool"] == "devicectl"
+            else c["tool"] for c in outcome.commands]
+        copied = [i for i, step in enumerate(steps)
+                  if step == "devicectl device copy from"]
+        self.assertEqual(len(copied), 23)
+        self.assertLess(copied[-1], steps.index("idevicecrashreport"))
+        self.assertLess(steps.index("idevicecrashreport"),
+                        steps.index("devicectl device install app"))
+        self.assertLess(steps.index("idevicecrashreport"), steps.index("launch"))
+        (move,) = outcome.tool("idevicecrashreport")
+        self.assertEqual(move["args"][:2], ["-u", "0000AAAA-0123456789ABCDEF"])
+        self.assertNotIn("-f", move["args"])
+        (folder,) = (self.scratch.root / "home" / "Library" / "Logs"
+                     / "Kernarium" / "device-reports").iterdir()
+        self.assertEqual(len(list((folder / "copy").iterdir())), 23)
+        self.assertEqual((self.scratch.state / "crash-logs.txt").read_text().strip(), "")
+        self.assertIn("JetsamEvent 23 -> 0", outcome.out)
+
+    def test_a_store_that_cannot_be_freed_stops_the_run_untouched(self) -> None:
+        self.hold_reports(25)
+        outcome = self.run_android(
+            "--app", str(self.scratch.app(automation=True)),
+            "--script", str(self.scratch.script),
+            environment={"FAKE_REPORT_MOVE": "keep"})
+        self.assertEqual(outcome.status, 1)
+        self.assertIn("still short of 5 free slots", outcome.err)
+        self.assertEqual(outcome.devicectl("device", "install"), [])
+        self.assertEqual(outcome.tool("launch"), [])
+        self.assertEqual(outcome.tool("adb"), [])
+
+    def test_a_failing_listing_stops_the_run_and_repeats_no_name(self) -> None:
+        self.hold_reports(25)
+        outcome = self.run_android(
+            "--app", str(self.scratch.app(automation=True)),
+            "--script", str(self.scratch.script),
+            environment={"FAKE_REPORT_LIST": "fail"})
+        self.assertEqual(outcome.status, 1)
+        self.assertIn("cannot list the device's diagnostic reports", outcome.err)
+        self.assertEqual(outcome.devicectl("device", "install"), [])
+        self.assertEqual(outcome.tool("launch"), [])
+        written = outcome.out + outcome.err + "".join(
+            path.read_text() for path in outcome.artifacts.rglob("*.json"))
+        self.assertNotIn("Leaky", written)
+
+    def test_a_caller_may_leave_the_old_reports_in_place(self) -> None:
+        self.hold_reports(25)
+        outcome = self.run_android(
+            "--app", str(self.scratch.app(automation=True)),
+            "--script", str(self.scratch.script), "--leave-device-reports")
+        self.assertEqual(outcome.status, 0, outcome.err)
+        self.assertEqual(outcome.tool("idevicecrashreport"), [])
+        self.assertEqual(
+            len((self.scratch.state / "crash-logs.txt").read_text().split()), 25)
+        self.assertIn("left in place", outcome.out)
+
+    def test_a_run_that_tests_haptics_leaves_the_switch_to_the_person(
+        self
+    ) -> None:
+        scratch = self.scratch
+        # Not even an inherited statement silences it.
+        outcome = self.run_android(
+            "--app", str(scratch.app(automation=True)),
+            "--script", str(scratch.script), "--haptics",
+            environment={"DEVICECTL_CHILD_ANDARIUM_HAPTICS": "0"})
+        self.assertEqual(outcome.status, 0, outcome.err)
+        (launch,) = outcome.tool("launch")
+        self.assertNotIn("ANDARIUM_HAPTICS", launch["environment"])
+        self.assertIs(outcome.summary["haptics"], True)
+
+    def test_the_haptics_setting_is_not_a_free_setting(self) -> None:
+        # One name for it: --haptics, never --setting.
+        outcome = self.run_android(
+            "--app", str(self.scratch.app(automation=True)),
+            "--script", str(self.scratch.script),
+            "--setting", "ANDARIUM_HAPTICS=1")
+        self.assertEqual(outcome.status, 1)
+        self.assertIn("ANDARIUM_HAPTICS", outcome.err)
+        self.assertEqual(outcome.tool("launch"), [])
 
     def test_a_run_boots_works_powers_off_and_leaves_nothing(self) -> None:
         scratch = self.scratch
@@ -221,6 +329,9 @@ class AndroidRunnerTests(unittest.TestCase):
                          f"tcp:127.0.0.1:{port}-5555")
         self.assertNotIn("KERNARIUM_ROOTFS", environment)
         self.assertNotIn("ANDARIUM_ERASE", environment)
+        # The guest's haptics are off for the run.
+        self.assertEqual(environment["ANDARIUM_HAPTICS"], "0")
+        self.assertIs(outcome.summary["haptics"], False)
         self.assertEqual(launch["args"][-1], "com.imxieyi.andarium")
 
         (proxy,) = outcome.tool("iproxy")
@@ -497,6 +608,18 @@ class AndroidRunnerTests(unittest.TestCase):
             self.assertEqual(outcome.status, 1, arguments)
             self.assertIn(message, outcome.err)
             self.assertEqual(outcome.commands, [])
+
+    def test_the_stand_in_debugger_serves_the_jit_unless_told_otherwise(
+            self) -> None:
+        for arguments, debugger in (
+            (["--engine", "jit"], "stand-in"),
+            (["--engine", "jit", "--jit-debugger", "none"], "none"),
+            ([], "none"),
+            (["--engine", "gadgets", "--jit-debugger", "stand-in"],
+             "stand-in"),
+        ):
+            options = runner.parse_arguments(["--device", DEVICE, *arguments])
+            self.assertEqual(options.jit_debugger, debugger, arguments)
 
 
 if __name__ == "__main__":

@@ -75,14 +75,28 @@ public:
         std::uint64_t cookie,
         Clock::time_point now);
 
+    /* A guest context was destroyed. What only it kept in the host driver,
+     * its textures and the batches that used them, is released by the reports
+     * the surviving contexts owe for the drop, and the driver then holds the
+     * freed memory in its caches: the buffers it keeps for reuse, the slabs
+     * of small ones, the command storage of batches nothing takes again. The
+     * release of those is due once the reports have been made, which is
+     * `reportsPerIdlePeriod` idle intervals after the destruction; another
+     * destruction before then moves it later. */
+    void noteDestroyed(Clock::time_point now);
+    /* Whether that release is due at `now`, once: the call that returns true
+     * has taken it. */
+    [[nodiscard]] bool takeRelease(Clock::time_point now);
+
     /* The contexts to trim at `now`. Each is reported at the end of its idle
      * interval and once more an interval later, then not again until it is
      * active or something was dropped. */
     [[nodiscard]] std::vector<std::uint32_t> takeIdle(Clock::time_point now);
 
-    /* How long until a context is next due for a report, zero if one already
-     * is, and nothing if no context is waiting for it: all of them have been
-     * reported twice, or are waiting on a fence. */
+    /* How long until a context is next due for a report or the driver's
+     * caches for a release, zero if one already is, and nothing if neither
+     * is waiting: every context has been reported twice, or is waiting on a
+     * fence, and no destruction is waiting for its release. */
     [[nodiscard]] std::optional<Clock::duration> nextDelay(
         Clock::time_point now) const;
 
@@ -114,6 +128,8 @@ private:
     Clock::duration idleInterval_;
     mutable std::mutex mutex_;
     std::unordered_map<std::uint32_t, Context> contexts_;
+    /* When the release a destruction owes is due, until it is taken. */
+    std::optional<Clock::time_point> releaseDue_;
 };
 
 } // namespace uml::gpu

@@ -24,8 +24,10 @@ ARCHIVE=
 PREFIX=
 WORK_ROOT=
 JOBS=8
-# Every Apple product, and the build machine's own pass, builds at this floor.
-DEPLOYMENT_TARGET=27.0
+# The Simulator libraries build at the iOS floor and the build machine's own
+# pass, whose tools run on this Mac, at the macOS floor.
+DEPLOYMENT_TARGET=26.0
+NATIVE_DEPLOYMENT_TARGET=27.0
 
 fail()
 {
@@ -123,7 +125,6 @@ set -- -G Ninja -DCMAKE_BUILD_TYPE=Release \
 	"-DCMAKE_IGNORE_PREFIX_PATH=/opt/homebrew;/usr/local" \
 	-DCMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH=OFF \
 	-DCMAKE_OSX_ARCHITECTURES=arm64 \
-	-DCMAKE_OSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
 	-DLLVM_TARGETS_TO_BUILD=AArch64 \
 	-DLLVM_ENABLE_PROJECTS= -DLLVM_ENABLE_RUNTIMES= \
 	-DLLVM_ENABLE_RTTI=ON -DLLVM_ENABLE_ASSERTIONS=OFF \
@@ -141,6 +142,7 @@ NATIVE_BUILD="$WORK_ROOT/llvm-native"
 SIMULATOR_BUILD="$WORK_ROOT/llvm-simulator"
 LLVM_STEP=native-configure
 llvm_cmake -S "$SOURCE/llvm" -B "$NATIVE_BUILD" "$@" \
+	-DCMAKE_OSX_DEPLOYMENT_TARGET="$NATIVE_DEPLOYMENT_TARGET" \
 	-DCMAKE_OSX_SYSROOT="$NATIVE_SDK"
 LLVM_STEP=native-build
 llvm_cmake --build "$NATIVE_BUILD" -j "$JOBS" \
@@ -153,6 +155,7 @@ llvm_cmake --build "$NATIVE_BUILD" -j "$JOBS" \
 LLVM_STEP=simulator-configure
 llvm_cmake -S "$SOURCE/llvm" -B "$SIMULATOR_BUILD" "$@" \
 	-DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT="$SIMULATOR_SDK" \
+	-DCMAKE_OSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
 	-DLLVM_HOST_TRIPLE="arm64-apple-ios$DEPLOYMENT_TARGET-simulator" \
 	-DLLVM_DEFAULT_TARGET_TRIPLE="arm64-apple-ios$DEPLOYMENT_TARGET-simulator" \
 	-DLLVM_TARGET_ARCH=AArch64 \

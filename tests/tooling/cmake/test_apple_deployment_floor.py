@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 """Configure scratch trees through the Apple toolchain at each deployment target.
 
-Every Apple product builds at the one floor the toolchain names. A tree whose
-CMake cache or command line holds another target must fail to configure rather
-than build at it.
+Every Apple platform builds at the one floor the toolchain names for it: macOS
+at 27.0, iOS and the iOS Simulator at 26.0. A tree whose CMake cache or command
+line holds another target, another platform's floor included, must fail to
+configure rather than build at it.
 """
 
 from __future__ import annotations
@@ -18,7 +19,9 @@ import sys
 import tempfile
 from pathlib import Path
 
-PLATFORMS = ("macos", "ios", "ios-simulator")
+# The deployment floor of each platform. iOS and the iOS Simulator share one.
+FLOORS = {"macos": "27.0", "ios": "26.0", "ios-simulator": "26.0"}
+PLATFORMS = tuple(FLOORS)
 CACHE_ENTRY = re.compile(r"^CMAKE_OSX_DEPLOYMENT_TARGET:[A-Z]+=(.*)$", re.MULTILINE)
 
 
@@ -65,6 +68,14 @@ def cached_target(build: Path) -> str:
     return match.group(1)
 
 
+def below(floor: str) -> str:
+    return f"{int(floor.split('.')[0]) - 1}.0"
+
+
+def above(floor: str) -> str:
+    return f"{int(floor.split('.')[0]) + 1}.0"
+
+
 def require_refusal(
     result: subprocess.CompletedProcess[str], label: str, stale: str, floor: str
 ) -> None:
@@ -90,24 +101,22 @@ def main() -> int:
         root = Path(scratch)
         bare = write_source(root, "NONE")
 
-        # The toolchain's own default is the floor, one for every platform.
-        # Targets below and above it are the others a tree must refuse.
-        floors = set()
+        # The toolchain's own default is each platform's floor. The floors a
+        # tree must refuse are the ones one major version below and above it.
         for platform in PLATFORMS:
             build = root / f"{platform}-probe"
             result = configure(options.cmake, toolchain, bare, build, platform)
             require(result.returncode == 0, f"{platform}: {result.stdout}")
-            floors.add(cached_target(build))
-        require(len(floors) == 1, f"the platforms disagree on the floor: {floors}")
-        floor = floors.pop()
-        version = re.fullmatch(r"([0-9]+)\.0", floor)
-        require(version is not None, f"the floor {floor!r} is not a major version")
-        stale = f"{int(version.group(1)) - 1}.0"
-        above = f"{int(version.group(1)) + 1}.0"
+            require(
+                cached_target(build) == FLOORS[platform],
+                f"{platform} defaults to {cached_target(build)}, not "
+                f"{FLOORS[platform]}",
+            )
 
         # The floor configures on every platform and a second configure of the
         # same tree stays at it. An empty value is no target and takes the floor.
         for platform in PLATFORMS:
+            floor = FLOORS[platform]
             for label, extra in (
                 ("default", ()),
                 ("explicit", (f"-DCMAKE_OSX_DEPLOYMENT_TARGET={floor}",)),
@@ -132,6 +141,8 @@ def main() -> int:
         # toolchain refuses it, without rewriting the cache, and both a new
         # binary directory and --fresh recover.
         for platform in PLATFORMS:
+            floor = FLOORS[platform]
+            stale = below(floor)
             build = root / f"{platform}-stale"
             result = configure(options.cmake, toolchain, bare, build, platform)
             require(result.returncode == 0, f"{platform}: {result.stdout}")
@@ -159,30 +170,36 @@ def main() -> int:
             require(cached_target(build) == floor, f"{platform}: --fresh kept {stale}")
 
         # Any other target passed on the command line is refused, below the
-        # floor or above it.
-        for passed in (stale, above):
-            result = configure(
-                options.cmake,
-                toolchain,
-                bare,
-                root / f"passed-{passed}",
-                "macos",
-                f"-DCMAKE_OSX_DEPLOYMENT_TARGET={passed}",
-            )
-            require_refusal(result, f"passed {passed}", passed, floor)
+        # floor or above it. Another platform's floor is another target.
+        for platform in PLATFORMS:
+            floor = FLOORS[platform]
+            for passed in sorted({below(floor), above(floor), *FLOORS.values()} - {floor}):
+                result = configure(
+                    options.cmake,
+                    toolchain,
+                    bare,
+                    root / f"passed-{platform}-{passed}",
+                    platform,
+                    f"-DCMAKE_OSX_DEPLOYMENT_TARGET={passed}",
+                )
+                require_refusal(result, f"{platform} passed {passed}", passed, floor)
 
         # A project with a compiler runs the toolchain again inside CMake's
         # compiler probes, which must see the floor too.
-        compiled_root = root / "compiled"
-        compiled_root.mkdir()
-        result = configure(
-            options.cmake,
-            toolchain,
-            write_source(compiled_root, "C"),
-            compiled_root / "build",
-            "macos",
-        )
-        require(result.returncode == 0, f"compiled configure failed:\n{result.stdout}")
+        for platform in PLATFORMS:
+            compiled_root = root / f"compiled-{platform}"
+            compiled_root.mkdir()
+            result = configure(
+                options.cmake,
+                toolchain,
+                write_source(compiled_root, "C"),
+                compiled_root / "build",
+                platform,
+            )
+            require(
+                result.returncode == 0,
+                f"{platform}: compiled configure failed:\n{result.stdout}",
+            )
     return 0
 
 

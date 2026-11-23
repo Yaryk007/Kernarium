@@ -381,8 +381,7 @@ gadget \operation\()_\width\()_m\form
 	read_operand (\width / 8), \load, \host_register, 24
 	shift_apply \operation, \width, \host_register, Lx86_shift_memory_store\@, Lx86_shift_memory_write\@
 	mov x7, x25
-	page_cross_check (\width / 8), Lx86_shift_memory_write_cross\@
-	translate 1, UML_X86_64_TLB_WRITE_PAGE, (\width / 8)
+	translate 1, UML_X86_64_TLB_WRITE_PAGE, (\width / 8), cross=Lx86_shift_memory_write_cross\@
 	\store \host_register\()27, [x7]
 	b Lx86_shift_memory_written\@
 Lx86_shift_memory_write_cross\@:
@@ -501,8 +500,7 @@ gadget \operation\()_\width\()_mr\form
 	cbz w26, Lx86_double_shift_memory_zero\@
 	double_shift_compute \operation, \width, \host_register
 	mov x7, x25
-	page_cross_check (\width / 8), Lx86_double_shift_write_cross\@
-	translate 1, UML_X86_64_TLB_WRITE_PAGE, (\width / 8)
+	translate 1, UML_X86_64_TLB_WRITE_PAGE, (\width / 8), cross=Lx86_double_shift_write_cross\@
 	\store \host_register\()27, [x7]
 	b Lx86_double_shift_written\@
 Lx86_double_shift_write_cross\@:

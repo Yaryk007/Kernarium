@@ -5,9 +5,27 @@ import Foundation
 /// The guest's GPU request gate as the background policy drives it. The runtime
 /// serializes the two calls, which may be made from any thread.
 nonisolated protocol GuestGPUGate: Sendable {
-    /// Closes the gate: no guest request reaches the host GPU afterwards.
+    /// Closes the gate: no guest request reaches the host GPU afterwards. On
+    /// an Android guest it first ends the guest's running camera video and
+    /// waits (two seconds at most) until the guest has stopped it, so a
+    /// recording that runs ends before the guest's GPU requests stop.
     func hold()
+    /// `hold()` for a caller whose deadline leaves `left` seconds: the camera
+    /// wait takes what is left of them after the second the gate itself may
+    /// wait for a request that is running, and never more than it does in
+    /// `hold()`. The deadline limits the camera's wait and not that second,
+    /// which the gate always has.
+    func hold(within left: TimeInterval)
+    /// Closes the gate at once, without that wait: the hold the bound takes
+    /// when the edge is already late. It also ends a wait that is pending in
+    /// `hold()`, which the held gate makes of no use.
+    func holdNow()
     func release()
+}
+
+nonisolated extension GuestGPUGate {
+    func hold(within left: TimeInterval) { hold() }
+    func holdNow() { hold() }
 }
 
 /// Runs an action once, after a delay, on a thread that is not the main
@@ -24,12 +42,24 @@ typealias GuestGPUHoldTimer =
 /// bound that is a timer of its own: it runs off the main thread, so a main
 /// thread that is waiting for the guest's storage to settle, or for its screen
 /// to go off, cannot hold the hold back. Whichever comes first, the path that
-/// holds at once or the bound, takes it; the other finds it taken.
+/// holds (`hold()`, which may wait for the guest's camera) or the bound (which
+/// holds at once, `GuestGPUGate.holdNow()`), takes it; the other finds it
+/// taken. A bound that fires while `hold()` waits for the camera lands the hold
+/// then, and `hold()` ends its wait and finds the gate held.
 nonisolated final class GuestGPUHold: @unchecked Sendable {
     private let gate: any GuestGPUGate
     private let timer: GuestGPUHoldTimer
+    /// The state below. Never held across the gate's `hold()`, which may wait
+    /// for the guest's camera: the bound must be able to land meanwhile.
     private let lock = NSLock()
+    /// Serializes `hold()` and `release()`, which may wait on the gate, so a
+    /// release never runs between a hold's start and its landing. The bound
+    /// does not take it.
+    private let serial = NSLock()
+    /// A hold is taken or being taken.
     private var held = false
+    /// The gate holds: `hold()` has landed or the bound has.
+    private var gateHolds = false
     /// Which bound is armed: a bound that fires as it is withdrawn or replaced
     /// sees another number and does nothing.
     private var generation = 0
@@ -48,14 +78,40 @@ nonisolated final class GuestGPUHold: @unchecked Sendable {
     /// Holds the GPU now, and withdraws the bound that would have. Returns
     /// whether this call took the hold, which is not so when it was taken.
     ///
-    /// The gate may wait for requests already inside the device, so a caller
-    /// that arrives while another is holding waits for it.
+    /// The gate may wait for requests already inside the device, and for the
+    /// guest's camera, so a caller that arrives while another is holding waits
+    /// for it. The bound does not: it holds at once. `deadline` is the one the
+    /// caller must be back inside (the edge's): the camera's wait is limited
+    /// to what it leaves when the gate is asked, after any wait for another
+    /// hold.
     @discardableResult
-    func hold() -> Bool {
+    func hold(before deadline: DispatchTime? = nil) -> Bool {
+        serial.lock()
+        defer { serial.unlock() }
         lock.lock()
-        defer { lock.unlock() }
-        withdrawLocked()
-        return takeLocked()
+        guard !held else {
+            withdrawLocked()
+            lock.unlock()
+            return false
+        }
+        held = true
+        lock.unlock()
+        // The bound stays armed while the gate waits for the camera, and
+        // lands the hold if it fires then. It is withdrawn once this hold has.
+        if let deadline {
+            let left = Double(
+                Int64(clamping: deadline.uptimeNanoseconds) -
+                    Int64(clamping: DispatchTime.now().uptimeNanoseconds)
+            ) / 1_000_000_000
+            gate.hold(within: left)
+        } else {
+            gate.hold()
+        }
+        lock.withLock {
+            gateHolds = true
+            withdrawLocked()
+        }
+        return true
     }
 
     /// Holds the GPU in `seconds` unless something held or released it first,
@@ -78,12 +134,15 @@ nonisolated final class GuestGPUHold: @unchecked Sendable {
     /// whether it released one.
     @discardableResult
     func release() -> Bool {
+        serial.lock()
+        defer { serial.unlock() }
         lock.lock()
         defer { lock.unlock() }
         withdrawLocked()
         guard held else { return false }
         gate.release()
         held = false
+        gateHolds = false
         return true
     }
 
@@ -95,16 +154,16 @@ nonisolated final class GuestGPUHold: @unchecked Sendable {
         }
         withdrawBound = nil
         generation += 1
-        let took = takeLocked()
+        // The bound holds at once, also when a hold is waiting for the camera:
+        // that hold is not on the gate yet.
+        let took = !gateHolds
+        if took {
+            held = true
+            gateHolds = true
+            gate.holdNow()
+        }
         lock.unlock()
         if took { landed?() }
-    }
-
-    private func takeLocked() -> Bool {
-        guard !held else { return false }
-        held = true
-        gate.hold()
-        return true
     }
 
     private func withdrawLocked() {

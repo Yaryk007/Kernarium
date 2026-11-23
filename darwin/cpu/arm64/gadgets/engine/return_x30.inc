@@ -16,6 +16,9 @@
 gadget return_x30_cached
 	ldr x9, [_stream]
 	ldr x10, [_vcpu, #(UML_GADGET_CPU_X0 + 30 * 8)]
+/* An epilogue head (run_heads.inc) branches here with the cell in x9 and
+ * the X30 it loaded in x10. */
+Lreturn_x30_follow:
 	follow_indirect_link 1
 
 .purgem follow_indirect_link

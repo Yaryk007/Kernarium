@@ -14,13 +14,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <optional>
 #include <vector>
 
 namespace arm64 = uml::cpu::arm64;
 namespace gadgets = arm64::gadgets;
 
 extern "C" {
-void uml_arm64_gadget_link_exit();
 void uml_arm64_gadget_test_bit_branch_z();
 void uml_arm64_gadget_test_bit_branch_nz();
 void uml_arm64_gadget_test_bit_branch_z_linked();
@@ -45,24 +45,24 @@ gadgets::BuildResult target_block(std::uint64_t pc, std::uint16_t marker)
 	return gadgets::Builder{}.build(pc, instructions);
 }
 
+/* Laid out as the executor's link record: unlinked, it names link_exit,
+ * and linked, a copy of a program behind a block header. */
 struct LinkTarget final {
-	explicit LinkTarget(std::uint64_t pc) noexcept
-		: fallback_stream{address(uml_arm64_gadget_link_exit)},
-		  link{.stream = &fallback_stream, .instruction_count = 0,
-			.guest_pc = pc}
+	explicit LinkTarget(std::uint64_t pc) noexcept : link{.guest_pc = pc}
 	{
+		uml::emulator::tests::unlink(link);
 	}
 	LinkTarget(const LinkTarget &) = delete;
 	LinkTarget &operator=(const LinkTarget &) = delete;
 
-	void resolve(const gadgets::BuildResult &built) noexcept
+	void resolve(const gadgets::BuildResult &built)
 	{
-		link.stream = built.program.words().data();
-		link.instruction_count = built.program.instruction_count();
+		block.emplace(built.program);
+		block->link(link);
 	}
 
-	std::uintptr_t fallback_stream;
 	gadgets::BlockLink link;
+	std::optional<uml::emulator::tests::LinkedBlock> block;
 };
 
 std::uint32_t test_bit(std::uint64_t pc, std::uint64_t target, bool nonzero,

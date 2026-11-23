@@ -16,8 +16,9 @@
 //   HEVC B-pictures and a seek in both (over open-group streams for HEVC);
 // - the H.264 and HEVC profile and level menus: Constrained High beside High,
 //   levels from 1.0 up to 5.2 and from 1 up to 6.2, the current level the
-//   highest;
-// - flat portrait and square H.264 and HEVC pictures (2304 x 4096,
+//   highest; and the VP9 profile menu (Profile 0, and Profile 2 where the host
+//   decodes it, whose 10-bit pictures are captured as 10-bit, 8-bit or packed);
+// - flat portrait and square H.264, HEVC and VP9 pictures (2304 x 4096,
 //   4096 x 4096, 4320 x 8192), decoded to frames of their own size inside a
 //   frame range that is a rectangle;
 // - a stream that changes its picture size twice, decoded the way Android's
@@ -88,6 +89,28 @@ struct Device {
     { if (fd < 0) throw std::runtime_error(std::string("open decoder: ") + std::strerror(errno)); }
     ~Device() { close(fd); }
 };
+/* Waits until `deadline` for an event `accept` takes. The descriptor is
+ * non-blocking, so DQEVENT with nothing pending fails with ENOENT (V4L2 does
+ * not use EAGAIN there), and that, like a poll that times out, only means the
+ * event has not come yet. The decoder answers a stream's first packet when the
+ * host has made its decoder session, which takes tens of milliseconds on an
+ * idle host and a few hundred on a busy one; a wait that ends at the first
+ * empty poll fails the run on the host's speed. */
+template <typename Accept>
+bool awaitEvent(int fd, std::chrono::steady_clock::time_point deadline, Accept accept)
+{
+    while (std::chrono::steady_clock::now() < deadline) {
+        pollfd p {fd, POLLPRI, 0};
+        if (poll(&p, 1, 100) < 0 && errno != EINTR) throw std::runtime_error("poll source change failed");
+        v4l2_event event {};
+        if (ioctl(fd, VIDIOC_DQEVENT, &event) == 0) {
+            if (accept(event)) return true;
+        } else {
+            require(errno == ENOENT || errno == EAGAIN, "DQEVENT failed");
+        }
+    }
+    return false;
+}
 struct Mapping {
     /* `data` is the plane's first byte and `length` its size. A plane that
      * starts inside a dma-buf, after the planes before it, need not start on a
@@ -512,15 +535,9 @@ void decode(const char* device, const std::string& directory, const char* name, 
     call(fd, VIDIOC_STREAMON, &type, "STREAMON output");
     queue(fd, output, 0, inputs[0], packet.size());
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-    bool source = false;
-    while (!source && std::chrono::steady_clock::now() < deadline) {
-        pollfd p {fd, POLLPRI, 0};
-        if (poll(&p, 1, 100) < 0 && errno != EINTR) throw std::runtime_error("poll source change failed");
-        v4l2_event event {};
-        if (ioctl(fd, VIDIOC_DQEVENT, &event) == 0)
-            source = event.type == V4L2_EVENT_SOURCE_CHANGE && (event.u.src_change.changes & V4L2_EVENT_SRC_CH_RESOLUTION);
-        else require(errno == EAGAIN, "DQEVENT failed");
-    }
+    const bool source = awaitEvent(fd, deadline, [](const v4l2_event& event) {
+        return event.type == V4L2_EVENT_SOURCE_CHANGE && (event.u.src_change.changes & V4L2_EVENT_SRC_CH_RESOLUTION);
+    });
     require(source, "decoder source-change timeout");
     v4l2_format format {};
     format.type = capture;
@@ -722,15 +739,9 @@ void decodeShape(const char* device, const std::string& directory, const char* n
     call(fd, VIDIOC_STREAMON, &type, "STREAMON output");
     queue(fd, output, 0, inputs[0], packet.size());
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
-    bool source = false;
-    while (!source && std::chrono::steady_clock::now() < deadline) {
-        pollfd p {fd, POLLPRI, 0};
-        if (poll(&p, 1, 100) < 0 && errno != EINTR) throw std::runtime_error("poll source change failed");
-        v4l2_event event {};
-        if (ioctl(fd, VIDIOC_DQEVENT, &event) == 0)
-            source = event.type == V4L2_EVENT_SOURCE_CHANGE && (event.u.src_change.changes & V4L2_EVENT_SRC_CH_RESOLUTION);
-        else require(errno == EAGAIN, "DQEVENT failed");
-    }
+    const bool source = awaitEvent(fd, deadline, [](const v4l2_event& event) {
+        return event.type == V4L2_EVENT_SOURCE_CHANGE && (event.u.src_change.changes & V4L2_EVENT_SRC_CH_RESOLUTION);
+    });
     require(source, "decoder source-change timeout");
     v4l2_format format {};
     format.type = capture;
@@ -927,15 +938,9 @@ void ringCycle(const char* device, const std::string& directory, const char* nam
     feed(0, ++sequence);
     unsigned free_inputs = unsigned(inputs.size()) - 1;
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-    bool source = false;
-    while (!source && std::chrono::steady_clock::now() < deadline) {
-        pollfd p {fd, POLLPRI, 0};
-        if (poll(&p, 1, 100) < 0 && errno != EINTR) throw std::runtime_error("poll source change failed");
-        v4l2_event event {};
-        if (ioctl(fd, VIDIOC_DQEVENT, &event) == 0)
-            source = event.type == V4L2_EVENT_SOURCE_CHANGE;
-        else require(errno == EAGAIN, "DQEVENT failed");
-    }
+    const bool source = awaitEvent(fd, deadline, [](const v4l2_event& event) {
+        return event.type == V4L2_EVENT_SOURCE_CHANGE;
+    });
     require(source, "decoder source-change timeout");
 
     v4l2_format format {};
@@ -1452,14 +1457,9 @@ private:
     void startCapture()
     {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-        bool source = false;
-        while (!source && std::chrono::steady_clock::now() < deadline) {
-            pollfd p {fd_, POLLPRI, 0};
-            if (poll(&p, 1, 100) < 0 && errno != EINTR) throw std::runtime_error("poll source change failed");
-            v4l2_event event {};
-            if (ioctl(fd_, VIDIOC_DQEVENT, &event) == 0) source = event.type == V4L2_EVENT_SOURCE_CHANGE;
-            else require(errno == EAGAIN, "DQEVENT failed");
-        }
+        const bool source = awaitEvent(fd_, deadline, [](const v4l2_event& event) {
+            return event.type == V4L2_EVENT_SOURCE_CHANGE;
+        });
         require(source, "decoder source-change timeout");
         v4l2_format format {};
         format.type = capture;
@@ -1971,6 +1971,20 @@ int main(int argc, char** argv)
             {V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10, "hevc-main10", V4L2_PIX_FMT_P010},
         };
         Device capabilities(device);
+        /* A stream that queued nothing has no event to give. Waiting for one
+         * ends at its limit, however many empty polls and empty DQEVENT calls
+         * that takes: a slow host answers late, and late is not an error. */
+        {
+            Device idle(device);
+            v4l2_event none {};
+            require(ioctl(idle.fd, VIDIOC_DQEVENT, &none) < 0 && errno == ENOENT,
+                    "DQEVENT on an empty queue does not fail with ENOENT");
+            require(!awaitEvent(idle.fd, std::chrono::steady_clock::now() + std::chrono::milliseconds(300),
+                                [](const v4l2_event&) { return true; }),
+                    "an event came from a stream that queued nothing");
+            std::puts("an empty event queue is waited out, not failed");
+            std::fflush(stdout);
+        }
         /* The discovery a V4L2 client performs before it builds a decoder.
          * Each of these answers gated Chromium's decoder entirely: a
          * continuous frame-size range left it on its built-in maximum coded
@@ -1999,6 +2013,10 @@ int main(int argc, char** argv)
             if (coded.pixelformat == V4L2_PIX_FMT_HEVC)
                 require(sizes.stepwise.max_width >= 8192 && sizes.stepwise.max_height >= 8192,
                         "the advertised HEVC range stops short of 8192 x 8192");
+            // Android's VP9 decoder states up to 4096 x 4096 on both axes whatever the driver says.
+            if (coded.pixelformat == V4L2_PIX_FMT_VP9)
+                require(sizes.stepwise.max_width >= 4096 && sizes.stepwise.max_height >= 4096,
+                        "the advertised VP9 range stops short of 4096 x 4096");
             /* A capture list in wire order names the planar format the device
              * actually decodes to; a reversed one names only the tail. */
             bool planar = false;
@@ -2063,9 +2081,12 @@ int main(int argc, char** argv)
                 decode(device, argv[1], "jpeg", fmt.pixelformat, V4L2_PIX_FMT_ABGR32, V4L2_MEMORY_DMABUF);
                 ++tested; continue;
             }
-            // VP9 states its profile in the stream itself, so the driver
-            // exposes no profile menu to walk: the advertised format is the
-            // whole capability.
+            /* The VP9 profile menu names the profiles the host decodes: Profile 0,
+             * and Profile 2 (10-bit) where the hardware decodes it. A 10-bit
+             * stream reaches an 8-bit capture format narrowed, as HEVC Main 10
+             * does. A kernel bundle that predates the menu leaves Android to
+             * state Profile 0 alone, so it is walked only where the driver has
+             * it. */
             if (fmt.pixelformat == V4L2_PIX_FMT_VP9) {
                 decode(device, argv[1], "vp9-profile0", fmt.pixelformat, V4L2_PIX_FMT_NV12M);
                 decode(device, argv[1], "vp9-profile0", fmt.pixelformat, V4L2_PIX_FMT_NV12M,
@@ -2073,6 +2094,33 @@ int main(int argc, char** argv)
                 decode(device, argv[1], "vp9-profile0", fmt.pixelformat, V4L2_PIX_FMT_ABGR32);
                 decode(device, argv[1], "vp9-profile0", fmt.pixelformat, V4L2_PIX_FMT_ABGR32,
                        V4L2_MEMORY_DMABUF);
+                decodeShape(device, argv[1], "vp9-uhd-3840x2160", fmt.pixelformat, 3840, 2160);
+                decodeShape(device, argv[1], "vp9-portrait-2304x4096", fmt.pixelformat, 2304, 4096);
+                decodeShape(device, argv[1], "vp9-square-4096x4096", fmt.pixelformat, 4096, 4096);
+                v4l2_queryctrl vp9Control {};
+                vp9Control.id = V4L2_CID_MPEG_VIDEO_VP9_PROFILE;
+                if (ioctl(capabilities.fd, VIDIOC_QUERYCTRL, &vp9Control) < 0) {
+                    require(errno == EINVAL, "QUERYCTRL VP9 profile failed");
+                    std::puts("VP9 profile menu: not published by this driver");
+                } else {
+                    const auto profiles = menuItems(capabilities.fd, V4L2_CID_MPEG_VIDEO_VP9_PROFILE);
+                    const auto listed = [&profiles](int value) {
+                        return std::find(profiles.begin(), profiles.end(), value) != profiles.end();
+                    };
+                    require(listed(V4L2_MPEG_VIDEO_VP9_PROFILE_0), "the VP9 profile menu lacks Profile 0");
+                    for (const auto value : profiles)
+                        require(value == V4L2_MPEG_VIDEO_VP9_PROFILE_0 || value == V4L2_MPEG_VIDEO_VP9_PROFILE_2,
+                                "the VP9 profile menu lists a profile the host does not decode");
+                    std::printf("VP9 profiles %zu\n", profiles.size());
+                    if (listed(V4L2_MPEG_VIDEO_VP9_PROFILE_2)) {
+                        decode(device, argv[1], "vp9-profile2", fmt.pixelformat, V4L2_PIX_FMT_P010);
+                        decode(device, argv[1], "vp9-profile2", fmt.pixelformat, V4L2_PIX_FMT_P010, V4L2_MEMORY_DMABUF);
+                        decode(device, argv[1], "vp9-profile2", fmt.pixelformat, V4L2_PIX_FMT_NV12M);
+                        decode(device, argv[1], "vp9-profile2", fmt.pixelformat, V4L2_PIX_FMT_NV12M, V4L2_MEMORY_DMABUF);
+                        decode(device, argv[1], "vp9-profile2", fmt.pixelformat, V4L2_PIX_FMT_ABGR32);
+                        decodeShape(device, argv[1], "vp9-profile2-square-4096x4096", fmt.pixelformat, 4096, 4096);
+                    }
+                }
                 ++tested; continue;
             }
             require(fmt.pixelformat == V4L2_PIX_FMT_H264 || fmt.pixelformat == V4L2_PIX_FMT_HEVC, "advertised codec lacks a fixture");

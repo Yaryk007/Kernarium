@@ -1,0 +1,181 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 04:10:02 +0900
+Subject: [PATCH] uml: virtio_uml: unregister a command-line device only once
+
+At power off the exit call removes every command-line device: the
+platform driver is unregistered, which deletes the virtqueues of each
+device, and the devices are unregistered after it. Deleting the
+virtqueues disables the rings and sends a GET_FEATURES round trip, and a
+backend that goes while that is on the wire is a lost connection.
+vhost_user_check_reset() then queues conn_broken_wk, which breaks the
+virtio device and unregisters the same platform device a second time,
+while the exit call unregisters it too. Whichever runs second fails:
+the events worker dereferences NULL in kernfs_find_and_get_ns()
+("Segfault with no mm") on a device the exit call removed, or the exit
+call frees the socket path a second time.
+
+Stop the work before the exit call removes anything:
+disable_work_sync() waits for one that is running, drops one that is
+queued and makes every later schedule_work() a no-op, so a device is
+unregistered by the work or by the exit call, never by both.
+
+A device that is being removed has nothing left to break or unregister,
+so virtio_uml_remove() clears the registered bit first, and a connection
+lost while its virtqueues are deleted queues nothing.
+
+Two races kept the promise from holding outside power off:
+
+- The work read the driver data and broke the device with no lock, so a
+  work queued before an unbind of the driver could break a device that
+  the unbind freed. Unbinding removes the device and clears the driver
+  data with the platform device's lock held, so the work takes that lock
+  around the lookup and the break and drops it before it unregisters the
+  device, which takes it. The work tolerates a driver that is already
+  unbound.
+- Loss reporters run on any CPU, and checking and then clearing a
+  one-bit field is not one step: two of them could both pass, and the
+  second schedule_work() after the work started would run it again on
+  storage the first run freed. The bit is now a word of its own that is
+  set, cleared and taken only by atomic bit operations, and the reporter
+  that takes it is the one that queues the work.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ arch/um/drivers/virtio_uml.c | 66 ++++++++++++++++++++++++++++++++----
+ 1 file changed, 59 insertions(+), 7 deletions(-)
+
+diff --git a/arch/um/drivers/virtio_uml.c b/arch/um/drivers/virtio_uml.c
+index d2eaa488d5f0d1cffab4619e448f3ed7a1f074c9..9bbbfed7ee3382a1ec84e0412a9c4d0f0bcd112d 100644
+--- a/arch/um/drivers/virtio_uml.c
++++ b/arch/um/drivers/virtio_uml.c
+@@ -45,6 +45,8 @@
+ #define to_virtio_uml_device(_vdev) \
+ 	container_of(_vdev, struct virtio_uml_device, vdev)
+ 
++#define VU_DEV_REGISTERED	0
++
+ struct virtio_uml_platform_data {
+ 	u32 virtio_device_id;
+ 	const char *socket_path;
+@@ -65,12 +67,21 @@ struct virtio_uml_device {
+ 	u64 max_vqs;
+ 	struct virtio_shm_region shmem_region;
+ 	u8 status;
+-	u8 registered:1;
+ 	u8 suspended:1;
+ 	u8 no_vq_suspend:1;
+ 	u8 has_shmem_region:1;
+ 	u8 req_fd_gone:1;
+ 
++	/*
++	 * VU_DEV_REGISTERED is set once the virtio device is registered and is
++	 * cleared by whoever comes first: the report of a lost connection,
++	 * which then queues the work that unregisters the device, or the
++	 * removal of the device.  Reporters run on any CPU, so the bit is
++	 * changed only by atomic bit operations, and it is a word of its own
++	 * rather than a bitfield beside flags that other contexts write.
++	 */
++	unsigned long state;
++
+ 	/* Set once the backend has gone; it is never cleared. */
+ 	bool backend_gone;
+ 
+@@ -188,11 +199,10 @@ static void vhost_user_check_reset(struct virtio_uml_device *vu_dev,
+ 
+ 	WRITE_ONCE(vu_dev->backend_gone, true);
+ 
+-	if (!vu_dev->registered)
++	/* However many report the loss, one of them queues the work. */
++	if (!test_and_clear_bit(VU_DEV_REGISTERED, &vu_dev->state))
+ 		return;
+ 
+-	vu_dev->registered = 0;
+-
+ 	schedule_work(&pdata->conn_broken_wk);
+ }
+ 
+@@ -1716,7 +1726,7 @@ static int virtio_uml_probe(struct platform_device *pdev)
+ 		put_device(&vu_dev->vdev.dev);
+ 		return rc;
+ 	}
+-	vu_dev->registered = 1;
++	set_bit(VU_DEV_REGISTERED, &vu_dev->state);
+ 	return 0;
+ 
+ error_init:
+@@ -1738,6 +1748,12 @@ static void virtio_uml_remove(struct platform_device *pdev)
+ {
+ 	struct virtio_uml_device *vu_dev = platform_get_drvdata(pdev);
+ 
++	/*
++	 * A device that is being removed has nothing left to break or to
++	 * unregister: a connection lost while its virtqueues are deleted must
++	 * not queue the work that unregisters the device a second time.
++	 */
++	clear_bit(VU_DEV_REGISTERED, &vu_dev->state);
+ 	unregister_virtio_device(&vu_dev->vdev);
+ }
+ 
+@@ -1772,9 +1788,18 @@ static void vu_conn_broken(struct work_struct *wk)
+ 
+ 	pdata = container_of(wk, struct virtio_uml_platform_data, conn_broken_wk);
+ 
++	/*
++	 * Unbinding the driver removes the device and clears the driver data
++	 * with this lock held, so a device that the lookup finds cannot go
++	 * before it is broken. The lock is released before the unregistration,
++	 * which takes it.
++	 */
++	device_lock(&pdata->pdev->dev);
+ 	vu_dev = platform_get_drvdata(pdata->pdev);
+-
+-	virtio_break_device(&vu_dev->vdev);
++	/* The driver may already be unbound from a device that was removed. */
++	if (vu_dev)
++		virtio_break_device(&vu_dev->vdev);
++	device_unlock(&pdata->pdev->dev);
+ 
+ 	vu_unregister_cmdline_device(&pdata->pdev->dev, NULL);
+ }
+@@ -1871,6 +1896,27 @@ __uml_help(vu_cmdline_param_ops,
+ );
+ 
+ 
++static int vu_disable_cmdline_conn_broken(struct device *dev, void *data)
++{
++	struct platform_device *pdev = to_platform_device(dev);
++	struct virtio_uml_platform_data *pdata = pdev->dev.platform_data;
++
++	disable_work_sync(&pdata->conn_broken_wk);
++	return 0;
++}
++
++/*
++ * Wait for the work of a lost connection that is running, drop the one that
++ * is queued, and refuse the ones to come, so that a device is unregistered by
++ * one path only: the work or the caller's.
++ */
++static void vu_disable_cmdline_conn_broken_work(void)
++{
++	if (vu_cmdline_parent_registered)
++		device_for_each_child(&vu_cmdline_parent, NULL,
++				      vu_disable_cmdline_conn_broken);
++}
++
+ static void vu_unregister_cmdline_devices(void)
+ {
+ 	if (vu_cmdline_parent_registered) {
+@@ -1953,6 +1999,12 @@ static int __init virtio_uml_init(void)
+ 
+ static void __exit virtio_uml_exit(void)
+ {
++	/*
++	 * Removing a device sends its backend messages, and a backend that
++	 * goes while they are sent queues the work that unregisters the
++	 * device. That work must be over before the devices are removed here.
++	 */
++	vu_disable_cmdline_conn_broken_work();
+ 	platform_driver_unregister(&virtio_uml_driver);
+ 	vu_unregister_cmdline_devices();
+ }

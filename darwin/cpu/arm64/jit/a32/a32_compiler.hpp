@@ -90,8 +90,10 @@ private:
       slow,
       /* The exclusive the hot path declined: the C++ helper runs it. */
       exclusive_slow,
-      /* Retry exit of a fused exclusive region. */
-      exclusive_mismatch,
+      /* An exit of a fused exclusive run before its store (a branch out of
+       * the run taken, or a store whose condition fails): the run is
+       * discarded and the load-exclusive runs again semantically. */
+      exclusive_rollback,
       /* The instruction is UNDEFINED at run time (a CP15 barrier while
        * SCTLR.CP15BEN is clear). */
       illegal,
@@ -108,9 +110,6 @@ private:
     std::uint32_t dirty_vectors{};
     GuestFlagsState flags{GuestFlagsState::memory};
     std::uint64_t target{};
-    /* A branch taken inside a fused exclusive run: the host's monitor is
-     * open and the exit closes it. */
-    bool monitor{};
   };
 
   /* A guarded floating-point operation whose operands or result were not
@@ -123,13 +122,6 @@ private:
     unsigned dest;
     unsigned a;
     unsigned b;
-  };
-
-  /* The skipped arm of a fused conditional store: it clears the monitor and
-   * resumes after the store. */
-  struct ResumePath final {
-    Arm64Emitter::Label label;
-    Arm64Emitter::Label continuation;
   };
 
   struct TranslationColdPath final {
@@ -216,7 +208,10 @@ private:
    * (or MOVW) that leaves the host flags alone (it sets none and shifts by
    * no register) and does not write the PC. */
   [[nodiscard]] bool can_predicate() const;
-  [[nodiscard]] Flow emit_side_exit_branch(bool monitor = false);
+  [[nodiscard]] Flow emit_side_exit_branch();
+  /* The same test as a side exit's, branching to `rollback` when the
+   * branch is taken: the exit of a fused exclusive run (emits no cold path). */
+  void emit_run_exit_branch(Arm64Emitter::Label rollback);
   [[nodiscard]] bool loop_candidate(const Request &request);
   void record_loop_plan();
   void apply_loop_plan();
@@ -533,7 +528,6 @@ private:
   std::vector<ColdPath> cold_;
   std::vector<TranslationColdPath> translation_cold_;
   std::vector<CrossingColdPath> crossing_cold_;
-  std::vector<ResumePath> resume_cold_;
   std::vector<FloatColdPath> float_cold_;
   /* The index of the VMRS APSR_nzcv, FPSCR whose flags the host NZCV already
    * holds, because the VCMP before it left them there and nothing came

@@ -36,3 +36,23 @@ target_link_libraries(uml_boot_initramfs_tests PRIVATE UML::BootInitramfs)
 uml_add_unit_test(NAME boot-initramfs-archive
     COMMAND uml_boot_initramfs_tests
     LABELS boot;device)
+
+# The installation's identity: the serial number and eth0 address, the file that
+# keeps them beside the data disk, and when a start keeps, makes or replaces
+# the file.
+add_executable(uml_android_identity_tests android_identity_tests.cpp)
+target_link_libraries(uml_android_identity_tests PRIVATE UML::AndroidBoot)
+add_dependencies(uml_android_identity_tests uml_android_release_fixture)
+uml_add_unit_test(NAME android-installation-identity
+    COMMAND uml_android_identity_tests ${_uml_android_fixture_dir}
+    LABELS android;device)
+
+# What a release says it is, as a launch states it to the emulator so that an
+# ahead-of-time blob runs only with the release it was made from.
+add_executable(uml_android_release_identity_tests
+    android_release_identity_tests.cpp)
+target_link_libraries(uml_android_release_identity_tests PRIVATE UML::AndroidBoot)
+add_dependencies(uml_android_release_identity_tests uml_android_release_fixture)
+uml_add_unit_test(NAME android-release-identity
+    COMMAND uml_android_release_identity_tests ${_uml_android_fixture_dir}
+    LABELS android;device)

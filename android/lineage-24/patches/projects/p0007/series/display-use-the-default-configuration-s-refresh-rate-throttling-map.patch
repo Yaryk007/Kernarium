@@ -1,0 +1,248 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 20:48:01 +0000
+Subject: [PATCH] display: use the default configuration's refresh rate
+ throttling map
+
+A display whose own configuration has no refresh rate throttling map
+got none at all. DisplayDeviceConfig copies only the density mapping
+from the default configuration (default.xml) into a display that lacks
+one, so the skin temperature observer of DisplayModeDirector had no
+points to vote with, and a product without a configuration per display
+could not cap the refresh rate of a hot device.
+
+Take the refresh rate throttling map of the default configuration when
+the display has none. A display that has a map of its own keeps it. The
+brightness throttling maps and the work durations are not taken: they
+stay as the display's own configuration has them.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ .../server/display/DisplayDeviceConfig.java   |   3 +
+ .../display/config/ThermalThrottlingData.java |  22 ++++
+ .../config/DisplayDeviceConfigTestUtils.kt    |  37 ++++++
+ .../config/ThermalThrottlingDataTest.kt       | 120 ++++++++++++++++++
+ 4 files changed, 182 insertions(+)
+ create mode 100644 services/tests/displayservicetests/src/com/android/server/display/config/ThermalThrottlingDataTest.kt
+
+diff --git a/services/core/java/com/android/server/display/DisplayDeviceConfig.java b/services/core/java/com/android/server/display/DisplayDeviceConfig.java
+index f25b593c26d7d30a7d7026c5be26f3667400b4f0..bb4589357d124733e0c03400b946be9064c76673 100644
+--- a/services/core/java/com/android/server/display/DisplayDeviceConfig.java
++++ b/services/core/java/com/android/server/display/DisplayDeviceConfig.java
+@@ -2118,6 +2118,9 @@ public class DisplayDeviceConfig {
+         if (mDensityMapping == null) {
+             loadDensityMapping(defaultConfig);
+         }
++
++        // A display without a refresh rate throttling map of its own takes the default one.
++        mThermalThrottlingData.loadRefreshRateThrottlingMapIfAbsent(defaultConfig);
+     }
+ 
+     private void loadName(DisplayConfiguration config) {
+diff --git a/services/core/java/com/android/server/display/config/ThermalThrottlingData.java b/services/core/java/com/android/server/display/config/ThermalThrottlingData.java
+index 2ff55d38e5ccfd4861a74754ba9d6d70ec235714..0cf60a8f9b85b69de5a1cebd7588c8a7e8ca6e0b 100644
+--- a/services/core/java/com/android/server/display/config/ThermalThrottlingData.java
++++ b/services/core/java/com/android/server/display/config/ThermalThrottlingData.java
+@@ -230,6 +230,28 @@ public class ThermalThrottlingData {
+         return mRefreshRateThrottlingMap;
+     }
+ 
++    /**
++     * Loads the refresh rate throttling map from the given display configuration unless this data
++     * already has one, so that a display without a map of its own takes the map of the default
++     * display configuration. The brightness throttling maps and the work durations are not taken
++     * from it.
++     *
++     * @param config The {@link DisplayConfiguration} to load the refresh rate throttling map from.
++     */
++    public void loadRefreshRateThrottlingMapIfAbsent(DisplayConfiguration config) {
++        if (!mRefreshRateThrottlingMap.isEmpty()) {
++            return;
++        }
++        final ThermalThrottling throttlingConfig = config.getThermalThrottling();
++        if (throttlingConfig == null) {
++            return;
++        }
++        loadThermalRefreshRateThrottlingMap(throttlingConfig);
++        if (!mRefreshRateThrottlingMap.isEmpty()) {
++            Slog.i(TAG, "RefreshRateThrottling: using the map of the default configuration");
++        }
++    }
++
+     private void loadThermalThrottlingWorkDurationsMap(ThermalThrottling throttlingConfig) {
+         if (!Flags.enableWorkDurations()) return;
+ 
+diff --git a/services/tests/displayservicetests/src/com/android/server/display/config/DisplayDeviceConfigTestUtils.kt b/services/tests/displayservicetests/src/com/android/server/display/config/DisplayDeviceConfigTestUtils.kt
+index d991dc238368e852edcb3d58809c119683208218..1bffe85bc5130742385755f87d9578a8eff82cb2 100644
+--- a/services/tests/displayservicetests/src/com/android/server/display/config/DisplayDeviceConfigTestUtils.kt
++++ b/services/tests/displayservicetests/src/com/android/server/display/config/DisplayDeviceConfigTestUtils.kt
+@@ -220,6 +220,43 @@ fun XmlSerializer.thermalStatus(status: ThermalStatusEnum) {
+     element("thermalStatus", status.value) // Output "none", "severe", etc.
+ }
+ 
++fun XmlSerializer.brightnessThrottlingMap(content: XmlSerializer.() -> Unit) {
++    element("brightnessThrottlingMap") {
++        content()
++    }
++}
++
++fun XmlSerializer.brightnessThrottlingPoint(status: ThermalStatusEnum, brightness: String) {
++    element("brightnessThrottlingPoint") {
++        thermalStatus(status)
++        element("brightness", brightness)
++    }
++}
++
++fun XmlSerializer.refreshRateThrottlingMap(
++    id: String? = null,
++    content: XmlSerializer.() -> Unit
++) {
++    element("refreshRateThrottlingMap") {
++        id?.let { attribute("", "id", it) }
++        content()
++    }
++}
++
++fun XmlSerializer.refreshRateThrottlingPoint(
++    status: ThermalStatusEnum,
++    minimum: String,
++    maximum: String
++) {
++    element("refreshRateThrottlingPoint") {
++        thermalStatus(status)
++        element("refreshRateRange") {
++            element("minimum", minimum)
++            element("maximum", maximum)
++        }
++    }
++}
++
+ fun XmlSerializer.refreshRateConfigs(content: XmlSerializer.() -> Unit) {
+     element("refreshRate") {
+         content()
+diff --git a/services/tests/displayservicetests/src/com/android/server/display/config/ThermalThrottlingDataTest.kt b/services/tests/displayservicetests/src/com/android/server/display/config/ThermalThrottlingDataTest.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..57e90077fb4014b486678e384cc0e41119a4e3e1
+--- /dev/null
++++ b/services/tests/displayservicetests/src/com/android/server/display/config/ThermalThrottlingDataTest.kt
+@@ -0,0 +1,120 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.android.server.display.config
++
++import com.google.common.truth.Truth.assertThat
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.junit.runners.JUnit4
++
++@RunWith(JUnit4::class)
++class ThermalThrottlingDataTest {
++    private val severe = ThermalStatusEnum.SEVERE.toPowerManagerConstant()
++
++    @Test
++    fun loadRefreshRateThrottlingMapIfAbsent_noMap_takesTheMapOfTheConfiguration() {
++        val config = createDisplayConfiguration {
++            thermalThrottling {
++                refreshRateThrottlingMap {
++                    refreshRateThrottlingPoint(ThermalStatusEnum.SEVERE, "0", "30")
++                }
++            }
++        }
++        val data = ThermalThrottlingData()
++
++        data.loadRefreshRateThrottlingMapIfAbsent(config)
++
++        assertThat(data.refreshRateThrottlingMap.keys).containsExactly("default")
++        val points = data.refreshRateThrottlingMap.getValue("default")
++        assertThat(points.size()).isEqualTo(1)
++        assertThat(points.get(severe).min).isEqualTo(0f)
++        assertThat(points.get(severe).max).isEqualTo(30f)
++    }
++
++    @Test
++    fun loadRefreshRateThrottlingMapIfAbsent_ownMap_keepsIt() {
++        val own = createDisplayConfiguration {
++            thermalThrottling {
++                refreshRateThrottlingMap {
++                    refreshRateThrottlingPoint(ThermalStatusEnum.SEVERE, "30", "60")
++                }
++            }
++        }
++        val default = createDisplayConfiguration {
++            thermalThrottling {
++                refreshRateThrottlingMap {
++                    refreshRateThrottlingPoint(ThermalStatusEnum.SEVERE, "0", "30")
++                }
++            }
++        }
++        val data = ThermalThrottlingData()
++        data.loadThermalThrottlingConfig(own)
++
++        data.loadRefreshRateThrottlingMapIfAbsent(default)
++
++        val points = data.refreshRateThrottlingMap.getValue("default")
++        assertThat(points.size()).isEqualTo(1)
++        assertThat(points.get(severe).min).isEqualTo(30f)
++        assertThat(points.get(severe).max).isEqualTo(60f)
++    }
++
++    @Test
++    fun loadRefreshRateThrottlingMapIfAbsent_noThermalThrottling_leavesNoMap() {
++        val data = ThermalThrottlingData()
++
++        data.loadRefreshRateThrottlingMapIfAbsent(createDisplayConfiguration())
++
++        assertThat(data.refreshRateThrottlingMap).isEmpty()
++    }
++
++    @Test
++    fun loadRefreshRateThrottlingMapIfAbsent_noRefreshRateMap_leavesNoMap() {
++        val config = createDisplayConfiguration {
++            thermalThrottling {
++                brightnessThrottlingMap {
++                    brightnessThrottlingPoint(ThermalStatusEnum.SEVERE, "0.4")
++                }
++            }
++        }
++        val data = ThermalThrottlingData()
++
++        data.loadRefreshRateThrottlingMapIfAbsent(config)
++
++        assertThat(data.refreshRateThrottlingMap).isEmpty()
++    }
++
++    @Test
++    fun loadRefreshRateThrottlingMapIfAbsent_takesNothingButTheRefreshRateMap() {
++        val config = createDisplayConfiguration {
++            thermalThrottling {
++                brightnessThrottlingMap {
++                    brightnessThrottlingPoint(ThermalStatusEnum.SEVERE, "0.4")
++                }
++                refreshRateThrottlingMap {
++                    refreshRateThrottlingPoint(ThermalStatusEnum.SEVERE, "0", "30")
++                }
++            }
++        }
++        val data = ThermalThrottlingData()
++
++        data.loadRefreshRateThrottlingMapIfAbsent(config)
++
++        assertThat(data.refreshRateThrottlingMap.keys).containsExactly("default")
++        assertThat(data.thermalBrightnessThrottlingDataMapByThrottlingId).isEmpty()
++        assertThat(data.thermalThrottlingWorkDurations).isEmpty()
++    }
++}

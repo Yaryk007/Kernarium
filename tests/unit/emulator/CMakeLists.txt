@@ -41,6 +41,13 @@ uml_add_unit_test(
     NAME emulator-lifecycle-suspend-silent
     COMMAND uml_emulator_lifecycle_tests suspend-silent
     LABELS console)
+# The settle calls' reports where a wait runs out: a sync with no reply, the
+# older kernel's SysRq fallback and its settling period, a lifecycle call that
+# keeps the mutex.
+uml_add_unit_test(
+    NAME emulator-lifecycle-settle-timeouts
+    COMMAND uml_emulator_lifecycle_tests settle-timeouts
+    LABELS console)
 # A guest whose threads the fence cannot hold keeps its disk locks; the fence
 # spends its whole two-second budget finding that out.
 uml_add_unit_test(
@@ -63,7 +70,8 @@ target_link_libraries(uml_emulator_run_end_tests PRIVATE
     UML::MemorySharedBacking
     uml_emulator_test_variant)
 target_include_directories(uml_emulator_run_end_tests PRIVATE
-    ${PROJECT_SOURCE_DIR}/darwin/runtime)
+    ${PROJECT_SOURCE_DIR}/darwin/runtime
+    ${PROJECT_SOURCE_DIR}/darwin/emulator/src)
 uml_add_unit_test(NAME emulator-run-end COMMAND uml_emulator_run_end_tests)
 
 # What a handle says of its running guest: the vCPU carriers' CPU time, the
@@ -161,6 +169,41 @@ if(TARGET uml_network_provider)
         UML::NetworkProvider)
 endif()
 uml_add_unit_test(NAME emulator-api COMMAND uml_emulator_api_tests)
+
+# A process with little address space: its window and its heap region are
+# reserved one after the other, a refusal of either leaves nothing of the run,
+# and a smaller guest tried next is started; the heap region does not take the
+# address a window needs. A process of its own (the limit is the system's, on
+# the whole process).
+add_executable(uml_emulator_address_space_tests
+    emulator_address_space_tests.cpp)
+target_link_libraries(uml_emulator_address_space_tests PRIVATE
+    UML::BridgeAbi
+    UML::MemorySharedBacking
+    uml_emulator_test_variant)
+target_include_directories(uml_emulator_address_space_tests PRIVATE
+    ${PROJECT_SOURCE_DIR}/darwin
+    ${PROJECT_SOURCE_DIR}/tests/unit/memory)
+uml_add_unit_test(NAME emulator-address-space
+    COMMAND uml_emulator_address_space_tests)
+uml_add_unit_test(NAME emulator-address-space-no-heap
+    COMMAND uml_emulator_address_space_tests --no-room-for-the-heap)
+uml_add_unit_test(NAME emulator-address-space-ram-trial
+    COMMAND uml_emulator_address_space_tests --ram-trial)
+uml_add_unit_test(NAME emulator-address-space-no-layout
+    COMMAND uml_emulator_address_space_tests --no-layout)
+uml_add_unit_test(NAME emulator-address-space-heap-and-window
+    COMMAND uml_emulator_address_space_tests --heap-and-window-addresses)
+uml_add_unit_test(NAME emulator-address-space-two-handles
+    COMMAND uml_emulator_address_space_tests --two-handles)
+uml_add_unit_test(NAME emulator-address-space-kept-text
+    COMMAND uml_emulator_address_space_tests --kept-text)
+uml_add_unit_test(NAME emulator-address-space-kept-text-by-the-host
+    COMMAND uml_emulator_address_space_tests --kept-text-by-the-host)
+uml_add_unit_test(NAME emulator-address-space-no-growth-leak
+    COMMAND uml_emulator_address_space_tests --no-growth-leak)
+uml_add_unit_test(NAME emulator-address-space-kept-text-replaced
+    COMMAND uml_emulator_address_space_tests --kept-text-window-replaced)
 
 add_executable(uml_native_4k_admission_tests native_4k_admission_tests.cpp)
 target_link_libraries(uml_native_4k_admission_tests PRIVATE

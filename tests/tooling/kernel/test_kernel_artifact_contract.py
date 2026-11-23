@@ -304,15 +304,21 @@ def verify_kernel_elf_contract(module: ModuleType, root: Path) -> None:
     abi.mkdir(parents=True)
     (abi / "darwin_uml_fixture.h").write_text(
         "int darwin_uml_everywhere(void);\n"
-        "void darwin_uml_arm64_only(void);\n",
+        "void darwin_uml_arm64_only(void);\n"
+        "void darwin_uml_x86_64_only(void);\n",
         encoding="utf-8",
     )
-    policy = ["darwin_uml_arm64_only\tarm64-only\tfixture"]
+    policy = [
+        "darwin_uml_arm64_only\tarm64-only\tfixture",
+        "darwin_uml_x86_64_only\tx86_64-only\tfixture",
+    ]
     write_bridge_policy(abi, policy)
     common = root / "common"
     path = root / "vmlinux"
     everywhere, arm64 = "darwin_uml_everywhere", "darwin_uml_arm64_only"
+    x86_64 = "darwin_uml_x86_64_only"
     active = [everywhere, arm64]
+    x86_active = [everywhere, x86_64]
 
     def check(
         image: bytes,
@@ -323,10 +329,12 @@ def verify_kernel_elf_contract(module: ModuleType, root: Path) -> None:
 
     # Each slice imports exactly its active symbols.
     check(kernel_elf(active), None)
-    check(kernel_elf([everywhere]), None, "x86_64")
+    check(kernel_elf(x86_active), None, "x86_64")
     for imports, kernel_slice, missing, extra in (
-        (active, "x86_64", [], [arm64]),
+        (active, "x86_64", [x86_64], [arm64]),
+        (x86_active, "arm64", [arm64], [x86_64]),
         ([everywhere], "arm64", [arm64], []),
+        ([everywhere], "x86_64", [x86_64], []),
         ([*active, "darwin_uml_undeclared"], "arm64", [], ["darwin_uml_undeclared"]),
     ):
         check(
@@ -416,7 +424,7 @@ def verify_kernel_elf_contract(module: ModuleType, root: Path) -> None:
 
     for kernel_slice, symbols in (
         ("arm64", active),
-        ("x86_64", [everywhere]),
+        ("x86_64", x86_active),
     ):
         printed = run("--print-expected", "--slice", kernel_slice)
         require(
@@ -443,13 +451,19 @@ def verify_kernel_elf_contract(module: ModuleType, root: Path) -> None:
         "darwin_uml_everywhere\t16k-only\tfixture",
         "darwin_uml_everywhere\t4k-only\tfixture",
         "darwin_uml_everywhere\tarm64-only\t",
+        "darwin_uml_everywhere\tx86_64-only\t",
         "darwin_uml_arm64_only\tarm64-only\tagain",
+        "darwin_uml_x86_64_only\tx86_64-only\tagain",
+        "darwin_uml_x86_64_only\tarm64-only\tboth",
         "uml_everywhere\tarm64-only\tfixture",
     ):
         write_bridge_policy(abi, [*policy, row])
-        check(kernel_elf(active), "ABI import policy is malformed at line 3")
-    write_bridge_policy(abi, [*policy, "darwin_uml_undeclared\tarm64-only\tfixture"])
-    check(kernel_elf(active), "ABI import policy names undeclared bridge symbols")
+        check(kernel_elf(active), "ABI import policy is malformed at line 4")
+    for availability in ("arm64-only", "x86_64-only"):
+        write_bridge_policy(
+            abi, [*policy, f"darwin_uml_undeclared\t{availability}\tfixture"]
+        )
+        check(kernel_elf(active), "ABI import policy names undeclared bridge symbols")
     (abi / "import-policy.tsv").write_text(
         "symbol\tavailability\n" + "\n".join(policy) + "\n", encoding="utf-8"
     )

@@ -61,6 +61,25 @@ starts during one, or the guest suspending and resuming, joins the mute. Taking
 the session back runs on another thread while the mute clock goes on, so no
 guest write waits longer than its stream's buffer lasts.
 
+iOS 27 reports an interruption through the session becoming inactive, which
+carries an interruption context for the system's own, and the system's
+resumption recommendation. Earlier iOS reports both in
+`AVAudioSessionInterruptionNotification`, whose end carries the same advice in
+its options. The sink and the microphone observe whichever the running system
+posts. The sink acts on interruption events in the order they arrived, an end
+that a later beginning overtook being skipped, and the microphone ignores a
+route change that began before an interruption did. The engine and player calls
+that report an error exist from iOS 27; earlier systems use the calls without a
+report, and a player that is not playing after its start is a failed start.
+
+An engine made on an output route that was lost (the app spent time in the
+background) never starts again, so the sink replaces it. A start with no route,
+or with a session the system will not activate yet, plays muted and starts a
+fresh engine once a second for up to 15 s before it reports the output as
+unavailable, naming which of the two it waited for; an interruption ends that
+wait, and the wait begins again if the route is missing when the interruption
+ends.
+
 ## Capture
 
 While the guest records, the device completes one receive buffer per period of
@@ -85,10 +104,37 @@ reads or opens the microphone, and no permission prompt can appear.
   the same silence as an off one.
 - `MicrophoneCaptureSource` runs the `MicrophoneInput` only while the guest
   records and the switch is active, so the system's recording indicator is lit
-  only while a guest listens.
+  only while a guest listens, and while the switch's standby holds: a camera of
+  the guest is in video mode (`CameraDeviceOptions::onVideoMode`), which is
+  when the guest is about to record and the system needs time to open the
+  microphone. Standby opens the input before the guest starts (mono until a
+  recording has said otherwise, opened again if the recording asks for other
+  channels). The guest's start is a boundary (`CaptureRing::restart`): what the
+  ring held, what the sample-rate converter holds (`MicrophoneTap` resets it),
+  a buffer the audio thread received before it and writes after it, and the
+  frames of a buffer that began before it are dropped, so the recording begins
+  with audio captured after the start, not with sound from before it, and keeps
+  what the audio thread writes while the start is made. It
+  changes neither the setting nor the permission, and it closes with video mode
+  unless the guest is recording. The indicator is lit, and a Bluetooth headset
+  is on the hands-free profile, from the open to the close, not from the
+  recording's start to its end. An application that records with no preview is
+  in video mode if it asks for the picture stabilized, as Android's record
+  template does; one that records without asking opens the microphone when it
+  starts, as before.
 - On iOS the microphone never takes the audio session from an app that plays or
   records, such as a call. The session is shared with the output
   (`audio_session.hpp`); macOS has no audio session.
+- The shared session's category is set only when the plan or the session's
+  reported settings changed.
+- While the guest records, a connected Bluetooth headset is the input, over the
+  hands-free profile (full bandwidth where the headset supports high-quality
+  recording), and the headset's output moves to that profile too, at telephone
+  quality where it has no better, until the recording stops. Playback alone
+  keeps the playback category and A2DP (`audio_session_category.hpp`). A route
+  change under a recording, a headset connecting or leaving, builds the
+  microphone's engine again on the same session, and the output restarts on the
+  new route and measures its latency again.
 
 macOS enables it with `--audio-input=host` (`silent` is the default): the
 launcher turns the switch on at start, which is when macOS asks, on behalf of the
@@ -105,11 +151,13 @@ tests make no sound. `host` is the default.
 
 `virtio-sound-protocol`, `virtio-sound-microphone` (over fakes, never opening
 the microphone or showing a prompt), `audio-mute-clock`, `audio-output-cycle`,
+`audio-session-category` (the session's category and options),
 `guest-virtio-sound-suspend` (a guest suspended under a playing and a paused
 stream, see [`../../../kernel/common/README.md`](../../../kernel/common/README.md))
 and `guest-virtio-sound-delay` (a guest's `snd_pcm_delay()` against when its
 last period completes) cover the device. `UML_TEST_APPLE_AUDIO=ON` adds
-`apple-audio-playback`, `apple-audio-interruption` and
+`apple-audio-playback`, `apple-audio-interruption` (on iOS 27, and
+`apple-audio-interruption-ios26` on iOS 26, the floor) and
 `guest-virtio-sound-delay-host` (see
 [`../../../docs/testing.md`](../../../docs/testing.md)); a real interruption on
 a device comes from Kernarium's `AudioInterrupter` test application (see
@@ -119,4 +167,6 @@ The real microphone is checked by hand, because granting access is the user's
 act: start a guest with `--audio-input=host`, answer the prompt, and record in
 the guest (`tinycap` on Android, `arecord` on Linux). The recording indicator
 lights while the guest records and goes out when it stops; with the setting off,
-or access denied, the capture is silence at the same rate.
+or access denied, the capture is silence at the same rate. A Bluetooth headset
+is checked the same way on an iPhone or iPad, connected before and during the
+recording.

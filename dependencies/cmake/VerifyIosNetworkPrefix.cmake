@@ -52,5 +52,5 @@ uml_verify_provenance_copy(
 foreach(_archive IN ITEMS
         libpcre2-8.a libffi.a libintl.a libglib-2.0.a libslirp.a)
     uml_verify_apple_binary(PATH "${PREFIX}/lib/${_archive}"
-        PLATFORM ${_mach_platform} MINOS 27.0)
+        PLATFORM ${_mach_platform} MINOS 26.0)
 endforeach()

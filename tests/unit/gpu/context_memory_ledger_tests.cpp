@@ -342,6 +342,25 @@ void aProcessIsTheSumOfItsContexts()
     require(snapshot.totalBytes == 40 * mebibyte, "the total was wrong");
 }
 
+void aContextNamesItsProcessUntilTheProcessIsGone()
+{
+    ContextMemoryLedger ledger;
+    ledger.contextCreated(2, owned(77, "app"), false, origin);
+    ledger.contextCreated(3, owned(77, "app"), true, origin);
+    ledger.contextCreated(4, "RenderThread", false, origin);
+    require(ledger.processOf(2) == 77 && ledger.processOf(3) == 77,
+        "a named context did not name its process");
+    require(ledger.processOf(4) == 0 && ledger.processOf(99) == 0,
+        "an unnamed or unknown context named a process");
+    require(ledger.hasProcess(77) && !ledger.hasProcess(78),
+        "the process's contexts were not found");
+    ledger.contextDestroyed(2);
+    require(ledger.hasProcess(77), "one context's end took its process");
+    ledger.contextDestroyed(3);
+    require(!ledger.hasProcess(77) && ledger.processOf(3) == 0,
+        "a process outlived its contexts");
+}
+
 void aHolderIsIdleWhenItsMostRecentContextIs()
 {
     ContextMemoryLedger ledger;
@@ -371,6 +390,107 @@ void aHolderIsIdleWhenItsMostRecentContextIs()
     require(ledger.snapshot(origin, 10, 0s, 0).holders.size() == 2 &&
             find(ledger.snapshot(origin, 10, 0s, 0), 50)->idle == 0s,
         "a clock that ran behind made a negative idle time");
+}
+
+/* A cached application that trims its memory runs commands that free it, and
+ * stays as idle as it was: freeing is not activity. A context that draws, or
+ * that allocates, is active, and a command after a release is credited again.
+ * The renderer reports memory after the command ran, and a command may both
+ * free and allocate. */
+void freeingIsNotActivity()
+{
+    const auto idleOf = [](const ContextMemoryLedger& ledger,
+                            Clock::time_point now, std::uint32_t pid) {
+        const auto snapshot = all(ledger, now);
+        const auto* holder = find(snapshot, pid);
+        require(holder != nullptr, "the holder was not in the snapshot");
+        return holder->idle;
+    };
+
+    ContextMemoryLedger ledger;
+    /* A venus application, a GL one that holds a 4 MiB resource, and one that
+     * draws. */
+    ledger.contextCreated(2, owned(50, "venus"), true, origin);
+    ledger.contextCreated(3, owned(51, "gl"), false, origin);
+    ledger.contextCreated(4, owned(52, "draws"), false, origin);
+    ledger.venusMemory(2, 8 * static_cast<std::int64_t>(mebibyte));
+    made(ledger, 101, 4 * mebibyte);
+    require(attach(ledger, 3, 101), "the attach was refused");
+    made(ledger, 102, mebibyte);
+    require(attach(ledger, 4, 102), "the attach was refused");
+    /* What the two keep, so that they stay holders. */
+    made(ledger, 120, mebibyte);
+    require(attach(ledger, 3, 120), "the attach was refused");
+    made(ledger, 121, mebibyte);
+    require(attach(ledger, 4, 121), "the attach was refused");
+
+    /* Trimming: a command that frees a Venus allocation, one that releases a
+     * resource, and one that shrinks it. */
+    ledger.contextActive(2, origin + 20s);
+    require(idleOf(ledger, origin + 21s, 50) == 1s,
+        "a command was not activity until the renderer said what it did");
+    ledger.venusMemory(2, -static_cast<std::int64_t>(mebibyte));
+    require(idleOf(ledger, origin + 30s, 50) == 30s,
+        "a command that freed memory reset the idle time");
+    ledger.contextActive(3, origin + 21s);
+    ledger.setResourceBytes(101, 3 * mebibyte);
+    require(idleOf(ledger, origin + 30s, 51) == 30s,
+        "a command that shrank a resource reset the idle time");
+    ledger.contextActive(3, origin + 22s);
+    ledger.resourceDetached(3, 101);
+    require(idleOf(ledger, origin + 30s, 51) == 30s,
+        "a command that dropped a resource reset the idle time");
+
+    /* Drawing is activity, whatever it frees on the way. */
+    ledger.contextActive(4, origin + 28s);
+    require(idleOf(ledger, origin + 30s, 52) == 2s,
+        "a context that draws was not active");
+    ledger.contextActive(4, origin + 29s);
+    require(idleOf(ledger, origin + 30s, 52) == 1s, "drawing was not credited");
+    ledger.resourceReleased(102);
+    ledger.contextActive(4, origin + 30s);
+    require(idleOf(ledger, origin + 30s, 52) == 0s,
+        "a command after a release was not credited");
+
+    /* A command that allocates is activity, in either order with a release. */
+    ledger.contextActive(2, origin + 40s);
+    ledger.venusMemory(2, 2 * static_cast<std::int64_t>(mebibyte));
+    ledger.venusMemory(2, -static_cast<std::int64_t>(mebibyte));
+    require(idleOf(ledger, origin + 45s, 50) == 5s,
+        "a command that allocated and freed was not activity");
+    ledger.contextActive(2, origin + 50s);
+    ledger.venusMemory(2, -static_cast<std::int64_t>(mebibyte));
+    ledger.venusMemory(2, 2 * static_cast<std::int64_t>(mebibyte));
+    require(idleOf(ledger, origin + 55s, 50) == 5s,
+        "a command that freed and then allocated was not activity");
+    /* What a release withdraws is the credit since the last allocation, not
+     * the one the allocation made good. */
+    ledger.venusMemory(2, -static_cast<std::int64_t>(mebibyte));
+    require(idleOf(ledger, origin + 60s, 50) == 10s,
+        "a release took back an allocation's activity");
+
+    /* A blob and an attach are allocations. */
+    ledger.contextActive(3, origin + 70s);
+    made(ledger, 103, 2 * mebibyte);
+    require(attach(ledger, 3, 103), "the attach was refused");
+    require(idleOf(ledger, origin + 75s, 51) == 5s,
+        "a command that attached a resource was not activity");
+    ledger.contextActive(3, origin + 80s);
+    madeBlob(ledger, 104, 3, mebibyte);
+    require(idleOf(ledger, origin + 85s, 51) == 5s,
+        "a command that made a blob was not activity");
+
+    /* A release that follows no command, or a zero-byte one, changes
+     * nothing, and a context that is quiet only grows idler. */
+    ledger.resourceReleased(104);
+    require(idleOf(ledger, origin + 90s, 51) == 10s,
+        "a release after an allocation took the allocation's activity");
+    made(ledger, 105, 0);
+    require(attach(ledger, 3, 105), "the attach was refused");
+    ledger.contextActive(3, origin + 95s);
+    ledger.resourceReleased(105);
+    require(idleOf(ledger, origin + 100s, 51) == 5s,
+        "a resource without bytes was a release");
 }
 
 void theSnapshotKeepsTheLargestHoldersThatAreBigEnough()
@@ -547,7 +667,9 @@ int main()
     aBlobBelongsToItsCreatorUnlessTheCreatorIsVenus();
     venusMemoryFollowsTheRenderersReports();
     aProcessIsTheSumOfItsContexts();
+    aContextNamesItsProcessUntilTheProcessIsGone();
     aHolderIsIdleWhenItsMostRecentContextIs();
+    freeingIsNotActivity();
     theSnapshotKeepsTheLargestHoldersThatAreBigEnough();
     clearForgetsTheGuest();
     threadsMeetOnOneLedger();

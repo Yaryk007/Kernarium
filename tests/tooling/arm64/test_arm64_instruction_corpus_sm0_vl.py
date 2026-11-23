@@ -35,7 +35,6 @@ __import__("sys").dont_write_bytecode = True
 
 import hashlib
 import importlib.util
-import json
 import pathlib
 import sys
 
@@ -260,10 +259,8 @@ def check_others(gen, records: list[dict]) -> None:
 def main() -> int:
     gen = load_generator()
     builder = gen.corpus
-    corpus, tokens = builder.decode_pack(pathlib.Path(sys.argv[1]).read_bytes())
-    records = [item for item in map(json.loads,
-                                    builder.dump_corpus(corpus, tokens))
-               if "cases" in item]
+    corpus, _tokens = builder.decode_pack(pathlib.Path(sys.argv[1]).read_bytes())
+    records = list(builder.dump_records(corpus))
     check_model(gen)
     check_spill_model(gen)
     ours = [item for item in records if item["producer"] == gen.PRODUCER]

@@ -9,14 +9,15 @@ aarch32_probe.S, aligned to 64 KiB, and PROGRAM4K the same program aligned to
 
 A 64-bit task sees aarch64 from uname and arm64 Linux's /proc/cpuinfo layout
 without a model name, vm.mmap_rnd_compat_bits has the range of the page
-profile, and abi.cp15_barrier is present.  The program runs its own checks to
-a zero failure count, in its default mode and in the "extra" and "tracer"
-modes of aarch32_probe.S; PER_LINUX32 changes uname and /proc/cpuinfo; a
-64-bit tracer sees the program's exec stop and signal stop through the
-72-byte NT_PRSTATUS of an AArch32 task, can rewrite its registers, reads its
-VFP and TLS registers, follows its system calls (PTRACE_GET_SYSCALL_INFO
-names AUDIT_ARCH_ARM) and single steps, and sees the VFP context of its
-signal frames; the faults end the program in SIGSEGV, SIGILL and SIGTRAP; a
+profile, abi.cp15_barrier is present, and the task maps the guest's vDSO.
+The program runs its own checks to a zero failure count, in its default mode
+and in the "extra" and "tracer" modes of aarch32_probe.S; PER_LINUX32 changes
+uname and /proc/cpuinfo; a 64-bit tracer sees the program's exec stop and
+signal stop through the 72-byte NT_PRSTATUS of an AArch32 task, which has the
+kuser helpers and the sigpage but no vDSO and no AT_SYSINFO_EHDR, can rewrite
+its registers, reads its VFP and TLS registers, follows its system calls
+(PTRACE_GET_SYSCALL_INFO names AUDIT_ARCH_ARM) and single steps, and sees the
+VFP context of its signal frames; the faults end the program in SIGSEGV, SIGILL and SIGTRAP; a
 core dump is a 32-bit ARM core file; and many runs at once all complete.  The
 4 KiB-layout program loads and runs.  With --aarch64-helper, the guest
 assembles aarch64_dirty.s, a 64-bit program that leaves x15-x30 set, and the
@@ -66,6 +67,7 @@ PSR_FLAGS = 0xf8000000 | 0x000f0000  # NZCVQ and GE
 FPSCR_MASK = 0xf800009f | 0x07f79f00
 AT_PAGESZ = 6
 AT_ENTRY = 9
+AT_SYSINFO_EHDR = 33
 AT_HWCAP = 16
 AT_PLATFORM = 15
 VECTORS = 0xffff0000
@@ -138,6 +140,9 @@ def check_native_view():
     check("cpuinfo lists one block per CPU",
           len(blocks) == os.cpu_count(), f"{len(blocks)} of {os.cpu_count()}")
     check("cpuinfo names no 32-bit platform", "(v8l)" not in read("/proc/cpuinfo"))
+    # A 64-bit task has the guest's vDSO (guest-vdso); an AArch32 task has
+    # none, and check_tracer looks for it there.
+    check("a 64-bit task maps its vDSO", "[vdso]" in read("/proc/self/maps"))
 
     # The compat range of the page profile, as arm64 Linux's Kconfig sets it.
     low = 11
@@ -361,7 +366,10 @@ def check_tracer(elf):
     check("the kuser helpers page is at 0xffff0000",
           re.search(r"^ffff0000-.*\[vectors\]$", maps, re.M) is not None)
     check("the sigpage is mapped", "[sigpage]" in maps)
+    check("an AArch32 task has no vDSO", "[vdso]" not in maps)
     vector = auxv(child)
+    check("an AArch32 task's vector has no AT_SYSINFO_EHDR",
+          AT_SYSINFO_EHDR not in vector, str(vector))
     check("the auxiliary vector is the 32-bit task's",
           vector.get(AT_ENTRY) == entry and vector.get(AT_PAGESZ) == page_size()
           and vector.get(AT_HWCAP, 0) != 0, str(vector))

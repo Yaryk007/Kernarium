@@ -450,10 +450,10 @@ index 48962190dc0cd4d9699e9aa303e482f1897ab424..3e2c59b6686259df2e4baba4bb748474
  vk_compare_op_to_mtl_compare_function(enum VkCompareOp op);
  
 diff --git a/src/kosmickrisp/vulkan/kk_cmd_draw.c b/src/kosmickrisp/vulkan/kk_cmd_draw.c
-index c1609538fff091860a40ed36555750e9b65a1de4..8509deb688d8ea16d02a4ad7cd6454cf089bc08a 100644
+index 97e3d22466c81d39e5f91ea4c25e91aa7b6dfaed..7834a95e5171c76b9aeddf8c2bd41932463fa27a 100644
 --- a/src/kosmickrisp/vulkan/kk_cmd_draw.c
 +++ b/src/kosmickrisp/vulkan/kk_cmd_draw.c
-@@ -1778,14 +1778,25 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
+@@ -1779,14 +1779,25 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
           enc, cmd->vk.dynamic_graphics_state.ds.stencil.front.reference,
           cmd->vk.dynamic_graphics_state.ds.stencil.back.reference);
  
@@ -484,7 +484,7 @@ index c1609538fff091860a40ed36555750e9b65a1de4..8509deb688d8ea16d02a4ad7cd6454cf
  
     if (IS_DIRTY(CB_LOGIC_OP)) {
 diff --git a/src/kosmickrisp/vulkan/kk_debug.c b/src/kosmickrisp/vulkan/kk_debug.c
-index 375698e44092641f2445a939b5482146de09734c..9dd178a198295175aab10f8abc237e06c9fd1c89 100644
+index 22e5116fc659d199e8a7b74b2f6348dfed72d58d..ec1eb26966ef12c4faebe9a3c8a962243f26f807 100644
 --- a/src/kosmickrisp/vulkan/kk_debug.c
 +++ b/src/kosmickrisp/vulkan/kk_debug.c
 @@ -12,6 +12,7 @@ const struct debug_named_value flags[] = {
@@ -492,11 +492,11 @@ index 375698e44092641f2445a939b5482146de09734c..9dd178a198295175aab10f8abc237e06
     {"force_robustness", KK_DEBUG_FORCE_ROBUSTNESS},
     {"submit_timing", KK_DEBUG_SUBMIT_TIMING},
 +   {"no_metal_blend", KK_DEBUG_NO_METAL_BLEND},
+    {"unroll", KK_DEBUG_UNROLL},
     {NULL, 0},
  };
- 
 diff --git a/src/kosmickrisp/vulkan/kk_debug.h b/src/kosmickrisp/vulkan/kk_debug.h
-index 178dcc89bd30cde7c58f89aa96945344a54ad5e8..e5664b76bb857eebe1b7d2bd0d39c02c2d4949bf 100644
+index f49650854a297c2b1a1e684c57938eaebbe2ec5f..0d8bb6e2407132a1f868124d4b87bf8d864bcfb4 100644
 --- a/src/kosmickrisp/vulkan/kk_debug.h
 +++ b/src/kosmickrisp/vulkan/kk_debug.h
 @@ -14,6 +14,11 @@ enum kk_debug {
@@ -508,9 +508,9 @@ index 178dcc89bd30cde7c58f89aa96945344a54ad5e8..e5664b76bb857eebe1b7d2bd0d39c02c
 +    * suspected fixed-function blend defect can be bisected without a
 +    * rebuild. */
 +   KK_DEBUG_NO_METAL_BLEND = 1ull << 4,
- };
- 
- extern enum kk_debug kk_mesa_debug_flags;
+    /* Report, for every draw, whether the driver unrolled it and whether it
+     * rewrote the draw's vertex order for the provoking vertex, so a workload's
+     * unrolls can be counted. */
 diff --git a/src/kosmickrisp/vulkan/kk_gpl.h b/src/kosmickrisp/vulkan/kk_gpl.h
 index fe1de5ed5aea8a91980dd71163d546051de05580..9a3f458f98a38ced65e9838be6b35a78f53bfb1c 100644
 --- a/src/kosmickrisp/vulkan/kk_gpl.h

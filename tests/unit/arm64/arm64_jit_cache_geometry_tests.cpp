@@ -31,8 +31,10 @@ void geometry_respects_every_supported_executor_count()
 	const auto per_executor_minimum =
 		arm64::minimum_jit_cache_budget_per_executor();
 	const auto minimum = arm64::minimum_jit_cache_budget(1);
-	require(per_executor_minimum != 0 && minimum > per_executor_minimum,
-		"minimum geometry omitted the shared-cache base");
+	/* The minimum funds every executor's minimum and nothing else: a tier
+	 * that small does not exist. */
+	require(per_executor_minimum != 0 && minimum == per_executor_minimum,
+		"the minimum budget is not the executors' minimum");
 	require(!arm64::derive_jit_cache_geometry(minimum - 1U, 1).valid(),
 		"a budget below the true one-executor minimum was accepted");
 	const auto exact = arm64::derive_jit_cache_geometry(minimum, 1);
@@ -48,10 +50,15 @@ void geometry_respects_every_supported_executor_count()
 		minimum_for_64, arm64::maximum_jit_cache_executors);
 	const auto shared_64 = arm64::derive_shared_translation_cache_budget(
 		minimum_for_64, arm64::maximum_jit_cache_executors);
-	require(exact_64.valid() &&
-		exact_64.total_bytes() * arm64::maximum_jit_cache_executors +
-			shared_64 <= minimum_for_64,
+	require(exact_64.valid() && shared_64 == 0 &&
+		minimum_for_64 ==
+			per_executor_minimum * arm64::maximum_jit_cache_executors &&
+		exact_64.total_bytes() * arm64::maximum_jit_cache_executors <=
+			minimum_for_64,
 		"the exact 64-executor minimum did not fit each executor");
+	require(!arm64::derive_jit_cache_geometry(minimum_for_64 - 1U,
+			arm64::maximum_jit_cache_executors).valid(),
+		"a budget below the true 64-executor minimum was accepted");
 	require(!arm64::derive_jit_cache_geometry(minimum_for_64, 0).valid(),
 		"zero executors were accepted");
 	require(!arm64::derive_jit_cache_geometry(
@@ -102,15 +109,18 @@ void representative_geometry_remains_stable_and_bounded()
 					arm64::default_jit_cache_budget_per_executor,
 				"private executor geometry exceeded its fixed cap");
 			if (total >= executors *
-					arm64::default_jit_cache_budget_per_executor +
-					arm64::minimum_shared_translation_cache_bytes) {
+					arm64::default_jit_cache_budget_per_executor) {
 				if (expected_geometry)
 					require(geometry == *expected_geometry,
 						"fully funded private geometry grew with guest memory");
 				else
 					expected_geometry = geometry;
 			}
-			require(shared > preceding_shared,
+			require((shared != 0) ==
+					(total - geometry.total_bytes() * executors >=
+						arm64::minimum_shared_translation_tier_bytes),
+				"shared cache did not follow its floor");
+			require(shared >= preceding_shared,
 				"shared cache did not grow with guest memory");
 			require(geometry.total_bytes() * executors + shared <= total,
 				"representative geometry exceeded its executor budget");
@@ -137,6 +147,99 @@ void representative_geometry_remains_stable_and_bounded()
 		4U * gib, 10,
 		arm64::maximum_jit_cache_budget_per_executor + 1U).valid(),
 		"private cap above the production ceiling was accepted");
+}
+
+/* The split of a whole-process budget at every executor count: the private
+ * caches take min(cap, budget / executors) each, and the shared tier takes
+ * what is left when that reaches its floor and there is a peer to share
+ * with. Nothing in it names a platform.
+ */
+void the_shared_tier_exists_only_above_its_floor()
+{
+	constexpr auto cap = arm64::default_jit_cache_budget_per_executor;
+	constexpr auto floor = arm64::minimum_shared_translation_tier_bytes;
+	static_assert(floor >= 128U * mib && floor <= gib);
+
+	/* Below the cap every byte of the budget is the private caches': what
+	 * rounding leaves of it is less than a mapping granule each, and no tier
+	 * is funded, at any executor count. This is the budget of an iOS device
+	 * (the gadget cache's cap, 160 to 304 MiB, at 1 to 8 vCPUs) and of a
+	 * small Mac guest. */
+	constexpr std::array device{160U, 192U, 224U, 256U, 272U, 272U, 304U, 304U};
+	for (unsigned executors = 1; executors <= device.size(); ++executors) {
+		const auto total = device[executors - 1U] * mib;
+		const auto geometry = arm64::derive_jit_cache_geometry(total, executors);
+		require(geometry.valid() && geometry.total_bytes() <= total / executors,
+			"a device budget had no private geometry");
+		require(arm64::derive_shared_translation_cache_budget(
+				total, executors) == 0,
+			"a device budget funded a shared tier");
+		require(total - geometry.total_bytes() * executors <
+				executors * 64U * 1024U,
+			"the private caches left budget unspent");
+	}
+	/* A tier that is off takes nothing from the executors: the same private
+	 * geometry as a budget with only that executor's share. */
+	for (const auto executors : {2U, 4U, 8U}) {
+		const auto total = 256U * mib;
+		require(arm64::derive_jit_cache_geometry(total, executors) ==
+				arm64::derive_jit_cache_geometry(
+					total / executors, 1),
+			"an off tier changed the private geometry");
+	}
+
+	/* At the boundary: the budget above which the executors are funded to
+	 * their cap, plus the floor. */
+	for (const auto executors : {2U, 3U, 4U, 8U, 64U}) {
+		const auto full = executors * cap;
+		const auto geometry = arm64::derive_jit_cache_geometry(full, executors);
+		const auto private_bytes = geometry.total_bytes() * executors;
+		require(geometry.valid() && private_bytes <= full &&
+			geometry == arm64::derive_jit_cache_geometry(
+				full + floor, executors) &&
+			geometry == arm64::derive_jit_cache_geometry(
+				full + 64U * floor, executors),
+			"the private geometry moved above its cap");
+		const auto boundary = private_bytes + floor;
+		require(arm64::derive_shared_translation_cache_budget(
+				boundary - 1U, executors) == 0,
+			"a tier under its floor was funded");
+		require(arm64::derive_shared_translation_cache_budget(
+				boundary, executors) == floor,
+			"a tier at its floor was not funded");
+		require(arm64::derive_shared_translation_cache_budget(
+				full + 3U * floor, executors) ==
+				full + 3U * floor - private_bytes,
+			"the shared tier did not take the remainder");
+		require(arm64::derive_shared_translation_cache_budget(
+				full, executors) == 0,
+			"a budget of exactly the private caches funded a tier");
+	}
+
+	/* One executor has no peer: its tier is off whatever the budget. */
+	require(arm64::derive_shared_translation_cache_budget(4U * gib, 1) == 0 &&
+		arm64::derive_shared_translation_cache_budget(
+			std::numeric_limits<std::size_t>::max(), 1) == 0,
+		"a single executor funded a shared tier");
+
+	/* A lowered private cap leaves more to the tier: four executors at
+	 * 32 MiB each spend 128 MiB, and the floor on top of that is funded. */
+	require(arm64::derive_shared_translation_cache_budget(
+			128U * mib + floor, 4, 32U * mib) >= floor,
+		"a lowered private cap did not fund the tier with the difference");
+	require(arm64::derive_shared_translation_cache_budget(
+			128U * mib + floor, 4, 64U * mib) == 0,
+		"a private cap that spends the difference funded a tier");
+
+	/* The Mac's default: half of a 4 GiB guest at four and eight vCPUs. */
+	const auto four = arm64::derive_shared_translation_cache_budget(2U * gib, 4);
+	require(four >= gib && four < gib + 4U * 64U * 1024U,
+		"the Mac default at four vCPUs did not fund a gigabyte of tier");
+	require(arm64::derive_shared_translation_cache_budget(2U * gib, 8) == 0,
+		"the Mac default at eight vCPUs funded a tier");
+	const auto eight = arm64::derive_shared_translation_cache_budget(4U * gib, 8);
+	require(eight >= 2U * gib && eight < 2U * gib + 8U * 64U * 1024U,
+		"eight vCPUs at 8 GiB did not fund the remainder");
 }
 
 void publication_is_an_atomic_first_valid_pair()
@@ -373,6 +476,7 @@ int main()
 	try {
 		geometry_respects_every_supported_executor_count();
 		representative_geometry_remains_stable_and_bounded();
+		the_shared_tier_exists_only_above_its_floor();
 		publication_is_an_atomic_first_valid_pair();
 		one_jit_run_session_is_admitted_at_a_time();
 		a_standalone_executor_lease_is_excluded_by_a_managed_session();

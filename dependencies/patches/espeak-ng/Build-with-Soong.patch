@@ -1,0 +1,617 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 06:47:14 +0900
+Subject: [PATCH] Build with Soong
+
+The Android image build compiles eSpeak NG from this tree with Soong, as
+it does the other applications it ships. The Android.bp lists the
+sources the CMake build compiles for the Android build (async speech,
+MBROLA and PCAudio off; libsonic, klatt and speechPlayer on) as static
+libraries for the device and for the host, with the config.h each of
+them gets, and builds libttsespeak and the app from android/. A host
+build of the command line program compiles the voice data as
+cmake/data.cmake does, and a genrule zips it with its SHA-256 into the
+raw resources the Gradle build makes. The Gradle files are not used.
+
+The pinned libsonic tree is placed in sonic/ beside these sources before
+the build; it is not part of this series. The BuildConfig the Gradle
+build generates and the manifest with the package it sets as the
+namespace are written beside the sources, in android/soong. The manifest
+leaves out the uses-library of the Wear OS shared library, which the
+platform does not have and the app does not require.
+
+The compat <stdio.h> includes the system one outside its include
+guard: glibc's <wchar.h> before 2.28 includes <stdio.h> for the FILE
+types only and expects it to be included again, which the guard of the
+shim turned into the only inclusion (the host libraries are built
+against a glibc 2.17 sysroot). The speechPlayer sources are built with
+-Wnon-virtual-dtor as a warning, which the platform's C++ flags make an
+error, and the data tool carries its C++ library.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .gitignore                                    |   2 +
+ Android.bp                                    | 272 ++++++++++++++++++
+ android/soong/AndroidManifest.xml             |  96 +++++++
+ android/soong/config/device/config.h          |  18 ++
+ android/soong/config/host/config.h            |  18 ++
+ android/soong/espeak-data.sh                  |  68 +++++
+ .../com/reecedunn/espeak/BuildConfig.java     |  13 +
+ src/include/compat/stdio.h                    |  15 +-
+ 8 files changed, 496 insertions(+), 6 deletions(-)
+ create mode 100644 Android.bp
+ create mode 100644 android/soong/AndroidManifest.xml
+ create mode 100644 android/soong/config/device/config.h
+ create mode 100644 android/soong/config/host/config.h
+ create mode 100755 android/soong/espeak-data.sh
+ create mode 100644 android/soong/java/com/reecedunn/espeak/BuildConfig.java
+
+diff --git a/.gitignore b/.gitignore
+index 71b9c8079166f33e65a5075d1fd12062a7f5a65d..0c6f19040808d52de4ed236914cdaf3698827919 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -66,6 +66,8 @@ aclocal.m4
+ autom4te.cache/
+ compile
+ config.*
++# the fixed configuration of the Android image build (Android.bp)
++!/android/soong/config/*/config.h
+ configure
+ depcomp
+ install-sh
+diff --git a/Android.bp b/Android.bp
+new file mode 100644
+index 0000000000000000000000000000000000000000..c19d7b3b64026ff250431aaaf522ddd5e3e4eaa4
+--- /dev/null
++++ b/Android.bp
+@@ -0,0 +1,272 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++// eSpeak NG, built from source by the Android image build. The Gradle and CMake
++// files of android/ are not used by it. This file lists what they build: the speech
++// engine and its parts as static libraries for the device and the host, the host
++// tool that compiles the voice data (cmake/data.cmake), libttsespeak, and the app.
++// The pinned libsonic tree is placed in sonic/ beside these sources.
++
++package {
++    default_applicable_licenses: ["external_espeak_ng_license"],
++    default_visibility: ["//external/espeak-ng:__subpackages__"],
++}
++
++license {
++    name: "external_espeak_ng_license",
++    visibility: [":__subpackages__"],
++    license_kinds: [
++        "SPDX-license-identifier-GPL-3.0-or-later",
++    ],
++    license_text: [
++        "COPYING",
++    ],
++}
++
++// The Android parts of the project: the app and the JNI library.
++license {
++    name: "external_espeak_ng_app_license",
++    visibility: [":__subpackages__"],
++    license_kinds: [
++        "SPDX-license-identifier-Apache-2.0",
++    ],
++    license_text: [
++        "COPYING.APACHE",
++    ],
++}
++
++license {
++    name: "external_espeak_ng_sonic_license",
++    visibility: [":__subpackages__"],
++    license_kinds: [
++        "SPDX-license-identifier-Apache-2.0",
++    ],
++    license_text: [
++        "sonic/LICENSE",
++    ],
++}
++
++// What the engine sources are built with. The values are those of the Gradle build
++// (async speech, MBROLA and PCAudio off; libsonic and speechPlayer on), in
++// android/soong/config/<device|host>/config.h.
++cc_defaults {
++    name: "espeak_ng_flags",
++    local_include_dirs: [
++        "src/libespeak-ng",
++        "src/include",
++        "src/include/compat",
++        "src/ucd-tools/src/include",
++        "src/speechPlayer/include",
++        "sonic",
++    ],
++    cflags: [
++        "-Wno-error",
++        "-fvisibility=hidden",
++        "-fno-exceptions",
++        "-fwrapv",
++        "-DLIBESPEAK_NG_EXPORT=1",
++        "-DPATH_ESPEAK_DATA=\"/usr/share/espeak-ng-data\"",
++    ],
++}
++
++// The device libraries are NDK libraries of the app's minSdk; the host ones are
++// for the data tool.
++cc_defaults {
++    name: "espeak_ng_device",
++    defaults: ["espeak_ng_flags"],
++    sdk_version: "21",
++    stl: "none",
++    local_include_dirs: ["android/soong/config/device"],
++}
++
++// The tool runs as a genrule tool: it carries its C++ library.
++cc_defaults {
++    name: "espeak_ng_host",
++    defaults: ["espeak_ng_flags"],
++    stl: "libc++_static",
++    local_include_dirs: ["android/soong/config/host"],
++}
++
++cc_defaults {
++    name: "espeak_ng_ucd_sources",
++    srcs: [
++        "src/ucd-tools/src/case.c",
++        "src/ucd-tools/src/categories.c",
++        "src/ucd-tools/src/ctype.c",
++        "src/ucd-tools/src/proplist.c",
++        "src/ucd-tools/src/scripts.c",
++        "src/ucd-tools/src/tostring.c",
++    ],
++    export_include_dirs: ["src/ucd-tools/src/include"],
++}
++
++// The platform makes -Wnon-virtual-dtor an error for C++; speechPlayer's WaveGenerator is an
++// interface without a virtual destructor, and its one implementation has one.
++cc_defaults {
++    name: "espeak_ng_speechplayer_sources",
++    srcs: [
++        "src/speechPlayer/src/frame.cpp",
++        "src/speechPlayer/src/speechPlayer.cpp",
++        "src/speechPlayer/src/speechWaveGenerator.cpp",
++    ],
++    cflags: ["-Wno-error=non-virtual-dtor"],
++    export_include_dirs: ["src/speechPlayer/include"],
++}
++
++cc_defaults {
++    name: "espeak_ng_sonic_sources",
++    srcs: ["sonic/sonic.c"],
++    export_include_dirs: ["sonic"],
++    licenses: ["external_espeak_ng_sonic_license"],
++}
++
++cc_defaults {
++    name: "espeak_ng_core_sources",
++    srcs: [
++        "src/libespeak-ng/common.c",
++        "src/libespeak-ng/mnemonics.c",
++        "src/libespeak-ng/error.c",
++        "src/libespeak-ng/ieee80.c",
++        "src/libespeak-ng/compiledata.c",
++        "src/libespeak-ng/compiledict.c",
++        "src/libespeak-ng/dictionary.c",
++        "src/libespeak-ng/encoding.c",
++        "src/libespeak-ng/intonation.c",
++        "src/libespeak-ng/langopts.c",
++        "src/libespeak-ng/numbers.c",
++        "src/libespeak-ng/phoneme.c",
++        "src/libespeak-ng/phonemelist.c",
++        "src/libespeak-ng/readclause.c",
++        "src/libespeak-ng/setlengths.c",
++        "src/libespeak-ng/soundicon.c",
++        "src/libespeak-ng/spect.c",
++        "src/libespeak-ng/ssml.c",
++        "src/libespeak-ng/synthdata.c",
++        "src/libespeak-ng/synthesize.c",
++        "src/libespeak-ng/tr_languages.c",
++        "src/libespeak-ng/translate.c",
++        "src/libespeak-ng/translateword.c",
++        "src/libespeak-ng/voices.c",
++        "src/libespeak-ng/wavegen.c",
++        "src/libespeak-ng/speech.c",
++        "src/libespeak-ng/espeak_api.c",
++        "src/libespeak-ng/klatt.c",
++        "src/libespeak-ng/sPlayer.c",
++    ],
++}
++
++cc_library_static {
++    name: "espeak_ng_ucd",
++    defaults: ["espeak_ng_device", "espeak_ng_ucd_sources"],
++}
++
++cc_library_static {
++    name: "espeak_ng_speechplayer",
++    defaults: ["espeak_ng_device", "espeak_ng_speechplayer_sources"],
++    stl: "c++_static",
++}
++
++cc_library_static {
++    name: "espeak_ng_sonic",
++    defaults: ["espeak_ng_device", "espeak_ng_sonic_sources"],
++}
++
++cc_library_static {
++    name: "espeak_ng_core",
++    defaults: ["espeak_ng_device", "espeak_ng_core_sources"],
++}
++
++cc_library_host_static {
++    name: "espeak_ng_ucd_host",
++    defaults: ["espeak_ng_host", "espeak_ng_ucd_sources"],
++}
++
++cc_library_host_static {
++    name: "espeak_ng_speechplayer_host",
++    defaults: ["espeak_ng_host", "espeak_ng_speechplayer_sources"],
++}
++
++cc_library_host_static {
++    name: "espeak_ng_sonic_host",
++    defaults: ["espeak_ng_host", "espeak_ng_sonic_sources"],
++}
++
++cc_library_host_static {
++    name: "espeak_ng_core_host",
++    defaults: ["espeak_ng_host", "espeak_ng_core_sources"],
++}
++
++// The command line program: the data is compiled with it, as cmake/data.cmake does.
++cc_binary_host {
++    name: "espeak_ng_tool",
++    defaults: ["espeak_ng_host"],
++    srcs: ["src/espeak-ng.c"],
++    static_libs: [
++        "espeak_ng_core_host",
++        "espeak_ng_speechplayer_host",
++        "espeak_ng_sonic_host",
++        "espeak_ng_ucd_host",
++    ],
++}
++
++// The JNI library of the app.
++cc_library_shared {
++    name: "espeak_ng_ttsespeak",
++    stem: "libttsespeak",
++    defaults: ["espeak_ng_device"],
++    licenses: ["external_espeak_ng_app_license"],
++    stl: "c++_static",
++    header_libs: ["jni_headers"],
++    srcs: ["android/jni/jni/eSpeakService.c"],
++    local_include_dirs: ["android/jni/include"],
++    static_libs: [
++        "espeak_ng_core",
++        "espeak_ng_speechplayer",
++        "espeak_ng_sonic",
++        "espeak_ng_ucd",
++    ],
++    shared_libs: ["liblog"],
++}
++
++// res/raw/espeakdata.zip and res/raw/espeakdata_version: the compiled voice data and
++// the SHA-256 of its archive, as the createDataArchive and createDataVersion tasks of
++// android/build.gradle make them.
++genrule {
++    name: "espeak_ng_data_res",
++    srcs: [
++        "cmake/data.cmake",
++        "espeak-ng-data/lang/**/*",
++        "espeak-ng-data/voices/!v/**/*",
++        "phsource/**/*",
++        "dictsource/**/*",
++    ],
++    out: ["espeakdata.res.zip"],
++    tools: [
++        "espeak_ng_tool",
++        "soong_zip",
++    ],
++    tool_files: ["android/soong/espeak-data.sh"],
++    cmd: "/bin/bash $(location android/soong/espeak-data.sh) $(location espeak_ng_tool) $(location soong_zip) " +
++        "external/espeak-ng $(genDir) $(out)",
++}
++
++android_app {
++    name: "eSpeakNG",
++    licenses: ["external_espeak_ng_app_license"],
++    sdk_version: "36",
++    min_sdk_version: "21",
++    target_sdk_version: "36",
++    java_version: "17",
++    product_specific: true,
++    manifest: "android/soong/AndroidManifest.xml",
++    srcs: [
++        "android/src/**/*.java",
++        // BuildConfig, as the Gradle build generates it for a release build.
++        "android/soong/java/**/*.java",
++    ],
++    resource_dirs: ["android/res"],
++    resource_zips: [":espeak_ng_data_res"],
++    jni_libs: ["espeak_ng_ttsespeak"],
++    optimize: {
++        enabled: false,
++    },
++}
+diff --git a/android/soong/AndroidManifest.xml b/android/soong/AndroidManifest.xml
+new file mode 100644
+index 0000000000000000000000000000000000000000..55e6352c03abc0fd8490fcd509b18d14bec28828
+--- /dev/null
++++ b/android/soong/AndroidManifest.xml
+@@ -0,0 +1,96 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- SPDX-License-Identifier: Apache-2.0 -->
++<!-- android/AndroidManifest.xml with the package the Gradle build sets as the namespace,
++     and without the uses-library of the Wear OS shared library (optional; the platform does not have it). -->
++<manifest xmlns:android="http://schemas.android.com/apk/res/android"
++    package="com.reecedunn.espeak"
++    android:versionCode="23"
++    android:versionName="1.53.0" >
++
++    <uses-feature
++        android:name="android.hardware.touchscreen"
++        android:required="false" />
++    <uses-feature
++        android:name="android.hardware.type.watch"
++        android:required="false" />
++
++    <application
++        android:name="com.reecedunn.espeak.EspeakApp"
++        android:icon="@mipmap/icon"
++        android:theme="@style/AppTheme"
++        android:label="@string/app_name" >
++        <meta-data
++            android:name="com.google.android.wearable.standalone"
++            android:value="true" />
++        <service
++            android:name=".TtsService"
++            android:label="@string/app_name"
++            android:directBootAware="true"
++            android:exported="true">
++            <intent-filter>
++                <action android:name="android.intent.action.TTS_SERVICE" />
++
++                <category android:name="android.intent.category.DEFAULT" />
++            </intent-filter>
++
++            <meta-data
++                android:name="android.speech.tts"
++                android:resource="@xml/tts_engine" />
++        </service>
++
++        <activity
++            android:name=".DownloadVoiceData"
++            android:theme="@style/AppTheme"
++            android:exported="true">
++            <intent-filter>
++                <action android:name="android.speech.tts.engine.INSTALL_TTS_DATA" />
++
++                <category android:name="android.intent.category.DEFAULT" />
++            </intent-filter>
++        </activity>
++        <activity
++            android:name=".CheckVoiceData"
++            android:theme="@android:style/Theme.Translucent.NoTitleBar"
++            android:exported="true">
++            <intent-filter>
++                <action android:name="android.speech.tts.engine.CHECK_TTS_DATA" />
++
++                <category android:name="android.intent.category.DEFAULT" />
++            </intent-filter>
++        </activity>
++        <activity
++            android:name=".GetSampleText"
++            android:theme="@android:style/Theme.Translucent.NoTitleBar"
++            android:exported="true">
++            <intent-filter>
++                <action android:name="android.speech.tts.engine.GET_SAMPLE_TEXT" />
++
++                <category android:name="android.intent.category.DEFAULT" />
++            </intent-filter>
++        </activity>
++        <activity
++            android:name=".TtsSettingsActivity"
++            android:label="@string/tts_settings_label"
++            android:exported="true">
++            <intent-filter>
++                <action android:name="android.speech.tts.engine.CONFIGURE_ENGINE" />
++
++                <category android:name="android.intent.category.DEFAULT" />
++            </intent-filter>
++        </activity>
++        <activity-alias
++            android:name=".WearLauncher"
++            android:targetActivity=".TtsSettingsActivity"
++            android:enabled="false"
++            android:exported="true"
++            android:icon="@mipmap/icon"
++            android:label="@string/tts_settings_label">
++            <intent-filter>
++                <action android:name="android.intent.action.MAIN" />
++
++                <category android:name="android.intent.category.LAUNCHER" />
++            </intent-filter>
++        </activity-alias>
++    </application>
++
++</manifest>
+diff --git a/android/soong/config/device/config.h b/android/soong/config/device/config.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..299813086a11dc33f343e8d8754b05139b2754da
+--- /dev/null
++++ b/android/soong/config/device/config.h
+@@ -0,0 +1,18 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++/* What cmake/config.cmake and src/libespeak-ng/config.h.in produce for the device build
++   of the Android image: no async speech, no MBROLA, no PCAudio; libsonic, klatt and
++   speechPlayer on. */
++#define HAVE_MKSTEMP 1
++#define HAVE_NBTOOL_CONFIG_H 0
++#define HAVE_DECL_OPTRESET 0
++#define HAVE_SYS_ENDIAN_H 1
++#define HAVE_ISWBLANK 1
++
++#define USE_ASYNC 0
++#define USE_KLATT 1
++#define USE_LIBPCAUDIO 0
++#define USE_LIBSONIC 1
++#define USE_MBROLA 0
++#define USE_SPEECHPLAYER 1
++
++#define PACKAGE_VERSION "1.53.0"
+diff --git a/android/soong/config/host/config.h b/android/soong/config/host/config.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..a3a99219e015d6ef275bec52bb362e825aba53b5
+--- /dev/null
++++ b/android/soong/config/host/config.h
+@@ -0,0 +1,18 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++/* What cmake/config.cmake and src/libespeak-ng/config.h.in produce for the host build
++   of the Android image: no async speech, no MBROLA, no PCAudio; libsonic, klatt and
++   speechPlayer on. */
++#define HAVE_MKSTEMP 1
++#define HAVE_NBTOOL_CONFIG_H 0
++#define HAVE_DECL_OPTRESET 0
++#define HAVE_SYS_ENDIAN_H 0
++#define HAVE_ISWBLANK 1
++
++#define USE_ASYNC 0
++#define USE_KLATT 1
++#define USE_LIBPCAUDIO 0
++#define USE_LIBSONIC 1
++#define USE_MBROLA 0
++#define USE_SPEECHPLAYER 1
++
++#define PACKAGE_VERSION "1.53.0"
+diff --git a/android/soong/espeak-data.sh b/android/soong/espeak-data.sh
+new file mode 100755
+index 0000000000000000000000000000000000000000..fda30719a92b73f293cd696ef522a06a4bed1244
+--- /dev/null
++++ b/android/soong/espeak-data.sh
+@@ -0,0 +1,68 @@
++#!/bin/bash
++# SPDX-License-Identifier: GPL-3.0-or-later
++#
++# Compiles the voice data of eSpeak NG as cmake/data.cmake does (intonations, phonemes, and the
++# dictionary of every language of its list) and writes the app's raw resources as a resource zip:
++#   raw/espeakdata.zip       the data below espeak-ng-data/ (what android/build.gradle's createDataArchive zips)
++#   raw/espeakdata_version   the SHA-256 of that archive (createDataVersion)
++#
++#   espeak-data.sh ESPEAK_NG SOONG_ZIP SOURCE_DIR WORK_DIR OUT_ZIP
++#
++# Everything is written below WORK_DIR; SOURCE_DIR is only read.
++set -eu
++
++absolute() { case $1 in /*) printf '%s' "$1" ;; *) printf '%s/%s' "$PWD" "$1" ;; esac; }
++tool=$(absolute "$1")
++zip=$(absolute "$2")
++src=$3
++gen=$(absolute "$4")
++out=$(absolute "$5")
++
++data=$gen/data
++log=$gen/espeak-data.log
++rm -rf "$data" "$gen/res" "$gen/espeakdata.zip"
++mkdir -p "$data/espeak-ng-data/voices" "$data/dictsource" "$gen/res/raw"
++
++# the data directory's layout: lang and voices/!v are copied, the rest is compiled
++cp -R "$src/espeak-ng-data/lang" "$data/espeak-ng-data/"
++cp -R "$src/espeak-ng-data/voices/!v" "$data/espeak-ng-data/voices/"
++cp -R "$src/phsource" "$data/"
++chmod -R u+w "$data"
++export ESPEAK_DATA_PATH=$data
++
++run() { # DIRECTORY ARGUMENT...: the tool, in that directory, with its output in the log
++	local dir=$1
++	shift
++	(cd "$dir" && "$tool" "$@") >> "$log" 2>&1 || { echo "espeak-data: $* failed in $dir; the end of the log:" >&2; tail -n 30 "$log" >&2; exit 1; }
++}
++: > "$log"
++run "$data/phsource" --compile-intonations
++run "$data/phsource" --compile-phonemes
++
++# the languages: the first list of cmake/data.cmake, the one the data build loops over
++langs=$(awk 'NR == 1 { next } /^\)/ { exit } { print }' "$src/cmake/data.cmake" | tr '\n' ' ')
++count=0
++for lang in $langs; do
++	files=("$src/dictsource/${lang}_rules" "$src/dictsource/${lang}_list")
++	if [ -e "$src/dictsource/extra/${lang}_listx" ]; then
++		files+=("$src/dictsource/extra/${lang}_listx")
++	elif [ -e "$src/dictsource/${lang}_listx" ]; then
++		files+=("$src/dictsource/${lang}_listx")
++	fi
++	[ ! -e "$src/dictsource/${lang}_emoji" ] || files+=("$src/dictsource/${lang}_emoji")
++	cp "${files[@]}" "$data/dictsource/"
++	chmod u+w "$data/dictsource"/*
++	run "$data/dictsource" "--compile=$lang"
++	[ -s "$data/espeak-ng-data/${lang}_dict" ] || { echo "espeak-data: no dictionary for $lang" >&2; exit 1; }
++	count=$((count + 1))
++done
++# a list that parsed to far fewer names than cmake/data.cmake holds (it has more than a hundred) means the file's layout changed
++[ "$count" -ge 100 ] || { echo "espeak-data: only $count languages read from cmake/data.cmake" >&2; exit 1; }
++for f in intonations phondata phondata-manifest phonindex phontab; do
++	[ -s "$data/espeak-ng-data/$f" ] || { echo "espeak-data: $f was not compiled" >&2; exit 1; }
++done
++
++"$zip" -o "$gen/espeakdata.zip" -P espeak-ng-data -C "$data/espeak-ng-data" -D "$data/espeak-ng-data"
++cp "$gen/espeakdata.zip" "$gen/res/raw/espeakdata.zip"
++printf '%s' "$(sha256sum "$gen/espeakdata.zip" | cut -d' ' -f1)" > "$gen/res/raw/espeakdata_version"
++"$zip" -o "$out" -C "$gen/res" -D "$gen/res"
+diff --git a/android/soong/java/com/reecedunn/espeak/BuildConfig.java b/android/soong/java/com/reecedunn/espeak/BuildConfig.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..366d6dd10479f5e6789b5982af11ca638cf6a4b6
+--- /dev/null
++++ b/android/soong/java/com/reecedunn/espeak/BuildConfig.java
+@@ -0,0 +1,13 @@
++// SPDX-License-Identifier: Apache-2.0
++package com.reecedunn.espeak;
++
++/** The fields the Gradle build generates for the app's release build. */
++public final class BuildConfig {
++  public static final boolean DEBUG = false;
++  public static final String APPLICATION_ID = "com.reecedunn.espeak";
++  public static final String BUILD_TYPE = "release";
++  public static final int VERSION_CODE = 23;
++  public static final String VERSION_NAME = "1.53.0";
++
++  private BuildConfig() {}
++}
+diff --git a/src/include/compat/stdio.h b/src/include/compat/stdio.h
+index 6b55337fbd94289ce47e8a6db848b6016511ec0b..4583fb8082eb4e50116712510b4f7cdd9e457332 100644
+--- a/src/include/compat/stdio.h
++++ b/src/include/compat/stdio.h
+@@ -16,21 +16,24 @@
+  * along with this program; if not, see: <http://www.gnu.org/licenses/>.
+  */
+ 
++#ifndef _MSC_VER
++#pragma GCC system_header // Silence "warning: #include_next is a GCC extension"
++// Outside the include guard: glibc's <wchar.h> (before 2.28) includes <stdio.h> with __need_FILE
++// and __need___FILE set, to get the FILE types only, and expects the next inclusion to declare the
++// rest. A guard around this include would turn that inclusion into the only one.
++#include_next <stdio.h>
++#endif
++
+ #ifndef STDIO_H_COMPAT_SHIM
+ #define STDIO_H_COMPAT_SHIM
+ 
+ #ifdef _MSC_VER
++
+ #if _MSC_VER >= 1900 // Visual C++ 14 (Visual Studio 2015) and above...
+ #include <../ucrt/stdio.h>
+ #else
+ #include <../include/stdio.h>
+ #endif
+-#else
+-#pragma GCC system_header // Silence "warning: #include_next is a GCC extension"
+-#include_next <stdio.h>
+-#endif
+-
+-#ifdef _MSC_VER
+ 
+ #ifndef snprintf
+ #define snprintf _snprintf

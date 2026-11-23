@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Key layout of "Kernarium Keyboard" (1af4:0002), the virtio-input device that
+# carries the side keys of the host application: Power, Volume Up and Down,
+# Back and Home. Android would otherwise give it Generic.kl, which maps every
+# key of a full keyboard, and then counts it as a hardware keyboard that is
+# always attached (Configuration.keyboard, the on-screen keyboard rules). The
+# host's keyboard is its own device (1af4:0003), present only while a keyboard
+# is.
+
+key 116   POWER
+key 115   VOLUME_UP
+key 114   VOLUME_DOWN
+key 158   BACK
+key 172   HOME

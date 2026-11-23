@@ -380,7 +380,7 @@ bool A32Compiler::continues_through(const Decoded &d) const {
  * a cold side exit that publishes the registers dirty here and links to the
  * target, and the block goes on with the fall-through, its registers and
  * flags still in the host. */
-A32Compiler::Flow A32Compiler::emit_side_exit_branch(bool monitor) {
+A32Compiler::Flow A32Compiler::emit_side_exit_branch() {
   const auto &inst = cur().inst;
   const auto &o = inst.operands;
   const auto info = op_info(inst.form);
@@ -390,16 +390,31 @@ A32Compiler::Flow A32Compiler::emit_side_exit_branch(bool monitor) {
     const auto side = cold_exit(ColdPath::Kind::branch);
     cold_.back().target = thumb_ ? aarch32::t32_key(target & ~1U)
                                  : aarch32::a32_key(target & ~3U);
-    cold_.back().monitor = monitor;
     emitter_.branch_condition(side, inst.cond);
   } else {
     const unsigned n = use(static_cast<unsigned>(o.n), 9);
     const auto side = cold_exit(ColdPath::Kind::branch);
     cold_.back().target = aarch32::t32_key(target);
-    cold_.back().monitor = monitor;
     emitter_.compare_zero(side, n, false, info.op == Op::cbnz);
   }
   return Flow::next;
+}
+
+/* The branch of a fused exclusive run whose taken arm discards the run. Inside
+ * the run load_flags() and use() emit nothing (the flags were made valid
+ * before the host interval or are the run's own compare, and the operand was
+ * bound before it), so no access enters the interval. */
+void A32Compiler::emit_run_exit_branch(Arm64Emitter::Label rollback) {
+  const auto &inst = cur().inst;
+  const auto &o = inst.operands;
+  const auto info = op_info(inst.form);
+  if (info.op == Op::b) {
+    load_flags();
+    emitter_.branch_condition(rollback, inst.cond);
+  } else {
+    const unsigned n = use(static_cast<unsigned>(o.n), 9);
+    emitter_.compare_zero(rollback, n, false, info.op == Op::cbnz);
+  }
 }
 
 bool A32Compiler::can_predicate() const {

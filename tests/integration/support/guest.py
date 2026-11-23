@@ -419,7 +419,9 @@ LINE_START = rb"(?:^|\r?\n|\r)"
 # prints `# ` alone, and BusyBox's ash puts the working directory before it
 # (`~ # `, `/ # `). A prompt ends the transcript so far, and the search starts
 # after the session's ready marker, so only the shell's own lines can precede it.
-ROOT_PROMPT = LINE_START + rb"[^\r\n]*# $"
+# ash's line editor may send the cursor-position request `<ESC>[6n` right after
+# the prompt, and nothing on the console answers it.
+ROOT_PROMPT = LINE_START + rb"[^\r\n]*# (?:\x1b\[6n)?$"
 
 # The watchdog behind every emulator the harness starts. It holds only the
 # read end of the harness's lifeline and waits for whichever comes first: the

@@ -10,14 +10,19 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <future>
 #include <iterator>
+#include <map>
+#include <memory>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 #include <fcntl.h>
@@ -415,6 +420,31 @@ std::uint64_t allocatedBytes(const fs::path &path)
 	return static_cast<std::uint64_t>(details.st_blocks) * 512U;
 }
 
+/* What a disk is as a file: the same inode and modification time prove that
+ * nothing wrote it or replaced it, the blocks that nothing was allocated. */
+struct FileIdentity {
+	ino_t inode;
+	off_t size;
+	timespec modified;
+	blkcnt_t blocks;
+
+	bool operator==(const FileIdentity &other) const
+	{
+		return inode == other.inode && size == other.size &&
+		       modified.tv_sec == other.modified.tv_sec &&
+		       modified.tv_nsec == other.modified.tv_nsec &&
+		       blocks == other.blocks;
+	}
+};
+
+FileIdentity identityOf(const fs::path &path)
+{
+	struct stat details {};
+	require(stat(path.c_str(), &details) == 0);
+	return {details.st_ino, details.st_size, details.st_mtimespec,
+		details.st_blocks};
+}
+
 /* A child that holds the disk open and locked as a running guest does, until
  * the object is destroyed. */
 class LockHolder final {
@@ -598,10 +628,35 @@ void testDataDiskGrow(const Fixture &fixture, const fs::path &directory)
 		readRange(fresh, 7U * gibibyte - mebibyte, mebibyte));
 	fs::remove(fresh);
 
-	/* It never shrinks. */
-	requireThrows([&] { (void)android::prepareDataDisk(layout, path, 6); });
+	/* A request below the disk keeps the disk: the caller asked for a size
+	 * the disk already exceeds, as an application does after the disk grew
+	 * for a start that never recorded it. Nothing is written, replaced or
+	 * left beside it. */
+	{
+		const auto before = identityOf(path);
+		const auto head = readRange(path, 0, 2 * mebibyte);
+		const auto tail = readRange(path, 7U * gibibyte - mebibyte, mebibyte);
+		for (const std::uint32_t smaller : {6U, 1U}) {
+			prepared = android::prepareDataDisk(layout, path, smaller);
+			require(prepared.change == android::DataDiskChange::none &&
+				prepared.capacityGiB == 7);
+		}
+		require(identityOf(path) == before);
+		require(android::validateDataDisk(layout, path) == 7);
+		require(readRange(path, 0, 2 * mebibyte) == head);
+		require(readRange(path, 7U * gibibyte - mebibyte, mebibyte) == tail);
+		require(readRange(path, userdata + 12345U, marker.size()) == marker);
+		require(readRange(path, metadata + 77U, marker.size()) == marker);
+		require(miscCommand(layout, path) == "boot-recovery");
+		require(entryCount(directory) == 1);
+	}
+
+	/* growDataDisk keeps its own precondition: it grows or it throws. */
 	requireThrows([&] { android::growDataDisk(layout, path, 7); });
+	requireThrows([&] { android::growDataDisk(layout, path, 6); });
 	requireThrows([&] { android::growDataDisk(layout, path, 129); });
+	/* A request beyond the template's range still fails, and the disk stays. */
+	requireThrows([&] { (void)android::prepareDataDisk(layout, path, 129); });
 	require(android::validateDataDisk(layout, path) == 7);
 	require(entryCount(directory) == 1);
 
@@ -770,6 +825,212 @@ void testBootloaderCommandIsConsumed(const Fixture &fixture, const fs::path &dir
 	fs::remove(disk);
 }
 
+/* Runs `body` on a thread of its own and fails, instead of hanging, when it
+ * has not returned within `limit`. */
+template <typename Body>
+void requireReturns(std::chrono::seconds limit, const char *what, Body body)
+{
+	auto finished = std::make_shared<std::promise<void>>();
+	auto done = finished->get_future();
+	std::thread([finished, &body] {
+		body();
+		finished->set_value();
+	}).detach();
+	require(done.wait_for(limit) == std::future_status::ready, what);
+}
+
+/* The release's own root image (the Magisk-patched copy of init_boot, beside
+ * the system disk) replaces the normal boot's ramdisk on every boot and
+ * restart when the guest is asked for root. Only its ramdisk is used, recovery
+ * is untouched, and anything malformed, absent or linked is refused. */
+void testRootBootImage(const Fixture &fixture, const fs::path &directory)
+{
+	const auto &layout = fixture.layout;
+	const auto data = newDataDisk(layout, directory);
+	const auto &initBoot = layout.systemPartition("init_boot");
+	const auto release = copyRelease(fixture, directory, "root-release");
+	const android::Storage storage{release, data};
+	const auto system = (release / android::releaseSystemDisk).string();
+	const auto image = release / android::releaseRootBootImage;
+
+	/* A release with no root image boots as before and refuses the option;
+	 * recovery is not asked for it. */
+	require(!storage.carriesRoot());
+	require(storage.selectBoot(android::BootMode::normal).ramdiskFile.empty());
+	requireThrows([&] {
+		(void)storage.selectBoot(android::BootMode::normal, android::RootMode::on);
+	});
+	requireThrows([&] { (void)storage.selectRestartBoot(android::RootMode::on); });
+	requireThrows([&] {
+		(void)storage.selectBoot(android::BootMode::normal,
+					 static_cast<android::RootMode>(7));
+	});
+
+	/* The release's init_boot as the root image, its ramdisk made a newc
+	 * archive by its first bytes. */
+	fs::create_directory(release / "root");
+	{
+		const auto whole = readRange(release / android::releaseSystemDisk,
+					     initBoot.offset, initBoot.imageBytes);
+		std::FILE *file = std::fopen(image.c_str(), "wb");
+		require(file != nullptr);
+		require(std::fwrite(whole.data(), 1, whole.size(), file) == whole.size());
+		require(std::fclose(file) == 0);
+	}
+	writeAt(image, pageSize, bytesOf("070701"));
+	require(storage.carriesRoot());
+
+	const auto taken = storage.selectBoot(android::BootMode::normal, android::RootMode::on);
+	require(taken.mode == android::BootMode::normal);
+	require(taken.kind() == android::RamdiskKind::root);
+	require(taken.ramdiskFile == image);
+	require(taken.ramdisk.offset == pageSize);
+	require(taken.ramdisk.size == normalRamdiskSize);
+	require((storage.kernelArguments(taken) == std::vector<std::string>{
+		"ubd0r=" + system,
+		"ubd1=" + data.string(),
+		"initrd=" + image.string(),
+		"initrd_offset=" + std::to_string(pageSize),
+		"initrd_size=" + std::to_string(normalRamdiskSize),
+		"root=/dev/ram0",
+		"rootfstype=ramfs"}));
+	/* Automatic mode and a restart take it too; without the option the
+	 * system disk's own ramdisk is still the one. */
+	require(storage.selectBoot(android::BootMode::automatic, android::RootMode::on)
+			.ramdiskFile == image);
+	require(storage.selectRestartBoot(android::RootMode::on).boot.ramdiskFile == image);
+	const auto stock = storage.selectBoot(android::BootMode::normal);
+	require(stock.kind() == android::RamdiskKind::stock);
+	require(stock.ramdiskFile.empty());
+	require(stock.ramdisk.offset == initBoot.offset + pageSize);
+	require(storage.kernelArguments(stock)[2] == "initrd=" + system);
+	require(storage.selectRestartBoot().boot.ramdiskFile.empty());
+
+	/* Recovery never takes it, and does not read it. */
+	const auto recovery = storage.selectBoot(android::BootMode::recovery, android::RootMode::on);
+	require(recovery.kind() == android::RamdiskKind::recovery);
+	require(recovery.ramdiskFile.empty());
+	require(recovery.ramdisk.offset == layout.systemPartition("recovery").offset + pageSize);
+	requestCommand(layout, data, "boot-recovery");
+	require(storage.selectRestartBoot(android::RootMode::on).boot.ramdiskFile.empty());
+	/* An automatic restart into recovery boots recovery's ramdisk, not the
+	 * root image the run asked for: the boot is recovery's. */
+	require(storage.selectRestartBoot(android::RootMode::on).boot.kind() ==
+		android::RamdiskKind::recovery);
+	requestCommand(layout, data, "");
+
+	const auto refuse = [&] {
+		requireThrows([&] {
+			(void)storage.selectBoot(android::BootMode::normal, android::RootMode::on);
+		});
+		/* The stock boot never reads the root image. */
+		require(storage.selectBoot(android::BootMode::normal).ramdiskFile.empty());
+	};
+	/* An image that is not a regular file the release carries. */
+	const auto original = release / "root" / "original.img";
+	fs::rename(image, original);
+	refuse();
+	fs::create_symlink(original, image);
+	require(!storage.carriesRoot());
+	refuse();
+	fs::remove(image);
+	fs::create_directory(image);
+	require(!storage.carriesRoot());
+	refuse();
+	fs::remove(image);
+	/* A pipe with no writer is refused too, and opening it does not wait for
+	 * one: the check of the type runs on the descriptor, after the open. */
+	require(mkfifo(image.c_str(), 0600) == 0);
+	requireReturns(std::chrono::seconds(10),
+		"opening a pipe at the root image's name did not return", [&] {
+			require(!storage.carriesRoot());
+			refuse();
+		});
+	fs::remove(image);
+	fs::rename(original, image);
+	/* `root/` itself is a real directory, never a link to one, whatever the
+	 * image inside is; and a file in its place is no directory. */
+	const auto elsewhere = release / "elsewhere";
+	fs::rename(release / "root", elsewhere);
+	fs::create_directory_symlink(elsewhere, release / "root");
+	require(!storage.carriesRoot());
+	refuse();
+	fs::remove(release / "root");
+	{
+		std::FILE *file = std::fopen((release / "root").c_str(), "wb");
+		require(file != nullptr);
+		require(std::fclose(file) == 0);
+	}
+	require(!storage.carriesRoot());
+	refuse();
+	fs::remove(release / "root");
+	fs::rename(elsewhere, release / "root");
+	require(storage.carriesRoot());
+
+	/* The header: magic, kernel size, header size, version, reserved words
+	 * and the signature size, as the release's own partitions are checked. */
+	const auto mutate = [&](std::uint64_t offset, const char *replacement,
+				std::size_t length) {
+		fs::copy_file(image, original, fs::copy_options::overwrite_existing);
+		writeAt(image, offset, bytesOf(std::string(replacement, length)));
+		refuse();
+		fs::rename(original, image);
+	};
+	mutate(0, "ANDROID?", 8);
+	mutate(8, "\x01", 1);	 /* a kernel the host never starts */
+	mutate(20, "\x00", 1);	 /* header size */
+	mutate(40, "\x03", 1);	 /* header version 3 */
+	mutate(24, "\x01", 1);	 /* reserved */
+	mutate(1580, "\x01", 1); /* boot signature size */
+	/* A ramdisk that is empty or does not fit the file. */
+	mutate(12, "\x00\x00\x00\x00", 4);
+	mutate(12, "\xff\xff\xff\x7f", 4);
+	mutate(12, "\x01\x20\x00\x00", 4); /* one byte past the file */
+	/* A ramdisk in no format the kernel unpacks. */
+	mutate(pageSize, "junk", 4);
+	/* The magic is the ramdisk's own, not the file's padding after it: a
+	 * ramdisk of one byte followed by padding that completes gzip's. */
+	fs::copy_file(image, original, fs::copy_options::overwrite_existing);
+	writeAt(image, 12, bytesOf(std::string("\x01\x00\x00\x00", 4)));
+	writeAt(image, pageSize, bytesOf(std::string("\x1f\x8b", 2)));
+	refuse();
+	fs::rename(original, image);
+	/* Every format the kernel unpacks is taken. */
+	using namespace std::string_view_literals;
+	for (const auto magic : {"\x1f\x8b"sv, "BZh"sv, "\xfd" "7zXZ\x00"sv,
+				 "\x5d\x00\x00"sv, "\x89LZO"sv, "\x02\x21\x4c\030"sv,
+				 "\x28\xb5\x2f\xfd"sv, "070702"sv}) {
+		fs::copy_file(image, original, fs::copy_options::overwrite_existing);
+		writeAt(image, pageSize, bytesOf(magic));
+		(void)storage.selectBoot(android::BootMode::normal, android::RootMode::on);
+		fs::rename(original, image);
+	}
+	/* A file with no ramdisk page. */
+	fs::copy_file(image, original, fs::copy_options::overwrite_existing);
+	fs::resize_file(image, pageSize);
+	refuse();
+	fs::rename(original, image);
+	/* The size bound, on the valid image grown past it: its header, ramdisk
+	 * and format stay as they were, so only the bound can refuse it. 256 MiB
+	 * is the most taken. */
+	fs::copy_file(image, original, fs::copy_options::overwrite_existing);
+	fs::resize_file(image, 256U * mebibyte);
+	(void)storage.selectBoot(android::BootMode::normal, android::RootMode::on);
+	fs::resize_file(image, 256U * mebibyte + 1U);
+	refuse();
+	fs::rename(original, image);
+	(void)storage.selectBoot(android::BootMode::normal, android::RootMode::on);
+
+	/* A damaged data disk stops a rooted boot as it stops any other. */
+	flipByte(data, sectorSize + 20U);
+	requireThrows([&] {
+		(void)storage.selectBoot(android::BootMode::normal, android::RootMode::on);
+	});
+	flipByte(data, sectorSize + 20U);
+	fs::remove_all(release);
+	fs::remove(data);
+}
+
 /* Every restart selects the ramdisk in automatic mode, whatever the first
  * boot was given, so `reboot recovery` boots recovery and `reboot bootloader`
  * boots normally after its request is consumed. */
@@ -799,6 +1060,10 @@ void testRestartSelectsAutomaticMode(const Fixture &fixture, const fs::path &dir
 	require(restarted.boot.ramdisk.size == recoveryRamdiskSize);
 	require(!restarted.bootloaderConsumed);
 	require(miscCommand(layout, disk) == "boot-recovery");
+
+	/* The same request read by an automatic selection of its own. */
+	require(storage.selectBoot(android::BootMode::automatic).mode ==
+		android::BootMode::recovery);
 
 	/* Recovery's own reboot cleared the request: the next boot is normal. */
 	requestCommand(layout, disk, "");
@@ -983,6 +1248,277 @@ void testHwTimeoutMultiplier(const fs::path &directory)
 	});
 }
 
+/* A launcher that has the installation's serial number sets it itself, and the
+ * release's own `umlandroid17` that every release published before then
+ * carries is dropped for it. Any other serial in a release is refused by such
+ * a launcher; a launcher with no serial of its own passes the release's
+ * command line through as it is. */
+void testSerialNumber(const fs::path &directory)
+{
+	require(android::serialPrefix == "androidboot.serialno=");
+	require(android::serialArgument("0123456789abcdef") ==
+		"androidboot.serialno=0123456789abcdef");
+	require(android::legacySerialArgument ==
+		std::string{android::serialPrefix} + "umlandroid17");
+
+	const std::string devices{android::bootDevicesArgument};
+	const auto path = directory / "serial-command-line.txt";
+	constexpr std::array<std::string_view, 2> setsSerial{
+		"androidboot.kernarium.adb_auth=", android::serialPrefix};
+	constexpr std::array<std::string_view, 1> leavesSerial{
+		"androidboot.kernarium.adb_auth="};
+
+	/* The legacy argument is dropped, in whatever place it stands, and the
+	 * others keep their order. */
+	writeText(path, "quiet androidboot.serialno=umlandroid17 " + devices +
+			" console=ttyS0\n");
+	require(android::readKernelCommandLine(path, setsSerial) ==
+		std::vector<std::string>{"quiet", devices, "console=ttyS0"});
+	writeText(path, "androidboot.serialno=umlandroid17 quiet " + devices + "\n");
+	require(android::readKernelCommandLine(path, setsSerial) ==
+		std::vector<std::string>{"quiet", devices});
+	/* A release without it reads the same. */
+	writeText(path, "quiet " + devices + "\n");
+	require(android::readKernelCommandLine(path, setsSerial) ==
+		std::vector<std::string>{"quiet", devices});
+	/* Any other serial is refused: the launcher fixes it. */
+	for (const char *bad : {"androidboot.serialno=0123456789abcdef",
+				"androidboot.serialno=umlandroid18",
+				"androidboot.serialno=umlandroid17x",
+				"androidboot.serialno=",
+				"androidboot.serialno=UMLANDROID17"}) {
+		writeText(path, std::string{"quiet "} + bad + " " + devices + "\n");
+		requireThrows([&] {
+			(void)android::readKernelCommandLine(path, setsSerial);
+		});
+		/* A launcher with no serial of its own passes it through. */
+		const auto arguments =
+			android::readKernelCommandLine(path, leavesSerial);
+		require(std::find(arguments.begin(), arguments.end(),
+				  std::string{bad}) != arguments.end());
+	}
+	/* The release's command line is read as it is when the launcher has no
+	 * serial: the legacy argument stays and boots the guest as before. */
+	writeText(path, "quiet androidboot.serialno=umlandroid17 " + devices + "\n");
+	require(android::readKernelCommandLine(path, leavesSerial) ==
+		std::vector<std::string>{"quiet", "androidboot.serialno=umlandroid17",
+					 devices});
+	/* Dropping the argument leaves the rest of the checks in force. */
+	writeText(path, "quiet androidboot.serialno=umlandroid17\n");
+	requireThrows([&] {
+		(void)android::readKernelCommandLine(path, setsSerial);
+	});
+	/* Android's reader removes quotes before it looks at an argument, so a
+	 * quoted word sets a serial number like the plain one: the quoted legacy
+	 * word is dropped and any other quoted serial is refused, whatever the
+	 * quotes surround, and the guest gets exactly one serial. */
+	for (const char *quotedLegacy :
+	     {"\"androidboot.serialno=umlandroid17\"",
+	      "androidboot.serialno=\"umlandroid17\"",
+	      "'androidboot.serialno=umlandroid17'",
+	      "androidboot.ser\"ial\"no=umlandroid17"}) {
+		writeText(path, std::string{"quiet "} + quotedLegacy + " " + devices + "\n");
+		require(android::readKernelCommandLine(path, setsSerial) ==
+				std::vector<std::string>{"quiet", devices},
+			std::string{"a quoted legacy serial stays: "} + quotedLegacy);
+	}
+	for (const char *quotedOther :
+	     {"\"androidboot.serialno=0123456789abcdef\"",
+	      "androidboot.serialno=\"0123456789abcdef\"",
+	      "'androidboot.serialno=umlandroid18'",
+	      "\"androidboot.serialno=umlandroid17x\""}) {
+		writeText(path, std::string{"quiet "} + quotedOther + " " + devices + "\n");
+		requireThrows([&] {
+			(void)android::readKernelCommandLine(path, setsSerial);
+		});
+	}
+	/* A quoted group that holds a serial spans words: refused (see
+	 * testQuotedGroups). */
+	writeText(path, "\"quiet androidboot.serialno=0123456789abcdef\" " + devices + "\n");
+	requireThrows([&] {
+		(void)android::readKernelCommandLine(path, setsSerial);
+	});
+	/* A launcher with no serial of its own leaves quoted words as they are. */
+	writeText(path, "\"androidboot.serialno=umlandroid17\" " + devices + "\n");
+	require(android::readKernelCommandLine(path, leavesSerial) ==
+		std::vector<std::string>{"\"androidboot.serialno=umlandroid17\"", devices});
+
+	/* The words of a launcher argument, quotes removed. */
+	require(android::withoutQuotes("a\"b'c") == "abc");
+	require(android::carriesPrefix("androidboot.serialno=x", android::serialPrefix));
+	require(android::carriesPrefix("quiet androidboot.serialno=x", android::serialPrefix));
+	require(android::carriesPrefix("\"androidboot.serialno=x\"", android::serialPrefix));
+	require(android::carriesPrefix("a\tb\n'androidboot.serialno=x'", android::serialPrefix));
+	require(android::carriesPrefix("androidboot.ser\"ialno=x", android::serialPrefix));
+	require(!android::carriesPrefix("", android::serialPrefix));
+	require(!android::carriesPrefix("quiet", android::serialPrefix));
+	require(!android::carriesPrefix("--android-serialno=ABCDEF", android::serialPrefix));
+	require(!android::carriesPrefix("xandroidboot.serialno=x", android::serialPrefix));
+	require(!android::carriesPrefix("androidboot.serialnumber=x", android::serialPrefix));
+
+	/* The launchers' own multiplier rule is unaffected. */
+	writeText(path, "androidboot.serialno=umlandroid17 "
+			"androidboot.hw_timeout_multiplier=5 " + devices + "\n");
+	constexpr std::array<std::string_view, 2> setsBoth{
+		android::serialPrefix, android::hwTimeoutMultiplierPrefix};
+	require(android::readKernelCommandLine(path, setsBoth) ==
+		std::vector<std::string>{devices});
+}
+
+/* The loop of the pinned Android fs_mgr_boot_config.cpp
+ * ImportKernelCmdlineFromString: a word ends at a space outside a `"` group, and
+ * the quote characters are removed from it. */
+std::map<std::string, std::string> importedProperties(const std::string &line)
+{
+	std::map<std::string, std::string> properties;
+	std::size_t base = 0;
+	while (true) {
+		auto found = base;
+		while ((found = line.find_first_of(" \"", found)) !=
+			       std::string::npos &&
+		       line[found] == '"') {
+			if ((found = line.find('"', found + 1)) ==
+			    std::string::npos)
+				break;
+			++found;
+		}
+		std::string piece = line.substr(base, found - base);
+		piece.erase(std::remove(piece.begin(), piece.end(), '"'),
+			    piece.end());
+		const auto equals = piece.find('=');
+		if (equals != std::string::npos)
+			properties.emplace(piece.substr(0, equals),
+					   piece.substr(equals + 1));
+		if (found == std::string::npos)
+			break;
+		base = found + 1;
+	}
+	return properties;
+}
+
+/* The release's arguments as the launcher joins them with its own. */
+std::map<std::string, std::string> importedAfterLauncher(
+	const std::vector<std::string> &release)
+{
+	std::string line;
+	for (const auto &argument : release)
+		line += argument + ' ';
+	line += android::lcdDensityArgument(240) + ' ' +
+		android::hwTimeoutMultiplierArgument(8) + ' ' +
+		android::serialArgument("0123456789abcdef");
+	return importedProperties(line);
+}
+
+/* A quoted group of a release's command line is one argument to Android and
+ * several words to the reader that drops the legacy serial and multiplier, and
+ * the launcher's own arguments come after the release's: a group that spans
+ * words, or a quote that never closes, is refused before anything is dropped,
+ * and what is accepted reaches Android as the launcher wrote it. */
+void testQuotedGroups(const fs::path &directory)
+{
+	const std::string devices{android::bootDevicesArgument};
+	const auto path = directory / "quoted-groups.txt";
+	constexpr std::array<std::string_view, 3> setsAll{
+		"androidboot.kernarium.adb_auth=", android::serialPrefix,
+		android::hwTimeoutMultiplierPrefix};
+	constexpr std::array<std::string_view, 1> leavesAll{
+		"androidboot.kernarium.adb_auth="};
+	const std::string legacySerial{android::legacySerialArgument};
+	const std::string legacyMultiplier{
+		android::legacyHwTimeoutMultiplierArgument};
+
+	for (const std::string &group : std::vector<std::string>{
+		     "\"quiet " + legacySerial + "\"",
+		     "\"" + legacySerial + " quiet\"",
+		     "\"quiet " + legacyMultiplier + "\"",
+		     "\"" + legacyMultiplier + " quiet\"",
+		     "quiet \"" + legacySerial + " extra\"",
+		     "androidboot.x=\"a b\"",
+		     "\"quiet\tconsole=ttyS0\"",
+		     "\"quiet\nconsole=ttyS0\"",
+		     "\"quiet " + legacySerial,
+		     "quiet " + legacySerial + "\"",
+		     "androidboot.ser\"ialno=umlandroid17",
+		     "\"a\" \"b"}) {
+		writeText(path, group + " " + devices + "\n");
+		/* Refused for every launcher: its own arguments follow the open quote. */
+		requireThrows([&] {
+			(void)android::readKernelCommandLine(path, setsAll);
+		});
+		requireThrows([&] {
+			(void)android::readKernelCommandLine(path, leavesAll);
+		});
+	}
+
+	/* The quote may be anywhere in the file, even after the arguments the
+	 * launcher would have dropped, and the file need not end in a newline. */
+	for (const std::string &tail : std::vector<std::string>{
+		     " \"quiet\n", " \"quiet", " quiet\"", " a\"b\"c\"",
+		     " androidboot.x=\"y"}) {
+		writeText(path, legacySerial + " " + devices + tail);
+		requireThrows([&] {
+			(void)android::readKernelCommandLine(path, setsAll);
+		});
+	}
+
+	/* A quote that opens and closes inside one word is a group of no words
+	 * to span: the legacy arguments in it are dropped and Android reads the
+	 * launcher's own as written, whatever the quotes surround. */
+	for (const std::string &whole : std::vector<std::string>{
+		     "\"" + legacySerial + "\"",
+		     "androidboot.serialno=\"umlandroid17\"",
+		     "androidboot.ser\"ial\"no=umlandroid17"}) {
+		writeText(path, "quiet " + whole + " " + legacyMultiplier +
+				" \"console=ttyS0\" " + devices + "\n");
+		const auto arguments = android::readKernelCommandLine(path, setsAll);
+		require(arguments ==
+			std::vector<std::string>{"quiet", "\"console=ttyS0\"", devices});
+		const auto properties = importedAfterLauncher(arguments);
+		require(properties.at("androidboot.serialno") == "0123456789abcdef");
+		require(properties.at("androidboot.lcd_density") == "240");
+		require(properties.at("androidboot.hw_timeout_multiplier") == "3");
+		require(properties.at("console") == "ttyS0");
+	}
+	/* A launcher that keeps the release's own multiplier passes it through
+	 * whole, quotes included, and the guest gets it. */
+	writeText(path, "\"" + legacyMultiplier + "\" " + devices + "\n");
+	const auto kept = android::readKernelCommandLine(path, leavesAll);
+	require(kept == std::vector<std::string>{"\"" + legacyMultiplier + "\"", devices});
+	require(importedProperties(kept[0] + " " + kept[1]).at(
+			"androidboot.hw_timeout_multiplier") == "5");
+}
+
+/* Both launchers reserve the hardware SKU that tells the guest what the host
+ * has (the iOS runtime's KernariumHostFeatures.hpp, and the standalone
+ * launcher, which passes a host's own argument through) and the vendor SKU
+ * that names the camera layout the host composed
+ * (camera/camera_layout.hpp), so a release cannot state either. The product
+ * axis stays the release's. */
+void testHostFeatureArguments(const fs::path &directory)
+{
+	constexpr std::array<std::string_view, 3> launcherPrefixes{
+		"androidboot.kernarium.adb_auth=",
+		"androidboot.product.hardware.sku=",
+		"androidboot.product.vendor.sku="};
+	const std::string devices{android::bootDevicesArgument};
+	const auto path = directory / "feature-command-line.txt";
+	for (const char *bad : {"androidboot.product.hardware.sku=haptics",
+				"androidboot.product.hardware.sku=",
+				"androidboot.product.hardware.sku=other",
+				"androidboot.product.vendor.sku=camera",
+				"androidboot.product.vendor.sku="}) {
+		writeText(path, std::string{"quiet "} + bad + " " + devices + "\n");
+		requireThrows([&] {
+			(void)android::readKernelCommandLine(path, launcherPrefixes);
+		});
+	}
+	writeText(path, "quiet androidboot.hardware.sku=camera "
+			"androidboot.product.hardware.skus=1 " + devices + "\n");
+	require(android::readKernelCommandLine(path, launcherPrefixes) ==
+		std::vector<std::string>{"quiet", "androidboot.hardware.sku=camera",
+					 "androidboot.product.hardware.skus=1", devices});
+}
+
 /* Both launchers read the release's kernel command line through one
  * tokenizer and refuse an argument that they set themselves. */
 void testKernelCommandLine(const fs::path &directory)
@@ -1056,9 +1592,13 @@ int main(int argc, char *argv[])
 	testStorageBoot(fixture, fresh("boot"));
 	testBootloaderCommandIsConsumed(fixture, fresh("consume"));
 	testRestartSelectsAutomaticMode(fixture, fresh("restart"));
+	testRootBootImage(fixture, fresh("root-image"));
 	testStorageIsExact(fixture, fresh("exact"));
 	testLcdDensity(fresh("density"));
 	testHwTimeoutMultiplier(fresh("multiplier"));
+	testSerialNumber(fresh("serial"));
+	testQuotedGroups(fresh("quoted-groups"));
+	testHostFeatureArguments(fresh("feature-arguments"));
 	testKernelCommandLine(fresh("command-line"));
 	testUbdPath();
 	return 0;

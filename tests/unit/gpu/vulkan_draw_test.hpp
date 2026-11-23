@@ -8,6 +8,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <source_location>
@@ -76,6 +77,7 @@ struct DrawExtensions {
     bool device_address_commands = false;
     bool maintenance8 = false;
     bool maintenance10 = false;
+    bool index_type_uint8 = false;
 };
 
 struct VertexInputDraw {
@@ -201,6 +203,126 @@ struct SubmitStormResult {
     uint32_t submissions = 0;
 };
 
+// A GPU particle simulation: a chain of passes that each load and store one
+// colour attachment, take the output the pass before captured as their vertex
+// input, capture the next step's output with the rasterizer discarded, and
+// draw nothing. A barrier separates the passes. The last pass does the same
+// and then rasterizes one point per vertex over the attachment, so what the
+// discard passes did to the attachment (nothing) and what the rasterizing
+// draw did are both in the result. An occlusion query spans the whole chain.
+//
+// A pass records `ChainOp`s in order. A pass the configuration does not name
+// records a capture, the last one a capture and then the rasterizing draw.
+
+// One command of a pass.
+struct ChainOp {
+    enum class Kind {
+        // The chain's step: a discard draw that captures the next state.
+        Capture,
+        // A rasterizing draw of one point per vertex on row 8.
+        Raster,
+        // The step's vertex stage drawn with the rasterizer on: it captures and
+        // paints the same points as Raster.
+        RasterCapture,
+        // The step's discard draw with no capture active.
+        DiscardNoCapture,
+        // Begins and ends a capture with no draw between.
+        EmptyCapture,
+        // A rasterizing draw whose points all fall outside the clip volume.
+        ClippedRaster,
+        // An indexed discard draw of `heap_capture_indices` uint8 indices that
+        // captures into a buffer of its own. The driver unrolls the indices
+        // and sets the capture up from its geometry heap.
+        HeapCapture,
+        // An indexed rasterizing draw of `heap_raster_indices` uint8 indices,
+        // each of which paints a point. The driver unrolls the indices from
+        // its geometry heap.
+        HeapRaster,
+        // vkCmdClearAttachments, painting the whole attachment blue.
+        Clear,
+        // vkCmdWriteTimestamp2 of `stage` into timestamp query `query`.
+        Timestamp,
+        // vkCmdCopyBuffer2 of a buffer of `copy_bytes`, recorded outside a
+        // pass: work for timestamps to lie either side of.
+        Copy,
+    };
+    Kind kind;
+    VkPipelineStageFlags2 stage = 0;
+    uint32_t query = 0;
+};
+
+struct FeedbackChainConfig {
+    std::span<const uint32_t> step_vertex_shader;
+    std::span<const uint32_t> raster_vertex_shader;
+    std::span<const uint32_t> raster_fragment_shader;
+    // Passes of discard draws before the rasterizing one.
+    uint32_t steps = 64;
+    // Vertices per draw, at most the width of the 16 by 16 attachment.
+    uint32_t points = 8;
+    // The attachment's sample count. More than one is resolved after the chain.
+    VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
+    // The commands of pass `step` (0 to steps), replacing the default.
+    std::map<uint32_t, std::vector<ChainOp>> passes;
+    // Timestamp and Copy commands recorded outside any pass just before pass
+    // `step` begins; `steps + 1` is after the last pass.
+    std::map<uint32_t, std::vector<ChainOp>> before_pass;
+    // The timestamp pool's size; its queries are all read back.
+    uint32_t timestamp_queries = 0;
+    // The size of the buffer a Copy command copies.
+    uint32_t copy_bytes = 32u << 20;
+    // A pass in the middle of the chain that has no draw.
+    bool empty_pass = false;
+    // The pass that begins with a clear load op (blue) rather than a load, so
+    // that its encoder starts when it begins and stays; `steps + 1` for none.
+    uint32_t clearing_pass = UINT32_MAX;
+    // One pipeline-statistics query over the whole chain, counting input
+    // assembly vertices and vertex shader invocations.
+    bool statistics_query = false;
+    // The occlusion query is precise, otherwise boolean.
+    bool precise_occlusion = true;
+    // After the chain, the occlusion query is reset and run again over one
+    // rasterizing pass, and the result is that second run's.
+    bool reuse_occlusion = false;
+    // A depth attachment loaded and stored by every pass, which the
+    // rasterizing draws test against and write.
+    bool depth = false;
+    // How a capture draws its vertices.
+    enum class StepDraw { Direct, Indexed, Indirect };
+    StepDraw step_draw = StepDraw::Direct;
+    // The indices of the HeapCapture and the HeapRaster draw.
+    uint32_t heap_capture_indices = 0;
+    uint32_t heap_raster_indices = 0;
+    // Called just before the chain's command buffer begins recording, and
+    // after the host has waited for everything it submitted. The resources the
+    // chain needs are created and cleared before the first, so the span
+    // between them holds the chain and nothing else.
+    std::function<void()> recording_begins;
+    std::function<void()> recording_complete;
+};
+
+struct FeedbackChainResult {
+    // The words the last capture made: `points` uvec4.
+    std::vector<uint32_t> captured;
+    // How many captures the chain made, so that the words are the seed after
+    // that many steps.
+    uint32_t captures = 0;
+    // The 16 by 16 attachment (resolved when it is multisampled).
+    std::vector<std::array<uint8_t, 4>> pixels;
+    // The 16 by 16 depth attachment; empty without one.
+    std::vector<float> depth;
+    uint64_t occlusion_samples = 0;
+    // Input assembly vertices, vertex shader invocations; empty without the
+    // statistics query.
+    std::vector<uint64_t> statistics;
+    // The timestamp queries; empty without a pool.
+    std::vector<uint64_t> timestamps;
+    // What a HeapCapture captured, heap_capture_indices uvec4, and how many
+    // captures the chain had made before it, which is what its input is the
+    // seed after.
+    std::vector<uint32_t> heap_captured;
+    uint32_t heap_captures = 0;
+};
+
 struct DrawResult {
     std::vector<std::array<uint8_t, 4>> pixels;
     std::vector<uint32_t> counters;
@@ -233,6 +355,7 @@ public:
     DrawResult draw(const DrawConfig &config,
                     std::span<const uint8_t> pipeline_cache = {});
     SubmitStormResult submit_storm(const SubmitStormConfig &config);
+    FeedbackChainResult feedback_chain(const FeedbackChainConfig &config);
     const DrawCapabilities &capabilities() const;
 
 private:

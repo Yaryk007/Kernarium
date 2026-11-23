@@ -23,17 +23,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import pinned_source  # noqa: E402
 import sign_release  # noqa: E402
+import magisk_image  # noqa: E402
 from release_common import (  # noqa: E402
     DIRECTORY_PREFIX,
-    PAYLOAD_SPECS,
     PRODUCT_FAMILY,
     RELEASE_ID_RE,
     SCHEMA_VERSION,
     error,
     fail,
     parse_env,
+    payload_specs,
     read_routes,
     require_release_build_variant,
+    root_record,
     tracked_identity,
     verify_disk_boot_payloads,
     verify_kernel_config,
@@ -231,6 +233,21 @@ def main() -> None:
     )
     parser.add_argument("--mkbootfs", type=Path, required=True)
     parser.add_argument("--mkbootimg", type=Path, required=True)
+    root = parser.add_mutually_exclusive_group(required=True)
+    root.add_argument(
+        "--magisk-apk",
+        type=Path,
+        help=(
+            "the official APK of the Magisk release that metadata/magisk.env pins: the "
+            "release carries it, unmodified, and the Magisk-patched copy of its own "
+            "init_boot under root/ (assemble-image.sh --magisk-apk makes both)"
+        ),
+    )
+    root.add_argument(
+        "--without-root",
+        action="store_true",
+        help="publish a release without root/: it has no Magisk root files",
+    )
     args = parser.parse_args()
 
     if RELEASE_ID_RE.fullmatch(args.release_id) is None:
@@ -256,6 +273,7 @@ def main() -> None:
             fail(f"the signing key directory must not live inside the {label}")
     mkbootfs = regular_file(args.mkbootfs, "mkbootfs", executable=True)
     mkbootimg = regular_file(args.mkbootimg, "mkbootimg", executable=True)
+    magisk_apk = regular_file(args.magisk_apk, "Magisk APK") if args.magisk_apk else None
     first_boot_artifacts = regular_directory(
         args.first_boot_artifacts, "first-boot artifact directory"
     )
@@ -338,6 +356,7 @@ def main() -> None:
         "--mkbootfs", str(mkbootfs),
         "--mkbootimg", str(mkbootimg),
         "--output-dir", str(disk_dir),
+        *(["--magisk-apk", str(magisk_apk)] if magisk_apk is not None else []),
     ])
     target_files = signed_archive
     run([
@@ -371,6 +390,16 @@ def main() -> None:
         str(android_root / "support/image/disk-policy.json"),
     ])
     verify_disk_boot_payloads(disk, disk_layout, android_root, structural=False)
+    root_dir = disk_dir / magisk_image.ROOT_DIRECTORY
+    root = None
+    if magisk_apk is not None:
+        # The files assemble-image.sh made from the signed disk, and the record the
+        # manifest keeps of them; verify_release below checks them against the
+        # pin, the disk's own init_boot and each other.
+        root_dir = regular_directory(root_dir, "root files directory")
+        root = root_record(root_dir, disk, disk_layout)
+    elif root_dir.exists() or root_dir.is_symlink():
+        fail("assemble-image.sh made root files that --without-root does not publish")
 
     java_candidates = (
         aosp_source / "prebuilts/jdk/jdk21/linux-x86/bin/java",
@@ -468,6 +497,9 @@ def main() -> None:
             )
 
             copy_regular(disk, staging / "guest/system.img")
+            if root is not None:
+                for relative in magisk_image.root_payload_specs(root):
+                    copy_regular(disk_dir / relative, staging / relative)
 
             resolved_manifest = run(
                 ["repo", "manifest", "-r"], cwd=aosp_source, capture=True
@@ -516,6 +548,11 @@ def main() -> None:
                     for name, digest in sorted(certificate_digests.items())
                 ),
             ]
+            if root is not None:
+                receipt_rows += [
+                    ("root_magisk", f"{root['magisk']['name']} {root['magisk']['version_name']}"),
+                    ("root_apk_sha256", root["apk"]["sha256"]),
+                ]
             write_receipt(staging / "provenance/build-receipt.tsv", receipt_rows)
 
             manifest = {
@@ -567,6 +604,7 @@ def main() -> None:
                         "explicit pinned linker",
                         "explicit AOSP VINTF checker",
                         "signed with a private release key set",
+                        *(["pinned Magisk root files"] if root is not None else []),
                     ],
                     "builder": {
                         "os": platform.platform(),
@@ -582,7 +620,9 @@ def main() -> None:
                 },
                 "inventory": [],
             }
-            for relative, (role, file_format) in sorted(PAYLOAD_SPECS.items()):
+            if root is not None:
+                manifest["root"] = root
+            for relative, (role, file_format) in sorted(payload_specs(manifest).items()):
                 payload = staging / relative
                 regular_file(payload, f"published payload {relative}")
                 manifest["inventory"].append({

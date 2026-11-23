@@ -29,6 +29,15 @@ struct NativeExecutionContext final {
 	/* This run holds the lock that serializes locked operands no exclusive
 	 * access can cover; the fault tail releases it. */
 	std::uint8_t split_lock{};
+	/* A helper published a store of this run that wrote, through another
+	 * address of its frame, into the block that is running, and its epilogue
+	 * has not yet answered for it: the range is `write_reached_address` and
+	 * `write_reached_size`. The epilogue of that store takes the reach (it
+	 * leaves the block as the store's own epilogue does, and does not publish
+	 * again), and a later store of the same instruction owes its own
+	 * publication. It sits in the padding after `split_lock`; no offset the
+	 * assembly names moves. */
+	std::uint8_t write_reached{};
 	std::size_t instruction_limit{};
 	IndirectLink *indirect_miss{};
 	const TargetLinkEntry *target_links{};
@@ -40,9 +49,10 @@ struct NativeExecutionContext final {
 	/* Pages holding a cached translation in any executor of this address
 	 * space; null publishes on every executable-page store. */
 	CodePageRegistry *code_pages{};
-	/* The TLB entry the last stack access translated through. A stack access
-	 * re-checks this entry's tag before hashing its address, and a plain-page
-	 * tag lets it skip the store epilogue; it is never null. */
+	/* The TLB entry the last stack instruction translated through, and at a
+	 * run's start the entry of RSP's page. A stack access re-checks this
+	 * entry's tag before hashing its address, and a plain-page tag lets it
+	 * skip the store epilogue; it is never null. */
 	NativeTlbEntry *stack_entry{};
 	/* The stack pointer entry left the frame at, to which an exit that a
 	 * gadget takes from inside its own frame returns. */
@@ -57,6 +67,9 @@ struct NativeExecutionContext final {
 	/* A segment-fault exit's #NP, #SS or #GP and its error code. */
 	std::uint8_t segment_vector{};
 	std::uint32_t segment_error{};
+	/* The range of the store `write_reached` stands for. */
+	std::uint64_t write_reached_address{};
+	std::uint64_t write_reached_size{};
 };
 
 static_assert(offsetof(NativeExecutionContext, tlb_entries) ==
@@ -107,7 +120,7 @@ extern "C" unsigned __int128 uml_x86_64_gadget_cross_page_load(
 extern "C" std::uint32_t uml_x86_64_gadget_cross_page_store(
 	NativeExecutionContext *context, std::uint64_t address,
 	std::uint64_t value, std::uint32_t size) noexcept;
-extern "C" void uml_x86_64_gadget_publish_code_write(
+extern "C" std::uint32_t uml_x86_64_gadget_publish_code_write(
 	NativeExecutionContext *context, std::uint64_t address,
 	std::uint32_t size) noexcept;
 extern "C" void uml_x86_64_gadget_invalidate_code(

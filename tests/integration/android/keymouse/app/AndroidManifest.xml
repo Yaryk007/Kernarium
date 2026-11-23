@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="org.example.andarium.keymouseprobe">
+    <application android:label="Key Mouse Probe" android:debuggable="true"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+        <activity android:name=".KeyMouseActivity" android:exported="true"
+            android:launchMode="singleTop" android:resizeableActivity="true"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|density|keyboard|keyboardHidden|navigation">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

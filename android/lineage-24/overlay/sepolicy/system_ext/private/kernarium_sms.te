@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# KernariumSms (overlay/sms) hands a text message the host sends to Android. It runs only while messages are
+# in flight: the holder of vsock port 5560 (kernarium_sms_listener.te) keeps the port from boot and, when a
+# connection waits, starts the service through the waker (kernarium_sms_wake.te) and passes it the listening
+# socket. The service reads a request only from the host's CID. It keeps its system uid and platform
+# signature, which the protected SMS broadcasts and the inbox need, and runs in a domain of its own that holds
+# the rights to the holder's vsock sockets, so that neither an adb shell nor an installed application can make
+# a vsock socket, listen on one, or reach this service's sockets and data.
+type kernarium_sms, domain;
+typeattribute kernarium_sms coredomain;
+app_domain(kernarium_sms)
+
+# The platform labels a user's directories with that user's categories (/data/user_de/<id> from a device's second
+# boot on, /data/data from its first), which this domain's level lacks. The multi-level constraint on searching a
+# directory that is not application data lets only a trusted subject through, as it does every system application;
+# without this the path of the record cannot be searched after the first boot. What the attribute lifts is that
+# constraint in every class, for this domain, wherever a type enforcement rule already grants the access: the level
+# checks on process transitions and signals, on socket creation and on unix connections, and on directory and file
+# operations, creation and relabel included. The grants it then meets are the ones below and the ordinary ones the
+# platform gives every application domain, which the verifier does not pin. The platform keeps a trusted subject
+# out of other applications' private data (its sandbox rule excludes it and its neverallows forbid the access), and
+# the system uid's own permissions apply: the posture of system_app.
+typeattribute kernarium_sms mlstrustedsubject;
+
+# Its own data: the record of the messages it has handed over, which no other system application's
+# grants reach. The type carries the attributes of the platform's own application data types, so that
+# installd, vold and zygote handle it through their attribute rules.
+type kernarium_sms_data_file, file_type, data_file_type, core_data_file_type, app_data_file_type;
+allow kernarium_sms kernarium_sms_data_file:dir create_dir_perms;
+allow kernarium_sms kernarium_sms_data_file:file create_file_perms;
+
+# Only the services a delivery uses: broadcasts, the current user and the inbox's provider (activity),
+# the SMS role holder (role) and the Messaging lookup (package).
+allow kernarium_sms { activity_service package_service role_service }:service_manager find;
+
+# The host's requests arrive on the vsock socket the holder listens on, which the holder passes to the service
+# over its own unix socket. The service creates, binds and listens on no vsock socket and never connects out: it
+# accepts from the descriptor it is given (accept, and read, write and shutdown of the connections that
+# inherit the holder's label), takes it by fd use, and connects to the holder's unix socket (write on its file
+# and connectto) to receive it. The platform requires the explicit classification for any domain that accepts
+# on a vsock socket.
+typeattribute kernarium_sms unconstrained_vsock_violators;
+allow kernarium_sms kernarium_sms_listener:vsock_socket { accept read write shutdown getattr getopt };
+allow kernarium_sms kernarium_sms_listener:fd use;
+unix_socket_connect(kernarium_sms, kernarium_sms, kernarium_sms_listener)
+
+# The shell and the other application domains never gain a vsock socket of their own, and none reaches the
+# holder's.
+neverallow { shell system_app platform_app priv_app untrusted_app_all } self:vsock_socket { create bind listen accept connect };
+neverallow { shell system_app platform_app priv_app untrusted_app_all } kernarium_sms_listener:vsock_socket *;

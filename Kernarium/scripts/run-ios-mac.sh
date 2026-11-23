@@ -193,6 +193,10 @@ if [ "$SKIP_BUILD" -eq 0 ]; then
 	python3 -B "$ROOT_DIR/scripts/check-no-fexcore.py" \
 		"$DERIVED_DATA/Build/Products" ||
 		fail "a built Kernarium product carries FEXCore"
+	# The AOT runtime's diagnostics build is for tests only.
+	python3 -B "$ROOT_DIR/scripts/check-no-aot-diagnostics.py" \
+		"$DERIVED_DATA/Build/Products" ||
+		fail "a built Kernarium product carries the AOT diagnostics build"
 fi
 
 # An iOS application on macOS is sandboxed into a per-bundle data container and

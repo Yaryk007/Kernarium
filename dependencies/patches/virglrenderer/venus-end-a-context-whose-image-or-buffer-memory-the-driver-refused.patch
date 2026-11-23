@@ -1,0 +1,140 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 03:24:11 +0900
+Subject: [PATCH] venus: end a context whose image or buffer memory the driver
+ refused
+
+The guest driver sends vkBindImageMemory and vkBindBufferMemory without
+waiting for the answer and always reports success, so a bind the host
+driver refused left an image or buffer the guest went on to use, and the
+dispatchers only skipped publishing the texture. KosmicKrisp then handed
+Metal a nil texture or buffer in the next copy, which Apple's GPU
+drivers dereference: the host ended in copyFromBuffer:toTexture:, in the
+field on A14 iPhones.
+
+All four bind dispatchers (the image and buffer commands, in their plain
+and their 2 form) log the result and mark the context lost when the
+driver answers anything but VK_SUCCESS, the way a command the host
+cannot honour does. The commands after it in the same stream do not run,
+and the guest finds the ring fatal at its next synchronous command.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/venus/vkr_buffer.c | 19 +++++++++++++++++--
+ src/venus/vkr_image.c  | 26 ++++++++++++++++++++++----
+ 2 files changed, 39 insertions(+), 6 deletions(-)
+
+diff --git a/src/venus/vkr_buffer.c b/src/venus/vkr_buffer.c
+index d4d23097d94637ae990c9f5aa1f4990a66ffcecf..86b98b426ba315425f10d559681e7c77782795bf 100644
+--- a/src/venus/vkr_buffer.c
++++ b/src/venus/vkr_buffer.c
+@@ -78,8 +78,19 @@ vkr_dispatch_vkGetBufferMemoryRequirements2(
+          args->pMemoryRequirements->memoryRequirements.memoryTypeBits, true);
+ }
+ 
++/* The guest's bind commands are asynchronous and always report success, so a
++ * bind the driver refused would leave a buffer the guest goes on to use, which
++ * the driver hands Metal as nil. The context is lost instead (see
++ * vkr_image_bind_failed). */
+ static void
+-vkr_dispatch_vkBindBufferMemory(UNUSED struct vn_dispatch_context *dispatch,
++vkr_buffer_bind_failed(struct vn_dispatch_context *dispatch, VkResult result)
++{
++   vkr_log("a buffer memory bind failed (vk ret %d)", result);
++   vkr_context_set_fatal(dispatch->data);
++}
++
++static void
++vkr_dispatch_vkBindBufferMemory(struct vn_dispatch_context *dispatch,
+                                 struct vn_command_vkBindBufferMemory *args)
+ {
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+@@ -88,10 +99,12 @@ vkr_dispatch_vkBindBufferMemory(UNUSED struct vn_dispatch_context *dispatch,
+    vn_replace_vkBindBufferMemory_args_handle(args);
+    args->ret =
+       vk->BindBufferMemory(args->device, args->buffer, args->memory, args->memoryOffset);
++   if (args->ret != VK_SUCCESS)
++      vkr_buffer_bind_failed(dispatch, args->ret);
+ }
+ 
+ static void
+-vkr_dispatch_vkBindBufferMemory2(UNUSED struct vn_dispatch_context *dispatch,
++vkr_dispatch_vkBindBufferMemory2(struct vn_dispatch_context *dispatch,
+                                  struct vn_command_vkBindBufferMemory2 *args)
+ {
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+@@ -99,6 +112,8 @@ vkr_dispatch_vkBindBufferMemory2(UNUSED struct vn_dispatch_context *dispatch,
+ 
+    vn_replace_vkBindBufferMemory2_args_handle(args);
+    args->ret = vk->BindBufferMemory2(args->device, args->bindInfoCount, args->pBindInfos);
++   if (args->ret != VK_SUCCESS)
++      vkr_buffer_bind_failed(dispatch, args->ret);
+ }
+ 
+ static void
+diff --git a/src/venus/vkr_image.c b/src/venus/vkr_image.c
+index 23eb8b58cd85a679abeb4c3144cd6e70c3b3a811..e3238a338cbedef8579c9147c62f2dd488a39df2 100644
+--- a/src/venus/vkr_image.c
++++ b/src/venus/vkr_image.c
+@@ -235,8 +235,20 @@ vkr_dispatch_vkGetImageSparseMemoryRequirements2(
+                                          args->pSparseMemoryRequirements);
+ }
+ 
++/* The guest's bind commands are asynchronous and always report success, so a
++ * bind the driver refused would leave an image the guest goes on to use. The
++ * driver hands Metal the texture of such an image as nil, which Apple's GPU
++ * drivers dereference, and so ends the host process. The context is lost
++ * instead, as for any command the host cannot honour. */
+ static void
+-vkr_dispatch_vkBindImageMemory(UNUSED struct vn_dispatch_context *dispatch,
++vkr_image_bind_failed(struct vn_dispatch_context *dispatch, VkResult result)
++{
++   vkr_log("an image memory bind failed (vk ret %d)", result);
++   vkr_context_set_fatal(dispatch->data);
++}
++
++static void
++vkr_dispatch_vkBindImageMemory(struct vn_dispatch_context *dispatch,
+                                struct vn_command_vkBindImageMemory *args)
+ {
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+@@ -249,8 +261,11 @@ vkr_dispatch_vkBindImageMemory(UNUSED struct vn_dispatch_context *dispatch,
+    vn_replace_vkBindImageMemory_args_handle(args);
+    args->ret =
+       vk->BindImageMemory(args->device, args->image, args->memory, args->memoryOffset);
+-   if (args->ret == VK_SUCCESS)
+-      vkr_image_publish_metal_texture(dev, image, mem, memory_offset);
++   if (args->ret != VK_SUCCESS) {
++      vkr_image_bind_failed(dispatch, args->ret);
++      return;
++   }
++   vkr_image_publish_metal_texture(dev, image, mem, memory_offset);
+ }
+ 
+ struct vkr_metal_image_binding {
+@@ -260,7 +275,7 @@ struct vkr_metal_image_binding {
+ };
+ 
+ static void
+-vkr_dispatch_vkBindImageMemory2(UNUSED struct vn_dispatch_context *dispatch,
++vkr_dispatch_vkBindImageMemory2(struct vn_dispatch_context *dispatch,
+                                 struct vn_command_vkBindImageMemory2 *args)
+ {
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+@@ -270,6 +285,7 @@ vkr_dispatch_vkBindImageMemory2(UNUSED struct vn_dispatch_context *dispatch,
+                args->bindInfoCount);
+    if (!bindings) {
+       args->ret = VK_ERROR_OUT_OF_HOST_MEMORY;
++      vkr_image_bind_failed(dispatch, args->ret);
+       return;
+    }
+    for (uint32_t i = 0; i < args->bindInfoCount; i++) {
+@@ -289,6 +305,8 @@ vkr_dispatch_vkBindImageMemory2(UNUSED struct vn_dispatch_context *dispatch,
+             dev, bindings[i].image, bindings[i].memory,
+             bindings[i].memory_offset);
+       }
++   } else {
++      vkr_image_bind_failed(dispatch, args->ret);
+    }
+    STACK_ARRAY_FINISH(bindings);
+ }

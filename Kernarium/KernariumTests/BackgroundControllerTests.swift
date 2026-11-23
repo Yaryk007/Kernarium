@@ -68,11 +68,13 @@ struct BackgroundControllerTests {
         var whileFlushing: (() -> Void)?
         var whileWaitingForDisplay: (() -> Void)?
 
-        init() {
-            gpuHold = GuestGPUHold(
-                gate: RecordingGate(log),
-                timer: timer.timer
-            )
+        /// The gate the hold works through.
+        let gate: any GuestGPUGate
+
+        init(gate make: ((CallLog) -> any GuestGPUGate)? = nil) {
+            let built = make?(log) ?? RecordingGate(log)
+            gate = built
+            gpuHold = GuestGPUHold(gate: built, timer: timer.timer)
         }
 
         func flushGuest(until deadline: DispatchTime?) {
@@ -283,10 +285,12 @@ struct BackgroundControllerTests {
     }
 
     /// Without a delay the bound is armed before the main thread can wait for
-    /// anything, and the hold lands at it when the screen has not gone off.
+    /// anything, and the hold lands at it when the screen has not gone off. The
+    /// bound's hold is the one that waits for nothing: a gate that tells the
+    /// holds apart says which of them it took.
     @Test
     func theHoldIsBoundedBeforeTheScreenIsWaitedFor() async {
-        let effects = Effects()
+        let effects = Effects(gate: { BudgetGate($0) })
         effects.jobActive = true
         effects.guestIsAndroid = true
         effects.displayGoesOff = false
@@ -303,9 +307,33 @@ struct BackgroundControllerTests {
         // The bound took the hold during the wait; the main thread finds it
         // taken and holds nothing a second time.
         #expect(effects.calls == [
-            "power", "wait display off", "hold", "flush", "trim on",
+            "power", "wait display off", "hold now", "flush", "trim on",
         ])
         #expect(effects.timer.pending == 0)
+    }
+
+    /// The main path that waited for the screen to go off and only then holds
+    /// has less than the whole edge left: the hold is told what the edge's
+    /// deadline leaves, so the camera's wait cannot take a full two seconds
+    /// of it.
+    @Test
+    func theMainPathHoldsWithWhatTheEdgeLeavesAfterTheScreenWait() {
+        let effects = Effects(gate: { BudgetGate($0) })
+        effects.jobActive = true
+        effects.guestIsAndroid = true
+        effects.whileWaitingForDisplay = {
+            // The screen takes 1.2 s to go off.
+            Thread.sleep(forTimeInterval: 1.2)
+        }
+        let policy = controller(.keepRunning, effects)
+
+        policy.didEnterBackground()
+        #expect(effects.calls == [
+            "power", "wait display off", "hold within", "flush", "trim on",
+        ])
+        let left = (effects.gate as? BudgetGate)?.left.first ?? 0
+        // 4 s edge budget less the 1.2 s wait, and a little scheduling.
+        #expect((2.5...2.8).contains(left))
     }
 
     /// An Android job that sees its screen go off holds then, and the bound

@@ -93,6 +93,53 @@ private:
     T value_ {};
 };
 
+#if UML_VIDEO_ENCODER_TESTING
+struct PropertyFaultState {
+    std::mutex mutex;
+    testing::PropertyFault fault;
+};
+PropertyFaultState& propertyFaultState()
+{
+    static PropertyFaultState state;
+    return state;
+}
+
+struct SampleTestState {
+    std::atomic<bool> split {};
+    std::atomic<std::uint64_t> copied {};
+};
+SampleTestState& sampleTestState()
+{
+    static SampleTestState state;
+    return state;
+}
+
+// `block` as the same bytes in two blocks held by one composite, so that the sample is not contiguous.
+CFRef<CMBlockBufferRef> splitInTwo(CMBlockBufferRef block)
+{
+    const std::size_t total = CMBlockBufferGetDataLength(block);
+    if (total < 2) return {};
+    const std::size_t first = total / 2;
+    const std::size_t lengths[2] = {first, total - first};
+    CMBlockBufferRef composite = nullptr;
+    if (CMBlockBufferCreateEmpty(kCFAllocatorDefault, 2, 0, &composite) != kCMBlockBufferNoErr) return {};
+    auto owner = CFRef<CMBlockBufferRef>::adopt(composite);
+    for (std::size_t part = 0; part < 2; ++part) {
+        CMBlockBufferRef piece = nullptr;
+        if (CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, nullptr, lengths[part], kCFAllocatorDefault, nullptr, 0, lengths[part],
+                                               kCMBlockBufferAssureMemoryNowFlag, &piece) != kCMBlockBufferNoErr)
+            return {};
+        const auto held = CFRef<CMBlockBufferRef>::adopt(piece);
+        char* pointer = nullptr;
+        if (CMBlockBufferGetDataPointer(piece, 0, nullptr, nullptr, &pointer) != kCMBlockBufferNoErr ||
+            CMBlockBufferCopyDataBytes(block, part == 0 ? 0 : first, lengths[part], pointer) != kCMBlockBufferNoErr ||
+            CMBlockBufferAppendBufferReference(composite, piece, 0, lengths[part], 0) != kCMBlockBufferNoErr)
+            return {};
+    }
+    return owner;
+}
+#endif
+
 bool sessionLoss(OSStatus status) noexcept
 {
     return status == kVTInvalidSessionErr || status == kVTVideoEncoderMalfunctionErr ||
@@ -304,6 +351,8 @@ struct AssemblyConfig {
     bool separateParameterSets {};
     bool parameterSetsWithEveryKeyFrame {true};
     unsigned temporalLayers {1};
+    // JPEG: the largest image returned (VideoEncodeSettings::maximumJpegBytes); zero: no bound.
+    std::uint64_t maximumJpegBytes {};
     // What decides the level the parameter sets state, in place of the one
     // VideoToolbox wrote (levels::restateLevel). A zero floor leaves them as
     // written.
@@ -441,8 +490,28 @@ private:
         Assembled result;
         CMBlockBufferRef block = CMSampleBufferGetDataBuffer(sample);
         if (!block) return result;
+#if UML_VIDEO_ENCODER_TESTING
+        CFRef<CMBlockBufferRef> pieces;
+        if (sampleTestState().split.load()) {
+            pieces = splitInTwo(block);
+            if (pieces) block = pieces.get();
+        }
+#endif
         const std::size_t total = CMBlockBufferGetDataLength(block);
         if (total == 0) return result;
+        // An image past the bound is not copied: not even into a scratch buffer, and no larger copy of it is made. The
+        // length of the file the caller gets is the sample's and the JFIF segment's the encoder leaves out, which the
+        // image's first bytes say, so it is known before any of the sample is copied, whether it is in one block or in
+        // several.
+        const bool jpeg = config_.codec == VideoCodec::jpeg;
+        bool jfif = false;
+        if (jpeg) {
+            std::uint8_t head[4] {};
+            if (total < sizeof(head) || CMBlockBufferCopyDataBytes(block, 0, sizeof(head), head) != kCMBlockBufferNoErr) return result;
+            if (head[0] != 0xff || head[1] != 0xd8) return result;
+            jfif = head[2] == 0xff && head[3] == 0xe0;
+            if (config_.maximumJpegBytes != 0 && total + (jfif ? 0 : sizeof(kJfifSegment)) > config_.maximumJpegBytes) return result;
+        }
         char* pointer = nullptr;
         std::size_t contiguous = 0;
         std::vector<std::uint8_t> copy;
@@ -450,6 +519,9 @@ private:
         if (CMBlockBufferGetDataPointer(block, 0, &contiguous, nullptr, &pointer) == kCMBlockBufferNoErr && contiguous == total) {
             data = reinterpret_cast<const std::uint8_t*>(pointer);
         } else {
+#if UML_VIDEO_ENCODER_TESTING
+            sampleTestState().copied += total;
+#endif
             copy.resize(total);
             if (CMBlockBufferCopyDataBytes(block, 0, total, copy.data()) != kCMBlockBufferNoErr) return result;
             data = copy.data();
@@ -471,8 +543,6 @@ private:
         if (config_.codec == VideoCodec::jpeg) {
             frame.type = VideoFrameType::key;
             frame.bytes.reserve(total + sizeof(kJfifSegment));
-            const bool jfif = total >= 4 && data[2] == 0xff && data[3] == 0xe0;
-            if (total < 4 || data[0] != 0xff || data[1] != 0xd8) return result;
             frame.bytes.insert(frame.bytes.end(), data, data + 2);
             if (!jfif) frame.bytes.insert(frame.bytes.end(), std::begin(kJfifSegment), std::end(kJfifSegment));
             frame.bytes.insert(frame.bytes.end(), data + 2, data + total);
@@ -698,6 +768,7 @@ public:
 
     [[nodiscard]] std::string encoderIdentifier() const override { return encoderIdentifier_; }
     [[nodiscard]] std::string diagnostic() const override { return diagnostic_; }
+    void setDrainWait(unsigned milliseconds) override { drainWait_ = milliseconds; }
 
     [[nodiscard]] VideoEncodeStatus update(const VideoEncodeUpdate& update) override
     {
@@ -811,9 +882,10 @@ public:
             }
             auto shared = shared_;
             auto session = session_;
+            const unsigned wait = drainWait_;
             dispatch_async(drainQueue_, ^{
                 @autoreleasepool {
-                    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kDrainWaitMilliseconds);
+                    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(wait);
                     const auto outstanding = [&] {
                         return !shared->pending.empty() && shared->pending.begin()->first < horizon;
                     };
@@ -887,6 +959,10 @@ public:
 
 #if UML_VIDEO_ENCODER_TESTING
     void loseSessionForTest(unsigned count) override { shared_->injectedLosses.store(count); }
+    void invalidateSessionForTest() override
+    {
+        if (session_) VTCompressionSessionInvalidate(session_.get());
+    }
 #endif
 
 private:
@@ -1093,6 +1169,7 @@ private:
         assembly.separateParameterSets = settings.separateParameterSets;
         assembly.parameterSetsWithEveryKeyFrame = settings.parameterSetsWithEveryKeyFrame;
         assembly.temporalLayers = settings.temporalLayers;
+        assembly.maximumJpegBytes = settings.maximumJpegBytes;
         assembly.levelPolicy = levels::makePolicy(settings, plan_.reorders, !plan_.lowLatency);
         if (settings.hdr) assembly.hdrSei = hdrSeiUnit(*settings.hdr);
         std::uint64_t epoch = 0;
@@ -1185,32 +1262,49 @@ private:
 
     static OSStatus setProperty(VTCompressionSessionRef session, CFStringRef key, CFTypeRef value)
     {
+#if UML_VIDEO_ENCODER_TESTING
+        {
+            const auto fault = testing::propertyFault();
+            if (fault.status != noErr && [(__bridge NSString*)key isEqualToString:[NSString stringWithUTF8String:fault.key.c_str()]])
+                return fault.status;
+        }
+#endif
         return VTSessionSetProperty(session, key, value);
     }
 
     // Sets one property. A refusal fails the configuration when the property
     // carries something the stream asked for, and is only noted when the
-    // property is a refinement the encoder is free to ignore.
+    // property is a refinement the encoder is free to ignore. A session that is
+    // lost or cannot get its hardware is not a refusal of the property, whatever
+    // the property is: the configuration is exhausted, not unsupported, and not
+    // made with a setting the host never applied.
     bool apply(VTCompressionSessionRef session, CFStringRef key, id value, bool required)
     {
         const OSStatus status = setProperty(session, key, (__bridge CFTypeRef)value);
         if (status == noErr) return true;
-        if (required) diagnostic_ = std::string("VTSessionSetProperty ") + [(__bridge NSString*)key UTF8String] + " " + std::to_string(status);
+        const bool unavailable = sessionLoss(status) || status == kVTAllocationFailedErr;
+        if (unavailable) hostUnavailable_ = true;
+        if (required || (unavailable && diagnostic_.empty()))
+            diagnostic_ = std::string("VTSessionSetProperty ") + [(__bridge NSString*)key UTF8String] + " " + std::to_string(status);
         return !required;
     }
 
     VideoEncodeStatus applyProperties(VTCompressionSessionRef session)
     {
         const auto& s = plan_.settings;
+        hostUnavailable_ = false;
         const auto refuse = [&](const char* what) {
             if (diagnostic_.empty()) diagnostic_ = std::string("cannot set ") + what;
-            return VideoEncodeStatus::unsupported;
+            return hostUnavailable_ ? VideoEncodeStatus::exhausted : VideoEncodeStatus::unsupported;
         };
+        // Every property is applied, so that the loss of the session is noticed
+        // at the property that met it, optional or not.
+        const auto done = [&] { return hostUnavailable_ ? VideoEncodeStatus::exhausted : VideoEncodeStatus::ok; };
 #define UML_KEY(name) kVTCompressionPropertyKey_##name
         if (s.codec == VideoCodec::jpeg) {
             if (!apply(session, UML_KEY(Quality), @(double(s.jpegQuality) / 100.0), true)) return refuse("Quality");
             applyColor(session);
-            return VideoEncodeStatus::ok;
+            return done();
         }
         if (!apply(session, UML_KEY(ProfileLevel), plan_.profileLevel, true)) return refuse("ProfileLevel");
         if (!apply(session, UML_KEY(AllowFrameReordering), plan_.reorders ? @YES : @NO, true)) return refuse("AllowFrameReordering");
@@ -1279,15 +1373,15 @@ private:
             if (!apply(session, UML_KEY(ContentLightLevelInfo), [NSData dataWithBytes:light.data() length:light.size()], true))
                 return refuse("ContentLightLevelInfo");
         }
-        return VideoEncodeStatus::ok;
+        return done();
     }
 
-    void applyColor(VTCompressionSessionRef session) const
+    void applyColor(VTCompressionSessionRef session)
     {
         const auto& color = plan_.settings.color;
-        if (NSString* value = colorPrimaries(color.primaries)) (void)setProperty(session, UML_KEY(ColorPrimaries), (__bridge CFTypeRef)value);
-        if (NSString* value = transferFunction(color.transfer)) (void)setProperty(session, UML_KEY(TransferFunction), (__bridge CFTypeRef)value);
-        if (NSString* value = matrixCoefficients(color.matrix)) (void)setProperty(session, UML_KEY(YCbCrMatrix), (__bridge CFTypeRef)value);
+        if (NSString* value = colorPrimaries(color.primaries)) (void)apply(session, UML_KEY(ColorPrimaries), value, false);
+        if (NSString* value = transferFunction(color.transfer)) (void)apply(session, UML_KEY(TransferFunction), value, false);
+        if (NSString* value = matrixCoefficients(color.matrix)) (void)apply(session, UML_KEY(YCbCrMatrix), value, false);
     }
 
     // The 24-byte mastering display colour volume and 4-byte content light
@@ -1536,7 +1630,7 @@ private:
         if (session_) {
             VTCompressionSessionCompleteFrames(session_.get(), kCMTimeInvalid);
             std::unique_lock lock(shared_->mutex);
-            shared_->condition.wait_for(lock, std::chrono::milliseconds(kDrainWaitMilliseconds),
+            shared_->condition.wait_for(lock, std::chrono::milliseconds(drainWait_),
                                         [&] { return shared_->pending.empty() || shared_->lost; });
         }
         recoverIfLost();
@@ -1639,6 +1733,8 @@ private:
     bool checked_ {};
     bool levelFallback_ {};
     bool rebuild_ {};   // a setting the running session ignores changed; the next frame starts a new session
+    bool hostUnavailable_ {};   // a property was refused because the session was lost, not because of the property
+    unsigned drainWait_ {kDrainWaitMilliseconds};
     CFRef<VTCompressionSessionRef> session_;
     CFRef<CVPixelBufferPoolRef> pool_;
     CFRef<CVPixelBufferPoolRef> stagingPool_;   // plan_.convertsRgb: the caller's frames
@@ -1678,10 +1774,33 @@ std::unique_ptr<VideoEncoder> makeVideoEncoder()
 }
 
 #if UML_VIDEO_ENCODER_TESTING
+testing::PropertyFault testing::propertyFault()
+{
+    auto& state = apple_encoder::propertyFaultState();
+    std::lock_guard lock(state.mutex);
+    return state.fault;
+}
+
+void testing::splitSamples(bool split) { apple_encoder::sampleTestState().split.store(split); }
+std::uint64_t testing::sampleBytesCopied() { return apple_encoder::sampleTestState().copied.load(); }
+void testing::resetSampleBytesCopied() { apple_encoder::sampleTestState().copied.store(0); }
+
+void testing::failProperty(const char* key, int status)
+{
+    auto& state = apple_encoder::propertyFaultState();
+    std::lock_guard lock(state.mutex);
+    state.fault = PropertyFault {key ? key : "", status};
+}
+
 void testing::loseSession(VideoEncoder& encoder, unsigned count)
 {
     // The variant's factory only ever makes the Apple session.
     static_cast<apple_encoder::ProbeEncoder&>(encoder).loseSessionForTest(count);
+}
+
+void testing::invalidateSession(VideoEncoder& encoder)
+{
+    static_cast<apple_encoder::ProbeEncoder&>(encoder).invalidateSessionForTest();
 }
 #endif
 

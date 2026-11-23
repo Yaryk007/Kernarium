@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "video_decoder.hpp"
+#include "video_decoder_testing.hpp"
 #include "h264_stream.hpp"
 #include "hevc_stream.hpp"
+#include "vp9_stream.hpp"
 
 #import <Foundation/Foundation.h>
 #import <VideoToolbox/VideoToolbox.h>
@@ -9,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -24,6 +27,30 @@ void checked(OSStatus status, const char* operation)
 {
     if (status != noErr)
         throw std::runtime_error(std::string(operation) + ": " + std::to_string(status));
+}
+
+/* Whether a status from a session that has been decoding says the system took
+ * the session away rather than that the stream is bad. iOS does so to an app
+ * that was in the background: the session is invalid when the app returns,
+ * and so is a hardware decoder the system reclaimed. */
+bool sessionLoss(OSStatus status) noexcept
+{
+    return status == kVTInvalidSessionErr || status == kVTVideoDecoderMalfunctionErr ||
+           status == kVTVideoDecoderNotAvailableNowErr;
+}
+
+/* A decode that failed because its session is gone. The decoder recovers from
+ * it; any other failure is the stream's and is reported. */
+struct SessionLost final : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
+void checkedDecode(OSStatus status, const char* operation)
+{
+    if (status == noErr) return;
+    const auto message = std::string(operation) + ": " + std::to_string(status);
+    if (sessionLoss(status)) throw SessionLost(message);
+    throw std::runtime_error(message);
 }
 
 template<class T> class CFObject {
@@ -47,8 +74,11 @@ private:
  * dimension and not the area: an M1 Ultra opens H.264 up to 4096 on either
  * axis (4096 x 4096 and 2304 x 4096 decode, 4112 in either direction is
  * refused) and HEVC at least to 8192 x 8192, where it stops being measured.
- * A level's frame-size limit is not used: level 5.2 allows 36864 macroblocks
- * and the hardware opens 65536. iOS has not been measured. */
+ * Its VP9 decoder opens pictures up to 8192 x 4320 and 4320 x 8192 and refuses
+ * 8192 x 8192; the square 4096 x 4096 and the portrait 2304 x 4096 that a
+ * guest's symmetric size range allows decode. A level's frame-size limit is
+ * not used: level 5.2 allows 36864 macroblocks and the hardware opens 65536.
+ * iOS has not been measured. */
 struct SizeLimit {
     std::uint32_t width;
     std::uint32_t height;
@@ -58,7 +88,8 @@ constexpr SizeLimit decodeSizeLimit(VideoCodec codec) noexcept
     switch (codec) {
     case VideoCodec::h264: return {4096, 4096};
     case VideoCodec::hevc: return {8192, 8192};
-    case VideoCodec::jpeg: case VideoCodec::vp9: return {4096, 2304};
+    case VideoCodec::jpeg: return {4096, 2304};
+    case VideoCodec::vp9: return {4096, 4096};
     }
     return {};
 }
@@ -101,78 +132,20 @@ bool high10Available()
 
 /* VP9 is a supplemental VideoToolbox decoder: `VTIsHardwareDecodeSupported`
  * answers no until the process asks for it, which is what Chromium and FFmpeg
- * do before probing. Asking once is harmless where no such decoder exists.
+ * do before probing. Asking once is harmless where no such decoder exists. The
+ * registration call needs iOS 26.2; below it the host reports no VP9 hardware
+ * decode.
  */
 bool vp9Available()
 {
     static const bool available = [] {
-        VTRegisterSupplementalVideoDecoderIfAvailable(kCMVideoCodecType_VP9);
-        return bool(VTIsHardwareDecodeSupported(kCMVideoCodecType_VP9));
+        if (@available(iOS 26.2, *)) {
+            VTRegisterSupplementalVideoDecoderIfAvailable(kCMVideoCodecType_VP9);
+            return bool(VTIsHardwareDecodeSupported(kCMVideoCodecType_VP9));
+        }
+        return false;
     }();
     return available;
-}
-
-class BitReader {
-public:
-    explicit BitReader(std::span<const std::uint8_t> bytes) : bytes_(bytes) {}
-    std::uint32_t read(unsigned count)
-    {
-        std::uint32_t value = 0;
-        while (count-- > 0) {
-            if (position_ >= bytes_.size() * 8) throw std::runtime_error("truncated VP9 header");
-            value = (value << 1) | ((bytes_[position_ / 8] >> (7 - position_ % 8)) & 1);
-            ++position_;
-        }
-        return value;
-    }
-private:
-    std::span<const std::uint8_t> bytes_;
-    std::size_t position_ {};
-};
-
-struct Vp9KeyFrame {
-    VideoFormat format;
-    unsigned profile;
-    unsigned colorSpace;   // VP9 CS_* as the uncompressed header states it
-    bool fullRange;
-};
-
-/* VP9 carries no parameter sets: a key frame's uncompressed header is the only
- * place the profile, bit depth and frame size appear, so the format is read
- * from the stream rather than configured ahead of it. Returns nothing for a
- * frame that cannot change the format, and the caller keeps the current one.
- */
-std::optional<Vp9KeyFrame> vp9KeyFrame(std::span<const std::uint8_t> bytes)
-{
-    BitReader reader(bytes);
-    if (reader.read(2) != 2) throw std::runtime_error("invalid VP9 frame marker");
-    const unsigned low = reader.read(1);
-    const unsigned high = reader.read(1);
-    const unsigned profile = (high << 1) | low;
-    if (profile == 3) reader.read(1);
-    if (reader.read(1) != 0) return std::nullopt;   // show_existing_frame
-    const bool key = reader.read(1) == 0;
-    reader.read(1);                                 // show_frame
-    reader.read(1);                                 // error_resilient_mode
-    if (!key) return std::nullopt;
-    if (reader.read(24) != 0x498342) throw std::runtime_error("invalid VP9 frame sync code");
-    unsigned bitDepth = 8;
-    if (profile >= 2) bitDepth = reader.read(1) != 0 ? 12 : 10;
-    unsigned colorSpace = 0, colorRange = 0;
-    colorSpace = reader.read(3);
-    if (colorSpace != 7 /* SRGB */) {
-        colorRange = reader.read(1);
-        if (profile == 1 || profile == 3) {
-            if (reader.read(1) != 1 || reader.read(1) != 1)
-                throw std::runtime_error("VP9 decoder requires 4:2:0 chroma");
-            reader.read(1);
-        }
-    } else {
-        throw std::runtime_error("VP9 4:4:4 is not a supported decoder input");
-    }
-    const std::uint32_t width = reader.read(16) + 1;
-    const std::uint32_t height = reader.read(16) + 1;
-    return Vp9KeyFrame {{width, height, bitDepth}, profile, colorSpace, colorRange != 0};
 }
 
 /* VP9 states its color space in the frame header rather than in a parameter
@@ -403,7 +376,10 @@ public:
         if (packet.empty()) return;
         if (!session_.get()) throw std::runtime_error("video picture precedes its parameter sets");
         Picture picture {timestamp, {}, layout_ == VideoPixelLayout::planar8Bit, {}};
-        decode(packet, picture);
+        if (!decodeOrLose(packet, picture)) return;
+        /* A VP9 packet that ends in a frame that is not shown shows nothing, as
+         * libvpx shows none: it is decoded for the references it refreshes. */
+        if (hiddenFinal_) return;
         for (auto& frame : picture.frames) emit(std::move(frame));
     }
 
@@ -423,7 +399,7 @@ public:
 
     void drain() override
     {
-        finishSession();
+        if (!finishSession()) loseSession();
         releaseWaiting();
     }
 
@@ -438,6 +414,7 @@ public:
             std::lock_guard lock(mutex_);
             frames_.clear();
             callbackError_.clear();
+            callbackLost_ = false;
         }
         waiting_.clear();
         order_.clear();
@@ -445,6 +422,9 @@ public:
         h264Order_.reset();
         if (session_.get()) VTDecompressionSessionInvalidate(session_.get());
         session_.reset();
+        // The client begins again at a random access point, as a seek does.
+        resuming_ = false;
+        lossesWithoutPicture_ = 0;
     }
 
     std::vector<DecodedVideoFrame> takeFrames() override
@@ -496,6 +476,7 @@ private:
     std::vector<std::uint8_t> prepare(std::span<const std::uint8_t> bytes)
     {
         checkPacketSize(bytes);
+        hiddenFinal_ = false;
         std::vector<std::uint8_t> packet;
         bool changed = false;
         // A point where restarting the session loses nothing, because the
@@ -508,21 +489,66 @@ private:
             randomAccess = true;   // every JPEG frame stands alone
             packet.assign(bytes.begin(), bytes.end());
         } else if (codec_ == VideoCodec::vp9) {
-            // A superframe reaches the decoder whole; its first frame's
-            // uncompressed header is the one that can resize the stream.
-            if (const auto key = vp9KeyFrame(bytes)) {
-                if (key->profile != 0) throw std::runtime_error("unsupported VP9 profile");
-                changed = key->format != format_ || key->colorSpace != vp9ColorSpace_ ||
-                          key->fullRange != vp9FullRange_;
-                format_ = key->format;
-                vp9ColorSpace_ = key->colorSpace;
-                vp9FullRange_ = key->fullRange;
+            /* A guest's packet is whatever bytes it likes, and VP9 states the
+             * profile and the picture size in each frame's own header, so every
+             * frame of a superframe is read here, not only the first. A size any
+             * frame states stays within the advertised rectangle, which holds
+             * every picture of the stream: a frame that does not state its size
+             * takes one an earlier frame stated. Nothing of the decoder changes
+             * until the whole packet has passed. */
+            const char* fault = nullptr;
+            const auto parsed = vp9::parsePacket(bytes, &fault);
+            if (!parsed) throw std::runtime_error(fault);
+            const auto limit = decodeSizeLimit(VideoCodec::vp9);
+            /* A key frame refreshes every reference and restates the stream's
+             * profile, colour and size, so the last one of a packet is where
+             * the packet's configuration begins, and what precedes it cannot
+             * affect any frame after it. libvpx too shows a packet's last
+             * frame and no other. */
+            std::optional<std::size_t> keyAt;
+            for (std::size_t i = 0; i < parsed->frames.size(); ++i)
+                if (parsed->frames[i].key) keyAt = i;
+            /* The hardware decodes Profile 0 (8-bit) and Profile 2 (10-bit),
+             * both 4:2:0. A stream keeps its profile until a key frame, and a
+             * packet is one profile: a frame of another is a stream the
+             * description the session was made from does not describe. */
+            const unsigned profile = keyAt ? parsed->frames[*keyAt].profile : vp9Profile_;
+            for (const auto& header : parsed->frames) {
+                if (header.profile != profile || (profile != 0 && profile != 2) ||
+                    header.bitDepth != (profile == 2 ? 10u : 8u))
+                    throw std::runtime_error("unsupported VP9 profile");
+                if (!header.size) continue;
+                if (header.size->width > limit.width || header.size->height > limit.height)
+                    throw std::runtime_error("video dimensions exceed decoder capabilities");
+                /* The hardware refuses to open a session below the minimum,
+                 * and only once the decoder has moved on to the new picture. */
+                if (header.size->width < kVp9DecodeMinimumSide || header.size->height < kVp9DecodeMinimumSide)
+                    throw std::runtime_error("video dimensions are below decoder capabilities");
+            }
+            hiddenFinal_ = !parsed->frames.back().showFrame;
+            if (keyAt) {
+                const auto& key = parsed->frames[*keyAt];
+                const VideoFormat next {key.size->width, key.size->height, key.bitDepth};
+                changed = next != format_ || key.profile != vp9Profile_ || key.colorSpace != vp9ColorSpace_ ||
+                          key.fullRange != vp9FullRange_;
+                format_ = next;
+                vp9Profile_ = key.profile;
+                vp9ColorSpace_ = key.colorSpace;
+                vp9FullRange_ = key.fullRange;
                 randomAccess = true;
+                // The frames ahead of the key frame are not sent: it replaces what they refer to.
+                if (*keyAt == 0) packet.assign(bytes.begin(), bytes.end());
+                else packet = vp9::joinFrames(std::span(parsed->data).subspan(*keyAt));
             } else if (!description_.get()) {
                 throw std::runtime_error("VP9 stream does not start with a key frame");
+            } else {
+                packet.assign(bytes.begin(), bytes.end());
             }
-            packet.assign(bytes.begin(), bytes.end());
         }
+        // A picture that needs one the lost session decoded has nothing to
+        // refer to, and the session is made anew at the next random access point.
+        if (resuming_ && !randomAccess) return {};
+        if (randomAccess) resuming_ = false;
         if (changed || !description_.get() || !session_.get() ||
             (randomAccess && wantedLayout() != sessionLayout_))
             configure();
@@ -612,11 +638,16 @@ private:
     {
         adoptHevc(picture.start.spsId);
         const auto sps = *hevcSets_.sps(picture.start.spsId);
+        const bool randomAccess = hevc::isIrap(picture.start.type);
+        // After a lost session the pictures that follow it have nothing to
+        // refer to until the next random access point; the picture order
+        // does not see them either.
+        if (resuming_ && !randomAccess) return;
         const auto verdict = hevcOrder_.next(picture.start, sps);
         // Nothing decoded before a new sequence is shown after a picture of it.
         if (verdict.startsSequence) releaseWaiting();
         if (!verdict.decode) return;
-        const bool randomAccess = hevc::isIrap(picture.start.type);
+        if (randomAccess) resuming_ = false;
         if (hevcChanged_ || !description_.get() || !session_.get() ||
             (randomAccess && wantedLayout() != sessionLayout_))
             configure();
@@ -626,7 +657,7 @@ private:
         // session decodes the whole coded picture and the copy is cut here.
         if (sps.hasWindow)
             decoded.crop = {sps.window.left, sps.window.top, sps.visibleWidth(), sps.visibleHeight(), true};
-        decode(picture.packet, decoded);
+        if (!decodeOrLose(picture.packet, decoded)) return;
         if (!verdict.output) return;   // decoded because later pictures refer to it
         std::vector<std::uint64_t> released;
         for (auto& frame : decoded.frames) {
@@ -716,6 +747,10 @@ private:
         adoptH264(picture.first.spsId);
         const auto sps = *h264Sets_.sps(picture.first.spsId);
         const bool randomAccess = picture.first.idr();
+        // After a lost session the pictures that follow it have nothing to
+        // refer to until the next IDR picture.
+        if (resuming_ && !randomAccess) return;
+        if (randomAccess) resuming_ = false;
         if (h264Changed_ || !description_.get() || !session_.get() ||
             (randomAccess && wantedLayout() != sessionLayout_))
             configure();
@@ -724,7 +759,7 @@ private:
         // The session decodes the whole coded picture and the copy is cut here.
         if (sps.hasWindow)
             decoded.crop = {sps.window.left, sps.window.top, sps.visibleWidth(), sps.visibleHeight(), true};
-        decode(picture.packet, decoded);
+        if (!decodeOrLose(picture.packet, decoded)) return;
         std::vector<std::uint64_t> released;
         // A picture the hardware returned no frame for is still a picture of
         // the stream: the buffer's account of what refers to what needs it.
@@ -759,12 +794,20 @@ private:
     /* The hardware returns every picture it has been given. Nothing is held
      * back inside it, and what the stream's order holds back is not its to
      * return, so this changes nothing that is waiting. */
-    void finishSession()
+    bool finishSession()
     {
-        if (!session_.get()) return;
-        checked(VTDecompressionSessionFinishDelayedFrames(session_.get()), "drain video decoder");
-        checked(VTDecompressionSessionWaitForAsynchronousFrames(session_.get()), "wait for video drain");
-        checkCallback();
+        if (!session_.get()) return true;
+        try {
+            checkedDecode(VTDecompressionSessionFinishDelayedFrames(session_.get()), "drain video decoder");
+            checkedDecode(VTDecompressionSessionWaitForAsynchronousFrames(session_.get()), "wait for video drain");
+            checkCallback();
+        } catch (const SessionLost&) {
+            // The system took the session. Nothing was in it that a drain
+            // would return, since the hardware returns each picture as it
+            // decodes it; the caller says what the loss means.
+            return false;
+        }
+        return true;
     }
 
     void emit(DecodedVideoFrame frame)
@@ -774,8 +817,54 @@ private:
         frames_.push_back(std::move(frame));
     }
 
+    /* Decodes one picture. A session the system took away is not an error of
+     * the stream: the pictures that need it are dropped, and the session is
+     * made anew from the parameter sets the stream stated at its next random
+     * access point, so a picture is missing and the client is told nothing.
+     * A second loss with no picture between is final, as the encoder's is. */
+    bool decodeOrLose(const std::vector<std::uint8_t>& packet, Picture& picture)
+    {
+        try {
+            decode(packet, picture);
+        } catch (const SessionLost&) {
+            picture.frames.clear();
+            if (lossesWithoutPicture_++ > 0) {
+                lossesWithoutPicture_ = 0;
+                loseSession();
+                throw std::runtime_error("video decoder session lost again before a picture");
+            }
+            loseSession();
+            return false;
+        }
+        lossesWithoutPicture_ = 0;
+        return true;
+    }
+
+    /* The session is gone: what was decoded and waits for the pictures before
+     * it leaves in order, since they will never come, and the stream's picture
+     * order starts over at the next random access point. */
+    void loseSession()
+    {
+        releaseWaiting();
+        waiting_.clear();
+        order_.clear();
+        hevcOrder_.reset();
+        h264Order_.reset();
+        if (session_.get()) VTDecompressionSessionInvalidate(session_.get());
+        session_.reset();
+        resuming_ = true;
+    }
+
     void decode(const std::vector<std::uint8_t>& packet, Picture& picture)
     {
+#if UML_VIDEO_DECODER_TESTING
+        // As the system does when it takes the hardware away: the session the
+        // call below uses is invalid.
+        if (injectedLosses_ > 0 && session_.get()) {
+            --injectedLosses_;
+            VTDecompressionSessionInvalidate(session_.get());
+        }
+#endif
         CFObject<CMBlockBufferRef> block;
         checked(CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, nullptr, packet.size(),
             kCFAllocatorDefault, nullptr, 0, packet.size(), 0, block.address()), "allocate video packet");
@@ -794,9 +883,9 @@ private:
         /* No temporal processing: the hardware returns each picture as it
          * decodes it, and the order pictures are shown in is worked out here,
          * from the stream, not from timestamps a client may not set. */
-        checked(VTDecompressionSessionDecodeFrame(session_.get(), sample.get(), 0, &picture, nullptr),
-                "decode video packet");
-        checked(VTDecompressionSessionWaitForAsynchronousFrames(session_.get()), "wait for decoded video");
+        checkedDecode(VTDecompressionSessionDecodeFrame(session_.get(), sample.get(), 0, &picture, nullptr),
+                      "decode video packet");
+        checkedDecode(VTDecompressionSessionWaitForAsynchronousFrames(session_.get()), "wait for decoded video");
         checkCallback();
     }
 
@@ -805,8 +894,9 @@ private:
         if (codec_ == VideoCodec::h264 && !h264Sets_.complete()) return;
         if (codec_ == VideoCodec::hevc && !hevcSets_.complete()) return;
         /* Building a session anew does not end the stream: what waits for the
-         * pictures before it keeps waiting. */
-        finishSession();
+         * pictures before it keeps waiting. A session the system already took
+         * away is replaced all the same. */
+        (void)finishSession();
         if (session_.get()) VTDecompressionSessionInvalidate(session_.get());
         session_.reset();
         hevcChanged_ = false;
@@ -817,7 +907,7 @@ private:
         } else if (codec_ == VideoCodec::vp9) {
             NSDictionary* extensions = @{
                 (__bridge NSString*)kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms:
-                    @{@"vpcC": vp9Configuration(0, format_.bitDepth, vp9ColorSpace_, vp9FullRange_)},
+                    @{@"vpcC": vp9Configuration(vp9Profile_, format_.bitDepth, vp9ColorSpace_, vp9FullRange_)},
                 (__bridge NSString*)kCMFormatDescriptionExtension_FullRangeVideo: @(vp9FullRange_),
             };
             checked(CMVideoFormatDescriptionCreate(kCFAllocatorDefault, kCMVideoCodecType_VP9,
@@ -902,28 +992,52 @@ private:
         auto& self = *static_cast<AppleVideoDecoder*>(context);
         auto& picture = *static_cast<Picture*>(source);
         std::lock_guard lock(self.mutex_);
+#if UML_VIDEO_DECODER_TESTING
+        if (const auto injected = self.injectedOutputStatus_.exchange(noErr); injected != noErr) status = injected;
+#endif
         try {
+            if (sessionLoss(status)) {
+                // Not over an error of the stream, which stays until discard().
+                if (self.callbackError_.empty() || self.callbackLost_) {
+                    self.callbackLost_ = true;
+                    self.callbackError_ = "hardware video output: " + std::to_string(status);
+                }
+                return;
+            }
             checked(status, "hardware video output");
             if (!image) return;
             picture.frames.push_back(copyPicture(image, picture, picture.timestamp));
         } catch (const std::exception& error) {
+            self.callbackLost_ = false;
             self.callbackError_ = error.what();
         } catch (...) {
+            self.callbackLost_ = false;
             self.callbackError_ = "hardware video output failed";
         }
     }
+    /* A session the system took away is reported once and the decoder makes a
+     * new one. Any other error of the callback is the stream's and stays until
+     * discard(), so every picture after it fails too. */
     void checkCallback()
     {
         std::lock_guard lock(mutex_);
-        if (!callbackError_.empty()) throw std::runtime_error(callbackError_);
+        if (callbackError_.empty()) return;
+        if (callbackLost_) {
+            callbackLost_ = false;
+            throw SessionLost(std::exchange(callbackError_, {}));
+        }
+        throw std::runtime_error(callbackError_);
     }
 
     VideoCodec codec_;
     VideoFormat format_;
     VideoPixelLayout layout_ {VideoPixelLayout::planarYuv};
     VideoPixelLayout sessionLayout_ {VideoPixelLayout::planarYuv};
+    unsigned vp9Profile_ {};
     unsigned vp9ColorSpace_ {};
     bool vp9FullRange_ {};
+    // The packet `prepare` last read ends in a frame that shows nothing.
+    bool hiddenFinal_ {};
     // H.264: the stream's parameter sets, the SPS in use, and the order its
     // frames are shown in.
     h264::ParameterSets h264Sets_;
@@ -945,9 +1059,47 @@ private:
     std::mutex mutex_;
     std::vector<DecodedVideoFrame> frames_;
     std::string callbackError_;
+    bool callbackLost_ {};
+    // The session was lost: pictures are dropped until a random access point
+    // lets a new one start, and a loss that follows another with no picture
+    // decoded between is reported.
+    bool resuming_ {};
+    unsigned lossesWithoutPicture_ {};
+#if UML_VIDEO_DECODER_TESTING
+public:
+    void loseSessionForTest(unsigned count) { injectedLosses_ = count; }
+    void failOutputForTest(OSStatus status) { injectedOutputStatus_ = status; }
+private:
+    unsigned injectedLosses_ {};
+    std::atomic<OSStatus> injectedOutputStatus_ {noErr};
+#endif
 };
 
 } // namespace
+
+/* Whether the hardware decodes VP9 Profile 2. Creating a session says no more
+ * than the codec does, so the probe decodes a 64 x 64 key frame of it and
+ * wants the 10-bit picture back. Done once, and only where VP9 itself is
+ * decoded in hardware. */
+static bool vp9Profile2Available()
+{
+    static const bool available = [] {
+        if (!vp9Available()) return false;
+        static const std::uint8_t keyFrame[] = {
+            0x92, 0x49, 0x83, 0x42, 0x00, 0x01, 0xf8, 0x01, 0xfb, 0x00, 0x1c, 0x12, 0x0e, 0x0c, 0x29,
+            0x00, 0x00, 0x18, 0x60, 0x00, 0x00, 0x69, 0x01, 0x76, 0x4d, 0xda, 0x99, 0xe4, 0x00};
+        try {
+            AppleVideoDecoder decoder(VideoCodec::vp9);
+            decoder.submit(keyFrame, 0);
+            decoder.drain();
+            const auto frames = decoder.takeFrames();
+            return frames.size() == 1 && frames[0].format == VideoFormat {64, 64, 10};
+        } catch (...) {
+            return false;
+        }
+    }();
+    return available;
+}
 
 std::vector<VideoDecodeCapability> videoDecodeCapabilities()
 {
@@ -975,9 +1127,13 @@ std::vector<VideoDecodeCapability> videoDecodeCapabilities()
     if (VTIsHardwareDecodeSupported(kCMVideoCodecType_JPEG))
         result.push_back({VideoCodec::jpeg, VideoProfile::jpegBaseline,
                           decodeSizeLimit(VideoCodec::jpeg).width, decodeSizeLimit(VideoCodec::jpeg).height, 0, 8});
-    if (vp9Available())
-        result.push_back({VideoCodec::vp9, VideoProfile::vp9Profile0,
-                          decodeSizeLimit(VideoCodec::vp9).width, decodeSizeLimit(VideoCodec::vp9).height, 0, 8});
+    if (vp9Available()) {
+        const auto vp9 = decodeSizeLimit(VideoCodec::vp9);
+        result.push_back({VideoCodec::vp9, VideoProfile::vp9Profile0, vp9.width, vp9.height, 0, 8});
+        // 10-bit pictures reach an 8-bit client narrowed, as HEVC Main 10 does.
+        if (vp9Profile2Available())
+            result.push_back({VideoCodec::vp9, VideoProfile::vp9Profile2, vp9.width, vp9.height, 0, 10});
+    }
     return result;
 }
 
@@ -989,5 +1145,17 @@ std::unique_ptr<VideoDecoder> makeVideoDecoder(VideoCodec codec)
         throw std::runtime_error("requested video hardware decoder is unavailable");
     return std::make_unique<AppleVideoDecoder>(codec);
 }
+
+#if UML_VIDEO_DECODER_TESTING
+void testing::loseSession(VideoDecoder& decoder, unsigned count)
+{
+    static_cast<AppleVideoDecoder&>(decoder).loseSessionForTest(count);
+}
+
+void testing::failOutput(VideoDecoder& decoder, std::int32_t status)
+{
+    static_cast<AppleVideoDecoder&>(decoder).failOutputForTest(status);
+}
+#endif
 
 } // namespace uml::platform

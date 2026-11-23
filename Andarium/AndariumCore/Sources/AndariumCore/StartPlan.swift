@@ -11,22 +11,24 @@ public enum StartBlock: Equatable, Sendable {
     /// The data uses a newer layout than this build can migrate.
     case newerDataLayout
     /// The guest's files do not match the Android in this build: another
-    /// system disk under the same release, or data nothing recorded.
+    /// system disk under the same release, data nothing recorded, or an
+    /// unsigned proof meeting data of another system (or the data a proof
+    /// created meeting another system).
     case mismatch
 }
 
 extension StartBlock {
-    public var title: String { "This guest cannot start" }
+    public var title: String { String(localized: "This virtual machine cannot start", bundle: .module) }
 
     /// What Home says; erasing the guest is the way out of each.
     public var explanation: String {
         switch self {
         case .olderAndroid:
-            "This app version is older than the one the guest last started with, and its data does not go back. Install a newer version of Andarium, or erase the guest to start again with this one."
+            String(localized: "This app version is older than the one the virtual machine last started with, and its data does not go back. Install a newer version of Andarium, or erase the virtual machine to start again with this one.", bundle: .module)
         case .newerDataLayout:
-            "The guest's data uses a newer layout than this app version can open. Erase the guest to start again with this one."
+            String(localized: "The virtual machine’s data uses a newer layout than this app version can open. Erase the virtual machine to start again with this one.", bundle: .module)
         case .mismatch:
-            "The guest's files do not match this app version. Erase the guest to start again."
+            String(localized: "The virtual machine’s files do not match this app version. Erase the virtual machine to start again.", bundle: .module)
         }
     }
 }
@@ -70,18 +72,6 @@ public enum StartPlan: Equatable, Sendable {
         case .unfinishedUpdate(_, let canRetry, _): mode == .normal && canRetry
         case .blocked, .firstStart, .normal, .update: allowsStart
         }
-    }
-
-    /// Whether Home offers Start in recovery. Until the guest has started
-    /// once, which is when the runtime creates its data disk (`firstStart`),
-    /// Recovery has nothing to work on and the control is disabled, not left
-    /// out; erasing the guest and setting up a new one returns to that state.
-    /// It decides only what Home offers: a start that arrives another way, as
-    /// an automation launch does, is the lifecycle's to allow
-    /// (`allowsStart(_:)`).
-    public var offersRecovery: Bool {
-        if case .firstStart = self { return false }
-        return allowsStart(.recovery)
     }
 
     /// What a start in `mode` is, for the words and steps of the boot.

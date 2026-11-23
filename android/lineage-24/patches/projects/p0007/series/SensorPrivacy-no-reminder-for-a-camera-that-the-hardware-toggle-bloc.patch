@@ -1,0 +1,94 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 07:03:21 +0000
+Subject: [PATCH] SensorPrivacy: no reminder for a camera that the hardware
+ toggle blocks
+
+A session started with Camera off holds the camera's hardware toggle,
+which the input manager sets from the host's lens cover. When an
+application then opens the camera, the service shows SystemUI's
+"Unblock device camera?" dialog, or posts a notification, whose Unblock
+writes the software toggle. A hardware toggle outranks it, so the
+button does nothing.
+
+Show no reminder for a camera under the hardware toggle. A camera
+request is dropped in enqueueSensorUseReminderDialog, before it can join
+a queued request or merge with the microphone's suppressed token: while
+SystemUI's dialog is up only the microphone is suppressed, so a camera
+retry that merged with it would start the microphone's dialog again, at
+every retry and after Cancel. A camera still in the set when the queue
+drains (the toggle changed meanwhile, or it joined through its own
+suppression) is removed in showSensorUserReminderDialog, which starts
+nothing when none is left; a combined camera and microphone reminder
+becomes the microphone's, which is the platform's own dialog and whose
+Unblock works. showSensorUseReminderNotification posts nothing for the
+camera. Each place logs "kernarium: no reminder for a camera that the
+hardware toggle blocks (<package>)". A camera under the software toggle,
+the microphone and a session with Camera on take the paths they took
+before.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .../sensorprivacy/SensorPrivacyService.java   | 35 +++++++++++++++++++
+ 1 file changed, 35 insertions(+)
+
+diff --git a/services/core/java/com/android/server/sensorprivacy/SensorPrivacyService.java b/services/core/java/com/android/server/sensorprivacy/SensorPrivacyService.java
+index 792d8fff62b1479d298fa479cc5cdba0380783b9..1508221f5b0f968de690fc2da67e10ee7bc9ef49 100644
+--- a/services/core/java/com/android/server/sensorprivacy/SensorPrivacyService.java
++++ b/services/core/java/com/android/server/sensorprivacy/SensorPrivacyService.java
+@@ -605,6 +605,18 @@ public final class SensorPrivacyService extends SystemService {
+ 
+         private void enqueueSensorUseReminderDialog(int taskId, @NonNull UserHandle user,
+                 @NonNull String packageName, int sensor) {
++            // A camera under the hardware toggle (the lens cover of a session started with Camera
++            // off) gets no reminder, and its request is dropped here, before it can join a queued
++            // request or merge with the microphone's suppressed token: while SystemUI's dialog is
++            // up only the microphone is suppressed, so a camera request that merged with it would
++            // start the microphone's dialog again at every retry. The dialog's Unblock writes the
++            // software toggle, which a hardware toggle outranks.
++            if (sensor == CAMERA && isToggleSensorPrivacyEnabled(TOGGLE_TYPE_HARDWARE, CAMERA)) {
++                Log.i(TAG, "kernarium: no reminder for a camera that the hardware toggle blocks ("
++                        + packageName + ")");
++                return;
++            }
++
+             SensorUseReminderDialogInfo info =
+                     new SensorUseReminderDialogInfo(taskId, user, packageName);
+             if (!mQueuedSensorUseReminderDialogs.containsKey(info)) {
+@@ -635,6 +647,21 @@ public final class SensorPrivacyService extends SystemService {
+                         + " Was the dialog queue modified from outside the handler thread?");
+                 return;
+             }
++
++            // A camera that is in the set although its request was not dropped (the toggle changed
++            // since it was queued, or it joined a microphone request through the camera's own
++            // suppression) is left out as well; a combined camera and microphone reminder is left
++            // with the microphone, whose Unblock works.
++            if (sensors.contains(CAMERA)
++                    && isToggleSensorPrivacyEnabled(TOGGLE_TYPE_HARDWARE, CAMERA)) {
++                Log.i(TAG, "kernarium: no reminder for a camera that the hardware toggle blocks ("
++                        + info.mPackageName + ")");
++                sensors.remove(CAMERA);
++                if (sensors.isEmpty()) {
++                    return;
++                }
++            }
++
+             Intent dialogIntent = new Intent();
+             dialogIntent.setComponent(
+                     ComponentName.unflattenFromString(getSensorUseActivityName(sensors)));
+@@ -685,6 +712,14 @@ public final class SensorPrivacyService extends SystemService {
+          */
+         private void showSensorUseReminderNotification(@NonNull UserHandle user,
+                 @NonNull String packageName, int sensor) {
++            // The reminder of a camera under the hardware toggle is withheld here too: the
++            // notification's Unblock writes the software toggle, which a hardware toggle outranks.
++            if (sensor == CAMERA && isToggleSensorPrivacyEnabled(TOGGLE_TYPE_HARDWARE, CAMERA)) {
++                Log.i(TAG, "kernarium: no reminder for a camera that the hardware toggle blocks ("
++                        + packageName + ")");
++                return;
++            }
++
+             int iconRes;
+             int messageRes;
+             int notificationId;

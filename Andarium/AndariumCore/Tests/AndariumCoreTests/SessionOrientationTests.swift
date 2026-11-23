@@ -4,47 +4,37 @@ import Foundation
 import Testing
 @testable import AndariumCore
 
-// Orientation ownership for phones, full-screen and windowed iPads and the loss
-// of a scene lock (SessionOrientationTests), and coalesced guest commands,
-// partial failures and stale completions after a guest restart
+// Orientation ownership for interfaces that turn (an iPad) and those that do
+// not (an iPhone) through every phase (SessionOrientationTests), and coalesced
+// guest commands, partial failures and stale completions after a guest restart
 // (GuestRotationControllerTests).
 struct SessionOrientationTests {
-    private let screen = CGSize(width: 1024, height: 768)
-
-    private func policy(
-        _ phase: Phase = .running(.normal), phone: Bool = false,
-        size: CGSize? = nil, locked: Bool = false
-    ) -> SessionOrientationPolicy {
-        SessionOrientationPolicy(
-            phase: phase, isPhone: phone, sceneSize: size ?? screen,
-            screenSize: screen, interfaceLocked: locked)
+    private func policy(_ phase: Phase = .running(.normal), rotates: Bool = true) -> SessionOrientationPolicy {
+        SessionOrientationPolicy(phase: phase, interfaceRotates: rotates)
     }
 
-    @Test func fullScreenWaitsForTheActualLock() {
-        #expect(policy().requestInterfaceLock)
-        #expect(policy().hostDrivesGuestRotation)
-        #expect(policy(locked: true).requestInterfaceLock)
-        #expect(!policy(locked: true).hostDrivesGuestRotation)
-        // Losing the lock to an overlapping scene restores the host policy.
-        #expect(policy(locked: false).hostDrivesGuestRotation)
-    }
+    private let sessionPhases: [Phase] = [
+        .booting(.normal), .booting(.firstStart), .booting(.upgrade), .booting(.recovery), .booting(.restart),
+        .running(.normal), .running(.recovery),
+    ]
 
-    @Test func windowsUseHostRotationEvenIfThePreviousSceneWasLocked() {
-        let window = CGSize(width: 600, height: 768)
-        #expect(!policy(size: window, locked: true).requestInterfaceLock)
-        #expect(policy(size: window, locked: true).hostDrivesGuestRotation)
-        #expect(policy(size: CGSize(width: 768, height: 1024)).hostDrivesGuestRotation)
-    }
-
-    @Test func phonesAndScreensOutsideTheSessionDoNotOverrideGuestRotation() {
-        #expect(!policy(phone: true).requestInterfaceLock)
-        #expect(!policy(phone: true).hostDrivesGuestRotation)
-        for phase in [Phase.home, .failed] {
-            #expect(!policy(phase).requestInterfaceLock)
-            #expect(!policy(phase).hostDrivesGuestRotation)
+    @Test func anInterfaceThatTurnsIsHostDrivenInEveryPhaseOfASession() {
+        for phase in sessionPhases {
+            #expect(policy(phase).hostDrivesGuestRotation, "\(phase)")
         }
-        #expect(policy(.booting(.normal)).requestInterfaceLock)
-        #expect(policy(.running(.recovery)).requestInterfaceLock)
+    }
+
+    @Test func aPortraitOnlyInterfaceLeavesRotationToTheGuest() {
+        for phase in sessionPhases {
+            #expect(!policy(phase, rotates: false).hostDrivesGuestRotation, "\(phase)")
+        }
+    }
+
+    @Test func screensOutsideTheSessionDoNotOverrideGuestRotation() {
+        for phase in [Phase.home, .failed] {
+            #expect(!policy(phase).hostDrivesGuestRotation, "\(phase)")
+            #expect(!policy(phase, rotates: false).hostDrivesGuestRotation, "\(phase)")
+        }
     }
 }
 

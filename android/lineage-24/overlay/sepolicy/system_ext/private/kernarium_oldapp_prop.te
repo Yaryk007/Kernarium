@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Old app compatibility is a choice per application. The person makes it in
+# Andarium, which runs `kernarium_oldapp set <package> on|off` as the adb shell
+# user (tools in overlay/oldapp_switch); the choice is the persistent property
+# persist.sys.kernarium.oldapp.<package>, whose value is the turn-on time and
+# whose emptiness means off. The framework reads it in the application's own
+# process (route p0007), so every application domain reads the type, and the
+# shell domain alone sets it. In this policy the shell domain is itself an
+# appdomain member, so the read rule below also lets the command list the
+# choices, and the neverallow names the exception.
+#
+# The type is system-owned and restricted. Every application domain reads it,
+# and two of those (gceservice and vzwomatrigger_app) are not core domains, which
+# a system_internal_prop forbids by neverallow; a restricted type may be read by
+# any domain and set only by core domains. Init may set it like any property
+# type, which keeps the value across an Android update (it lives in /data) and
+# lets a snapshot restore bring it back.
+system_restricted_prop(kernarium_oldapp_prop)
+
+set_prop(shell, kernarium_oldapp_prop)
+get_prop(shell, kernarium_oldapp_prop)
+get_prop(appdomain, kernarium_oldapp_prop)
+
+# An application must never turn the layer on or off for itself or another. The
+# restricted type's own rule keeps only the non-core domains from setting it, so
+# the application domains are named here.
+neverallow { appdomain -shell } kernarium_oldapp_prop:property_service set;

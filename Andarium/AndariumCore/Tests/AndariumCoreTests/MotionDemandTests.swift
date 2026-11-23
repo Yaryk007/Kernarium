@@ -10,9 +10,9 @@ import Testing
 /// session that drives a fake device through a fake guest connection.
 ///
 /// The session's cases: a guest that never sends a frame is read continuously,
-/// sensors are started, stopped and retimed as the guest says, the switch is
-/// off, the guest is in the background, a new mounting, a lost connection and
-/// a failing device.
+/// sensors are started, stopped and retimed as the guest says, the device has
+/// no sensors, the guest is in the background, a new mounting, a lost
+/// connection and a failing device.
 struct MotionDemandTests {
     // Independent wire fixtures, little endian.
     private func frame(mask: UInt8, accelerometer: [UInt8], gyroscope: [UInt8]) -> Data {
@@ -44,8 +44,12 @@ struct MotionDemandTests {
         #expect(MotionDemand(frame: good.dropLast()) == nil)
         #expect(MotionDemand(frame: good + [0]) == nil)
         var wrong = good
-        wrong[3] = 0x32
+        wrong[3] = 0x33
         #expect(MotionDemand(frame: wrong) == nil)
+        // "ANC2" is the service that has the orientation sensor (its own tests).
+        wrong[3] = 0x32
+        #expect(MotionDemand(frame: wrong) == MotionDemand(accelerometer: 20_000, orientationSensor: .idle))
+        wrong[3] = 0x33
         // The sample record's own magic is not a frame.
         wrong[2] = 0x53
         wrong[3] = 0x31
@@ -65,18 +69,18 @@ struct MotionDemandTests {
 
     private func wanted(connected: Bool = true) -> MotionSampling {
         var sampling = MotionSampling()
-        sampling.enabled = true
+        sampling.hasSensors = true
         sampling.foreground = true
         sampling.connectionChanged(connected)
         return sampling
     }
 
-    @Test func nothingIsReadWithoutTheSwitchTheForegroundOrAConnection() {
+    @Test func nothingIsReadWithoutSensorsTheForegroundOrAConnection() {
         var sampling = wanted()
         #expect(sampling.plan != .off)
-        sampling.enabled = false
+        sampling.hasSensors = false
         #expect(sampling.plan == .off && !sampling.wantsConnection)
-        sampling.enabled = true
+        sampling.hasSensors = true
         sampling.foreground = false
         #expect(sampling.plan == .off && !sampling.wantsConnection)
         sampling.foreground = true
@@ -104,12 +108,12 @@ struct MotionDemandTests {
         #expect(sampling.plan == MotionPlan(accelerometer: nil, gyroscope: 0.5))
     }
 
-    @Test func theSwitchAndTheForegroundGateAWholeDemand() {
+    @Test func theDeviceAndTheForegroundGateAWholeDemand() {
         var sampling = wanted()
         sampling.received(MotionDemand(accelerometer: 20_000, gyroscope: 20_000))
-        sampling.enabled = false
+        sampling.hasSensors = false
         #expect(sampling.plan == .off)
-        sampling.enabled = true
+        sampling.hasSensors = true
         #expect(sampling.plan == MotionPlan(accelerometer: 0.01, gyroscope: 0.01))
         sampling.foreground = false
         #expect(sampling.plan == .off)
@@ -128,18 +132,74 @@ struct MotionDemandTests {
     // MARK: A session over a fake guest
 
     /// A device with sensors that records what the session does with them.
-    private final class FakeDevice: MotionDevice, @unchecked Sendable {
+    /// (Shared with `MotionCompassTests`.)
+    final class FakeDevice: MotionDevice, @unchecked Sendable {
         let hasAccelerometer: Bool
         let hasGyroscope: Bool
+        private let magnetometer: Bool
         private let lock = NSLock()
+        private var reads = 0
+        var hasMagnetometer: Bool { lock.withLock { reads += 1 }; return magnetometer }
+        /// How often the session asked whether the device has a magnetometer.
+        var magnetometerReads: Int { lock.withLock { reads } }
         private var running: [MotionSample.Sensor: TimeInterval] = [:]
         private var handlers: [MotionSample.Sensor: @Sendable (Double, Double, Double) -> Void] = [:]
         private var failures: [@Sendable () -> Void] = []
+        private var fieldInterval: TimeInterval?
+        private var fieldHandler: (@Sendable (Double, Double, Double, UInt8) -> Void)?
+        private var fieldFailures: [@Sendable () -> Void] = []
+        /// Every handler a start gave, kept after a stop: a reading that Core
+        /// Motion had already taken can still be delivered to it.
+        private var fieldHandlersGiven: [@Sendable (Double, Double, Double, UInt8) -> Void] = []
         private(set) var starts = 0
+        private(set) var magnetometerStarts = 0
 
-        init(accelerometer: Bool = true, gyroscope: Bool = true) {
+        init(accelerometer: Bool = true, gyroscope: Bool = true, magnetometer: Bool = false) {
             hasAccelerometer = accelerometer
             hasGyroscope = gyroscope
+            self.magnetometer = magnetometer
+        }
+
+        func startMagnetometer(
+            interval: TimeInterval,
+            handler: @escaping @Sendable (Double, Double, Double, UInt8) -> Void,
+            failure: @escaping @Sendable () -> Void
+        ) {
+            lock.withLock {
+                fieldInterval = interval
+                fieldHandler = handler
+                fieldHandlersGiven.append(handler)
+                fieldFailures.append(failure)
+                magnetometerStarts += 1
+            }
+        }
+
+        func stopMagnetometer() {
+            lock.withLock {
+                fieldInterval = nil
+                fieldHandler = nil
+            }
+        }
+
+        /// How often the magnetometer is read, nil while it is off.
+        var magnetometerInterval: TimeInterval? { lock.withLock { fieldInterval } }
+        func emitField(_ x: Double, _ y: Double, _ z: Double, status: UInt8) {
+            let handler = lock.withLock { fieldHandler }
+            handler?(x, y, z, status)
+        }
+        func failMagnetometer() {
+            let failure = lock.withLock { fieldFailures.last }
+            failure?()
+        }
+        /// A reading, or a failure, that the start number `start` (from 0) was
+        /// given to deliver, whatever has happened since.
+        func emitField(fromStart start: Int, _ x: Double, _ y: Double, _ z: Double, status: UInt8) {
+            let handler = lock.withLock { fieldHandlersGiven[start] }
+            handler(x, y, z, status)
+        }
+        func failMagnetometer(fromStart start: Int) {
+            let failure = lock.withLock { fieldFailures[start] }
+            failure()
         }
 
         func start(
@@ -175,10 +235,19 @@ struct MotionDemandTests {
 
     /// Hands out one end of a socket pair per connection; the other end is the
     /// guest's.
-    private final class FakeGuest: GuestStreamOpener, @unchecked Sendable {
+    final class FakeGuest: GuestStreamOpener, @unchecked Sendable {
         private let lock = NSLock()
         private var ends: [Int32] = []
+        /// Nothing listens: the guest is down, or its image has no service.
+        private var down: Bool
+        private var refusals = 0
+        init(down: Bool = false) { self.down = down }
         func openStream() throws -> Int32 {
+            let refused = lock.withLock { () -> Bool in
+                if down { refusals += 1 }
+                return down
+            }
+            if refused { throw POSIXError(.ECONNREFUSED) }
             var sockets: [Int32] = [-1, -1]
             guard socketpair(AF_UNIX, SOCK_STREAM, 0, &sockets) == 0 else { throw POSIXError(.EIO) }
             lock.withLock { ends.append(sockets[1]) }
@@ -198,6 +267,30 @@ struct MotionDemandTests {
                 bytes += (0..<4).map { UInt8((period >> UInt32(8 * $0)) & 0xff) }
             }
             if let end = current { _ = write(end, bytes, bytes.count) }
+        }
+
+        /// A service that lists a magnetometer says what it needs: "ANC3".
+        func sayCompass(_ demand: MotionDemand) {
+            var mask: UInt8 = 0
+            if demand.accelerometer != nil { mask |= 1 }
+            if demand.gyroscope != nil { mask |= 2 }
+            if demand.orientationSensor == .active { mask |= 4 }
+            if demand.magnetometer != nil { mask |= 8 }
+            if demand.orientationSensor != .absent { mask |= 16 }
+            send(Self.compassFrame(mask: mask, periods: [
+                demand.accelerometer ?? 10_000, demand.gyroscope ?? 10_000, demand.magnetometer ?? 20_000,
+            ]))
+        }
+
+        static func compassFrame(mask: UInt8, periods: [UInt32]) -> [UInt8] {
+            var bytes: [UInt8] = [0x41, 0x4e, 0x43, 0x33, mask, 0, 0, 0]
+            for period in periods { bytes += (0..<4).map { UInt8((period >> UInt32(8 * $0)) & 0xff) } }
+            return bytes
+        }
+
+        /// Bytes the guest's service sends, as they are.
+        func send(_ bytes: [UInt8]) {
+            if let end = current { _ = Darwin.write(end, bytes, bytes.count) }
         }
 
         /// What the guest has received, up to `count` bytes within `timeout`.
@@ -235,6 +328,14 @@ struct MotionDemandTests {
         func hangUp() {
             if let end = current { shutdown(end, SHUT_RDWR) }
         }
+
+        /// Android powers off: the service's connection ends and nothing
+        /// listens any more.
+        func goDown() {
+            lock.withLock { down = true }
+            hangUp()
+        }
+        var refused: Int { lock.withLock { refusals } }
     }
 
     private func eventually(_ timeout: Double = 3, _ condition: () -> Bool) -> Bool {
@@ -246,36 +347,27 @@ struct MotionDemandTests {
         return condition()
     }
 
-    private final class Problems: @unchecked Sendable {
-        private let lock = NSLock()
-        private var seen: [MotionProblem?] = []
-        func record(_ problem: MotionProblem?) { lock.withLock { seen.append(problem) } }
-        var all: [MotionProblem?] { lock.withLock { seen } }
-    }
-
-    private func session(
-        _ guest: FakeGuest, _ device: FakeDevice, problems: Problems = Problems()
-    ) -> MotionSession {
-        MotionSession(opener: guest, device: device, retryDelay: .milliseconds(40), problem: problems.record)
+    private func session(_ guest: FakeGuest, _ device: FakeDevice) -> MotionSession {
+        MotionSession(opener: guest, device: device, retryDelay: .milliseconds(40))
     }
 
     @Test func aServiceThatNeverSpeaksIsReadContinuouslyAndItsSamplesArrive() throws {
         let guest = FakeGuest()
         let device = FakeDevice()
         let session = session(guest, device)
-        session.update(enabled: true, foreground: true, axes: .portrait)
+        session.update(foreground: true, axes: .portrait)
         #expect(eventually { device.intervals == [.accelerometer: 0.01, .gyroscope: 0.01] })
         device.emit(.accelerometer, 0, 0, -1)
         let packet = try #require(MotionSample(sensor: .accelerometer, x: 0, y: 0, z: -1).encoded)
         #expect(guest.receive(count: 20) == packet)
-        session.update(enabled: false, foreground: true, axes: .portrait)
+        session.update(foreground: false, axes: .portrait)
     }
 
     @Test func aServiceThatSpeaksIsReadOnlyForTheSensorsInUseAtTheirRate() {
         let guest = FakeGuest()
         let device = FakeDevice()
         let session = session(guest, device)
-        session.update(enabled: true, foreground: true, axes: .portrait)
+        session.update(foreground: true, axes: .portrait)
         #expect(eventually { device.intervals.count == 2 })
         // An application takes the accelerometer at 20 ms: the gyroscope stops.
         guest.say(MotionDemand(accelerometer: 20_000))
@@ -293,50 +385,32 @@ struct MotionDemandTests {
         #expect(guest.receive(count: 20, timeout: 60).isEmpty)
         guest.say(MotionDemand(gyroscope: 1_000_000))
         #expect(eventually { device.intervals == [.gyroscope: 0.5] })
-        session.update(enabled: false, foreground: true, axes: .portrait)
-    }
-
-    @Test func turningTheSwitchOffStopsTheSensorsAndClosesTheConnection() {
-        let guest = FakeGuest()
-        let device = FakeDevice()
-        let session = session(guest, device)
-        session.update(enabled: true, foreground: true, axes: .portrait)
-        #expect(eventually { device.intervals.count == 2 })
-        guest.say(MotionDemand(accelerometer: 20_000))
-        #expect(eventually { device.intervals == [.accelerometer: 0.01] })
-        session.update(enabled: false, foreground: true, axes: .portrait)
-        #expect(eventually { device.intervals.isEmpty })
-        #expect(guest.sawClose())
-        // On again: a new connection, and the service has not spoken on it,
-        // so it is read continuously, not as the last one said.
-        session.update(enabled: true, foreground: true, axes: .portrait)
-        #expect(eventually { device.intervals == [.accelerometer: 0.01, .gyroscope: 0.01] && guest.connections == 2 })
-        session.update(enabled: false, foreground: false, axes: .portrait)
+        session.update(foreground: false, axes: .portrait)
     }
 
     @Test func leavingTheForegroundStopsTheSensorsAndReturningStartsAfresh() {
         let guest = FakeGuest()
         let device = FakeDevice()
         let session = session(guest, device)
-        session.update(enabled: true, foreground: true, axes: .portrait)
+        session.update(foreground: true, axes: .portrait)
         #expect(eventually { device.intervals.count == 2 })
         guest.say(MotionDemand(gyroscope: 100_000))
         #expect(eventually { device.intervals == [.gyroscope: 0.05] })
-        session.update(enabled: true, foreground: false, axes: .portrait)
+        session.update(foreground: false, axes: .portrait)
         #expect(eventually { device.intervals.isEmpty })
         #expect(guest.sawClose())
-        session.update(enabled: true, foreground: true, axes: .portrait)
+        session.update(foreground: true, axes: .portrait)
         #expect(eventually { device.intervals.count == 2 && guest.connections == 2 })
-        session.update(enabled: false, foreground: false, axes: .portrait)
+        session.update(foreground: false, axes: .portrait)
     }
 
     @Test func aNewMountingBeginsANewRunWithItsAxes() throws {
         let guest = FakeGuest()
         let device = FakeDevice()
         let session = session(guest, device)
-        session.update(enabled: true, foreground: true, axes: .portrait)
+        session.update(foreground: true, axes: .portrait)
         #expect(eventually { device.intervals.count == 2 })
-        session.update(enabled: true, foreground: true, axes: .landscapeLeft)
+        session.update(foreground: true, axes: .landscapeLeft)
         #expect(eventually { guest.connections == 2 && device.intervals.count == 2 })
         device.emit(.gyroscope, 1, 2, 3)
         let packet = try #require(MotionSample(sensor: .gyroscope, x: 1, y: 2, z: 3, axes: .landscapeLeft).encoded)
@@ -344,16 +418,16 @@ struct MotionDemandTests {
         // Restarting without a change of axes is a run too, and starts at the next update.
         session.restart()
         #expect(eventually { device.intervals.isEmpty })
-        session.update(enabled: true, foreground: true, axes: .landscapeLeft)
+        session.update(foreground: true, axes: .landscapeLeft)
         #expect(eventually { guest.connections == 3 && device.intervals.count == 2 })
-        session.update(enabled: false, foreground: false, axes: .landscapeLeft)
+        session.update(foreground: false, axes: .landscapeLeft)
     }
 
     @Test func aDeviceWithNoSensorsNeverConnects() {
         let guest = FakeGuest()
         let device = FakeDevice(accelerometer: false, gyroscope: false)
         let session = session(guest, device)
-        session.update(enabled: true, foreground: true, axes: .portrait)
+        session.update(foreground: true, axes: .portrait)
         session.settle()
         usleep(100_000)
         #expect(guest.connections == 0 && device.starts == 0)
@@ -363,49 +437,73 @@ struct MotionDemandTests {
         let guest = FakeGuest()
         let device = FakeDevice(accelerometer: true, gyroscope: false)
         let session = session(guest, device)
-        session.update(enabled: true, foreground: true, axes: .portrait)
+        session.update(foreground: true, axes: .portrait)
         #expect(eventually { device.intervals == [.accelerometer: 0.01] })
         guest.say(MotionDemand(gyroscope: 20_000))
         #expect(eventually { device.intervals.isEmpty })
-        session.update(enabled: false, foreground: false, axes: .portrait)
+        session.update(foreground: false, axes: .portrait)
     }
 
     @Test func aLostConnectionStopsTheSensorsAndIsMadeAgain() {
         let guest = FakeGuest()
         let device = FakeDevice()
-        let problems = Problems()
-        let session = session(guest, device, problems: problems)
-        session.update(enabled: true, foreground: true, axes: .portrait)
+        let session = session(guest, device)
+        session.update(foreground: true, axes: .portrait)
         #expect(eventually { device.intervals.count == 2 })
         guest.say(MotionDemand(accelerometer: 20_000))
         #expect(eventually { device.intervals == [.accelerometer: 0.01] })
         guest.hangUp()
-        #expect(eventually { problems.all.contains(.guestUnavailable) })
         // A new connection, and the new service is read as it says (here, nothing yet).
         #expect(eventually { guest.connections >= 2 && device.intervals.count == 2 })
-        #expect(eventually { problems.all.last == .some(nil) })
-        session.update(enabled: false, foreground: false, axes: .portrait)
+        session.update(foreground: false, axes: .portrait)
+    }
+
+    @Test func aGuestGoingDownAfterItsServiceAnsweredIsAskedForAgainWhileItIsInFront() {
+        let guest = FakeGuest()
+        let device = FakeDevice()
+        let session = session(guest, device)
+        session.update(foreground: true, axes: .portrait)
+        #expect(eventually { guest.connections == 1 })
+        guest.say(MotionDemand())
+        #expect(eventually { session.demand != nil && device.intervals.isEmpty })
+        // Android powers off: the connection ends and is asked for again, to no sensor's cost.
+        guest.goDown()
+        #expect(eventually { guest.refused >= 2 })
+        session.settle()
+        #expect(device.intervals.isEmpty && session.plan == .off)
+        session.update(foreground: false, axes: .portrait)
+    }
+
+    @Test func aGuestWithoutAServiceIsAskedForAndNothingIsRead() {
+        let guest = FakeGuest(down: true)
+        let device = FakeDevice()
+        let session = session(guest, device)
+        session.update(foreground: true, axes: .portrait)
+        #expect(eventually { guest.refused >= 2 })
+        session.update(foreground: false, axes: .portrait)
+        session.settle()
+        #expect(device.starts == 0)
     }
 
     @Test func aGarbledFrameDropsTheConnection() {
         let guest = FakeGuest()
         let device = FakeDevice()
         let session = session(guest, device)
-        session.update(enabled: true, foreground: true, axes: .portrait)
+        session.update(foreground: true, axes: .portrait)
         #expect(eventually { device.intervals.count == 2 })
         if let end = guest.current {
             let junk = [UInt8](repeating: 0x55, count: 16)
             _ = write(end, junk, junk.count)
         }
         #expect(eventually { guest.connections >= 2 })
-        session.update(enabled: false, foreground: false, axes: .portrait)
+        session.update(foreground: false, axes: .portrait)
     }
 
     @Test func aFrameThatArrivesInPiecesIsRead() {
         let guest = FakeGuest()
         let device = FakeDevice()
         let session = session(guest, device)
-        session.update(enabled: true, foreground: true, axes: .portrait)
+        session.update(foreground: true, axes: .portrait)
         #expect(eventually { device.intervals.count == 2 })
         let bytes: [UInt8] = [0x41, 0x4e, 0x43, 0x31, 1, 0, 0, 0, 0x20, 0x4e, 0, 0, 0x20, 0x4e, 0, 0]
         if let end = guest.current {
@@ -415,18 +513,31 @@ struct MotionDemandTests {
             _ = write(end, Array(bytes[5...]), 11)
         }
         #expect(eventually { device.intervals == [.accelerometer: 0.01] })
-        session.update(enabled: false, foreground: false, axes: .portrait)
+        session.update(foreground: false, axes: .portrait)
     }
 
-    @Test func aFailingDeviceEndsTheRunAndSaysSo() {
+    @Test func aFailingDeviceStopsTheSensorsAndKeepsTheConnection() {
         let guest = FakeGuest()
         let device = FakeDevice()
-        let problems = Problems()
-        let session = session(guest, device, problems: problems)
-        session.update(enabled: true, foreground: true, axes: .portrait)
+        let session = session(guest, device)
+        session.update(foreground: true, axes: .portrait)
         #expect(eventually { device.intervals.count == 2 })
         device.fail()
-        #expect(eventually { problems.all.contains(.deviceFailed) && device.intervals.isEmpty })
-        #expect(guest.sawClose())
+        #expect(eventually { device.intervals.isEmpty })
+        session.settle()
+        #expect(guest.isQuiet() && guest.connections == 1)
+        // Nothing is read again on its own: a sample the device still delivers is not sent.
+        device.emit(.accelerometer, 0, 0, -1)
+        #expect(guest.receive(count: 20, timeout: 60).isEmpty)
+        // The guest's demand changes: the sensors are tried again, on the same connection.
+        guest.say(MotionDemand(accelerometer: 20_000))
+        #expect(eventually { device.intervals == [.accelerometer: 0.01] })
+        // And the next update does the same after another failure.
+        device.fail()
+        #expect(eventually { device.intervals.isEmpty })
+        session.update(foreground: true, axes: .portrait)
+        #expect(eventually { device.intervals == [.accelerometer: 0.01] })
+        #expect(guest.connections == 1)
+        session.update(foreground: false, axes: .portrait)
     }
 }

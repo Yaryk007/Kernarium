@@ -9,8 +9,11 @@ prompt); each posts the audio-session notifications iOS posts when another app
 interrupts the session and prints one PASS or FAIL line per check. This runner
 compiles each with the code it tests, the session and the other files it uses,
 and runs them in a simulator device of its own, which it creates on the newest
-iOS runtime at or above the deployment target and deletes afterwards; it never
-uses a device it did not create unless --device names one. A new device keeps
+iOS runtime at or above the deployment target (and, with --runtime-major, of
+that major version) and deletes afterwards; it never uses a device it did not
+create unless --device names one. --legacy-session-notifications posts what
+systems before iOS 27 post for an interruption, which a deployment target below
+27 can build and an iOS 26 runtime can run. A new device keeps
 several cores busy for about two minutes after it boots, so the tests start
 once its processes have settled. The runner passes when both tests do, and
 exits 77, which CTest reports as skipped, when the host has no iOS Simulator
@@ -40,12 +43,14 @@ DEADLINE_SECONDS = 780
 CLEANUP_SECONDS = 90
 BOOT_TIMEOUT_SECONDS = 240
 COMPILE_TIMEOUT_SECONDS = 300
-RUN_TIMEOUT_SECONDS = 240
+RUN_TIMEOUT_SECONDS = 360
 # The device has settled when its processes use less than one core in this many
 # samples in a row, five seconds apart.
 SETTLE_TIMEOUT_SECONDS = 240
 SETTLE_PERCENT = 100.0
 SETTLE_SAMPLES = 3
+# One row of `ps -o pid=,ppid=,pcpu=,args=`.
+PROCESS_ROW = re.compile(r"\s*(\d+)\s+(\d+)\s+(\d+(?:\.\d+)?)\s+(\S.*)")
 
 
 class Deadline:
@@ -80,9 +85,11 @@ def simctl(*arguments: str, timeout: int = 60) -> subprocess.CompletedProcess:
         )
 
 
-def pick_runtime(floor: tuple[int, int]) -> tuple[str, str] | None:
-    """The newest available iOS runtime at or above |floor|, and an iPhone device
-    type it supports."""
+def pick_runtime(
+    floor: tuple[int, int], major: int | None = None
+) -> tuple[str, str] | None:
+    """The newest available iOS runtime at or above |floor| (of |major| when it
+    is given), and an iPhone device type it supports."""
     listing = json.loads(simctl("list", "runtimes", "available", "--json").stdout or "{}")
     best = None
     for runtime in listing.get("runtimes", []):
@@ -95,6 +102,8 @@ def pick_runtime(floor: tuple[int, int]) -> tuple[str, str] | None:
             for device_type in runtime.get("supportedDeviceTypes", [])
             if device_type.get("productFamily") == "iPhone"
         ]
+        if major is not None and version[0] != major:
+            continue
         if version >= floor and phones and (best is None or version > best[0]):
             best = (version, runtime["identifier"], phones[0])
     return None if best is None else (best[1], best[2])
@@ -126,14 +135,16 @@ def device_cpu(udid: str) -> float | None:
     usage: dict[int, float] = {}
     root = None
     for line in listing.splitlines():
-        fields = line.split(None, 3)
-        if len(fields) < 4:
+        row = PROCESS_ROW.fullmatch(line)
+        if row is None:
+            # A process whose arguments span lines leaves rows of its own text
+            # in the listing, which are no process.
             continue
-        pid, parent = int(fields[0]), int(fields[1])
-        usage[pid] = float(fields[2])
+        pid, parent = int(row[1]), int(row[2])
+        usage[pid] = float(row[3])
         children.setdefault(parent, []).append(pid)
-        program = os.path.basename(fields[3].split(" ", 1)[0])
-        if program == "launchd_sim" and f"/{udid}/" in fields[3]:
+        program = os.path.basename(row[4].split(" ", 1)[0])
+        if program == "launchd_sim" and f"/{udid}/" in row[4]:
             root = pid
     if root is None:
         return None
@@ -175,6 +186,16 @@ def main() -> int:
     parser.add_argument("--include-directory", required=True, type=pathlib.Path)
     parser.add_argument("--deployment-target", required=True)
     parser.add_argument(
+        "--runtime-major",
+        type=int,
+        help="create the device on the newest runtime of this iOS major version",
+    )
+    parser.add_argument(
+        "--legacy-session-notifications",
+        action="store_true",
+        help="post the interruption notification systems before iOS 27 post",
+    )
+    parser.add_argument(
         "--device",
         metavar="UDID",
         help="run in this simulator device instead of one of the runner's own; the runner "
@@ -188,9 +209,17 @@ def main() -> int:
 
     chosen = None
     if arguments.device is None:
-        chosen = pick_runtime(floor)
+        chosen = pick_runtime(floor, arguments.runtime_major)
         if chosen is None:
-            print(f"SKIP: no iOS Simulator runtime at iOS {arguments.deployment_target} or later")
+            kind = (
+                f"of iOS {arguments.runtime_major} "
+                if arguments.runtime_major is not None
+                else ""
+            )
+            print(
+                f"SKIP: no iOS Simulator runtime {kind}at iOS "
+                f"{arguments.deployment_target} or later"
+            )
             return SKIPPED
     elif device_state(arguments.device) is None:
         print(f"FAIL: no simulator device {arguments.device}")
@@ -210,6 +239,7 @@ def main() -> int:
         "microphone_tests": [
             here / "ios_microphone_tests.mm",
             sink / "apple_microphone_input.mm",
+            sink / "apple_microphone_tap.mm",
         ],
     }
     with tempfile.TemporaryDirectory(prefix="uml-audio-interruption-") as scratch:
@@ -245,6 +275,8 @@ def main() -> int:
                     "-target", f"arm64-apple-ios{arguments.deployment_target}-simulator",
                     "-x", "objective-c++", "-std=c++20", "-fobjc-arc", "-O1",
                     "-Wall", "-Wextra", "-Werror",
+                    *(["-DUML_AUDIO_LEGACY_SESSION=1"]
+                      if arguments.legacy_session_notifications else []),
                     f"-I{here}", f"-I{sink}", f"-I{arguments.include_directory}",
                     f"-I{arguments.include_directory / 'device' / 'vhost_user'}",
                     *(str(source) for source in sources + shared),

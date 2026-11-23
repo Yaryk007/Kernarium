@@ -10,6 +10,11 @@ guest's adbd for ``iproxy``. The guest boots the system the application
 carries, and nothing is written into the container. The module also reads
 the console lines a run is judged by: the runtime's result and the thermal
 state at the start and the end.
+
+A device run keeps the phone silent: ``settings_for`` states
+``ANDARIUM_HAPTICS=0``, so the application plays none of the guest's haptics
+for that launch, and only a run that tests haptics (``haptics=True``, the
+runners' ``--haptics``) leaves the person's own Haptics switch in charge.
 """
 
 from __future__ import annotations
@@ -49,12 +54,16 @@ MEMORY_MIB_RANGE = (1024, 4096)
 MEMORY_MIB_STEP = 64
 START_MODES = ("normal", "recovery")
 SETTING_NAME = re.compile(r"(?:KERNARIUM|ANDARIUM)_[A-Z0-9_]+")
+# "0" runs the launch as if the person's Haptics switch were off; the
+# application's own switch is the setting's absence.
+HAPTICS_SETTING = "ANDARIUM_HAPTICS"
+HAPTICS_OFF = "0"
 SLOT_PORT_VARIABLE = slot_ports.SLOT_PORT_VARIABLE
 
 # A launch clears every inherited setting of either family, because one would
 # select a different guest.
 APPLICATION = ios_device.Application(
-    BUNDLE_ID, ("KERNARIUM_", "ANDARIUM_"), RUNTIME_RESULT
+    BUNDLE_ID, ("KERNARIUM_", "ANDARIUM_"), RUNTIME_RESULT, "Andarium"
 )
 
 
@@ -125,12 +134,15 @@ def settings_for(
     engine: str,
     host_port: int,
     disk_size_gib: int | None = None,
+    haptics: bool = False,
     extra: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """The application settings for one run, without the child prefix.
 
     The runtime's authorization setting is off because nobody is at the
     screen to answer the prompt; ``host_forward`` keeps that on loopback.
+    An automated run keeps the phone silent: the guest's haptics are off for
+    it (``HAPTICS_SETTING``) unless ``haptics`` says the run tests them.
     """
     if start not in START_MODES:
         raise AndariumError(f"not a start mode: {start!r}")
@@ -150,13 +162,24 @@ def settings_for(
         "KERNARIUM_HOST_FORWARD": host_forward(host_port),
         "KERNARIUM_ANDROID_ADB_AUTH": "0",
     }
+    if engine == "jit":
+        # A device's engine is Andarium's JIT setting: the JIT where a debugger
+        # prepared its memory and the gadgets otherwise, so the runtime's own
+        # selection stays "auto".
+        settings["KERNARIUM_EXECUTION_ENGINE"] = "auto"
+        settings["ANDARIUM_JIT"] = "1"
     if erase:
         settings["ANDARIUM_ERASE"] = "1"
     if disk_size_gib is not None:
         settings["KERNARIUM_ANDROID_DISK_SIZE_GIB"] = str(disk_size_gib)
+    if not haptics:
+        settings[HAPTICS_SETTING] = HAPTICS_OFF
     for name, value in (extra or {}).items():
         if SETTING_NAME.fullmatch(name) is None:
             raise AndariumError(f"not an application setting: {name!r}")
+        if name == HAPTICS_SETTING:
+            raise AndariumError(
+                f"{name} is the runner's haptics option, not a setting")
         if name in settings:
             raise AndariumError(f"{name} is set by the runner's own options")
         settings[name] = value

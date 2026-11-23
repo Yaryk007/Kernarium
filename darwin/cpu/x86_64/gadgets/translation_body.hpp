@@ -20,6 +20,10 @@ namespace uml::cpu::x86_64::gadgets {
  * compares them. */
 struct ProgramCodeStamps final {
 	std::array<::uml::memory::CodePageStamp, 2> pages{};
+	/* The generation's flush serial when the stamps were taken: a walk of the
+	 * generation moves it, so no stamp recorded before the walk is current
+	 * (frame_accounting.hpp). 0 where the memory has none. */
+	std::uint64_t flush_serial{};
 	std::uint8_t count{};
 	bool complete{};
 
@@ -34,8 +38,10 @@ struct ProgramCodeStamps final {
  * translation is kept here and the slot holds three words and a few flags.
  * The body is the arena allocation [Body][guest bounds][stream words]: the
  * stream is the one the engine runs, and the two words before it are the
- * guest range its code was read from, which a chained block reads at
- * [stream, #-16] (program.hpp). The saved source is a second, cold
+ * guest range its code was read from. The body's last word, right in front of
+ * them, is the block's instruction count, so that a link to the body finds the
+ * count and the bounds in front of the stream its pair names (link_header in
+ * program.hpp). The saved source is a second, cold
  * allocation in the address space's source arena, so that streams stay dense.
  * A body's program is a view of those, and the body is the only owner of
  * what a replay decoded.
@@ -46,7 +52,10 @@ struct ProgramCodeStamps final {
  * bodies, so those are atomic, or read and written as a pair.
  */
 struct alignas(16) Body final {
-	explicit Body(Program &&view) noexcept : program{std::move(view)} {}
+	explicit Body(Program &&view) noexcept
+		: program{std::move(view)},
+		  link_count{static_cast<std::uint32_t>(program.instruction_count())}
+	{}
 
 	/* The words a body takes in the arena for a stream of `words`. */
 	[[nodiscard]] static std::size_t allocation_bytes(
@@ -82,6 +91,9 @@ struct alignas(16) Body final {
 				std::memory_order_relaxed);
 		result.count = state & (stamps_complete_bit - 1U);
 		result.complete = (state & stamps_complete_bit) != 0U;
+		result.flush_serial = std::atomic_ref<std::uint64_t>{
+			const_cast<std::uint64_t &>(flush_serial)}.load(
+				std::memory_order_relaxed);
 		return result;
 	}
 	void set_stamps(const ProgramCodeStamps &stamps) noexcept
@@ -94,6 +106,8 @@ struct alignas(16) Body final {
 			static_cast<std::uint8_t>(stamps.count |
 				(stamps.complete ? stamps_complete_bit : 0U)),
 			std::memory_order_relaxed);
+		std::atomic_ref<std::uint64_t>{flush_serial}.store(
+			stamps.flush_serial, std::memory_order_relaxed);
 	}
 
 	Program program;
@@ -121,12 +135,32 @@ struct alignas(16) Body final {
 	/* How many of `code_pages` are stamps, in two bits, and above them
 	 * whether they cover the whole block; zero while there are none. */
 	std::uint8_t stamp_state{};
+	/* The flush serial the stamps were taken under, one word beside the
+	 * pairs: a torn mix of two validations' stamps and serial can only
+	 * reproduce a hit that some completed registration justifies, because
+	 * every recorded field comes from a capture taken before one. */
+	alignas(8) std::uint64_t flush_serial{};
+	/* The count that follows is the body's last word but four bytes. */
+	std::uint32_t reserved[2]{};
+	/* program.instruction_count(), where follow_block_link reads it for the
+	 * budget test. */
+	std::uint32_t link_count;
 
 	static constexpr std::uint8_t stamps_complete_bit = 4;
 };
 static_assert(sizeof(Body) % 16 == 0 && alignof(Body) == 16,
 	"the guest bounds that follow a body start on a sixteen-byte boundary");
-static_assert(sizeof(Body) == 128);
+static_assert(sizeof(Body) == 144);
+static_assert(static_cast<std::ptrdiff_t>(offsetof(Body, link_count)) ==
+		static_cast<std::ptrdiff_t>(sizeof(Body) +
+			stream_header_words * sizeof(std::uintptr_t) +
+			sizeof(std::uintptr_t)) +
+			link_header::count &&
+	-static_cast<std::ptrdiff_t>(
+		(stream_header_words + 1) * sizeof(std::uintptr_t)) ==
+		link_header::bounds,
+	"a link to a body names its stream past the first entry, with the count "
+	"and the bounds in front of it");
 static_assert(offsetof(Body, code_pages) % 16 == 0,
 	"a stamp is one aligned pair");
 

@@ -4,6 +4,8 @@
 #include "runtime_test_route.hpp"
 
 #include "cpu/arm64/gadgets/executor.hpp"
+#include "cpu/arm64/sme_profile.hpp"
+#include "cpu/gadget_cache_budget.hpp"
 #include "cpu/gadget_cache_geometry.hpp"
 #include "static_mmu_test_support.hpp"
 
@@ -116,9 +118,11 @@ void changed_words_rebuild_and_republish_links()
 
 /* Linux writes a traced process's text through its own view of the frame --
  * ptrace inserting a breakpoint -- so no translated store publishes it. The
- * kernel then names the process's generation and the written range through
- * darwin_uml_vm_invalidate_code(); the page
- * stamp must move and the next run must execute the new instruction. */
+ * kernel then names the process's generation, the written range and, for a
+ * ptrace or process_vm_writev(), the frame, or only the range, for a flush by
+ * address (an AArch32 cacheflush()), through darwin_uml_vm_invalidate_code()
+ * or darwin_uml_vm_invalidate_code_frame(); the page stamp must move and the
+ * next run must execute the new instruction. */
 void a_kernel_text_write_republishes_through_the_bridge()
 {
 	constexpr unsigned long generation = 922;
@@ -167,6 +171,23 @@ void a_kernel_text_write_republishes_through_the_bridge()
 	require(darwin_uml_static_vm_invalidate_code_generation(
 		generation, code_base, 4) == 0);
 	require(darwin_uml_static_vm_code_changes(generation) != code_changes);
+
+	/* The same two writes with the frame named, as ptrace and
+	 * process_vm_writev() make them: the data page publishes nothing, and
+	 * the code page changes. */
+	const auto named_changes = darwin_uml_static_vm_code_changes(generation);
+	require(darwin_uml_static_vm_invalidate_code_frame(generation, data_base,
+		DARWIN_UML_GUEST_PAGE_SIZE, data.descriptor(), 0) == 0);
+	require(darwin_uml_static_vm_code_changes(generation) == named_changes);
+	backing.put32(0, move_immediate(0, 3));
+	require(darwin_uml_static_vm_invalidate_code_frame(generation, code_base, 4,
+		backing.descriptor(), 0) == 0);
+	require(darwin_uml_static_vm_code_changes(generation) != named_changes);
+	cpu = {};
+	cpu.pc = code_base;
+	require(run_once(executor, memory, generation, cpu).event ==
+		::uml::cpu::EngineEvent::system_call);
+	require(cpu.registers[0] == 3);
 }
 
 /* A code change resets every activation, not only the ones it touched.
@@ -959,6 +980,279 @@ void an_address_space_that_only_grows_does_not_sweep()
 	require(executor.cache_diagnostics().link_sweeps == 0);
 }
 
+/* An A64 key at or above the guest address limit (2^47) has no compact tag
+ * form, so no slot can name it: its translation runs once, uncached, and takes
+ * no way from the set it hashes to. A guest's own mappings stay below the
+ * limit, but the static MMU admits code above it to a direct caller, so the
+ * cache has to meet such a key with every slot's owner id still one an address
+ * space holds. A slot that carried one would make a lookup of another such key
+ * run the wrong program, and its eviction, a code change's sweep and the
+ * cache's teardown read the owner table past its end. */
+constexpr std::uint64_t uncacheable_pc = DARWIN_UML_GUEST_ADDRESS_LIMIT;
+static_assert((uncacheable_pc >> 47) != 0);
+
+/* Whether the pass run_all() is in lets executors share translations: main()
+ * flips DARWIN_UML_GADGET_SHARED_BODIES between its two. */
+bool sharing_pass = false;
+
+/* `mov x0, #value; svc #0` at `offset`. */
+void put_block(JitBacking &backing, std::uint64_t offset, std::uint32_t value)
+{
+	backing.put32(offset, move_immediate(0, value));
+	backing.put32(offset + 4, system_call);
+}
+
+[[nodiscard]] std::uint64_t run_block_at(gadgets::GadgetExecutor &executor,
+	StaticGuestMemory &memory, unsigned long generation, std::uint64_t pc)
+{
+	arm64::CpuState cpu{};
+	cpu.pc = pc;
+	require(run_once(executor, memory, generation, cpu).event ==
+		::uml::cpu::EngineEvent::system_call);
+	return cpu.registers[0];
+}
+
+/* The first page-aligned address from `from` whose block lands in `set`. */
+[[nodiscard]] std::uint64_t uncacheable_in_set(unsigned long generation,
+	std::size_t set, std::uint64_t from)
+{
+	auto pc = from;
+	while (cache_set(generation, pc) != set) {
+		pc += DARWIN_UML_GUEST_PAGE_SIZE;
+		require(pc - from < (std::uint64_t{1} << 36));
+	}
+	return pc;
+}
+
+/* The rows below stay out of line: an executor is large, and rows
+ * inlined into run_all() would add their frames to its, past the main thread's
+ * stack under the sanitizers. */
+
+/* Two uncacheable blocks in one set each run their own code, however often
+ * they are entered: neither is ever found in a slot the other left. A block
+ * that stopped at a word the builder does not translate, and an empty one,
+ * report their stop as a stored block does. */
+[[gnu::noinline]] void uncacheable_blocks_in_one_set_run_their_own_code()
+{
+	constexpr unsigned long generation = 990;
+	const auto set = cache_set(generation, uncacheable_pc);
+	const auto other_pc = uncacheable_in_set(generation, set,
+		uncacheable_pc + DARWIN_UML_GUEST_PAGE_SIZE);
+
+	/* An exception-class word no allocation gives a meaning: the builder
+	 * stops before it without retiring it. */
+	constexpr std::uint32_t unimplemented = 0xd400'0000U;
+	const auto stopped_pc = other_pc + 0x100;
+	const auto empty_pc = other_pc + 0x200;
+
+	JitBacking anchor{1}, first{1}, second{1};
+	put_block(first, 0, 11);
+	put_block(second, 0, 22);
+	second.put32(0x100, move_immediate(0, 7));
+	second.put32(0x104, unimplemented);
+	second.put32(0x200, unimplemented);
+	JitMapping mapping{generation, code_base, anchor, 1};
+	const uml::emulator::tests::GenerationMapping first_mapping{generation,
+		uncacheable_pc, first, 1, PROT_READ | PROT_EXEC, true};
+	const uml::emulator::tests::GenerationMapping second_mapping{generation,
+		other_pc, second, 1, PROT_READ | PROT_EXEC, true};
+
+	StaticGuestMemory memory;
+	gadgets::GadgetExecutor executor{sharing_options()};
+	for (int round = 0; round < 2; ++round) {
+		require(run_block_at(executor, memory, generation,
+			uncacheable_pc) == 11);
+		require(run_block_at(executor, memory, generation, other_pc) == 22);
+
+		arm64::CpuState stopped{};
+		stopped.pc = stopped_pc;
+		require(run_once(executor, memory, generation, stopped).event ==
+			::uml::cpu::EngineEvent::illegal_instruction);
+		require(stopped.pc == stopped_pc + 4);
+		require(stopped.registers[0] == 7);
+		arm64::CpuState empty{};
+		empty.pc = empty_pc;
+		require(run_once(executor, memory, generation, empty).event ==
+			::uml::cpu::EngineEvent::illegal_instruction);
+		require(empty.pc == empty_pc);
+	}
+	/* Nothing was stored, so every entry translated. */
+	require(executor.cache_diagnostics().translations == 8);
+	require(executor.cache_diagnostics().validation_attempts == 0);
+}
+
+/* A second executor of the address space finds no translation of an
+ * uncacheable block to adopt, though it adopts a cacheable one where
+ * translations are shared. */
+[[gnu::noinline]] void a_peer_executor_does_not_adopt_an_uncacheable_block()
+{
+	constexpr unsigned long generation = 991;
+	JitBacking anchor{1}, uncached{1};
+	put_block(anchor, 0, 33);
+	put_block(uncached, 0, 11);
+	JitMapping mapping{generation, code_base, anchor, 1};
+	const uml::emulator::tests::GenerationMapping uncached_mapping{generation,
+		uncacheable_pc, uncached, 1, PROT_READ | PROT_EXEC, true};
+
+	StaticGuestMemory memory, peer_memory;
+	gadgets::GadgetExecutor executor{sharing_options()};
+	gadgets::GadgetExecutor peer{sharing_options()};
+	require(run_block_at(executor, memory, generation, uncacheable_pc) == 11);
+	require(run_block_at(peer, peer_memory, generation, uncacheable_pc) == 11);
+	require(peer.cache_diagnostics().adoptions == 0);
+	require(peer.cache_diagnostics().translations == 1);
+
+	/* The control: the peer does adopt a block that can be cached. */
+	require(run_block_at(executor, memory, generation, code_base) == 33);
+	require(run_block_at(peer, peer_memory, generation, code_base) == 33);
+	require(peer.cache_diagnostics().adoptions == (sharing_pass ? 1U : 0U));
+	require(peer.cache_diagnostics().translations ==
+		(sharing_pass ? 1U : 2U));
+}
+
+/* An uncacheable block takes no way from its set: a set's worth of cacheable
+ * blocks fits beside it without one of them being translated again, and the
+ * block after them evicts one of those, whose owner is an address space the
+ * cache holds. */
+[[gnu::noinline]] void an_uncacheable_block_takes_no_way_from_its_set()
+{
+	constexpr unsigned long generation = 992;
+	const auto set = cache_set(generation, uncacheable_pc);
+	std::vector<std::uint64_t> pcs;
+	for (auto pc = code_base; pcs.size() < cache_ways + 1;
+	     pc += 2 * sizeof(std::uint32_t))
+		if (cache_set(generation, pc) == set)
+			pcs.push_back(pc);
+	const std::size_t pages = (pcs.back() + 8 - code_base +
+		DARWIN_UML_GUEST_PAGE_SIZE - 1) / DARWIN_UML_GUEST_PAGE_SIZE;
+
+	JitBacking low{pages}, uncached{1};
+	for (const auto pc : pcs)
+		put_block(low, pc - code_base, 33);
+	put_block(uncached, 0, 11);
+	JitMapping mapping{generation, code_base, low, pages};
+	const uml::emulator::tests::GenerationMapping uncached_mapping{generation,
+		uncacheable_pc, uncached, 1, PROT_READ | PROT_EXEC, true};
+
+	StaticGuestMemory memory;
+	gadgets::GadgetExecutor executor{sharing_options()};
+	require(run_block_at(executor, memory, generation, uncacheable_pc) == 11);
+	for (std::size_t index = 0; index < cache_ways; ++index)
+		require(run_block_at(executor, memory, generation, pcs[index]) ==
+			33);
+	require(executor.cache_diagnostics().translations == 1 + cache_ways);
+	for (std::size_t index = 0; index < cache_ways; ++index)
+		require(run_block_at(executor, memory, generation, pcs[index]) ==
+			33);
+	require(executor.cache_diagnostics().translations == 1 + cache_ways);
+
+	require(run_block_at(executor, memory, generation, pcs[cache_ways]) ==
+		33);
+	require(executor.cache_diagnostics().translations ==
+		2 + cache_ways);
+	require(run_block_at(executor, memory, generation, uncacheable_pc) == 11);
+	for (const auto pc : pcs)
+		require(run_block_at(executor, memory, generation, pc) == 33);
+}
+
+/* A cache that ran an uncacheable block ends with no slot to walk for it. */
+[[gnu::noinline]] void a_cache_that_ran_an_uncacheable_block_tears_down()
+{
+	constexpr unsigned long generation = 993;
+	JitBacking anchor{1}, uncached{1};
+	put_block(uncached, 0, 11);
+	JitMapping mapping{generation, code_base, anchor, 1};
+	const uml::emulator::tests::GenerationMapping uncached_mapping{generation,
+		uncacheable_pc, uncached, 1, PROT_READ | PROT_EXEC, true};
+	StaticGuestMemory memory;
+	{
+		gadgets::GadgetExecutor executor{sharing_options()};
+		require(run_block_at(executor, memory, generation,
+			uncacheable_pc) == 11);
+	}
+}
+
+/* An uncacheable block is built unlinked, so it leaves no link record or
+ * indirect site in its address space. Nothing would collect them: a sweep
+ * follows a block's departure from a slot, and the budget is relieved by a
+ * store. A direct exit and an indirect one each leave the block with its PC and
+ * its one instruction retired, and a thousand distinct entries leave the
+ * address space's charged bytes as they were. */
+[[gnu::noinline]] void uncacheable_blocks_leave_no_link_state(bool za)
+{
+	const unsigned long generation = za ? 995 : 994;
+	constexpr std::size_t entries = 1024;
+	constexpr std::uint32_t nop = 0xd503'201fU;
+	const std::uint64_t exits = uncacheable_pc;
+	const std::uint64_t direct = exits;
+	const std::uint64_t indirect = exits + 0x100;
+	const std::uint64_t target = exits + 0x200;
+	const std::uint64_t run_base = exits + DARWIN_UML_GUEST_PAGE_SIZE;
+
+	JitBacking anchor{1}, code{1}, nops{1};
+	code.put32(direct - exits, branch(direct, target));
+	code.put32(indirect - exits, branch_register(1));
+	put_block(code, target - exits, 5);
+	for (std::size_t index = 0; index < entries; ++index)
+		nops.put32(index * sizeof(std::uint32_t), nop);
+	JitMapping mapping{generation, code_base, anchor, 1};
+	const uml::emulator::tests::GenerationMapping code_mapping{generation,
+		exits, code, 1, PROT_READ | PROT_EXEC, true};
+	const uml::emulator::tests::GenerationMapping nop_mapping{generation,
+		run_base, nops, 1, PROT_READ | PROT_EXEC, true};
+
+	/* ZA mode runs the same code through the ZA-mode cache, whose blocks are
+	 * built by their own path; any host runs it through an injected SME
+	 * profile. */
+	auto options = sharing_options();
+	if (za) {
+		for (const auto feature : {uml::cpu::ArmFeature::sme,
+			     uml::cpu::ArmFeature::sme_f64f64,
+			     uml::cpu::ArmFeature::sme_i16i64})
+			options.host_capabilities.supported.set(
+				static_cast<std::size_t>(feature));
+		options.host_capabilities.sme_svl_bytes = 64;
+		options.host_capabilities.sme_hardware = false;
+	}
+	const auto file = arm64::SmeRegisterFile::for_host(
+		options.host_capabilities);
+	std::vector<std::byte> task(za ? arm64::sme_storage_size(file.svl()) : 0);
+	require(!za || file.data() != nullptr);
+	StaticGuestMemory memory;
+	gadgets::GadgetExecutor executor{options};
+	const auto cpu = std::make_unique<arm64::CpuState>();
+	const auto enter = [&](std::uint64_t pc, std::uint64_t x1 = 0) {
+		*cpu = {};
+		if (za) {
+			cpu->bind_sme_registers(file);
+			cpu->defer_sme_load(task.data(), arm64::svcr_za, 0);
+		}
+		cpu->pc = pc;
+		cpu->registers[1] = x1;
+		return run_once(executor, memory, generation, *cpu);
+	};
+
+	require(enter(target).event == ::uml::cpu::EngineEvent::system_call);
+	require(cpu->registers[0] == 5);
+	require(cpu->svcr == (za ? arm64::svcr_za : 0));
+	const auto charged = ::uml::cpu::gadget_cache::ledger_state().total;
+
+	const auto direct_exit = enter(direct);
+	require(direct_exit.event == ::uml::cpu::EngineEvent::continued);
+	require(direct_exit.executed == 1);
+	require(cpu->pc == target);
+
+	const auto indirect_exit = enter(indirect, target);
+	require(indirect_exit.event == ::uml::cpu::EngineEvent::continued);
+	require(indirect_exit.executed == 1);
+	require(cpu->pc == target);
+
+	for (std::size_t index = 0; index < entries; ++index)
+		require(enter(run_base + index * sizeof(std::uint32_t)).executed !=
+			0);
+	require(::uml::cpu::gadget_cache::ledger_state().total == charged);
+}
+
 /* The same cases with each address space's translations private to its
  * executor and then shared among them: the cache's slots and bodies keep
  * their own packing in both. */
@@ -975,6 +1269,12 @@ void run_all()
 	a_replaced_slot_drops_the_previous_owner_link();
 	an_evicted_block_misses_and_its_predecessor_link_is_reset();
 	retired_address_spaces_release_and_the_others_keep_running();
+	uncacheable_blocks_in_one_set_run_their_own_code();
+	a_peer_executor_does_not_adopt_an_uncacheable_block();
+	an_uncacheable_block_takes_no_way_from_its_set();
+	a_cache_that_ran_an_uncacheable_block_tears_down();
+	uncacheable_blocks_leave_no_link_state(false);
+	uncacheable_blocks_leave_no_link_state(true);
 }
 
 } // namespace
@@ -983,6 +1283,7 @@ int main()
 {
 	const uml::testing::RuntimeTestRoute runtime_route;
 	require(setenv("DARWIN_UML_GADGET_SHARED_BODIES", "0", 1) == 0);
+	sharing_pass = false;
 	run_all();
 	/* A shared address space is never swept, so the sweep's cases run
 	 * with private translations only (arm64_gadget_shared_bodies_tests
@@ -991,6 +1292,7 @@ int main()
 	an_address_space_that_only_grows_does_not_sweep();
 	/* Sharing is the default. */
 	require(unsetenv("DARWIN_UML_GADGET_SHARED_BODIES") == 0);
+	sharing_pass = true;
 	run_all();
 	return 0;
 }

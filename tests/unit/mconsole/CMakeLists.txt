@@ -15,8 +15,18 @@ uml_add_unit_test(NAME guest-console-suspend-silent
 uml_add_unit_test(NAME guest-console-suspend-suspended-after-wake
     COMMAND uml_guest_console_tests suspend-suspended-after-wake
     LABELS console)
+# A reply refused in its first part is refused as a whole when its end arrives
+# only after the deadline.
+uml_add_unit_test(NAME guest-console-suspend-partial-refusal
+    COMMAND uml_guest_console_tests suspend-partial-refusal
+    LABELS console)
 uml_add_unit_test(NAME guest-console-suspend-retry-deadline
     COMMAND uml_guest_console_tests suspend-retry-deadline
+    LABELS console)
+# A suspend's reply states whether the suspend synced: only the two whole
+# texts do, and a kernel that says only "suspended" states nothing.
+uml_add_unit_test(NAME guest-console-suspend-statement
+    COMMAND uml_guest_console_tests suspend-statement
     LABELS console)
 # A guest that reports itself busy is asked again for two seconds; any other
 # refusal, or one that stays busy, leaves it running with no stop.
@@ -32,8 +42,21 @@ uml_add_unit_test(NAME guest-console-run
 uml_add_unit_test(NAME guest-console-wake
     COMMAND uml_guest_console_tests wake
     LABELS console)
+# A writeback is the console's sync, confirmed by its reply; a kernel without
+# the command is asked for SysRq 's', which only starts one.
 uml_add_unit_test(NAME guest-console-writeback
     COMMAND uml_guest_console_tests writeback
+    LABELS console)
+uml_add_unit_test(NAME guest-console-writeback-timeout
+    COMMAND uml_guest_console_tests writeback-timeout
+    LABELS console)
+# Only the whole reply "synced in <n> ms" confirms, and one budget covers the
+# console's lock, every part of a reply, the fallback and its settling period.
+uml_add_unit_test(NAME guest-console-writeback-strict
+    COMMAND uml_guest_console_tests writeback-strict
+    LABELS console)
+uml_add_unit_test(NAME guest-console-writeback-budget
+    COMMAND uml_guest_console_tests writeback-budget
     LABELS console)
 uml_add_unit_test(NAME guest-console-trim
     COMMAND uml_guest_console_tests trim

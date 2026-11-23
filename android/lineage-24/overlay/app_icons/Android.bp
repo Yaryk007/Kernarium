@@ -1,0 +1,41 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 The Android Open Source Project
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+// The request and answer that kernarium_apps (overlay/app_shortcuts) and the
+// icon renderer agree on, compiled into both.
+filegroup {
+    name: "kernarium_icon_protocol",
+    srcs: ["src/com/kernarium/icons/IconProtocol.java"],
+}
+
+// Draws the launcher applications' icons for Andarium's Add to Home Screen, so
+// that no icon is drawn in the adb shell user's process. An ordinary
+// application of the image (not privileged, not signed with the platform key, no
+// launcher entry, no permission requested, no SELinux rule of its own): a
+// provider that only the shell user may use hands each request to a service in
+// an isolated process, which opens the application's files and draws.
+android_app {
+    name: "KernariumIcons",
+    manifest: "AndroidManifest.xml",
+    srcs: ["src/**/*.java"],
+    platform_apis: true,
+    system_ext_specific: true,
+    optimize: { enabled: false },
+}

@@ -528,6 +528,25 @@ void closedBackendChannelEndsTheConnectionQuietly()
     }
 }
 
+/* A write to a socket the front-end has closed fails with EPIPE, with
+ * ECONNRESET when it left data unread, or with ENOTCONN when the write lands
+ * between the kernel's disconnect of the socket and its shutdown for sending,
+ * a window Darwin opens only for a moment. Each means the front-end let the
+ * device go, which ends the connection without a failure report; any other
+ * error is a failure. */
+void aWriteFailureThatMeansTheFrontEndLeftIsNotAFailure()
+{
+    for (const int error : {EPIPE, ECONNRESET, ENOTCONN})
+        require(
+            uml::gpu::writeFailureMeansPeerClosed(error),
+            "a write error that shows the peer closed was a failure");
+    for (const int error :
+         {EAGAIN, EINTR, EBADF, EINVAL, EMSGSIZE, ENOBUFS, EIO, ETIMEDOUT})
+        require(
+            !uml::gpu::writeFailureMeansPeerClosed(error),
+            "a write error that does not show the peer closed was quiet");
+}
+
 class SharedMemoryDevice final : public FixtureDevice {
 public:
     explicit SharedMemoryDevice(std::size_t actionCount = 1)
@@ -746,6 +765,10 @@ void rejectedSharedMemoryActionClosesBackendChannel()
 
         replyToBackend(backendClient, backendMessage.header, 1);
         waitForConnectionClose(backendClient);
+        // The server closes the channel before it completes the rejected
+        // action, so the close does not order the callback's state: the reset's
+        // own reply, which follows its cleanup, does.
+        readAcknowledgement(socket, protocol::VhostRequest::resetOwner);
         require(observed->completedAction() == 77);
         require(!observed->actionSucceeded());
     });
@@ -990,6 +1013,108 @@ void aDisabledRingKeepsTheBuffersTheDeviceFills()
             memory.subspan(eventOffset, EventSourceDevice::event.size()),
             EventSourceDevice::event));
         require(source->delivered() == 1);
+    });
+}
+
+/* A driver's teardown disables its rings, sends GET_FEATURES to know that
+ * the disables were handled, and frees the rings. What the guest then leaves
+ * in that memory is no ring, and an event the device raises meanwhile must not
+ * have the server read it as one. A ring that is enabled, or disabled with no
+ * teardown behind it, as a suspended guest's is, is one the guest may still
+ * use: it stays read, and its reserved flags stay refused. */
+enum class RingStage { enabled, disabled, tornDown };
+
+void reservedFlagsOnARing(RingStage stage)
+{
+    auto device = std::make_unique<EventSourceDevice>();
+    auto* source = device.get();
+    VhostUserServer server {std::move(device)};
+    const SplitRing ring;
+    const auto memory = ring.memory();
+
+    withServerConnection(server, [&](int socket) {
+        negotiateProtocolFeatures(socket, protocol::protocolFeatureReplyAck);
+        configureMemory(socket, ring.descriptor());
+        const auto channels = startQueue(socket, ring, 0, true);
+        if (stage != RingStage::enabled) {
+            const protocol::VringState disabled {.index = 0, .value = 0};
+            sendRequestAndReadAcknowledgement(
+                socket,
+                protocol::VhostRequest::setVringEnable,
+                bytesOf(disabled));
+        }
+        if (stage == RingStage::tornDown)
+            (void)getFeatures(socket);
+
+        // The page the guest freed and reused for something else.
+        constexpr std::uint16_t reusedPage = 0xe000;
+        std::memcpy(
+            memory.data() + SplitRing::availableOffset,
+            &reusedPage,
+            sizeof(reusedPage));
+        source->raise();
+        awaitCondition([&] { return source->drained() != 0; });
+        if (stage == RingStage::tornDown) {
+            // A reply shows the pass over the rings is over, and the
+            // connection is still served.
+            (void)getFeatures(socket);
+            require(ring.usedIndex() == 0);
+        } else {
+            waitForConnectionClose(socket);
+        }
+        require(channels.call.readEnd.get() >= 0);
+    });
+}
+
+/* The kick of the next driver starts a retired ring again, laid out afresh,
+ * and the event the device raised while it was retired reaches it. */
+void aRetiredRingServesTheNextDriver()
+{
+    auto device = std::make_unique<EventSourceDevice>();
+    auto* source = device.get();
+    VhostUserServer server {std::move(device)};
+    const SplitRing ring;
+    const auto memory = ring.memory();
+
+    constexpr std::size_t eventOffset = 0x300;
+    const std::array descriptors {
+        protocol::VirtqueueDescriptor {
+            .address = SplitRing::guestBase + eventOffset,
+            .length = EventSourceDevice::event.size(),
+            .flags = protocol::descriptorWrite,
+            .next = 0,
+        },
+    };
+    constexpr std::array<std::uint16_t, 1> heads {0};
+
+    withServerConnection(server, [&](int socket) {
+        negotiateProtocolFeatures(socket, protocol::protocolFeatureReplyAck);
+        configureMemory(socket, ring.descriptor());
+        const auto first = startQueue(socket, ring, 0, true);
+        const protocol::VringState disabled {.index = 0, .value = 0};
+        sendRequestAndReadAcknowledgement(
+            socket,
+            protocol::VhostRequest::setVringEnable,
+            bytesOf(disabled));
+        (void)getFeatures(socket);
+
+        constexpr std::uint16_t reusedPage = 0xe000;
+        std::memcpy(
+            memory.data() + SplitRing::availableOffset,
+            &reusedPage,
+            sizeof(reusedPage));
+        source->raise();
+        awaitCondition([&] { return source->drained() != 0; });
+        (void)getFeatures(socket);
+        require(source->delivered() == 0);
+
+        std::memset(memory.data(), 0, SplitRing::size);
+        ring.publish(descriptors, heads);
+        const auto second = startQueue(socket, ring, 0, true);
+        awaitCall(second.call.readEnd.get());
+        require(ring.usedIndex() == 1);
+        require(source->delivered() == 1);
+        require(first.call.readEnd.get() >= 0);
     });
 }
 
@@ -2539,6 +2664,10 @@ void runVhostUserProtocolTests()
     deferredCompletionSupportsFourQueues();
     completedPrefixNotifiesBeforeRetry();
     aDisabledRingKeepsTheBuffersTheDeviceFills();
+    reservedFlagsOnARing(RingStage::enabled);
+    reservedFlagsOnARing(RingStage::disabled);
+    reservedFlagsOnARing(RingStage::tornDown);
+    aRetiredRingServesTheNextDriver();
     aDisabledRingKeepsRequestsOnlyForADeviceThatAsksForThem();
     aGateDiscardsOnlyWhileItIsClosed();
     aDiscardingGateCompletesRequestsWithoutRunningThem();
@@ -2555,6 +2684,7 @@ void runVhostUserProtocolTests()
     configChangeWaitsForTheBackendChannelAndRequiresAcknowledgement();
     configChangeWaitStillAnswersConfigReads();
     closedBackendChannelEndsTheConnectionQuietly();
+    aWriteFailureThatMeansTheFrontEndLeftIsNotAFailure();
     sharedMemoryRequiresBackendAcknowledgements();
     sharedMemoryConfigurationRequiresNegotiation();
     standardizedSharedMemoryNegotiationBatchesBackendRequestsBeforeReply();

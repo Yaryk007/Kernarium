@@ -66,6 +66,15 @@ uml_add_tooling_test(
     TIMEOUT 30)
 
 uml_add_tooling_test(
+    NAME kernel-input-protocol-sync
+    COMMAND ${Python3_EXECUTABLE} -B
+        ${PROJECT_SOURCE_DIR}/tests/tooling/kernel/test_input_protocol_sync.py
+        --tool ${PROJECT_SOURCE_DIR}/kernel/common/input/sync-protocol.py
+        --header ${PROJECT_SOURCE_DIR}/kernel/common/input/virtio_input_uml.h
+    LABELS kernel;audit
+    TIMEOUT 30)
+
+uml_add_tooling_test(
     NAME kernel-darwin-host-compat
     COMMAND ${PROJECT_SOURCE_DIR}/tests/tooling/kernel/test_darwin_host_compat.sh
     LABELS kernel;audit
@@ -85,6 +94,26 @@ uml_add_tooling_test(
 uml_add_tooling_test(
     NAME kernel-darwin-irq-edge
     COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/tooling/kernel/test_darwin_irq_edge.py
+    LABELS kernel
+    TIMEOUT 120)
+
+uml_add_tooling_test(
+    NAME kernel-darwin-ipi-drain
+    COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/tooling/kernel/test_darwin_ipi_drain.py
+    LABELS kernel
+    TIMEOUT 120)
+
+uml_add_tooling_test(
+    NAME kernel-darwin-ubd-hold
+    COMMAND ${Python3_EXECUTABLE} -B
+        ${PROJECT_SOURCE_DIR}/tests/tooling/kernel/test_darwin_ubd_hold.py
+    LABELS kernel
+    TIMEOUT 120)
+
+uml_add_tooling_test(
+    NAME kernel-darwin-mconsole-suspend
+    COMMAND ${Python3_EXECUTABLE} -B
+        ${PROJECT_SOURCE_DIR}/tests/tooling/kernel/test_darwin_mconsole_suspend.py
     LABELS kernel
     TIMEOUT 120)
 

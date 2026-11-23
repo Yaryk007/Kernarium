@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="org.example.andarium.gamepadprobe">
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <application android:label="Gamepad Probe" android:debuggable="true"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+        <activity android:name=".GamepadActivity" android:exported="true"
+            android:launchMode="singleTop" android:resizeableActivity="true"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|density|keyboardHidden">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

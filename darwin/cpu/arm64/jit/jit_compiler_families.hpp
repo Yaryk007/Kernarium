@@ -106,6 +106,9 @@ protected:
   };
 
   [[nodiscard]] bool gpr_slots_unbound() const noexcept;
+  /* No guest register is bound to a host one: at a translation's first
+   * instruction, or at any in a translation compiled without the cache. */
+  [[nodiscard]] bool no_gprs_bound() const noexcept;
   [[nodiscard]] constexpr std::size_t gpr_slot_capacity() const noexcept {
     return gpr_host_limit_;
   }

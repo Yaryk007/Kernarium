@@ -1,0 +1,256 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 04:39:10 +0900
+Subject: [PATCH] venus: size the shmem of an oversized allocation to its need
+
+An allocation larger than a pool serves gets a shmem of its own, and so does
+the upload buffer of a command that large. Both were sized to the next power
+of two, the size the shmem cache is keyed by. The cache keeps nothing above
+64 MiB, so above that the power of two buys nothing: the shmem is destroyed
+with its last reference, and it only takes up to twice the allocation from
+the aperture of the blob heap while the call runs. A reply of 274 MB took 512
+MiB, next to the burst of resources an application had just imported.
+
+Size such a shmem to the allocation rounded up to a whole MiB when it is
+larger than the cache keeps. Sizes up to 64 MiB are unchanged, and so is what
+the cache serves. The upload encoder does not double its buffer past the
+rounded size for a command that gets a shmem of its own.
+
+The size test covers the rounding and its overflow limit, the ring test checks
+the largest shmem a large reply and a large command create, and the renderer
+checks that the limit matches the cache's buckets.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .../tests/vn_renderer_shmem_pool_size_test.c  | 21 ++++++++++++++
+ .../vulkan/tests/vn_ring_release_test.c       | 28 ++++++++++++++++++-
+ src/virtio/vulkan/vn_cs.c                     | 13 +++++++++
+ src/virtio/vulkan/vn_renderer_internal.c      | 10 +++++++
+ .../vulkan/vn_renderer_shmem_pool_size.h      | 28 +++++++++++++++++++
+ src/virtio/vulkan/vn_renderer_util.c          |  4 +--
+ 6 files changed, 101 insertions(+), 3 deletions(-)
+
+diff --git a/src/virtio/vulkan/tests/vn_renderer_shmem_pool_size_test.c b/src/virtio/vulkan/tests/vn_renderer_shmem_pool_size_test.c
+index 0c5ed01f2cc20abbfe6add7a1303cc8e3e30e318..6b722fc26a9f988fd4ffbee6c315897327525c20 100644
+--- a/src/virtio/vulkan/tests/vn_renderer_shmem_pool_size_test.c
++++ b/src/virtio/vulkan/tests/vn_renderer_shmem_pool_size_test.c
+@@ -48,6 +48,27 @@ main(void)
+    /* A size no power of two reaches reports failure instead of looping. */
+    CHECK(vn_renderer_shmem_pool_shmem_size(min_alloc, SIZE_MAX) == 0);
+ 
++   /* The shmem of an allocation that gets one of its own keeps the power of
++    * two where a shmem cache serves it (up to 64 MiB), and past that is the
++    * allocation rounded up to a whole MiB. */
++   CHECK(vn_renderer_shmem_pool_dedicated_shmem_size(
++            min_alloc, VN_RENDERER_SHMEM_POOL_MAX_SIZE + 1) == (size_t)32 << 20);
++   CHECK(vn_renderer_shmem_pool_dedicated_shmem_size(min_alloc, (size_t)40 << 20) ==
++         (size_t)64 << 20);
++   CHECK(vn_renderer_shmem_pool_dedicated_shmem_size(min_alloc, (size_t)64 << 20) ==
++         (size_t)64 << 20);
++   CHECK(vn_renderer_shmem_pool_dedicated_shmem_size(
++            min_alloc, ((size_t)64 << 20) + 1) == (size_t)65 << 20);
++   CHECK(vn_renderer_shmem_pool_dedicated_shmem_size(min_alloc, (size_t)240565361) ==
++         (size_t)230 << 20);
++   CHECK(vn_renderer_shmem_pool_dedicated_shmem_size(min_alloc, (size_t)273916521) ==
++         (size_t)262 << 20);
++   CHECK(vn_renderer_shmem_pool_dedicated_shmem_size(min_alloc, (size_t)256 << 20) ==
++         (size_t)256 << 20);
++   CHECK(vn_renderer_shmem_pool_dedicated_shmem_size(min_alloc, SIZE_MAX) == 0);
++   CHECK(vn_renderer_shmem_pool_dedicated_shmem_size(
++            min_alloc, SIZE_MAX - ((size_t)1 << 20) + 2) == 0);
++
+    printf("vn_renderer_shmem_pool_size passed\n");
+    return 0;
+ }
+diff --git a/src/virtio/vulkan/tests/vn_ring_release_test.c b/src/virtio/vulkan/tests/vn_ring_release_test.c
+index 3ff8ff05035ceccd5e16ef2c11d111c1c0460828..203f70d06319f3eeaffc20c6774adf9a8760d498 100644
+--- a/src/virtio/vulkan/tests/vn_ring_release_test.c
++++ b/src/virtio/vulkan/tests/vn_ring_release_test.c
+@@ -56,6 +56,8 @@ static struct {
+    size_t live_bytes;
+    /* live shmems that a pool does not serve: 16 MiB and up */
+    unsigned live_large;
++   /* the largest shmem created since the last reset */
++   size_t largest_created;
+    uint32_t next_res_id;
+    struct vn_renderer_shmem *ring_shmem;
+    size_t ring_shmem_size;
+@@ -81,6 +83,8 @@ fake_shmem_create(UNUSED struct vn_renderer *renderer, size_t size)
+    fake.live_bytes += size;
+    if (size >= 16 * MIB)
+       fake.live_large++;
++   if (size > fake.largest_created)
++      fake.largest_created = size;
+    if (!fake.ring_shmem && size == fake.ring_shmem_size)
+       fake.ring_shmem = &shmem->base;
+    return &shmem->base;
+@@ -185,14 +189,18 @@ test_free(UNUSED void *user_data, void *memory)
+ 
+ /* One command that waits for a reply: `command_size` bytes of zeros and a
+  * reply of `reply_size`.  Returns the live large shmems once the caller is
+- * done with the reply and the ring is not submitted to again.
++ * done with the reply and the ring is not submitted to again, and the largest
++ * shmem the call created.
+  */
++static size_t last_largest;
++
+ static int
+ run_command(struct vn_ring *ring,
+             size_t command_size,
+             size_t reply_size,
+             unsigned *out_live_large)
+ {
++   fake.largest_created = 0;
+    void *command = calloc(1, command_size);
+    CHECK(command);
+ 
+@@ -212,6 +220,7 @@ run_command(struct vn_ring *ring,
+ 
+    vn_ring_free_command_reply(ring, &submit);
+    *out_live_large = fake.live_large;
++   last_largest = fake.largest_created;
+    return 0;
+ }
+ 
+@@ -268,6 +277,23 @@ main(void)
+    CHECK(!run_command(ring, 20 * MIB, 20 * MIB, &live_large));
+    CHECK(live_large == 0);
+ 
++   /* The shmem of its own is as large as the allocation needs.  Sizes that a
++    * shmem cache serves (up to 64 MiB) stay powers of two; past them nothing
++    * would keep the shmem, and a power of two only takes aperture from the
++    * rest of the process while the call runs. */
++   CHECK(!run_command(ring, 64, 24 * MIB, &live_large));
++   CHECK(live_large == 0 && last_largest == 32 * MIB);
++   CHECK(!run_command(ring, 64, 40 * MIB, &live_large));
++   CHECK(live_large == 0 && last_largest == 64 * MIB);
++   CHECK(!run_command(ring, 64, 70 * MIB + 4, &live_large));
++   CHECK(live_large == 0 && last_largest == 71 * MIB);
++   CHECK(!run_command(ring, 24 * MIB, 64, &live_large));
++   CHECK(live_large == 0 && last_largest == 32 * MIB);
++   CHECK(!run_command(ring, 40 * MIB, 64, &live_large));
++   CHECK(live_large == 0 && last_largest == 64 * MIB);
++   CHECK(!run_command(ring, 70 * MIB + 4, 64, &live_large));
++   CHECK(live_large == 0 && last_largest == 71 * MIB);
++
+    vn_ring_destroy(ring);
+    vn_renderer_shmem_pool_fini(&renderer, &instance->reply_shmem_pool);
+    vn_renderer_shmem_pool_fini(&renderer, &instance->cs_shmem_pool);
+diff --git a/src/virtio/vulkan/vn_cs.c b/src/virtio/vulkan/vn_cs.c
+index 7b0e87e1891958fd7413e79cb96ccf2fafe9f128..0b36eb7049068ce80f288c5c5a53d028874d532b 100644
+--- a/src/virtio/vulkan/vn_cs.c
++++ b/src/virtio/vulkan/vn_cs.c
+@@ -275,6 +275,19 @@ vn_cs_encoder_reserve_internal(struct vn_cs_encoder *enc, size_t size)
+          return false;
+    }
+ 
++   /* A request that gets a shmem of its own, as the upload of a command of
++    * hundreds of MiB does, is sized to its need where no cache would keep the
++    * shmem (see vn_renderer_shmem_pool_size.h), not doubled up to a power of
++    * two.
++    */
++   if (enc->storage_type == VN_CS_ENCODER_STORAGE_SHMEM_ARRAY &&
++       vn_renderer_shmem_pool_is_dedicated(size)) {
++      const size_t own_size = vn_renderer_shmem_pool_dedicated_shmem_size(
++         enc->min_buffer_size, size);
++      if (own_size && own_size < buf_size)
++         buf_size = own_size;
++   }
++
+    struct vn_renderer_shmem *shmem;
+    size_t buf_offset;
+    if (enc->storage_type == VN_CS_ENCODER_STORAGE_SHMEM_ARRAY) {
+diff --git a/src/virtio/vulkan/vn_renderer_internal.c b/src/virtio/vulkan/vn_renderer_internal.c
+index 5e29b190cf8298a7a58e80b655b9ff79c4cabc79..d5e71cc493ba0602bf496414d88cd7e561cf829d 100644
+--- a/src/virtio/vulkan/vn_renderer_internal.c
++++ b/src/virtio/vulkan/vn_renderer_internal.c
+@@ -5,6 +5,8 @@
+ 
+ #include "vn_renderer_internal.h"
+ 
++#include "vn_renderer_shmem_pool_size.h"
++
+ #ifdef HAVE_LIBDRM
+ #include <xf86drm.h>
+ 
+@@ -14,6 +16,14 @@
+ /* 3 seconds */
+ #define VN_RENDERER_SHMEM_CACHE_EXPIRACY (3ll * 1000 * 1000)
+ 
++/* the shmem pool sizes a shmem of its own by whether this cache keeps it */
++static_assert(
++   VN_RENDERER_SHMEM_CACHE_MAX_SIZE ==
++      ((size_t)1 << (sizeof(((struct vn_renderer_shmem_cache *)0)->buckets) /
++                        sizeof(struct vn_renderer_shmem_bucket) -
++                     1)),
++   "VN_RENDERER_SHMEM_CACHE_MAX_SIZE is the largest bucket of the cache");
++
+ static void
+ vn_renderer_shmem_cache_dump(struct vn_renderer_shmem_cache *cache)
+ {
+diff --git a/src/virtio/vulkan/vn_renderer_shmem_pool_size.h b/src/virtio/vulkan/vn_renderer_shmem_pool_size.h
+index c6efd004b5d73cba3808588d16c0ac2af43c86db..dd53f71666bab1979aee59b6d2502e69e51c8dbd 100644
+--- a/src/virtio/vulkan/vn_renderer_shmem_pool_size.h
++++ b/src/virtio/vulkan/vn_renderer_shmem_pool_size.h
+@@ -8,6 +8,7 @@
+ 
+ #include <stdbool.h>
+ #include <stddef.h>
++#include <stdint.h>
+ 
+ /* A shmem pool serves short-lived commands and replies from one shmem.  An
+  * allocation larger than this is not a suballocation: it gets a shmem of its
+@@ -19,6 +20,12 @@
+  */
+ #define VN_RENDERER_SHMEM_POOL_MAX_SIZE ((size_t)16 << 20)
+ 
++/* The largest shmem a renderer's shmem cache keeps (see
++ * vn_renderer_internal.h, which checks it against its buckets).  A shmem
++ * above it is freed with its last reference, whatever its size.
++ */
++#define VN_RENDERER_SHMEM_CACHE_MAX_SIZE ((size_t)64 << 20)
++
+ static inline bool
+ vn_renderer_shmem_pool_is_dedicated(size_t size)
+ {
+@@ -41,4 +48,25 @@ vn_renderer_shmem_pool_shmem_size(size_t min_alloc_size, size_t size)
+    return alloc_size;
+ }
+ 
++/* The size of the shmem of its own that serves an allocation of `size` for
++ * which vn_renderer_shmem_pool_is_dedicated holds.  Where a shmem cache would
++ * keep the shmem (up to VN_RENDERER_SHMEM_CACHE_MAX_SIZE) it is the power of
++ * two the cache is keyed by.  Above it nothing keeps the shmem, so it is the
++ * allocation rounded up to a whole MiB: a power of two would take up to twice
++ * the allocation from the aperture of the blob heap while the call runs.
++ * Returns 0 when no such size fits in a size_t.
++ */
++static inline size_t
++vn_renderer_shmem_pool_dedicated_shmem_size(size_t min_alloc_size, size_t size)
++{
++   const size_t pot = vn_renderer_shmem_pool_shmem_size(min_alloc_size, size);
++   if (!pot || pot <= VN_RENDERER_SHMEM_CACHE_MAX_SIZE)
++      return pot;
++
++   const size_t mib = (size_t)1 << 20;
++   if (size > SIZE_MAX - (mib - 1))
++      return 0;
++   return (size + (mib - 1)) & ~(mib - 1);
++}
++
+ #endif /* VN_RENDERER_SHMEM_POOL_SIZE_H */
+diff --git a/src/virtio/vulkan/vn_renderer_util.c b/src/virtio/vulkan/vn_renderer_util.c
+index c4917837333f62ea0be157664494ad8e3e520734..8166ff338462a0819b6af7a23d94bda755fd9c2d 100644
+--- a/src/virtio/vulkan/vn_renderer_util.c
++++ b/src/virtio/vulkan/vn_renderer_util.c
+@@ -94,8 +94,8 @@ vn_renderer_shmem_pool_alloc(struct vn_renderer *renderer,
+                              size_t *out_offset)
+ {
+    if (unlikely(vn_renderer_shmem_pool_is_dedicated(size))) {
+-      const size_t alloc_size =
+-         vn_renderer_shmem_pool_shmem_size(pool->min_alloc_size, size);
++      const size_t alloc_size = vn_renderer_shmem_pool_dedicated_shmem_size(
++         pool->min_alloc_size, size);
+       if (!alloc_size)
+          return NULL;
+ 

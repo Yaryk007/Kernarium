@@ -221,7 +221,16 @@ public:
 		const int result = poll(descriptors_.data(),
 					static_cast<nfds_t>(descriptors_.size()),
 					wait_ms);
+		if (result > 0)
+			++ready_polls_;
 		slirp_pollfds_poll(slirp_, result < 0, descriptor_events, this);
+	}
+
+	/* How many passes found a descriptor ready: an event loop with nothing
+	 * to do finds none, and one that spins finds one on every pass. */
+	[[nodiscard]] std::uint64_t ready_polls() const noexcept
+	{
+		return ready_polls_;
 	}
 
 	[[nodiscard]] std::deque<std::vector<std::uint8_t>> &frames() noexcept
@@ -346,6 +355,7 @@ private:
 	std::int64_t now_ns_{1'000'000'000};
 	std::vector<pollfd> descriptors_;
 	std::deque<std::vector<std::uint8_t>> frames_;
+	std::uint64_t ready_polls_{};
 };
 
 } // namespace slirp_harness

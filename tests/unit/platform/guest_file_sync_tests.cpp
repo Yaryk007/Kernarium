@@ -17,6 +17,7 @@
 #include <string>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <sys/xattr.h>
 #include <thread>
 #include <unistd.h>
 
@@ -338,6 +339,26 @@ void aChangedDiskRefusesResumeAndReleasesEarlierLocks()
 	(void)uml::platform::forget_guest_files();
 }
 
+/* A macOS host also verifies the change time: a disk whose metadata alone
+ * changed while unlocked keeps the guest quiesced. */
+void aDiskWhoseChangeTimeMovedRefusesResume()
+{
+	const int disk = openScratch("attributed-disk", O_RDWR);
+	require(pwrite(disk, "content", 7, 0) == 7);
+	lockDisk(disk);
+	require(uml::platform::release_guest_file_locks() == 0);
+	std::this_thread::sleep_for(std::chrono::milliseconds {2});
+	constexpr char value[] = "com.apple.backupd";
+	require(fsetxattr(disk, "com.apple.metadata:com_apple_backup_excludeItem",
+		value, sizeof value - 1, 0, 0) == 0, "set the backup exclusion");
+	errno = 0;
+	require(!uml::platform::restore_guest_file_locks() && errno == ESTALE,
+		"a macOS disk whose change time moved while unlocked must not resume");
+	require(!anotherProcessSeesALock(disk), "a failed restore relocks nothing");
+	close(disk);
+	(void)uml::platform::forget_guest_files();
+}
+
 void aReusedDiskDescriptorMustNotBeRelocked()
 {
 	const int first = openScratch("released-first", O_RDWR);
@@ -500,6 +521,7 @@ int main()
 	aSecondDescriptionCannotLockALockedDisk();
 	aReadOnlyDiskLockIsReleasedToo();
 	aChangedDiskRefusesResumeAndReleasesEarlierLocks();
+	aDiskWhoseChangeTimeMovedRefusesResume();
 	aReusedDiskDescriptorMustNotBeRelocked();
 	aContendedDiskRefusesResume();
 	aBlockingLockRequestIsRefusedInsteadOfWaiting();

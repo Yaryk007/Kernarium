@@ -78,13 +78,13 @@ not a multiple of the pitch.
  drivers/media/virtio/virtio_video.h         |  474 +++++++
  drivers/media/virtio/virtio_video_blob.c    |  183 +++
  drivers/media/virtio/virtio_video_caps.c    |  515 +++++++
- drivers/media/virtio/virtio_video_dec.c     |  479 +++++++
+ drivers/media/virtio/virtio_video_dec.c     |  482 +++++++
  drivers/media/virtio/virtio_video_device.c  | 1329 +++++++++++++++++++
  drivers/media/virtio/virtio_video_driver.c  |  261 ++++
- drivers/media/virtio/virtio_video_helpers.c |  317 +++++
- drivers/media/virtio/virtio_video_vq.c      | 1185 +++++++++++++++++
+ drivers/media/virtio/virtio_video_helpers.c |  321 +++++
+ drivers/media/virtio/virtio_video_vq.c      | 1188 +++++++++++++++++
  include/uapi/linux/virtio_video.h           |  544 ++++++++
- 14 files changed, 5334 insertions(+)
+ 14 files changed, 5344 insertions(+)
  create mode 100644 drivers/media/virtio/Kconfig
  create mode 100644 drivers/media/virtio/Makefile
  create mode 100644 drivers/media/virtio/README
@@ -1374,10 +1374,10 @@ index 0000000000000000000000000000000000000000..25294725f72ecf946a8647f95b10daa8
 +}
 diff --git a/drivers/media/virtio/virtio_video_dec.c b/drivers/media/virtio/virtio_video_dec.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..d3ec77840dc7e7e2d2265dac1e15ea0e593f0fe8
+index 0000000000000000000000000000000000000000..650d97f9e31b15b06cfdac444b1d17a3e2270105
 --- /dev/null
 +++ b/drivers/media/virtio/virtio_video_dec.c
-@@ -0,0 +1,479 @@
+@@ -0,0 +1,482 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/* Decoder for virtio video device.
 + *
@@ -1501,13 +1501,16 @@ index 0000000000000000000000000000000000000000..d3ec77840dc7e7e2d2265dac1e15ea0e
 +        struct virtio_video_device *vvd = to_virtio_vd(stream->video_dev);
 +        struct video_control_format *fmt;
 +        list_for_each_entry(fmt, &vvd->controls_fmt_list, controls_list_entry) {
-+            u32 profile_id, level_id;
++            u32 profile_id, level_id = 0;
 +            if (fmt->format == V4L2_PIX_FMT_H264) {
 +                profile_id = V4L2_CID_MPEG_VIDEO_H264_PROFILE;
 +                level_id = V4L2_CID_MPEG_VIDEO_H264_LEVEL;
 +            } else if (fmt->format == V4L2_PIX_FMT_HEVC) {
 +                profile_id = V4L2_CID_MPEG_VIDEO_HEVC_PROFILE;
 +                level_id = V4L2_CID_MPEG_VIDEO_HEVC_LEVEL;
++            } else if (fmt->format == V4L2_PIX_FMT_VP9) {
++                /* VP9 has no level control. */
++                profile_id = V4L2_CID_MPEG_VIDEO_VP9_PROFILE;
 +            } else {
 +                continue;
 +            }
@@ -1517,7 +1520,7 @@ index 0000000000000000000000000000000000000000..d3ec77840dc7e7e2d2265dac1e15ea0e
 +                    fmt->profile->min);
 +                if (ctrl) ctrl->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 +            }
-+            if (fmt->level) {
++            if (fmt->level && level_id) {
 +                ctrl = v4l2_ctrl_new_std_menu(&stream->ctrl_handler, NULL,
 +                    level_id, fmt->level->max, fmt->level->skip_mask,
 +                    fmt->level->min);
@@ -3461,10 +3464,10 @@ index 0000000000000000000000000000000000000000..1f73c6beb1fe81627b675f87d655c162
 +MODULE_LICENSE("GPL");
 diff --git a/drivers/media/virtio/virtio_video_helpers.c b/drivers/media/virtio/virtio_video_helpers.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..f27c516cf031dd09eccd685deb05827c748a2ab3
+index 0000000000000000000000000000000000000000..dbe51fc92b903a7db082c5789d1b6b39fee0b488
 --- /dev/null
 +++ b/drivers/media/virtio/virtio_video_helpers.c
-@@ -0,0 +1,317 @@
+@@ -0,0 +1,321 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/* Driver for virtio video device.
 + *
@@ -3545,6 +3548,10 @@ index 0000000000000000000000000000000000000000..f27c516cf031dd09eccd685deb05827c
 +	{ VIRTIO_VIDEO_PROFILE_H264_CONSTRAINED_HIGH, V4L2_MPEG_VIDEO_H264_PROFILE_CONSTRAINED_HIGH },
 +	{ VIRTIO_VIDEO_PROFILE_HEVC_MAIN, V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN },
 +	{ VIRTIO_VIDEO_PROFILE_HEVC_MAIN10, V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10 },
++	{ VIRTIO_VIDEO_PROFILE_VP9_PROFILE0, V4L2_MPEG_VIDEO_VP9_PROFILE_0 },
++	{ VIRTIO_VIDEO_PROFILE_VP9_PROFILE1, V4L2_MPEG_VIDEO_VP9_PROFILE_1 },
++	{ VIRTIO_VIDEO_PROFILE_VP9_PROFILE2, V4L2_MPEG_VIDEO_VP9_PROFILE_2 },
++	{ VIRTIO_VIDEO_PROFILE_VP9_PROFILE3, V4L2_MPEG_VIDEO_VP9_PROFILE_3 },
 +	{ VIRTIO_VIDEO_PROFILE_H264_BASELINE,
 +		V4L2_MPEG_VIDEO_H264_PROFILE_BASELINE },
 +	{ VIRTIO_VIDEO_PROFILE_H264_MAIN, V4L2_MPEG_VIDEO_H264_PROFILE_MAIN },
@@ -3784,10 +3791,10 @@ index 0000000000000000000000000000000000000000..f27c516cf031dd09eccd685deb05827c
 +}
 diff --git a/drivers/media/virtio/virtio_video_vq.c b/drivers/media/virtio/virtio_video_vq.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..5917feb0512bf044b5dccecc520f02b2bc87d3b3
+index 0000000000000000000000000000000000000000..365a01dae2a209e7aa67fccf9a359b6bfea08be9
 --- /dev/null
 +++ b/drivers/media/virtio/virtio_video_vq.c
-@@ -0,0 +1,1185 @@
+@@ -0,0 +1,1188 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/* Driver for virtio video device.
 + *
@@ -4008,7 +4015,8 @@ index 0000000000000000000000000000000000000000..5917feb0512bf044b5dccecc520f02b2
 +				continue;
 +			}
 +
-+			vbuf->resp_len = len;
++			/* The used length is the device's word: keep it inside the buffer. */
++			vbuf->resp_len = min_t(unsigned int, len, vbuf->resp_size);
 +			if (vbuf->resp_cb)
 +				vbuf->resp_cb(vvd, vbuf);
 +
@@ -4123,9 +4131,11 @@ index 0000000000000000000000000000000000000000..5917feb0512bf044b5dccecc520f02b2
 +/*
 + * Stop both queues and delete them, once the device can no longer use a
 + * buffer it was given. A transport's reset need not reach the device
-+ * itself: vhost-user's does not, and only disabling the rings in del_vqs()
-+ * makes the backend drop what it holds. Nothing the device may still write is
-+ * freed before that; virtio_video_cancel_cmds() then returns the commands.
++ * itself: vhost-user's does not. del_vqs() disables the rings and then asks
++ * the backend for its features, and that request is what makes a backend that
++ * keeps requests across a ring disable, as the codecs' does, reset its device
++ * and drop what it holds. Nothing the device may still write is freed before
++ * that; virtio_video_cancel_cmds() then returns the commands.
 + */
 +void virtio_video_stop_queues(struct virtio_video_device *vvd)
 +{

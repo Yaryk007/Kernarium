@@ -49,11 +49,14 @@ class Application:
     environment (``DEVICECTL_CHILD_`` followed by a prefix), because an
     inherited one would select a different guest. ``runtime_result`` matches
     the console line that ends a run and has one group, the runtime's result.
+    ``process_name`` is the process's name on the device, which names its
+    diagnostic reports (tests/integration/support/ios_device_reports.py).
     """
 
     bundle_id: str
     setting_prefixes: tuple[str, ...]
     runtime_result: re.Pattern[str]
+    process_name: str
 
 
 def device_command(*arguments: str) -> list[str]:
@@ -213,7 +216,8 @@ class Console:
 
     ``devicectl device process launch --console`` stays attached for as long
     as the application runs and writes what it prints to ``log``; leaving the
-    block interrupts it.
+    block interrupts it. ``start_stopped`` launches it stopped, for a debugger
+    to attach to before it runs (tests/integration/support/ios_jit_debugger.py).
     """
 
     def __init__(
@@ -222,11 +226,15 @@ class Console:
         application: Application,
         settings: Mapping[str, str],
         log: pathlib.Path,
+        *,
+        start_stopped: bool = False,
     ) -> None:
         self.log = log
         self._command = device_command(
             "device", "process", "launch", "--device", device,
-            "--console", "--terminate-existing", application.bundle_id,
+            "--console", "--terminate-existing",
+            *(["--start-stopped"] if start_stopped else []),
+            application.bundle_id,
         )
         self._environment = device_launch_environment(application, settings)
         self._output: IO[bytes] | None = None

@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+# The thermal HAL runs on every device. It reports the host's thermal state,
+# which the host application sends over vsock; until a host connects it reports
+# NONE.
+service vendor.thermal-andarium /vendor/bin/hw/android.hardware.thermal-service.andarium
+    interface aidl android.hardware.thermal.IThermal/default
+    class hal
+    user nobody
+    group system

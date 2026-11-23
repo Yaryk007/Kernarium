@@ -1,0 +1,28 @@
+{
+  "identical": [
+    { "catalog": "Localizable", "key": "Andarium", "reason": "The name of the application." },
+    { "catalog": "Localizable", "key": "CPU", "reason": "A name every language keeps, as iOS does." },
+    { "catalog": "Localizable", "key": "CPU %@", "reason": "A name every language keeps, as iOS does." },
+    { "catalog": "Localizable", "key": "VRAM", "reason": "A technical name every language keeps." },
+    { "catalog": "Localizable", "key": "120 Hz", "reason": "The unit of a display's refresh rate, kept by every language." },
+    { "catalog": "Localizable", "key": "TalkBack", "reason": "The name of Android's screen reader, which a person looks for by that name in Android and every language keeps." },
+    { "catalog": "Localizable", "key": "%lld dpi", "reason": "The unit of a pixel density, kept by every language as Android writes it." },
+    { "catalog": "Localizable", "key": "Android", "reason": "The name of the system, shown as the subtitle under an app in Shortcuts and Search; every language keeps it." },
+    { "catalog": "Localizable", "key": "%@", "reason": "The name under an app's icon is Android's own label of the app, in the language Android is in; no catalog translates it." },
+    { "catalog": "Localizable", "key": "Root", "reason": "The name of the access, which every language keeps as Android's own words for it do." },
+    { "catalog": "AndariumCore", "key": "VRAM", "reason": "A technical name every language keeps." },
+    { "catalog": "AndariumCore", "key": "%lld vCPUs", "reason": "Japanese counts vCPUs as a number and the unit name, as it counts GiB." },
+    { "catalog": "WhatsNew", "key": "AOT", "reason": "A term every language keeps in English." },
+    { "catalog": "WhatsNew", "key": "120 Hz", "reason": "The unit of a display's refresh rate, kept by every language." }
+  ],
+  "english": [
+    { "text": "JIT", "file": "Andarium/Andarium/Shared/HomeSections.swift", "reason": "A section only development builds have." },
+    { "text": "AOT", "file": "Andarium/Andarium/Shared/TranslatedLibrariesRow.swift", "reason": "A term every language keeps in English, as JIT." },
+    { "text": "Input probe", "file": "Andarium/Andarium/Shared/Settings.swift", "reason": "The field UI tests type into." },
+    { "text": "adb connect", "file": "Andarium/Andarium/Shared/Settings.swift", "reason": "The command typed on a computer." },
+    { "text": "The previous session ended in a guest kernel panic", "file": "Andarium/AndariumCore/Sources/AndariumCore/SessionRecord.swift", "reason": "Session record text: bug report data, English by decision." },
+    { "text": "Stalls of the guest's vCPUs", "file": "Andarium/AndariumCore/Sources/AndariumCore/BugReportArchive.swift", "reason": "Bug report text, English by decision." },
+    { "text": "The guest's /proc files were not read for this report", "file": "Andarium/AndariumCore/Sources/AndariumCore/GuestProcFiles.swift", "reason": "Bug report text, English by decision." },
+    { "text": "Zstandard decompression failed", "file": "GuestHost/Sources/ZstdUtil.swift", "reason": "A technical diagnostic of the runtime's decompressor, shown inside a failure alert." }
+  ]
+}

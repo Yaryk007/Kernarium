@@ -19,14 +19,42 @@ and may still have the pages in the GPU's address space, so the pages are
 released behind a fence rather than at destroy time. Hosts without pinned
 memory keep the previous storage paths.
 
+A blob larger than the pages behind it is refused with -EINVAL
+when the context takes the buffer, and the device answers invalid
+parameter instead of mapping the buffer.
+
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 ---
- src/vrend/vrend_renderer.c | 171 ++++++++++++++++++++++++++++++++++++-
- src/vrend/vrend_renderer.h |   5 ++
- 2 files changed, 174 insertions(+), 2 deletions(-)
+ src/vrend/vrend_decode.c   |   6 +-
+ src/vrend/vrend_renderer.c | 195 ++++++++++++++++++++++++++++++++++++-
+ src/vrend/vrend_renderer.h |  12 +++
+ 3 files changed, 210 insertions(+), 3 deletions(-)
 
+diff --git a/src/vrend/vrend_decode.c b/src/vrend/vrend_decode.c
+index ad45ca94fc6ea350f15e9571deec05937fff7f0f..6e41c0184d5c35e74f5b0d5c588b9edaf9714d77 100644
+--- a/src/vrend/vrend_decode.c
++++ b/src/vrend/vrend_decode.c
+@@ -1701,13 +1701,17 @@ static int vrend_decode_ctx_transfer_3d(struct virgl_context *ctx,
+ static int vrend_decode_ctx_get_blob(struct virgl_context *ctx,
+                                      UNUSED uint32_t res_id,
+                                      uint64_t blob_id,
+-                                     UNUSED uint64_t blob_size,
++                                     uint64_t blob_size,
+                                      UNUSED uint32_t blob_flags,
+                                      struct virgl_context_blob *blob)
+ {
+    TRACE_FUNC();
+    struct vrend_decode_ctx *dctx = (struct vrend_decode_ctx *)ctx;
+ 
++   /* before the resource is taken, so a refused blob leaves it in place */
++   if (!vrend_blob_pipe_covers(dctx->grctx, blob_id, blob_size))
++      return -EINVAL;
++
+    blob->type = VIRGL_RESOURCE_FD_INVALID;
+    /* this transfers ownership and blob_id is no longer valid */
+    blob->u.pipe_resource = vrend_get_blob_pipe(dctx->grctx, blob_id);
 diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
-index 74129d804475167b34cbd98f7da5aa772b38b99c..85917e0d826f4cef991ff8ec0c2c74cf17da7fcb 100644
+index 74129d804475167b34cbd98f7da5aa772b38b99c..e3290b832b3741d36abf78b14038763d99f383df 100644
 --- a/src/vrend/vrend_renderer.c
 +++ b/src/vrend/vrend_renderer.c
 @@ -41,6 +41,7 @@
@@ -275,7 +303,38 @@ index 74129d804475167b34cbd98f7da5aa772b38b99c..85917e0d826f4cef991ff8ec0c2c74cf
  #ifdef ENABLE_GBM
     if (res->egl_image) {
        virgl_egl_image_destroy(egl, res->egl_image);
-@@ -13563,6 +13721,12 @@ uint32_t vrend_renderer_resource_get_map_info(struct pipe_resource *pres)
+@@ -13383,6 +13541,30 @@ int vrend_renderer_pipe_resource_create(struct vrend_context *ctx, uint32_t blob
+    return 0;
+ }
+ 
++bool vrend_blob_pipe_covers(struct vrend_context *ctx, uint64_t blob_id,
++                            uint64_t blob_size)
++{
++   uint32_t id = (uint32_t)blob_id;
++
++   list_for_each_entry(struct vrend_resource, res, &ctx->vrend_resources, head) {
++      if (res->blob_id != id)
++         continue;
++
++      /* The guest maps blob_size bytes of the shared pages, and a blob they
++       * do not cover would fault the host on the first access past their end.
++       */
++      if (res->host_shm && blob_size > res->host_shm->size) {
++         virgl_error("%s: blob %" PRIu64 " asks %" PRIu64 " bytes of %zu\n", __func__,
++                     blob_id, blob_size, res->host_shm->size);
++         return false;
++      }
++      return true;
++   }
++
++   /* No such resource: vrend_get_blob_pipe reports it. */
++   return true;
++}
++
+ struct pipe_resource *vrend_get_blob_pipe(struct vrend_context *ctx, uint64_t blob_id)
+ {
+    uint32_t id = (uint32_t)blob_id;
+@@ -13563,6 +13745,12 @@ uint32_t vrend_renderer_resource_get_map_info(struct pipe_resource *pres)
  int vrend_renderer_resource_map(struct pipe_resource *pres, void **map, uint64_t *out_size)
  {
     struct vrend_resource *res = (struct vrend_resource *)pres;
@@ -288,7 +347,7 @@ index 74129d804475167b34cbd98f7da5aa772b38b99c..85917e0d826f4cef991ff8ec0c2c74cf
     if (!has_bits(res->storage_bits, VREND_STORAGE_GL_BUFFER | VREND_STORAGE_GL_IMMUTABLE))
        return -EINVAL;
  
-@@ -13579,6 +13743,9 @@ int vrend_renderer_resource_map(struct pipe_resource *pres, void **map, uint64_t
+@@ -13579,6 +13767,9 @@ int vrend_renderer_resource_map(struct pipe_resource *pres, void **map, uint64_t
  int vrend_renderer_resource_unmap(struct pipe_resource *pres)
  {
     struct vrend_resource *res = (struct vrend_resource *)pres;
@@ -299,7 +358,7 @@ index 74129d804475167b34cbd98f7da5aa772b38b99c..85917e0d826f4cef991ff8ec0c2c74cf
        return -EINVAL;
  
 diff --git a/src/vrend/vrend_renderer.h b/src/vrend/vrend_renderer.h
-index 8b59c2f7cdd5954fbaaf8e703213e93a6f4a7495..ba4a0a054d84657f67aa351318e3bfe0055d1e71 100644
+index 8b59c2f7cdd5954fbaaf8e703213e93a6f4a7495..1c464b457aaea1af2d598482597118099c453de4 100644
 --- a/src/vrend/vrend_renderer.h
 +++ b/src/vrend/vrend_renderer.h
 @@ -61,6 +61,7 @@ struct virgl_gl_ctx_param {
@@ -328,3 +387,17 @@ index 8b59c2f7cdd5954fbaaf8e703213e93a6f4a7495..ba4a0a054d84657f67aa351318e3bfe0
  
     uint32_t blob_id;
     struct list_head head;
+@@ -621,6 +626,13 @@ int
+ vrend_renderer_pipe_resource_create(struct vrend_context *ctx, uint32_t blob_id,
+                                     const struct vrend_renderer_resource_create_args *args);
+ 
++/* Whether the shared host pages that back the pipe resource the guest created
++ * for the blob id cover blob_size bytes. A blob larger than they are is one the
++ * guest must not map, so the caller refuses it and leaves the resource for a
++ * request of its own size. */
++bool vrend_blob_pipe_covers(struct vrend_context *ctx, uint64_t blob_id,
++                            uint64_t blob_size);
++
+ struct pipe_resource *vrend_get_blob_pipe(struct vrend_context *ctx, uint64_t blob_id);
+ 
+ int

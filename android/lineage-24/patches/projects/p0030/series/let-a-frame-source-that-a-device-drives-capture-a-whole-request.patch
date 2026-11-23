@@ -1,0 +1,588 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 07:00:01 +0000
+Subject: [PATCH] let a frame source that a device drives capture a whole
+ request
+
+The emulated sensor pulls: for each buffer of a request it asks its frame source to paint a frame
+for a time the sensor chose. A frame source that stands for a camera outside the HAL cannot work that
+way. The camera exposes once for all the streams of a request, the shutter time is the time of that
+exposure, and the picture, its metadata and a JPEG's Exif data come from the device.
+
+Add an optional, host-driven mode to IFrameSource. For such a source the sensor queues every output
+buffer of the request in one call (BeginRequest), collects them one by one (ProduceFrame, or
+ProduceBlob for a JPEG), reads the frame time and the exposure's own values from FrameResult, sends the
+shutter message itself and returns the buffers. A source that does not opt in is driven exactly as
+before. The request's controls that only such a source needs (the modes and triggers of 3A, the white
+balance gains, the flash mode, the JPEG quality and the metering regions) are carried to it in a
+HostSettings member of the sensor settings.
+
+The sensor's limits are widened to what a host-driven camera can offer: frame durations from 4 ms, a
+sensitivity range of ISO 1 to 102400, and any of the four Bayer orders. An idle sensor, with no
+request, keeps its 33 ms cycle. A flush or a close interrupts the waits of a capture in progress
+(IFrameSource::Interrupt), so that they do not hold the thread up for the device's own timeout; the
+sensor takes the cancellation back (ClearInterrupt) under the control mutex when it takes the next
+request, so that a flush between that and the first wait still counts. A result reports the neutral
+color point that the source measured when it has one.
+
+A BLOB output that is not a JFIF picture, or has no result metadata, is not queued: the sensor does
+not collect it, and a buffer the source cannot take back must not be handed to the device. The
+settings also carry the top of the request's AE target frame rate range (HostSettings::ae_max_fps).
+
+A request none of whose outputs was produced failed as a whole. The sensor asks the source
+(IFrameSource::FailsRequest) and, when the source says so, reports ERROR_REQUEST for the request,
+with no shutter message and no result metadata, and returns every buffer marked as failed, as the
+stock request processor does for the pending requests that a flush drops. Only that tells an
+application that its capture failed (onCaptureFailed); an ERROR_BUFFER alone does not, and a request
+that lost only some of its outputs still reports ERROR_BUFFER for those.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ devices/EmulatedCamera/hwl/Android.bp         |   1 +
+ .../hwl/EmulatedRequestState.cpp              |  44 ++++
+ devices/EmulatedCamera/hwl/EmulatedSensor.cpp |  56 +++++-
+ devices/EmulatedCamera/hwl/EmulatedSensor.h   |  10 +
+ .../EmulatedCamera/hwl/EmulatedSensorHost.cpp | 189 ++++++++++++++++++
+ devices/EmulatedCamera/hwl/IFrameSource.h     |  61 ++++++
+ .../hwl/SensorCharacteristics.h               |  26 +++
+ 7 files changed, 377 insertions(+), 10 deletions(-)
+ create mode 100644 devices/EmulatedCamera/hwl/EmulatedSensorHost.cpp
+
+diff --git a/devices/EmulatedCamera/hwl/Android.bp b/devices/EmulatedCamera/hwl/Android.bp
+index 1fffe9da48ce3a68b30b185b58e282a5a6e505c8..15127af8299f24d4c1ec2beadabfb99d1afbf8a3 100644
+--- a/devices/EmulatedCamera/hwl/Android.bp
++++ b/devices/EmulatedCamera/hwl/Android.bp
+@@ -113,6 +113,7 @@ cc_library_static {
+     srcs: [
+         "EmulatedScene.cpp",
+         "EmulatedSensor.cpp",
++        "EmulatedSensorHost.cpp",
+         "JpegCompressor.cpp",
+         "utils/ExifUtils.cpp",
+         "utils/HWLUtils.cpp",
+diff --git a/devices/EmulatedCamera/hwl/EmulatedRequestState.cpp b/devices/EmulatedCamera/hwl/EmulatedRequestState.cpp
+index 15064556454db2c6c62c613e30a291ecb8758a53..cb182a31dc2081bb53042cefc557d28e3aa227e9 100644
+--- a/devices/EmulatedCamera/hwl/EmulatedRequestState.cpp
++++ b/devices/EmulatedCamera/hwl/EmulatedRequestState.cpp
+@@ -623,6 +623,49 @@ int EmulatedRequestState::GetExposureTimeClampToRange(uint32_t exposure) {
+   return std::max(min_exposure, std::min(max_exposure, exposure));
+ }
+ 
++// What a frame source driven by a device outside the HAL needs from a request
++// beyond the sensor settings: the modes and triggers as the request gave them.
++static void FillHostSettings(const HalCameraMetadata& request,
++                             const EmulatedCameraDeviceInfo& info,
++                             HostSettings* host) {
++  camera_metadata_ro_entry_t entry;
++  const bool control_off = info.control_mode_ == ANDROID_CONTROL_MODE_OFF;
++  host->ae_mode = control_off ? ANDROID_CONTROL_AE_MODE_OFF : info.ae_mode_;
++  host->af_mode = control_off ? ANDROID_CONTROL_AF_MODE_OFF : info.af_mode_;
++  host->awb_mode = control_off ? ANDROID_CONTROL_AWB_MODE_OFF : info.awb_mode_;
++  host->ae_lock = info.ae_lock_ == ANDROID_CONTROL_AE_LOCK_ON;
++  host->awb_lock = info.awb_lock_ == ANDROID_CONTROL_AWB_LOCK_ON;
++  host->ae_compensation = info.exposure_compensation_;
++  host->focus_distance = info.focus_distance_;
++
++  host->ae_precapture_trigger = ANDROID_CONTROL_AE_PRECAPTURE_TRIGGER_IDLE;
++  if ((request.Get(ANDROID_CONTROL_AE_PRECAPTURE_TRIGGER, &entry) == OK) &&
++      (entry.count == 1)) {
++    host->ae_precapture_trigger = entry.data.u8[0];
++  }
++  host->af_trigger = ANDROID_CONTROL_AF_TRIGGER_IDLE;
++  if ((request.Get(ANDROID_CONTROL_AF_TRIGGER, &entry) == OK) && (entry.count == 1)) {
++    host->af_trigger = entry.data.u8[0];
++  }
++  if ((request.Get(ANDROID_COLOR_CORRECTION_GAINS, &entry) == OK) && (entry.count == 4)) {
++    for (size_t i = 0; i < 4; ++i) {
++      host->color_correction_gains[i] = entry.data.f[i];
++    }
++  }
++  if ((request.Get(ANDROID_FLASH_MODE, &entry) == OK) && (entry.count == 1)) {
++    host->flash_mode = entry.data.u8[0];
++  }
++  if ((request.Get(ANDROID_JPEG_QUALITY, &entry) == OK) && (entry.count == 1)) {
++    host->jpeg_quality = entry.data.u8[0];
++  }
++  if ((request.Get(ANDROID_CONTROL_AE_TARGET_FPS_RANGE, &entry) == OK) && (entry.count == 2) &&
++      (entry.data.i32[1] > 0)) {
++    host->ae_max_fps = static_cast<uint32_t>(entry.data.i32[1]);
++  }
++  memcpy(host->ae_regions, info.ae_metering_region_, sizeof(host->ae_regions));
++  memcpy(host->af_regions, info.af_metering_region_, sizeof(host->af_regions));
++}
++
+ status_t EmulatedRequestState::InitializeSensorSettings(
+     std::unique_ptr<HalCameraMetadata> request_settings,
+     uint32_t override_frame_number,
+@@ -920,6 +963,7 @@ status_t EmulatedRequestState::InitializeSensorSettings(
+   sensor_settings->timestamp_source = info.timestamp_source_;
+   memcpy(sensor_settings->test_pattern_data, test_pattern_data,
+          sizeof(sensor_settings->test_pattern_data));
++  FillHostSettings(*request_settings_, info, &sensor_settings->host);
+ 
+   return OK;
+ }
+diff --git a/devices/EmulatedCamera/hwl/EmulatedSensor.cpp b/devices/EmulatedCamera/hwl/EmulatedSensor.cpp
+index a474355af105c177dbe8cc7f005c7f482bfcc85d..2e4b787abd8180e8db0772dcb2811cd40055a16f 100644
+--- a/devices/EmulatedCamera/hwl/EmulatedSensor.cpp
++++ b/devices/EmulatedCamera/hwl/EmulatedSensor.cpp
+@@ -60,11 +60,14 @@ using android::hardware::graphics::common::V1_2::Dataspace;
+ const nsecs_t EmulatedSensor::kSupportedExposureTimeRange[2] = {1000LL,
+                                                                 30000000000LL};
+ 
+-// ~1/30 s - 30 sec
+-const nsecs_t EmulatedSensor::kSupportedFrameDurationRange[2] = {33331760LL,
++// 4 ms (250 fps) - 30 sec. The bounds are the widest a frame source may report:
++// the emulated scene runs at its own 30 fps and a camera device the host drives
++// at the rates the host offers.
++const nsecs_t EmulatedSensor::kSupportedFrameDurationRange[2] = {4000000LL,
+                                                                  30000000000LL};
+ 
+-const int32_t EmulatedSensor::kSupportedSensitivityRange[2] = {100, 1600};
++// ISO 1 - 102400, likewise.
++const int32_t EmulatedSensor::kSupportedSensitivityRange[2] = {1, 102400};
+ const int32_t EmulatedSensor::kDefaultSensitivity = 100;  // ISO
+ const nsecs_t EmulatedSensor::kDefaultExposureTime = ms2ns(15);
+ const nsecs_t EmulatedSensor::kDefaultFrameDuration = ms2ns(33);
+@@ -169,9 +172,17 @@ bool EmulatedSensor::AreCharacteristicsSupported(
+     return false;
+   }
+ 
+-  if (characteristics.color_arangement != kSupportedColorFilterArrangement) {
+-    ALOGE("%s: Unsupported color arrangement!", __FUNCTION__);
+-    return false;
++  // The emulated scene produces RGGB; a camera device the host drives may use
++  // any of the four orders.
++  switch (characteristics.color_arangement) {
++    case ANDROID_SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_RGGB:
++    case ANDROID_SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_GRBG:
++    case ANDROID_SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_GBRG:
++    case ANDROID_SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_BGGR:
++      break;
++    default:
++      ALOGE("%s: Unsupported color arrangement!", __FUNCTION__);
++      return false;
+   }
+ 
+   for (const auto& blackLevel : characteristics.black_level_pattern) {
+@@ -600,6 +611,11 @@ status_t EmulatedSensor::StartUp(
+ 
+ status_t EmulatedSensor::ShutDown() {
+   int res;
++  // A capture that waits for a device outside the HAL must not hold the thread
++  // up for the device's own timeout.
++  if (frame_source_ != nullptr) {
++    frame_source_->Interrupt();
++  }
+   res = requestExitAndWait();
+   if (res != OK) {
+     ALOGE("Unable to shut down sensor capture thread: %d", res);
+@@ -642,6 +658,11 @@ bool EmulatedSensor::WaitForVSync(nsecs_t reltime) {
+ 
+ status_t EmulatedSensor::Flush() {
+   Mutex::Autolock lock(control_mutex_);
++  // The capture in progress, if it waits for a device outside the HAL, fails
++  // its buffers now instead of at the device's timeout.
++  if (frame_source_ != nullptr) {
++    frame_source_->Interrupt();
++  }
+   auto ret = WaitForVSyncLocked(kSupportedFrameDurationRange[1]);
+ 
+   // First recreate the jpeg compressor. This will abort any ongoing processing
+@@ -713,6 +734,9 @@ bool EmulatedSensor::threadLoop() {
+     std::swap(next_input_buffer, current_input_buffers_);
+     std::swap(next_result, current_result_);
+     std::swap(partial_result, partial_result_);
++    if (frame_source_ != nullptr) {
++      frame_source_->ClearInterrupt();
++    }
+ 
+     // Signal VSync for start of readout
+     ALOGVV("Sensor VSync");
+@@ -720,7 +744,8 @@ bool EmulatedSensor::threadLoop() {
+     vsync_.signal();
+   }
+ 
+-  auto frame_duration = EmulatedSensor::kSupportedFrameDurationRange[0];
++  // Without a request the sensor idles at the default rate.
++  auto frame_duration = EmulatedSensor::kDefaultFrameDuration;
+   auto exposure_time = EmulatedSensor::kSupportedExposureTimeRange[0];
+   uint32_t timestamp_source = ANDROID_SENSOR_INFO_TIMESTAMP_SOURCE_UNKNOWN;
+   // Frame duration must always be the same among all physical devices
+@@ -778,7 +803,16 @@ bool EmulatedSensor::threadLoop() {
+     std::vector<StreamGroupState> stream_group_state =
+         GetStreamGroupState(*next_buffers);
+     uint32_t frame_number = next_buffers->at(0)->frame_number;
+-    if (callback.notify != nullptr) {
++    // A source driven by a device outside the HAL captures the whole request
++    // here, sends the shutter message once it has the frame time, and returns
++    // the buffers.
++    const bool host_driven =
++        frame_source_->IsHostDriven() && !reprocess_request;
++    if (host_driven) {
++      CaptureFromHost(*settings, next_buffers.get(), next_result.get(),
++                      callback, stream_group_state, frame_number);
++    }
++    if (!host_driven && callback.notify != nullptr) {
+       NotifyMessage msg = ShutterMessage{
+           .frame_number = frame_number,
+           .timestamp_ns = static_cast<uint64_t>(next_capture_time_),
+@@ -787,7 +821,7 @@ bool EmulatedSensor::threadLoop() {
+       callback.notify(next_result->pipeline_id, msg);
+     }
+ 
+-    if (callback.notify_override_pending_buffer != nullptr &&
++    if (!host_driven && callback.notify_override_pending_buffer != nullptr &&
+         stream_group_state.size() > 0) {
+       callback.notify_override_pending_buffer(frame_number, stream_group_state);
+     }
+@@ -1103,7 +1137,9 @@ void EmulatedSensor::ReturnResults(
+       result->result_metadata->Set(ANDROID_EDGE_MODE,
+                                    &logical_settings->second.edge_mode, 1);
+     }
+-    if (logical_settings->second.report_neutral_color_point) {
++    if (logical_settings->second.report_neutral_color_point &&
++        !frame_source_->AppendNeutralColorPoint(
++            logical_camera_id_, result->result_metadata.get())) {
+       result->result_metadata->Set(ANDROID_SENSOR_NEUTRAL_COLOR_POINT,
+                                    kNeutralColorPoint,
+                                    ARRAY_SIZE(kNeutralColorPoint));
+diff --git a/devices/EmulatedCamera/hwl/EmulatedSensor.h b/devices/EmulatedCamera/hwl/EmulatedSensor.h
+index 8fa8954ed4cc310bf5efef77229df5b9f5385946..b7f8e622257551764d1b850a42176f3b75a71f30 100644
+--- a/devices/EmulatedCamera/hwl/EmulatedSensor.h
++++ b/devices/EmulatedCamera/hwl/EmulatedSensor.h
+@@ -272,6 +272,16 @@ class EmulatedSensor : private Thread, public virtual RefBase {
+   void CalculateBinningInfo(uint32_t camera_id, const SensorSettings& settings,
+                             const Buffers& buffers, bool is_reprocess);
+ 
++  // Captures a request from a frame source that a device outside the HAL
++  // drives (IFrameSource::IsHostDriven): queues all of the request's buffers,
++  // collects them, takes the frame time, sends the shutter message and returns
++  // the buffers. Sets next_capture_time_ and next_readout_time_.
++  void CaptureFromHost(const LogicalCameraSettings& settings, Buffers* buffers,
++                       HwlPipelineResult* result,
++                       const HwlPipelineCallback& callback,
++                       const std::vector<StreamGroupState>& stream_group_state,
++                       uint32_t frame_number);
++
+   void ReturnResults(HwlPipelineCallback callback,
+                      std::unique_ptr<LogicalCameraSettings> settings,
+                      std::unique_ptr<HwlPipelineResult> result,
+diff --git a/devices/EmulatedCamera/hwl/EmulatedSensorHost.cpp b/devices/EmulatedCamera/hwl/EmulatedSensorHost.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..d2105c09f0f31cfa7a0c73f1c423c0756df17431
+--- /dev/null
++++ b/devices/EmulatedCamera/hwl/EmulatedSensorHost.cpp
+@@ -0,0 +1,189 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "system/graphics-base-v1.1.h"
++#define LOG_TAG "EmulatedSensorHost"
++#define ATRACE_TAG ATRACE_TAG_CAMERA
++
++#include <inttypes.h>
++#include <log/log.h>
++#include <system/camera_metadata.h>
++#include <utils/Trace.h>
++
++#include "EmulatedSensor.h"
++
++namespace android {
++
++using google_camera_hal::BufferStatus;
++using google_camera_hal::ErrorCode;
++using google_camera_hal::ErrorMessage;
++using google_camera_hal::HalCameraMetadata;
++using google_camera_hal::NotifyMessage;
++using google_camera_hal::ShutterMessage;
++
++void EmulatedSensor::CaptureFromHost(
++    const LogicalCameraSettings& settings, Buffers* buffers,
++    HwlPipelineResult* result, const HwlPipelineCallback& callback,
++    const std::vector<StreamGroupState>& stream_group_state,
++    uint32_t frame_number) {
++  ATRACE_CALL();
++  if (buffers == nullptr || buffers->empty()) {
++    return;
++  }
++  const uint32_t pipeline_id =
++      result != nullptr ? result->pipeline_id : buffers->at(0)->pipeline_id;
++  HalCameraMetadata* metadata =
++      result != nullptr ? result->result_metadata.get() : nullptr;
++
++  uint32_t timestamp_source = ANDROID_SENSOR_INFO_TIMESTAMP_SOURCE_UNKNOWN;
++  nsecs_t exposure_time = kSupportedExposureTimeRange[0];
++  if (!settings.empty()) {
++    timestamp_source = settings.begin()->second.timestamp_source;
++    exposure_time = settings.begin()->second.exposure_time;
++  }
++
++  // The request processor hands every buffer over marked as failed, and the
++  // stock sensor flips the mark as it produces the buffer. Here the source's
++  // BeginRequest marks only the buffers it could not queue, so the others start
++  // out as good: a buffer left marked as failed is skipped below, never
++  // collected, and its slot stays with the device. A BLOB that is not a JFIF
++  // picture, or has no result metadata, is not collected below either, so it
++  // stays marked as failed and BeginRequest does not queue it.
++  for (auto& buffer : *buffers) {
++    if (buffer->is_input) {
++      continue;
++    }
++    const bool collected = buffer->format != PixelFormat::BLOB ||
++                           (buffer->dataSpace == HAL_DATASPACE_V0_JFIF && metadata != nullptr);
++    if (!collected) {
++      ALOGE("%s: Dataspace %x of a BLOB is not a JPEG", __FUNCTION__, buffer->dataSpace);
++    }
++    buffer->stream_buffer.status = collected ? BufferStatus::kOk : BufferStatus::kError;
++  }
++
++  // The whole request is queued before any of it is collected, so that all of
++  // its streams are one exposure. A buffer that could not be queued has been
++  // marked as failed.
++  const status_t queued = frame_source_->BeginRequest(settings, buffers);
++  if (queued != OK) {
++    ALOGW("%s: frame %u was not queued completely (%d)", __FUNCTION__,
++          frame_number, queued);
++  }
++
++  for (auto& buffer : *buffers) {
++    if (buffer->is_input ||
++        buffer->stream_buffer.status == BufferStatus::kError) {
++      continue;
++    }
++    auto device_settings = settings.find(buffer->camera_id);
++    auto device_chars = chars_->find(buffer->camera_id);
++    if (device_settings == settings.end() || device_chars == chars_->end()) {
++      ALOGE("%s: Sensor settings or characteristics absent for device: %u",
++            __FUNCTION__, buffer->camera_id);
++      buffer->stream_buffer.status = BufferStatus::kError;
++      continue;
++    }
++
++    buffer->stream_buffer.status = BufferStatus::kOk;
++    status_t ret = BAD_VALUE;
++    if (buffer->format == PixelFormat::BLOB) {
++      if (buffer->dataSpace == HAL_DATASPACE_V0_JFIF && metadata != nullptr) {
++        ret = frame_source_->ProduceBlob(buffer->camera_id,
++                                         device_settings->second, buffer.get(),
++                                         metadata, device_chars->second);
++      } else {
++        ALOGE("%s: Dataspace %x of a BLOB is not a JPEG", __FUNCTION__,
++              buffer->dataSpace);
++      }
++    } else {
++      ret = frame_source_->ProduceFrame(buffer->camera_id, 0 /*timestamp*/,
++                                        device_settings->second, buffer.get(),
++                                        nullptr /*input_buffer*/);
++    }
++    if (ret != OK) {
++      buffer->stream_buffer.status = BufferStatus::kError;
++    }
++  }
++
++  // A request that produced none of its outputs failed as a whole. The
++  // framework is told by an error for the request, with no shutter and no
++  // results (an application hears of that as a failed capture and may shoot
++  // again), and the buffers go back marked as failed, so that none of them
++  // sends a buffer error of its own.
++  size_t outputs = 0;
++  size_t failed = 0;
++  for (auto& buffer : *buffers) {
++    if (buffer->is_input) {
++      continue;
++    }
++    ++outputs;
++    if (buffer->stream_buffer.status == BufferStatus::kError) {
++      ++failed;
++    }
++  }
++  if (frame_source_->FailsRequest(outputs, failed)) {
++    ALOGW("%s: frame %u failed: none of its %zu outputs was produced",
++          __FUNCTION__, frame_number, outputs);
++    for (auto& buffer : *buffers) {
++      buffer->is_failed_request = true;
++    }
++    next_capture_time_ = getSystemTimeWithSource(timestamp_source);
++    next_readout_time_ = next_capture_time_ + exposure_time;
++    if (callback.notify != nullptr) {
++      NotifyMessage msg = ErrorMessage{.frame_number = frame_number,
++                                       .error_stream_id = -1,
++                                       .error_code = ErrorCode::kErrorRequest};
++      callback.notify(pipeline_id, msg);
++    }
++    if (result != nullptr) {
++      result->result_metadata.reset();
++    }
++    buffers->clear();
++    return;
++  }
++
++  // The frame time and the exposure's own values come from the device; without
++  // them (every buffer failed) the time is now.
++  nsecs_t frame_time = getSystemTimeWithSource(timestamp_source);
++  if (metadata != nullptr) {
++    frame_source_->FrameResult(logical_camera_id_, metadata, &frame_time);
++    camera_metadata_ro_entry_t entry;
++    if ((metadata->Get(ANDROID_SENSOR_EXPOSURE_TIME, &entry) == OK) &&
++        (entry.count == 1)) {
++      exposure_time = entry.data.i64[0];
++    }
++  }
++  next_capture_time_ = frame_time;
++  next_readout_time_ = frame_time + exposure_time;
++
++  // The shutter message precedes every buffer; the buffers go back to the
++  // framework when they are destroyed.
++  if (callback.notify != nullptr) {
++    NotifyMessage msg = ShutterMessage{
++        .frame_number = frame_number,
++        .timestamp_ns = static_cast<uint64_t>(next_capture_time_),
++        .readout_timestamp_ns = static_cast<uint64_t>(next_readout_time_),
++        .stream_group_state = stream_group_state};
++    callback.notify(pipeline_id, msg);
++  }
++  if (callback.notify_override_pending_buffer != nullptr &&
++      stream_group_state.size() > 0) {
++    callback.notify_override_pending_buffer(frame_number, stream_group_state);
++  }
++  buffers->clear();
++}
++
++}  // namespace android
+diff --git a/devices/EmulatedCamera/hwl/IFrameSource.h b/devices/EmulatedCamera/hwl/IFrameSource.h
+index a0f4d30206ae132f8594375203a44b50e66d1b73..cea72f2711ef850a568d7fc8830a4414dc430326 100644
+--- a/devices/EmulatedCamera/hwl/IFrameSource.h
++++ b/devices/EmulatedCamera/hwl/IFrameSource.h
+@@ -21,6 +21,8 @@
+ #include <utils/Errors.h>
+ #include <utils/Timers.h>
+ 
++#include <cstddef>
++
+ #include "Base.h"
+ #include "SensorCharacteristics.h"
+ 
+@@ -54,6 +56,65 @@ class IFrameSource {
+   virtual void CalculateAndAppendNoiseProfile(
+       float gain /*in ISO*/, float max_raw_value,
+       HalCameraMetadata* result /*out*/) = 0;
++
++  // A source that is driven by a device outside the HAL captures by itself.
++  // For such a request the sensor calls BeginRequest once, which queues every
++  // output buffer of the request and applies the request's controls. It then
++  // collects each buffer, with ProduceFrame or, for a JPEG, ProduceBlob,
++  // takes the frame time and the exposure's metadata from FrameResult, and
++  // sends the shutter message itself.
++  virtual bool IsHostDriven() const {
++    return false;
++  }
++
++  virtual status_t BeginRequest(const LogicalCameraSettings& /*settings*/,
++                                Buffers* /*buffers*/) {
++    return INVALID_OPERATION;
++  }
++
++  // Whether a request, of which `failed` of its `outputs` output buffers could
++  // not be produced, failed as a whole. The sensor then reports an error for
++  // the request, with no shutter and no results, instead of an error for each
++  // buffer: only that tells an application that its capture failed.
++  virtual bool FailsRequest(size_t /*outputs*/, size_t /*failed*/) const {
++    return false;
++  }
++
++  // Collects a JPEG into `buffer`: the picture, its Exif data built from the
++  // result's metadata, and the trailing blob header.
++  virtual status_t ProduceBlob(uint32_t /*camera_id*/,
++                               const SensorSettings& /*settings*/,
++                               SensorBuffer* /*buffer*/,
++                               HalCameraMetadata* /*result_metadata*/,
++                               const SensorCharacteristics& /*chars*/) {
++    return INVALID_OPERATION;
++  }
++
++  // Replaces the values of the result's keys that the exposure determined, and
++  // reports the frame time (CLOCK_BOOTTIME) of the request's first buffer.
++  virtual bool FrameResult(uint32_t /*camera_id*/, HalCameraMetadata* /*result*/,
++                           nsecs_t* /*timestamp*/) {
++    return false;
++  }
++
++  // A flush or a close is under way: the waits of the capture in progress end
++  // at once and fail their buffers. Callable from any thread. The sensor takes
++  // it back with ClearInterrupt when it starts the next capture.
++  virtual void Interrupt() {
++  }
++
++  // Called by the sensor thread, under the control mutex that Flush holds when
++  // it calls Interrupt, as the sensor takes the next request. A flush that
++  // comes after this call belongs to that request, however soon BeginRequest
++  // follows.
++  virtual void ClearInterrupt() {
++  }
++
++  // Adds the neutral color point that the last still measured, if there is one.
++  virtual bool AppendNeutralColorPoint(uint32_t /*camera_id*/,
++                                       HalCameraMetadata* /*result*/) {
++    return false;
++  }
+ };
+ 
+ }  // namespace framesource
+diff --git a/devices/EmulatedCamera/hwl/SensorCharacteristics.h b/devices/EmulatedCamera/hwl/SensorCharacteristics.h
+index fae9a5c39eeaeb99ac696b8a1d24baa4aa9a4485..355cee16c72667a672d317596d56e165bfb99a9a 100644
+--- a/devices/EmulatedCamera/hwl/SensorCharacteristics.h
++++ b/devices/EmulatedCamera/hwl/SensorCharacteristics.h
+@@ -121,6 +121,31 @@ struct SensorCharacteristics {
+ // Maps logical/physical camera ids to sensor characteristics
+ typedef std::unordered_map<uint32_t, SensorCharacteristics> LogicalCharacteristics;
+ 
++/*
++ * The controls of a request that only a source driven by a device outside the
++ * HAL uses; see IFrameSource::IsHostDriven().
++ */
++struct HostSettings {
++  uint8_t ae_mode = ANDROID_CONTROL_AE_MODE_ON;
++  bool ae_lock = false;
++  int32_t ae_compensation = 0;
++  uint8_t ae_precapture_trigger = ANDROID_CONTROL_AE_PRECAPTURE_TRIGGER_IDLE;
++  uint8_t af_mode = ANDROID_CONTROL_AF_MODE_OFF;
++  uint8_t af_trigger = ANDROID_CONTROL_AF_TRIGGER_IDLE;
++  float focus_distance = 0.f;
++  uint8_t awb_mode = ANDROID_CONTROL_AWB_MODE_AUTO;
++  bool awb_lock = false;
++  float color_correction_gains[4] = {1.f, 1.f, 1.f, 1.f};
++  uint8_t flash_mode = ANDROID_FLASH_MODE_OFF;
++  uint8_t jpeg_quality = 90;
++  // Metering and focus regions as (left, top, right, bottom, weight) of the
++  // active array, the first one of the request.
++  int32_t ae_regions[5] = {0, 0, 0, 0, 0};
++  int32_t af_regions[5] = {0, 0, 0, 0, 0};
++  // The top of the request's AE target frame rate range; 0 when it gave none.
++  uint32_t ae_max_fps = 0;
++};
++
+ /*
+  * Physical camera settings control
+  */
+@@ -144,6 +169,7 @@ struct SensorSettings {
+   uint32_t test_pattern_data[4] = {0, 0, 0, 0};
+   uint32_t screen_rotation = 0;
+   uint32_t timestamp_source = ANDROID_SENSOR_INFO_TIMESTAMP_SOURCE_UNKNOWN;
++  HostSettings host;
+ };
+ 
+ // Maps physical and logical camera ids to individual device settings

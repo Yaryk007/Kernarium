@@ -1,0 +1,206 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 06:09:06 +0900
+Subject: [PATCH] um: skip the IPI pipe drain when an idle wait found it empty
+
+An idle virtual CPU drained its IPI wake pipe after every wait, and when
+a vector was pending the poll of the pending mask at the idle exit
+drained it a second time, right after the first. Nearly every wait ends
+by the clock deadline with the pipe empty, so the first drain was a
+poll() that found nothing.
+
+The wait already tells whether the pipe was readable. When pselect()
+returns without an error and the pipe is not in its result set, the idle
+exit skips the first drain. After an error the result set is undefined
+(EINTR ends the wait on SIGUSR2 and on the IPI signal), so the pipe is
+drained first, as before. After a drain the exit has just made, the poll
+of the pending mask no longer drains again; where the exit made none,
+that poll keeps the drain it makes when it finds a vector pending.
+
+No vector is lost. The byte only ends a wait; the vectors are the
+pending mask, which the idle exit reads whatever woke the wait, and a
+sender sets its vector before it writes its byte. A byte written after
+the wait looked is drained by the poll when a vector is pending, and
+otherwise stays readable, ends the next wait at once and is drained
+there. Bytes still cannot pile up: a wait that returns on the pipe
+drains it, and the drain of the busy path in darwin_ipi_poll() is
+unchanged.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ arch/um/os-Darwin/internal.h |  2 ++
+ arch/um/os-Darwin/smp.c      | 30 ++++++++++++++++++-----
+ arch/um/os-Darwin/time.c     | 46 +++++++++++++++++++++++++++++-------
+ 3 files changed, 64 insertions(+), 14 deletions(-)
+
+diff --git a/arch/um/os-Darwin/internal.h b/arch/um/os-Darwin/internal.h
+index a3b76d3f4ff53f28df3dc65e0600e465590f03f9..4e3b7fbf5f87cfce35da0f47a577a2a9b5228a89 100644
+--- a/arch/um/os-Darwin/internal.h
++++ b/arch/um/os-Darwin/internal.h
+@@ -70,6 +70,7 @@ void darwin_retire_cpu_thread(pthread_t thread);
+ int darwin_start_primary_cpu_carrier(void *stack, jmp_buf *switch_buffer);
+ void __attribute__((noreturn)) darwin_exit_cpu_carrier(void);
+ void darwin_ipi_poll(void);
++void darwin_ipi_idle_poll(void);
+ int darwin_ipi_idle_fd(void);
+ void darwin_ipi_idle_begin(void);
+ int darwin_ipi_idle_pending(void);
+@@ -108,6 +109,7 @@ static inline void __attribute__((noreturn)) darwin_exit_cpu_carrier(void)
+ 	__builtin_unreachable();
+ }
+ static inline void darwin_ipi_poll(void) { }
++static inline void darwin_ipi_idle_poll(void) { }
+ static inline int darwin_ipi_idle_fd(void) { return -1; }
+ static inline void darwin_ipi_idle_begin(void) { }
+ static inline int darwin_ipi_idle_pending(void) { return 0; }
+diff --git a/arch/um/os-Darwin/smp.c b/arch/um/os-Darwin/smp.c
+index 751a21a3110dfb5c0ab87b4c1b9972726a28c0cc..e78d9de7ac1fcd819ad68f198c5345ef649de671 100644
+--- a/arch/um/os-Darwin/smp.c
++++ b/arch/um/os-Darwin/smp.c
+@@ -274,7 +274,7 @@ void __attribute__((noreturn)) darwin_exit_cpu_carrier(void)
+ 	__builtin_unreachable();
+ }
+ 
+-static void drain_ipis(void)
++static void drain_ipis(int drain_pipe)
+ {
+ 	int cpu = uml_curr_cpu();
+ 	int previous;
+@@ -293,9 +293,11 @@ static void drain_ipis(void)
+ 	 * code.  Consume that edge whenever the corresponding pending mask is
+ 	 * handled, not only after pselect().  Otherwise kernel-boundary delivery
+ 	 * clears pending_ipis while stale bytes accumulate until the nonblocking
+-	 * pipe is full and can no longer wake a genuinely idle vCPU.
++	 * pipe is full and can no longer wake a genuinely idle vCPU.  An idle exit
++	 * which has just drained the pipe passes drain_pipe as 0.
+ 	 */
+-	darwin_ipi_idle_drain();
++	if (drain_pipe)
++		darwin_ipi_idle_drain();
+ 	pending = __atomic_exchange_n(&pending_ipis[cpu], 0, __ATOMIC_ACQUIRE);
+ 	uml_ipi_handler_mask(pending);
+ 	darwin_restore_irqs_trace(previous);
+@@ -319,7 +321,7 @@ void os_raise_local_ipi(int vector)
+ 	__atomic_fetch_or(&pending_ipis[cpu], 1U << vector, __ATOMIC_RELEASE);
+ }
+ 
+-void darwin_ipi_poll(void)
++static void poll_ipis(int pipe_handled)
+ {
+ 	int cpu;
+ 
+@@ -328,17 +330,33 @@ void darwin_ipi_poll(void)
+ 	/* Finishing a reschedule batch may resume this task on another virtual
+ 	 * CPU.  Recheck there before returning so callers never continue from an
+ 	 * IPI boundary with a stale CPU identity or an already-pending local
+-	 * callback queue.
++	 * callback queue.  A pipe the caller dealt with is the first CPU's only.
+ 	 */
+ 	do {
+ 		cpu = uml_curr_cpu();
+ 		if (__atomic_load_n(&pending_ipis[cpu], __ATOMIC_ACQUIRE))
+-			drain_ipis();
++			drain_ipis(!pipe_handled);
++		pipe_handled = 0;
+ 	} while (cpu != uml_curr_cpu());
+ 	if (darwin_task_shutdown_requested())
+ 		darwin_exit_cpu_carrier();
+ }
+ 
++void darwin_ipi_poll(void)
++{
++	poll_ipis(0);
++}
++
++/*
++ * The poll of an idle exit which has just drained the wake pipe: it handles the
++ * pending vectors without a second drain.  A byte which a sender writes after
++ * that drain stays in the pipe and ends the next idle wait at once.
++ */
++void darwin_ipi_idle_poll(void)
++{
++	poll_ipis(1);
++}
++
+ void darwin_cpu_relax(void)
+ {
+ 	int cpu;
+diff --git a/arch/um/os-Darwin/time.c b/arch/um/os-Darwin/time.c
+index d14fef76b6d1b47cfd583e23ce797bac28b14c5f..8ca0eb169c4de544f081206b0a79fa912511adb5 100644
+--- a/arch/um/os-Darwin/time.c
++++ b/arch/um/os-Darwin/time.c
+@@ -235,6 +235,15 @@ static void add_wake_fd(fd_set *read_fds, int fd)
+ 		1U << ((unsigned int)fd % (sizeof(read_fds->fds_bits[0]) * 8));
+ }
+ 
++static int wake_fd_ready(const fd_set *read_fds, int fd)
++{
++	/* Unfortified for the same reason as add_wake_fd(). */
++	return (read_fds->fds_bits[(unsigned int)fd /
++		(sizeof(read_fds->fds_bits[0]) * 8)] &
++		(1U << ((unsigned int)fd %
++			(sizeof(read_fds->fds_bits[0]) * 8)))) != 0;
++}
++
+ void os_idle_sleep(void)
+ {
+ 	int cpu = uml_curr_cpu();
+@@ -256,6 +265,8 @@ void os_idle_sleep(void)
+ 		int wake_fd;
+ 		int fire_timer = 0;
+ 		int edge_left = 0;
++		int pipe_empty;
++		int ready;
+ 
+ 		if (cpu == 0)
+ 			edge_left = darwin_irq_idle_begin();
+@@ -309,9 +320,9 @@ void os_idle_sleep(void)
+ 			timeout.tv_nsec = 0;
+ 			timeout_pointer = &timeout;
+ 		}
+-		(void)pselect(wake_fd >= 0 ? wake_fd + 1 : 0,
+-			      wake_fd >= 0 ? &read_fds : NULL, NULL, NULL,
+-			      timeout_pointer, &mask);
++		ready = pselect(wake_fd >= 0 ? wake_fd + 1 : 0,
++				wake_fd >= 0 ? &read_fds : NULL, NULL, NULL,
++				timeout_pointer, &mask);
+ 		if (deadline_fd >= 0)
+ 			disarm_idle_deadline(state);
+ 		/* Clear before draining.  A sender which observed the idle state has
+@@ -325,12 +336,31 @@ void os_idle_sleep(void)
+ 		if (cpu == 0)
+ 			darwin_irq_idle_end();
+ 		darwin_host_stop_checkpoint();
+-		/* Drain the pipe before the bitmask.  An IPI which races after the
+-		 * mask exchange leaves a fresh byte readable for the next idle wait;
+-		 * one which races before it is included in this drain.
++		/* A wait which returned without an error and left the IPI pipe out
++		 * of its result set found the pipe empty, as it is at nearly every
++		 * wake by the deadline or the stop descriptor, so draining it first
++		 * would only confirm that.  Nothing is lost by not looking: the byte
++		 * only ends a wait, the vectors are the pending mask, which the poll
++		 * reads whatever woke the wait, and a sender sets its vector before
++		 * it writes its byte.  A byte which lands after the wait looked is
++		 * consumed by the drain a poll makes when it finds a vector pending,
++		 * or else ends the next wait at once.  An error leaves the result
++		 * set undefined (EINTR is how SIGUSR2 and the IPI signal end a
++		 * wait), so then the pipe is drained first, as it always was.
+ 		 */
+-		darwin_ipi_idle_drain();
+-		darwin_ipi_poll();
++		pipe_empty = ready >= 0 && ipi_fd >= 0 &&
++			     !wake_fd_ready(&read_fds, ipi_fd);
++		if (pipe_empty) {
++			darwin_ipi_poll();
++		} else {
++			/* Drain the pipe before the bitmask.  An IPI which races after
++			 * the mask exchange leaves a fresh byte readable for the next
++			 * idle wait; one which races before it is included in this
++			 * drain, so the poll makes no drain of its own.
++			 */
++			darwin_ipi_idle_drain();
++			darwin_ipi_idle_poll();
++		}
+ 		if (fire_timer)
+ 			timer_handler(SIGALRM, NULL, &registers);
+ 		/* A CPU which may dispatches descriptor IRQs here, from idle

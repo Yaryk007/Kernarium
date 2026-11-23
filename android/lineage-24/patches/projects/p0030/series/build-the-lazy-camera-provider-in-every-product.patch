@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 01:32:40 +0000
+Subject: [PATCH] build the lazy camera provider in every product
+
+The lazy provider binary is disabled unless the soong config variable gch.use_lazy_hal is set, and
+that variable disables the eager provider instead, which the stock emulated camera APEX packages. A
+product that installs the lazy provider cannot set the variable without leaving that APEX with a
+disabled dependency.
+
+Build the lazy provider's defaults in every product. The eager provider is built as before (unless
+the variable is set), and a product installs the one it names.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ common/hal/aidl_service/Android.bp | 7 +------
+ 1 file changed, 1 insertion(+), 6 deletions(-)
+
+diff --git a/common/hal/aidl_service/Android.bp b/common/hal/aidl_service/Android.bp
+index 55cffa9ec6c0766f75ec8c368b66d926adef079c..ce3d2fe915b0604a064edd7cd51be5078d62570c 100644
+--- a/common/hal/aidl_service/Android.bp
++++ b/common/hal/aidl_service/Android.bp
+@@ -42,12 +42,7 @@ gch_lazy_hal_cc_defaults {
+ 
+ gch_lazy_hal_cc_defaults {
+     name: "camera_service_lazy_hal_defaults",
+-    enabled: false,
+-    soong_config_variables: {
+-        use_lazy_hal: {
+-            enabled: true,
+-        },
+-    },
++    enabled: true,
+ }
+ 
+ // Exported for use in vendor/google/services/LyricCameraHAL/src/

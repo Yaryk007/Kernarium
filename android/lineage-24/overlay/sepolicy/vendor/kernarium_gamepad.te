@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The gamepad relay (overlay/gamepad) turns the host application's game
+# controllers into HID devices of the guest. It opens /dev/uhid, the node that
+# Android's own Bluetooth stack creates a paired controller's device through, and
+# it listens on vsock for the host application, which is how the controllers'
+# descriptions and reports reach it. It is a plain daemon that init starts, not a
+# HAL, so it has a domain of its own and nothing else is granted to it.
+type kernarium_gamepad, domain;
+type kernarium_gamepad_exec, exec_type, vendor_file_type, file_type;
+
+init_daemon_domain(kernarium_gamepad)
+
+# The kernel's uhid driver is read and written through its character device.
+allow kernarium_gamepad uhid_device:chr_file rw_file_perms;
+
+# The platform requires this explicit domain classification for direct vsock
+# access. The relay accepts only host CID 2 and never connects out; these are
+# the vsock rights of the sensors sub-HAL.
+typeattribute kernarium_gamepad unconstrained_vsock_violators;
+allow kernarium_gamepad self:vsock_socket { create bind listen accept read write shutdown getattr getopt };

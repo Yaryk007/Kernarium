@@ -40,6 +40,51 @@ struct GuestRunEndTests {
         #expect(failed.message.contains("-4"))
     }
 
+    /// A run the host could not give the guest's memory never started its
+    /// kernel: the notice names that and what to change, not a bare status.
+    @Test
+    func theNoticeNamesAMemoryTheHostWouldNotGive() {
+        let refused = GuestRunEnd(
+            result: Int32(KERNARIUM_RUNTIME_RESULT_MEMORY_REFUSED)
+        )
+        #expect(refused.hostRefusedMemory)
+        #expect(refused.title == "The virtual machine can\u{2019}t start")
+        #expect(refused.message.contains("memory"))
+        #expect(refused.message.contains("smaller size"))
+        #expect(!refused.message.contains("returned"))
+        #expect(
+            refused.message.hasSuffix("Relaunch Kernarium to start it again.")
+        )
+        #expect(refused.systemName == "memorychip")
+        // The advice to choose a smaller size is given only where the
+        // settings offer one: a run at the least size keeps its title and the
+        // cause, and takes the relaunch alone.
+        let least = GuestRunEnd(
+            result: Int32(KERNARIUM_RUNTIME_RESULT_MEMORY_REFUSED),
+            memoryMiB: EmulatorConfiguration.guestMemoryRangeMiB.lowerBound
+        )
+        #expect(least.hostRefusedMemory)
+        #expect(least.title == "The virtual machine can\u{2019}t start")
+        #expect(!least.message.contains("smaller size"))
+        #expect(least.message.hasSuffix("Relaunch Kernarium to start it again."))
+        let above = GuestRunEnd(
+            result: Int32(KERNARIUM_RUNTIME_RESULT_MEMORY_REFUSED),
+            memoryMiB: EmulatorConfiguration.guestMemoryRangeMiB.lowerBound + 64
+        )
+        #expect(above.message.contains("smaller size"))
+        // Another status, and a stop the application asked for, are not it.
+        #expect(!GuestRunEnd(result: -4).hostRefusedMemory)
+        // The library's own out-of-memory status, which a failed allocation
+        // of its own also returns, names nothing of the guest's size.
+        #expect(!GuestRunEnd(result: -2).hostRefusedMemory)
+        #expect(
+            !GuestRunEnd(
+                result: Int32(KERNARIUM_RUNTIME_RESULT_MEMORY_REFUSED),
+                requested: true
+            ).hostRefusedMemory
+        )
+    }
+
     /// A guest that restarted itself again and again is not an error of the
     /// runtime, and the notice does not print the status the runtime used to
     /// say so.

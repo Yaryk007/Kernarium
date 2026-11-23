@@ -5,6 +5,7 @@ set -eu
 BINARY=
 APPLE_GPU_PREFIX=
 FRAMEWORK_DIRECTORY=
+LOCAL_FRAMEWORK=
 
 fail()
 {
@@ -29,6 +30,11 @@ while [ "$#" -gt 0 ]; do
 		FRAMEWORK_DIRECTORY=$2
 		shift 2
 		;;
+	--local-framework)
+		[ "$#" -ge 2 ] || fail "--local-framework requires a path"
+		LOCAL_FRAMEWORK=$2
+		shift 2
+		;;
 	*) fail "unknown option: $1" ;;
 	esac
 done
@@ -46,6 +52,21 @@ case "$APPLE_GPU_PREFIX:$FRAMEWORK_DIRECTORY" in
 		fail "Apple GPU prefix and framework directory must be specified together"
 	;;
 esac
+
+LOCAL_FRAMEWORK_NAME=
+if [ -n "$LOCAL_FRAMEWORK" ]; then
+	[ -n "$FRAMEWORK_DIRECTORY" ] ||
+		fail "--local-framework requires --framework-directory"
+	[ -d "$LOCAL_FRAMEWORK" ] && [ ! -L "$LOCAL_FRAMEWORK" ] ||
+		fail "local framework is missing or symbolic: $LOCAL_FRAMEWORK"
+	local_fw_parent=$(CDPATH= cd -- "$(dirname -- "$LOCAL_FRAMEWORK")" && pwd -P)
+	LOCAL_FRAMEWORK="$local_fw_parent/$(basename -- "$LOCAL_FRAMEWORK")"
+	LOCAL_FRAMEWORK_NAME=$(basename -- "$LOCAL_FRAMEWORK" .framework)
+	local_fw_symlink=$(find "$LOCAL_FRAMEWORK" -type l -print -quit)
+	[ -z "$local_fw_symlink" ] ||
+		fail "local framework contains a symbolic link: $local_fw_symlink"
+fi
+
 command -v xcrun >/dev/null 2>&1 || fail "xcrun is required"
 OTOOL=$(xcrun --find otool)
 [ -x "$OTOOL" ] || fail "xcrun returned an invalid otool"
@@ -76,7 +97,14 @@ while IFS= read -r dependency; do
 		[ -n "$APPLE_GPU_PREFIX" ] ||
 			fail "production executable has an unauthenticated Apple GPU dependency: $dependency"
 		;;
-	*) fail "production executable has a non-system dynamic dependency: $dependency" ;;
+	*)
+		if [ -n "$LOCAL_FRAMEWORK_NAME" ] &&
+		   [ "$dependency" = "@rpath/$LOCAL_FRAMEWORK_NAME.framework/$LOCAL_FRAMEWORK_NAME" ]; then
+			:
+		else
+			fail "production executable has a non-system dynamic dependency: $dependency"
+		fi
+		;;
 	esac
 done
 
@@ -115,16 +143,25 @@ embedded_frameworks=$(
 	find . -mindepth 1 -maxdepth 1 -print | LC_ALL=C sort
 )
 frameworks="$GL_FRAMEWORKS KosmicKrisp"
+if [ -n "$LOCAL_FRAMEWORK_NAME" ]; then
+	all_frameworks="$frameworks $LOCAL_FRAMEWORK_NAME"
+else
+	all_frameworks="$frameworks"
+fi
 expected_frameworks=$(
-	for framework in $frameworks; do
+	for framework in $all_frameworks; do
 		printf './%s.framework\n' "$framework"
 	done | LC_ALL=C sort
 )
 [ "$embedded_frameworks" = "$expected_frameworks" ] ||
 	fail "embedded Apple GPU framework set is not exact: $embedded_frameworks"
 
-for framework in $frameworks; do
-	source="$SOURCE_FRAMEWORKS/$framework.framework"
+for framework in $all_frameworks; do
+	if [ -n "$LOCAL_FRAMEWORK_NAME" ] && [ "$framework" = "$LOCAL_FRAMEWORK_NAME" ]; then
+		source="$LOCAL_FRAMEWORK"
+	else
+		source="$SOURCE_FRAMEWORKS/$framework.framework"
+	fi
 	embedded="$FRAMEWORK_DIRECTORY/$framework.framework"
 	[ -d "$source" ] && [ -d "$embedded" ] ||
 		fail "$framework.framework is missing from the source or runtime"
@@ -163,6 +200,7 @@ for framework in $frameworks; do
 		@rpath/KosmicKrisp.framework/KosmicKrisp|\
 		/usr/lib/libc++.1.dylib|/usr/lib/libSystem.B.dylib|\
 		/usr/lib/libobjc.A.dylib|/usr/lib/libz.1.dylib|\
+		/usr/lib/libcompression.dylib|\
 		/usr/lib/libexpat.1.dylib|\
 		/System/Library/Frameworks/AppKit.framework/*|\
 		/System/Library/Frameworks/CoreFoundation.framework/*|\
@@ -182,7 +220,7 @@ for framework in $frameworks; do
 		fail "runtime must contain exactly one $framework.framework copy"
 done
 
-for framework in $frameworks; do
+for framework in $all_frameworks; do
 	count=$(printf '%s\n' "$binary_dependencies" |
 		awk -v expected="@rpath/$framework.framework/$framework" \
 			'$0 == expected { count++ } END { print count + 0 }')

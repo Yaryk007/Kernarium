@@ -124,7 +124,7 @@ index fcf875c2c3fcc242342034a04ad1ab1bd0e81673..980b6877f18409fe5cc5e4e99d1febc3
  VKR_DEFINE_OBJECT_CAST(device, VK_OBJECT_TYPE_DEVICE, VkDevice)
  
 diff --git a/src/venus/vkr_device_memory.c b/src/venus/vkr_device_memory.c
-index f01e1020296faed1bce5c5fce17a63534c3820d9..7233e6024606d0c1ea1afadc903dbd376e96d03c 100644
+index f6acce4536cc5c8955610cc1db69ccb09cbba012..b78b59b734981d64f066d7383d782c0b764e0c0d 100644
 --- a/src/venus/vkr_device_memory.c
 +++ b/src/venus/vkr_device_memory.c
 @@ -269,6 +269,7 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
@@ -231,7 +231,7 @@ index f01e1020296faed1bce5c5fce17a63534c3820d9..7233e6024606d0c1ea1afadc903dbd37
  bool
  vkr_device_memory_export_blob(struct vkr_device_memory *mem,
                                uint64_t blob_size,
-@@ -737,35 +799,19 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
+@@ -749,35 +811,19 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
     }
  
     if (mem->metal_heap_exportable) {
@@ -295,7 +295,7 @@ index 19456f74a27f6c787decc9c5a5a0b809c5a1bcdd..c695c7de3ee0297e82318076af207abf
  vkr_device_memory_export_blob(struct vkr_device_memory *mem,
                                uint64_t blob_size,
 diff --git a/src/venus/vkr_image.c b/src/venus/vkr_image.c
-index bb0e867cbc7b4ffd1a262555a4c4d3b1ad9b7f5a..0ec9ccc144668c58f5fefc6a0c32e9f05e6ab491 100644
+index 6e94ecb87f383b3ef2f3b8483821e551f9f6a558..6564cc92cc50d61989c4a6fb751cdfb5cd6765b9 100644
 --- a/src/venus/vkr_image.c
 +++ b/src/venus/vkr_image.c
 @@ -6,13 +6,132 @@
@@ -431,8 +431,8 @@ index bb0e867cbc7b4ffd1a262555a4c4d3b1ad9b7f5a..0ec9ccc144668c58f5fefc6a0c32e9f0
     /* XXX If VkExternalMemoryImageCreateInfo is chained by the app, all is
      * good.  If it is not chained, we might still bind an external memory to
      * the image, because vkr_dispatch_vkAllocateMemory makes any HOST_VISIBLE
-@@ -39,6 +158,8 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
-       image->format = format;
+@@ -41,6 +160,8 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
+       image->mip_levels = mip_levels;
        image->array_layers = array_layers;
        image->tiling = tiling;
 +      image->extent = extent;
@@ -440,7 +440,7 @@ index bb0e867cbc7b4ffd1a262555a4c4d3b1ad9b7f5a..0ec9ccc144668c58f5fefc6a0c32e9f0
     }
  }
  
-@@ -118,12 +239,24 @@ vkr_dispatch_vkBindImageMemory(UNUSED struct vn_dispatch_context *dispatch,
+@@ -120,12 +241,24 @@ vkr_dispatch_vkBindImageMemory(UNUSED struct vn_dispatch_context *dispatch,
  {
     struct vkr_device *dev = vkr_device_from_handle(args->device);
     struct vn_device_proc_table *vk = &dev->proc_table;
@@ -465,7 +465,7 @@ index bb0e867cbc7b4ffd1a262555a4c4d3b1ad9b7f5a..0ec9ccc144668c58f5fefc6a0c32e9f0
  static void
  vkr_dispatch_vkBindImageMemory2(UNUSED struct vn_dispatch_context *dispatch,
                                  struct vn_command_vkBindImageMemory2 *args)
-@@ -131,8 +264,31 @@ vkr_dispatch_vkBindImageMemory2(UNUSED struct vn_dispatch_context *dispatch,
+@@ -133,8 +266,31 @@ vkr_dispatch_vkBindImageMemory2(UNUSED struct vn_dispatch_context *dispatch,
     struct vkr_device *dev = vkr_device_from_handle(args->device);
     struct vn_device_proc_table *vk = &dev->proc_table;
  
@@ -498,11 +498,11 @@ index bb0e867cbc7b4ffd1a262555a4c4d3b1ad9b7f5a..0ec9ccc144668c58f5fefc6a0c32e9f0
  
  static void
 diff --git a/src/venus/vkr_image.h b/src/venus/vkr_image.h
-index f098dc3ccbf5093c370d3d843f0fcd880745bbd9..886ed62a32fbe8082b425dd0bdc11df88cd91665 100644
+index fd1185b340364db79aa7433a55358a20c85885eb..3eae1ac7553d7996e68e76c0199cb88f6b044339 100644
 --- a/src/venus/vkr_image.h
 +++ b/src/venus/vkr_image.h
-@@ -14,6 +14,8 @@ struct vkr_image {
-    VkFormat format;
+@@ -15,6 +15,8 @@ struct vkr_image {
+    uint32_t mip_levels;
     uint32_t array_layers;
     VkImageTiling tiling;
 +   VkExtent3D extent;

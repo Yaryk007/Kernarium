@@ -27,6 +27,14 @@ public protocol GuestStreamOpener: Sendable {
 /// cannot be what wakes a thread blocked in a write. When one side ends, the
 /// end passes on as a half close, and the connection goes when both
 /// directions are done. A computer that vanishes is found by TCP keepalive.
+///
+/// The bridge serves other computers. A connection whose peer address is one
+/// of the device's own (loopback included, and the Wi-Fi address reached from
+/// the device itself) comes from a process of the device, another application
+/// or, for the iPad build on a Mac, the Mac's own adb, and is closed at once
+/// without a stream to the guest. `deviceAddresses` supplies the addresses the
+/// device holds; an empty list is a table that could not be read and refuses
+/// every connection.
 public final class AdbNetworkBridge: @unchecked Sendable {
     public static let defaultPort: UInt16 = 5555
     /// The most computers connected at once. The runtime allows 32 open
@@ -36,6 +44,7 @@ public final class AdbNetworkBridge: @unchecked Sendable {
     private let port: UInt16
     private let maxPeers: Int
     private let opener: any GuestStreamOpener
+    private let deviceAddresses: @Sendable () -> [InterfaceAddress]
 
     private let lock = NSLock()
     private var running = false
@@ -47,13 +56,17 @@ public final class AdbNetworkBridge: @unchecked Sendable {
     private let threadsIdle = NSCondition()
     private var threads = 0
 
-    /// `port` 0 asks for any free port, which tests use.
+    /// `port` 0 asks for any free port, which tests use. `deviceAddresses` is
+    /// read for each connection; the default lists the interfaces of the
+    /// device, and a test names the device's addresses itself.
     public init(
         port: UInt16 = AdbNetworkBridge.defaultPort, maxPeers: Int = AdbNetworkBridge.defaultMaxPeers,
+        deviceAddresses: @escaping @Sendable () -> [InterfaceAddress] = LanAddress.interfaceAddresses,
         opener: any GuestStreamOpener
     ) {
         self.port = port
         self.maxPeers = maxPeers
+        self.deviceAddresses = deviceAddresses
         self.opener = opener
     }
 
@@ -192,7 +205,13 @@ public final class AdbNetworkBridge: @unchecked Sendable {
                 if fds[0].revents != 0 { return }
                 continue
             }
-            let peer = accept(listener, nil, nil)
+            var from = sockaddr_in()
+            var fromLength = socklen_t(MemoryLayout<sockaddr_in>.size)
+            let peer = withUnsafeMutablePointer(to: &from) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    accept(listener, $0, &fromLength)
+                }
+            }
             if peer < 0 {
                 switch errno {
                 case EINTR, EAGAIN, ECONNABORTED, EPROTO:
@@ -205,8 +224,27 @@ public final class AdbNetworkBridge: @unchecked Sendable {
                     return
                 }
             }
+            guard isAnotherComputer(from, length: fromLength) else {
+                Darwin.close(peer)
+                continue
+            }
             admit(peer)
         }
+    }
+
+    /// Whether a connection came from a computer that is not the device
+    /// itself. Whatever cannot be told refuses.
+    private func isAnotherComputer(_ from: sockaddr_in, length: socklen_t) -> Bool {
+        guard length >= socklen_t(MemoryLayout<sockaddr_in>.size), from.sin_family == sa_family_t(AF_INET) else {
+            return false
+        }
+        let value = UInt32(bigEndian: from.sin_addr.s_addr)
+        let octets = [
+            UInt8(truncatingIfNeeded: value >> 24), UInt8(truncatingIfNeeded: value >> 16),
+            UInt8(truncatingIfNeeded: value >> 8), UInt8(truncatingIfNeeded: value),
+        ]
+        let own = deviceAddresses()
+        return !own.isEmpty && !LanAddress.isOwn(octets, among: own)
     }
 
     // MARK: Connections

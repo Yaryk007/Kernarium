@@ -1,0 +1,112 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 18:53:07 +0000
+Subject: [PATCH] report the scene mode and the black level lock of a camera
+
+CTS reads every key a LIMITED camera lists from each of its results,
+and two keys were listed and never reported:
+
+- android.control.sceneMode was reported only for a camera that has
+  scenes. A camera whose only scene is DISABLED lists the key and now
+  reports DISABLED, which is what the camera API documents for it.
+- android.blackLevel.lock was reported only at the FULL level, and
+  always as ON. A camera with MANUAL_SENSOR lists the key and now
+  reports it, and the request's own value, which the HAL left unread.
+  The HAL has no black level stage to adjust, so it reports the lock
+  the request asks for; it does not claim that the black level
+  compensation of the camera behind it stays fixed.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .../hwl/EmulatedCameraDeviceInfo.cpp            | 17 ++++++++++++-----
+ .../hwl/EmulatedCameraDeviceInfo.h              |  1 +
+ .../EmulatedCamera/hwl/EmulatedRequestState.cpp | 12 +++++++++++-
+ 3 files changed, 24 insertions(+), 6 deletions(-)
+
+diff --git a/devices/EmulatedCamera/hwl/EmulatedCameraDeviceInfo.cpp b/devices/EmulatedCamera/hwl/EmulatedCameraDeviceInfo.cpp
+index 8738c6dd5eb4b33864e42b1e3d419f4fb622ae96..be2a12eac3f887ae057b0419474a75dd29102d82 100644
+--- a/devices/EmulatedCamera/hwl/EmulatedCameraDeviceInfo.cpp
++++ b/devices/EmulatedCamera/hwl/EmulatedCameraDeviceInfo.cpp
+@@ -382,6 +382,11 @@ status_t EmulatedCameraDeviceInfo::InitializeControlSceneDefaults() {
+     return BAD_VALUE;
+   }
+ 
++  // A camera without scenes reports the scene mode as DISABLED if it lists
++  // the key (CTS wants it of every camera that is not LEGACY).
++  report_scene_mode_ = available_results_.find(ANDROID_CONTROL_SCENE_MODE) !=
++                       available_results_.end();
++
+   if ((entry.count == 1) &&
+       (entry.data.u8[0] == ANDROID_CONTROL_SCENE_MODE_DISABLED)) {
+     scenes_supported_ = false;
+@@ -543,12 +548,14 @@ status_t EmulatedCameraDeviceInfo::InitializeControlAWBDefaults() {
+ }
+ 
+ status_t EmulatedCameraDeviceInfo::InitializeBlackLevelDefaults() {
+-  if (is_level_full_or_higher_) {
++  // The lock belongs to the FULL level and to MANUAL_SENSOR (CTS wants it in
++  // the results of a camera that lists the capability).
++  if (is_level_full_or_higher_ || supports_manual_sensor_) {
+     if (available_requests_.find(ANDROID_BLACK_LEVEL_LOCK) ==
+         available_requests_.end()) {
+       ALOGE(
+-          "%s: Full or above capable devices must be able to set the black "
+-          "level lock!",
++          "%s: Full or above or manual sensor devices must be able to set "
++          "the black level lock!",
+           __FUNCTION__);
+       return BAD_VALUE;
+     }
+@@ -556,8 +563,8 @@ status_t EmulatedCameraDeviceInfo::InitializeBlackLevelDefaults() {
+     if (available_results_.find(ANDROID_BLACK_LEVEL_LOCK) ==
+         available_results_.end()) {
+       ALOGE(
+-          "%s: Full or above capable devices must be able to report the black "
+-          "level lock!",
++          "%s: Full or above or manual sensor devices must be able to "
++          "report the black level lock!",
+           __FUNCTION__);
+       return BAD_VALUE;
+     }
+diff --git a/devices/EmulatedCamera/hwl/EmulatedCameraDeviceInfo.h b/devices/EmulatedCamera/hwl/EmulatedCameraDeviceInfo.h
+index 034580e7b3b9df6df146a86b5aa9d7d911e627cc..d77ceabbaea58c4bed49853ad7b774450ce15ff0 100644
+--- a/devices/EmulatedCamera/hwl/EmulatedCameraDeviceInfo.h
++++ b/devices/EmulatedCamera/hwl/EmulatedCameraDeviceInfo.h
+@@ -213,6 +213,7 @@ struct EmulatedCameraDeviceInfo {
+   bool ae_lock_available_ = false;
+   bool report_ae_lock_ = false;
+   bool scenes_supported_ = false;
++  bool report_scene_mode_ = false;
+   bool vstab_available_ = false;
+   int32_t post_raw_boost_ = 100;
+   bool report_post_raw_boost_ = false;
+diff --git a/devices/EmulatedCamera/hwl/EmulatedRequestState.cpp b/devices/EmulatedCamera/hwl/EmulatedRequestState.cpp
+index cb182a31dc2081bb53042cefc557d28e3aa227e9..3884d28cd14f819fe8dafee44dd6424f1fbc4661 100644
+--- a/devices/EmulatedCamera/hwl/EmulatedRequestState.cpp
++++ b/devices/EmulatedCamera/hwl/EmulatedRequestState.cpp
+@@ -713,6 +713,16 @@ status_t EmulatedRequestState::InitializeSensorSettings(
+     }
+   }
+ 
++  // The HAL has no black level stage that it could adjust, so it reports the
++  // lock that the request asks for. That says nothing about the black level
++  // compensation of the camera behind it.
++  if (info.report_black_level_lock_) {
++    ret = request_settings_->Get(ANDROID_BLACK_LEVEL_LOCK, &entry);
++    if ((ret == OK) && (entry.count == 1)) {
++      info.black_level_lock_ = entry.data.u8[0];
++    }
++  }
++
+   float min_zoom = info.min_zoom_, max_zoom = info.max_zoom_;
+   ret = request_settings_->Get(ANDROID_CONTROL_EXTENDED_SCENE_MODE, &entry);
+   if ((ret == OK) && (entry.count == 1)) {
+@@ -1089,7 +1099,7 @@ std::unique_ptr<HwlPipelineResult> EmulatedRequestState::InitializeResult(
+     }
+     result->result_metadata->Set(ANDROID_CONTROL_AWB_LOCK, &info.awb_lock_, 1);
+   }
+-  if (info.scenes_supported_) {
++  if (info.report_scene_mode_) {
+     result->result_metadata->Set(ANDROID_CONTROL_SCENE_MODE, &info.scene_mode_,
+                                  1);
+   }

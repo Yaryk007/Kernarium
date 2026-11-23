@@ -1,0 +1,60 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+//
+// Andarium's base settings: the shared signing settings, the address of its
+// updates, and what decides whether Follow developer on X is compiled in.
+//
+// Release reads the ignored Developer.local.xcconfig and carries Follow
+// developer on X when it names a handle, and reads the ignored
+// ../../GuestHost/Config/Update.local.xcconfig (Update.xcconfig) and carries the
+// update notice when it names a host.
+
+#include "../../GuestHost/Config/Signing.xcconfig"
+#include "../../GuestHost/Config/Update.xcconfig"
+
+SWIFT_ACTIVE_COMPILATION_CONDITIONS = $(inherited) $(FOLLOW_X_CONDITION)
+
+// Follow developer on X, an Info row, shows the developer's profile on X. The
+// maker names the handle in the ignored Developer.local.xcconfig
+// (Developer.local.xcconfig.example: a handle, never an address, as `//` starts
+// a comment here and the code builds the address) and puts the logo in the
+// ignored Local directory beside this file (Local/x-logo.svg). FOLLOW_X_HANDLE
+// is that handle in Release and empty elsewhere; a non-empty one adds the
+// FOLLOW_X compilation condition, the AndariumFollowXHandle key of Info.plist,
+// the FollowX string table and the X logo, and a build that names a handle and
+// lacks the logo fails its first build phase. A fork, or a Debug build, carries none of it. The tests and the
+// screen captures state FOLLOW_X_HANDLE=example_handle on the xcodebuild
+// command line to build the row into a Debug build, with the plain glyph the
+// tracked catalog draws in place of the logo; adding FOLLOW_X_LOGO_SOURCE=local
+// takes the logo from Local instead, for a capture. AndariumPreview sets the
+// handle empty itself, so it takes the arrangement alone and never the local
+// file's.
+DEVELOPER_X_HANDLE =
+#include? "Developer.local.xcconfig"
+
+FOLLOW_X_HANDLE =
+FOLLOW_X_HANDLE[config=Release] = $(DEVELOPER_X_HANDLE)
+
+// An empty handle names the setting FOLLOW_X_ARRANGED_ and gets NO_FOLLOW_X;
+// any other lands on an undefined name and gets FOLLOW_X.
+FOLLOW_X_ARRANGED_ = NO_FOLLOW_X
+FOLLOW_X_CONDITION = $(FOLLOW_X_ARRANGED_$(FOLLOW_X_HANDLE:identifier):default=FOLLOW_X)
+
+// Info.plist holds the handle only where FOLLOW_X is defined.
+FOLLOW_X_PLIST_ = FOLLOW_X_OFF=1
+FOLLOW_X_PLIST_DEFINITION = $(FOLLOW_X_PLIST_$(FOLLOW_X_HANDLE:identifier):default=FOLLOW_X=1)
+
+// The maker's logo is the catalog linked to Local/x-logo.svg ("local"), the
+// tracked glyph the tests draw is the other (empty). Release takes the
+// maker's.
+FOLLOW_X_LOGO_SOURCE =
+FOLLOW_X_LOGO_SOURCE[config=Release] = local
+
+// What the row adds is left out the same way: the logo's catalogs and the
+// row's string table are wanted only with a handle, and of the two logo
+// catalogs the one its source does not name is left out.
+X_LOGO_ABSENT_ = XLogoLocal.xcassets XLogoGlyph.xcassets
+FOLLOW_X_ABSENT_ = FollowX.xcstrings
+FOLLOW_X_UNUSED_ = XLogoLocal.xcassets
+FOLLOW_X_UNUSED_local = XLogoGlyph.xcassets
+
+EXCLUDED_SOURCE_FILE_NAMES = $(FOLLOW_X_ABSENT_$(FOLLOW_X_HANDLE:identifier):default=) $(X_LOGO_ABSENT_$(FOLLOW_X_HANDLE:identifier):default=) $(FOLLOW_X_UNUSED_$(FOLLOW_X_LOGO_SOURCE:identifier):default=)

@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 
+#include "cpu/gadget_cache_budget.hpp"
+#include "cpu/gadget_generation_window.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <cassert>
@@ -45,10 +48,11 @@ struct alignas(128) ExecutorAnnouncement final {
 };
 
 /* Publish a pair of words that translated code reads with one `ldp`: a
- * BlockLink's stream and instruction count, or an indirect cell's guest PC
- * and link. With FEAT_LSE2 an aligned sixteen-byte `stp` is a single access,
- * so a vCPU following the pair while another retargets it sees one value or
- * the other, never a stream with another block's count. */
+ * BlockLink's pair (in both engines the first entry and the stream past
+ * it), or an indirect cell's guest PC and link. With FEAT_LSE2 an aligned
+ * sixteen-byte `stp` is a single access, so a vCPU following the pair
+ * while another retargets it sees one value or the other, never half of
+ * each. */
 inline void store_pair(void *at, std::uint64_t first,
 	std::uint64_t second) noexcept
 {
@@ -223,6 +227,23 @@ private:
 	mutable std::mutex mutex_;
 	std::vector<const ExecutorAnnouncement *> attached_;
 };
+
+/* How a cache's window sees an address space it holds at epoch `now`, the
+ * `attached` executors being the ones that hold it (the asking cache among
+ * them) and `account` its charge to the budget: PlaceUse::elsewhere when
+ * another executor holds it and some executor entered it within the account's
+ * window of activity, PlaceUse::here when only the asking cache holds it and
+ * it was entered lately, PlaceUse::idle when nobody entered it in that window.
+ * A closed or shedding space is idle: its holders let go of it at their next
+ * entry, so no window keeps it. A new account counts as entered until its
+ * history is its own. */
+[[nodiscard]] inline PlaceUse place_use(const AttachedExecutors &attached,
+	const Account &account, bool closed, std::uint64_t now)
+{
+	if (closed || account.shedding() || account.activity(now) == 0)
+		return PlaceUse::idle;
+	return attached.size() > 1 ? PlaceUse::elsewhere : PlaceUse::here;
+}
 
 /* Where bodies wait after they are unpublished, until no executor can still be
  * running them.
@@ -435,17 +456,31 @@ public:
 			/* One the budget asked to shed is closed here instead, as
 			 * close() would, if no executor holding it has yet. */
 			if (space->shedding()) {
-				if (space->close()) {
-					Space::note_closed();
-					space->request_renewal();
-				}
+				close_shed(space);
 				candidates.erase(candidates.begin() +
 					static_cast<std::ptrdiff_t>(index));
 				continue;
 			}
 			if (space->key().options == key.options) {
 				space->attach(announcement);
-				return space;
+				/* The budget may have asked the space to shed after
+				 * the check above and before this executor was among
+				 * those it asks, and nothing would then ask this one
+				 * to let go: a shed that reached the attached list
+				 * first is seen here, since attaching and asking
+				 * both hold the list's lock and the flag is set
+				 * before the ask. Another executor holds the space,
+				 * since a registered space always has one, so this
+				 * detach destroys nothing. */
+				if (!space->shedding())
+					return space;
+				const bool last = space->detach(announcement);
+				assert(!last);
+				(void)last;
+				close_shed(space);
+				candidates.erase(candidates.begin() +
+					static_cast<std::ptrdiff_t>(index));
+				continue;
 			}
 			++index;
 		}
@@ -481,6 +516,8 @@ public:
 		if (!space->close())
 			return;
 		Space::note_closed();
+		if (!space->shedding())
+			ledger().renewals.fetch_add(1, std::memory_order_relaxed);
 		const std::lock_guard guard{mutex_};
 		withdraw(space);
 		space->request_renewal();
@@ -512,6 +549,18 @@ private:
 				(std::size_t{key.mode} << 56);
 		}
 	};
+
+	/* Close a space the budget asked to shed, if no executor has, and ask
+	 * its executors to let go of it: they are asked once by the budget, but
+	 * an executor that attached after that was not among them. The caller
+	 * holds mutex_ and erases the space from its candidates. */
+	static void close_shed(Space *space)
+	{
+		if (space->close()) {
+			Space::note_closed();
+			space->request_renewal();
+		}
+	}
 
 	/* Stop handing a space out. It may already be gone, when it was closed.
 	 * The caller holds mutex_. */

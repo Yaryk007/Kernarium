@@ -67,7 +67,7 @@ def findings(output: str) -> set[tuple[str, int, str]]:
     parsed: set[tuple[str, int, str]] = set()
     for line in output.splitlines():
         parts = line.split(": ", 2)
-        if len(parts) == 3 and parts[1] in ("R1", "R2", "R3", "R4", "R5", "R6"):
+        if len(parts) == 3 and parts[1] in ("R1", "R2", "R3", "R4", "R5", "R6", "R7"):
             path, _, number = parts[0].rpartition(":")
             parsed.add((path, int(number), parts[1]))
     return parsed
@@ -571,6 +571,77 @@ def run_fixture(checker: Checker, directory: Path) -> None:
     )
 
 
+PATCH_BODY = "\nSubject: [PATCH] A change\n\nThe message.\n---\n"
+IDENTITY = "Someone <someone@users.noreply.github.com>"
+OUTSIDE = "Someone Else <outsider@example.invalid>"
+
+
+def run_patch_addresses(checker: Checker, directory: Path) -> None:
+    """R7: only the configured identity's and the agent's addresses in the
+    patches this project replays (dependencies/patches and the Android
+    routes); an outside contributor's own series is allowed on its From:
+    line, and nowhere else."""
+    root = directory / "patch-repo"
+    root.mkdir()
+    write(root, "dependencies/patches/own/Own.patch",
+          f"From: {IDENTITY}\n{PATCH_BODY}\n"
+          "Co-Authored-By: Claude <noreply@anthropic.com>\n")
+    write(root, "dependencies/patches/own/Context.patch",
+          f"From: {IDENTITY}\n{PATCH_BODY}diff --git a/f b/f\n"
+          " Copyright (C) 2009 Upstream Author <upstream@example.invalid>\n")
+    write(root, "dependencies/patches/outside/One.patch",
+          f"From: {OUTSIDE}\n{PATCH_BODY}")
+    write(root, "dependencies/patches/outside/Two.patch",
+          f"From: {OUTSIDE}\nSigned-off-by: {OUTSIDE}\n{PATCH_BODY}")
+    write(root, "dependencies/patches/outside/Message.patch",
+          f"From: {IDENTITY}\nSubject: [PATCH] A change\n\nReported by {OUTSIDE}.\n---\n")
+    write(root, "dependencies/patches/other/Three.patch",
+          f"From: {OUTSIDE}\n{PATCH_BODY}")
+    # The Android routes: one series is the outside contributor's own.
+    listed = "android/lineage-24/patches/projects/p0034/series"
+    unlisted = "android/lineage-24/patches/projects/p0035/series"
+    write(root, f"{listed}/Listed.patch", f"From: {OUTSIDE}\n{PATCH_BODY}")
+    write(root, f"{listed}/Message.patch",
+          f"From: {IDENTITY}\nSubject: [PATCH] A change\n\nReported by {OUTSIDE}.\n---\n")
+    write(root, f"{unlisted}/Unlisted.patch", f"From: {OUTSIDE}\n{PATCH_BODY}")
+    write(root, "android/lineage-24/patches/projects/p0001/series/Own.patch",
+          f"From: {IDENTITY}\n{PATCH_BODY}\nCo-Authored-By: Claude <noreply@anthropic.com>\n")
+    write(root, "android/lineage-24/third_party/mesa-venus/Upstream.patch", f"From: {OUTSIDE}\n{PATCH_BODY}")
+    write(root, "kernel/patches/Upstream.patch", f"From: {OUTSIDE}\n{PATCH_BODY}")
+    write(root, "docs/notes.md", f"From: {OUTSIDE}\n")
+    allowed = directory / "outside-allow.tsv"
+    allowed.write_text(
+        "R7\tdependencies/patches/outside/One.patch\t^From:\toutside contributor's own patch\n"
+        "R7\tdependencies/patches/outside/Two.patch\t^From:\toutside contributor's own patch\n"
+        f"R7\t{listed}/*.patch\t^From:\toutside contributor's own patch\n",
+        encoding="utf-8")
+    result = checker.run("--source-root", str(root), "--allowlist", str(allowed), "--no-denylist")
+    require(result.returncode == 1, f"R7 run must fail:\n{result.stdout}")
+    expected = {
+        ("dependencies/patches/outside/Two.patch", 2, "R7"),  # Signed-off-by is not the From: line
+        ("dependencies/patches/outside/Message.patch", 4, "R7"),  # the message is not the From: line
+        ("dependencies/patches/other/Three.patch", 1, "R7"),  # no row names this series
+        (f"{listed}/Message.patch", 4, "R7"),  # the row allows the From: line of its series only
+        (f"{unlisted}/Unlisted.patch", 1, "R7"),  # an Android series no row names
+    }
+    require(findings(result.stdout) == expected, f"R7 findings differ:\n{result.stdout}")
+    require("0 stale allowlist entries" in result.stdout, f"an allow row went unused:\n{result.stdout}")
+    # The same rows without the exception: the From: lines fail too.
+    bare = directory / "no-allow.tsv"
+    bare.write_text("# no entries\n", encoding="utf-8")
+    without = findings(checker.run("--source-root", str(root), "--allowlist", str(bare), "--no-denylist").stdout)
+    for path, line in (
+        ("dependencies/patches/outside/One.patch", 1),
+        ("dependencies/patches/outside/Two.patch", 1),
+        (f"{listed}/Listed.patch", 1),
+    ):
+        require((path, line, "R7") in without, f"{path} must fail without its allow row")
+    require(not any(path.startswith(("kernel/", "docs/", "android/lineage-24/third_party/")) for path, _, _ in without),
+            "R7 reads only the patches under dependencies/patches and android/lineage-24/patches")
+    require(not any(path.endswith(("Own.patch", "Context.patch")) for path, _, _ in without),
+            "the configured identity, the agent and diff context are not findings")
+
+
 def run_tree(checker: Checker, root: Path) -> None:
     for extra in ((), ("--no-denylist",)):
         result = checker.run("--source-root", str(root), *extra)
@@ -592,6 +663,7 @@ def main() -> int:
         (directory / "home").mkdir()
         checker = Checker(arguments.checker, directory / "home")
         run_fixture(checker, directory)
+        run_patch_addresses(checker, directory)
     # The tree runs use the invoking environment, as a developer's would.
     run_tree(Checker(arguments.checker, None), arguments.source_root)
     print("environment portability checker passed")

@@ -1,0 +1,185 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 14:09:40 +0900
+Subject: [PATCH] um: leave the VMAs a fork cannot change alone at its flush
+
+dup_mmap() ends with flush_tlb_mm(oldmm), and the Darwin flush_tlb_mm()
+invalidated every VMA of the parent on the host, text included: the
+parent then faulted back every page it touched, each x86 text page lost
+its code holders, and every engine validated or translated the code on
+those pages again, after every fork of a real process (not a vfork).
+Android's zygote forks for every app start.
+
+Fork changes the parent's present entries in one way: copy_present_ptes()
+write-protects a writable entry of a copy-on-write mapping
+(__copy_present_ptes() in mm/memory.c). Every site that makes an entry
+writable also requires VM_WRITE of its VMA, and mprotect() rewrites the
+entries of a VMA that loses it, so only a VMA that is copy-on-write and
+writable holds such an entry. The other entries fork rewrites in the
+parent are not present (swap, migration and device entries) and have no
+host mapping, and a page that may be pinned is copied for the child
+alone. Huge pages and hugetlb are not configured, and a
+dup_mmap() that fails before arch_dup_mmap() still flushes everything.
+
+The host never maps a page with more than its page-table entry grants,
+drops a frame before Linux reuses it, and moves the code stamp after
+every code change, so every other VMA's host mappings are still exact:
+arch_dup_mmap(), defined for every Darwin build, names the forking task
+in the parent's mm context, and the flush that task makes next, which
+clears the mark, leaves those VMAs alone. Any other flush, another
+task's included, covers the whole mm as before.
+---
+ arch/um/include/asm/mm_hooks.h   |  8 -------
+ arch/um/include/asm/mmu.h        | 10 ++++++++
+ arch/um/kernel/skas/mmu_darwin.c | 17 +++++++++++---
+ arch/um/kernel/tlb.c             | 39 ++++++++++++++++++++++++++++++++
+ 4 files changed, 63 insertions(+), 11 deletions(-)
+
+diff --git a/arch/um/include/asm/mm_hooks.h b/arch/um/include/asm/mm_hooks.h
+index 2427d23ff06b608042a4b2eec8c8b4438a19a56a..100f5c3b00671e01248150642025c6ea0139b0d5 100644
+--- a/arch/um/include/asm/mm_hooks.h
++++ b/arch/um/include/asm/mm_hooks.h
+@@ -6,15 +6,7 @@
+ struct mm_struct;
+ struct vm_area_struct;
+ 
+-#ifdef CONFIG_UML_DARWIN_MM_SHARED
+ int arch_dup_mmap(struct mm_struct *oldmm, struct mm_struct *mm);
+-#else
+-static inline int arch_dup_mmap(struct mm_struct *oldmm,
+-				struct mm_struct *mm)
+-{
+-	return 0;
+-}
+-#endif
+ 
+ void arch_exit_mmap(struct mm_struct *mm);
+ 
+diff --git a/arch/um/include/asm/mmu.h b/arch/um/include/asm/mmu.h
+index 4dd32155d3f216cd86b2d5943048e6d3bd06e898..9b73b2b32531998bbd5b6d61b0609e4e1b05da8f 100644
+--- a/arch/um/include/asm/mmu.h
++++ b/arch/um/include/asm/mmu.h
+@@ -13,6 +13,8 @@
+ 
+ #ifdef UML_HOST_DARWIN
+ #include <asm/tlb_sync_ranges.h>
++
++struct task_struct;
+ #endif
+ 
+ typedef struct mm_context {
+@@ -34,6 +36,14 @@ typedef struct mm_context {
+ #ifdef CONFIG_UML_ARM64_VDSO
+ 	/* Where the task's vDSO is mapped, or 0 if it has none. */
+ 	unsigned long vdso;
++#endif
++#ifdef UML_HOST_DARWIN
++	/*
++	 * The task whose dup_mmap() flushes this mm next, set by
++	 * arch_dup_mmap() and consumed by that task's flush_tlb_mm(), which
++	 * then leaves the VMAs fork cannot have changed alone.
++	 */
++	struct task_struct *darwin_fork_flusher;
+ #endif
+ 	struct mutex turnstile;
+ 
+diff --git a/arch/um/kernel/skas/mmu_darwin.c b/arch/um/kernel/skas/mmu_darwin.c
+index 7a70e528b66dd95c7102ff2f8bc335907c18c985..30fbcd330fc60626cce2fa5b890b8845707222a3 100644
+--- a/arch/um/kernel/skas/mmu_darwin.c
++++ b/arch/um/kernel/skas/mmu_darwin.c
+@@ -110,18 +110,27 @@ void arch_ring_unpin(struct mm_struct *mm)
+ 	atomic_dec_return_release(&mm->context.darwin_ring_pins);
+ }
+ 
++#endif
++
+ /*
++ * dup_mmap() has copied the page tables and flushes oldmm next, in this task
++ * and under the same mmap_lock, which both mms hold for writing here: say so,
++ * so that flush_tlb_mm() can tell that flush from any other.  A dup_mmap()
++ * that fails earlier never gets here, and its flush stays complete.
++ *
+  * A fork child gets the shared vmas its parent may not keep to itself
+- * (MADV_DONTFORK); both mmap_locks are held for writing.  Its pages that
+- * io_uring pins were copied for it, so it starts with no pinned ring.
++ * (MADV_DONTFORK).  Its pages that io_uring pins were copied for it, so it
++ * starts with no pinned ring.
+  */
+ int arch_dup_mmap(struct mm_struct *oldmm, struct mm_struct *mm)
+ {
++	WRITE_ONCE(oldmm->context.darwin_fork_flusher, current);
++#ifdef CONFIG_UML_DARWIN_MM_SHARED
+ 	if (READ_ONCE(oldmm->context.darwin_maps_shared) && maps_shared(mm))
+ 		WRITE_ONCE(mm->context.darwin_maps_shared, 1);
++#endif
+ 	return 0;
+ }
+-#endif
+ 
+ int arch_unmap_one(struct mm_struct *mm, struct vm_area_struct *vma,
+ 		   unsigned long addr, pte_t orig_pte)
+@@ -139,6 +148,8 @@ int init_new_context(struct task_struct *task, struct mm_struct *mm)
+ 	mutex_init(&mm->context.turnstile);
+ 	spin_lock_init(&mm->context.sync_tlb_lock);
+ 	mm->context.sync_tlb_range_count = 0;
++	/* dup_mm() copied the parent's context over this one. */
++	mm->context.darwin_fork_flusher = NULL;
+ 
+ 	/*
+ 	 * This is a guest address-space number, not a Darwin PID.  The host
+diff --git a/arch/um/kernel/tlb.c b/arch/um/kernel/tlb.c
+index 04cff8cc7fb270a9b3980c3324335b5cd8868104..7ce5ae0fe9820ab0e84bdfab11d201634b1bd0d5 100644
+--- a/arch/um/kernel/tlb.c
++++ b/arch/um/kernel/tlb.c
+@@ -1292,12 +1292,51 @@ void darwin_flush_icache_user_page(struct vm_area_struct *vma,
+ }
+ #endif
+ 
++#ifdef UML_HOST_DARWIN
++/*
++ * Whether fork can have changed a present PTE of @vma in the parent.  The
++ * parent's page tables change at fork only where copy_present_ptes() write
++ * protects a writable PTE of a copy-on-write mapping (mm/memory.c,
++ * __copy_present_ptes()), and every site that makes a PTE writable also
++ * requires VM_WRITE of its vma (maybe_mkwrite() and the like), while
++ * mprotect() rewrites the PTEs of a vma that loses it.  The other entries
++ * fork rewrites in the parent are not present, and a page that may be
++ * pinned is copied for the child alone.
++ *
++ * The host never maps a page with more than its PTE grants, drops a frame
++ * before Linux reuses it, and moves the code stamp after every code change,
++ * so a vma this returns false for has host mappings, stamps and code
++ * holders that are still exact: a fork that left them alone made the parent
++ * fault and the engines translate or validate every page of its text again.
++ */
++static bool darwin_fork_changes_vma(const struct vm_area_struct *vma)
++{
++	return is_cow_mapping(vma->vm_flags) && (vma->vm_flags & VM_WRITE);
++}
++#endif
++
+ void flush_tlb_mm(struct mm_struct *mm)
+ {
+ 	struct vm_area_struct *vma;
+ 	VMA_ITERATOR(vmi, mm, 0);
++#ifdef UML_HOST_DARWIN
++	/*
++	 * Only the flush that ends dup_mmap(), by the task that marked the mm
++	 * in arch_dup_mmap(), is the fork's.  Every other flush of this mm,
++	 * another task's included, and every flush of an mm no fork marked
++	 * covers all of it.
++	 */
++	bool fork = READ_ONCE(mm->context.darwin_fork_flusher) == current;
++
++	if (fork)
++		WRITE_ONCE(mm->context.darwin_fork_flusher, NULL);
++#endif
+ 
+ 	for_each_vma(vmi, vma) {
++#ifdef UML_HOST_DARWIN
++		if (fork && !darwin_fork_changes_vma(vma))
++			continue;
++#endif
+ 		um_tlb_mark_sync(mm, vma->vm_start, vma->vm_end);
+ #ifdef UML_HOST_DARWIN
+ 		/*

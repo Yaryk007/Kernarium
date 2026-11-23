@@ -22,7 +22,7 @@ inputs are cast the same way and get the same requirement.
  2 files changed, 22 insertions(+), 8 deletions(-)
 
 diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
-index 15aa830d39dcff2d6c71e7cdb22509e4ae5602a2..1916c2fc77038d0f31675de0cf39bb8223d9b3e4 100644
+index 700c3ac9d63eed9568f0607c3a1b1e83b45856be..858360b8740ccab4c78177c4b4b64089a21f4f8a 100644
 --- a/src/vrend/vrend_renderer.c
 +++ b/src/vrend/vrend_renderer.c
 @@ -7611,6 +7611,14 @@ static bool use_integer(void) {

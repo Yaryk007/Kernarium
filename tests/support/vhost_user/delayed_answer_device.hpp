@@ -38,6 +38,13 @@ namespace uml::testing {
  * device's place: the wrapped device then never hears of the request, and the
  * answer goes back at once. That reaches the driver's paths for an answer the
  * device would give only when its own work fails.
+ *
+ * A postponer, when set, sees each request after the answerer and may hold the
+ * request itself back: the wrapped device hears of it only when its delay has
+ * passed (or never, when a reset comes first), as it would of a request that
+ * waits behind slow work, and the transport sees it deferred meanwhile. That
+ * reaches the driver's paths for a device that is late to act, not only late
+ * to answer.
  */
 class DelayedAnswerDevice final : public uml::virtio::VhostUserDevice {
 public:
@@ -48,10 +55,16 @@ public:
     using Log = std::function<void(std::string_view)>;
     using Answerer = std::function<std::optional<std::vector<std::uint8_t>>(
         std::uint32_t queue, std::span<const std::uint8_t> request)>;
+    /* How long to hold the request itself back; `never` until a reset. */
+    using Postponer = std::function<std::optional<std::chrono::milliseconds>(
+        std::uint32_t queue, std::span<const std::uint8_t> request)>;
 
     DelayedAnswerDevice(std::unique_ptr<uml::virtio::VhostUserDevice> device,
                         Policy policy, Log log = {}, Answerer answerer = {});
     ~DelayedAnswerDevice() override;
+
+    /* Call it before the device is handed to the transport. */
+    void setPostponer(Postponer postponer);
 
     DelayedAnswerDevice(const DelayedAnswerDevice&) = delete;
     DelayedAnswerDevice& operator=(const DelayedAnswerDevice&) = delete;
@@ -68,8 +81,16 @@ public:
         std::uint32_t index, std::uint64_t requestId,
         std::span<const std::uint8_t> request,
         std::size_t responseCapacity) override;
+    [[nodiscard]] std::vector<std::uint8_t> discardedResponse(
+        std::uint32_t queueIndex,
+        std::span<const std::uint8_t> request) const override;
     void reset() noexcept override;
     void prepareReset() noexcept override;
+    /* The transport's policy for the device is the wrapped device's, so a
+     * test sees the transport treat it as it would the device alone. */
+    [[nodiscard]] bool keepsRequestsOnDisabledRing() const noexcept override;
+    [[nodiscard]] bool keepsDeferredRequestsWhileDisabled() const noexcept override;
+    [[nodiscard]] bool answersKicksBeforeRunning() const noexcept override;
     void setGuestMapper(GuestMapper mapper) override;
     void setSharedMemoryRegions(
         std::shared_ptr<const uml::virtio::SharedMemoryRegions>
@@ -94,10 +115,18 @@ public:
     [[nodiscard]] std::string readinessDescription() const override;
 
 private:
+    /* A request held back whole: the wrapped device has not heard of it. */
+    struct Postponed {
+        std::uint32_t queue {};
+        std::vector<std::uint8_t> bytes;
+        std::size_t responseCapacity {};
+    };
+
     struct Held {
         std::optional<std::chrono::steady_clock::time_point> due;
         uml::virtio::VhostUserQueueCompletion completion;
         bool signalled {};
+        std::optional<Postponed> postponed;
     };
 
     void runTimer();
@@ -107,6 +136,7 @@ private:
     Policy policy_;
     Log log_;
     Answerer answerer_;
+    Postponer postponer_;
     std::mutex mutex_;
     std::condition_variable changed_;
     std::deque<Held> held_;

@@ -158,11 +158,71 @@ struct NativeKernelPlacement final {
  *
  * A window longer than the one held, which only a process whose guest is not
  * spent asks for, extends the reservation at its exact address or, where the
- * host places the window, takes a new one and releases the old, which holds
- * nothing. Only one run uses the window at a time (the caller holds the
- * process address-space gate). Invalid when the host will not reserve it. */
+ * host places the window, takes a new one beside the held one. Only one run
+ * uses the window at a time (the caller holds the process address-space gate).
+ * Invalid when the host will not reserve it.
+ *
+ * THE RULE: a start that is refused before the heap region is reserved leaves
+ * the process's window exactly as it was before the start. (The region stays
+ * once reserved, and with it the start has committed: a refused RAM trial
+ * keeps the window.) What a start reserves for itself, the growth of the held
+ * window or a new window, is an attempt, and the caller settles it once the
+ * start is past what can refuse it, either way and once: commit keeps it; undo
+ * gives back exactly the attempt and nothing else. The growth is shrunk off the
+ * end, and the new window is released with the window held before the start the
+ * process's again. The window held before is never given up until the start
+ * commits: committing releases it, unless it holds signed kernel text a load
+ * kept (no mapping can replace that on iOS), which stays mapped, inert. What an
+ * earlier start left, the window and the text kept in it, is never touched by
+ * an undo; the attempt has none, because a start loads no kernel before it can
+ * be refused. A start that does, an informational run (it asks for no heap
+ * region), commits. The pieces an undo gives back are empty reservations, which
+ * every product's host maps and unmaps, so every configuration can shrink and
+ * restore; a failed unmap leaves a reservation the process does not track. A
+ * reservation asked for while an attempt is unsettled keeps it. */
 [[nodiscard]] NativeKernelLayout reserve_process_native_window(
 	const NativeKernelLayout &geometry, WindowPlacement placement) noexcept;
+
+/* Reserves the process's heap region now, after the process's window.
+ *
+ * The kernel's mapping of its RAM takes its first block from the region, which
+ * is a reservation of its own (HeapRegion) and is lazy: a process with little
+ * address space (an iOS application without Extended Virtual Addressing) can
+ * have no room for it once the window holds its share, and the host answers
+ * the kernel's first block with nothing, which ends the process. A run asks
+ * for it after the window, the order a kernel's own start has always had, so
+ * that no host's placement of a window is displaced by it; a refusal is then
+ * answered with undo_process_window. True when the region is
+ * reserved, now or before; false, with a line on stderr, where the host has no
+ * room for it. A refusal reserves nothing, and a later call tries again. The
+ * caller holds the process address-space gate. */
+[[nodiscard]] bool reserve_process_heap() noexcept;
+
+/* Keeps what the start reserved in the process's window (THE RULE, above). */
+void commit_process_window() noexcept;
+
+/* Gives back what the start reserved in the process's window and nothing else
+ * (THE RULE, above): called for a start refused before its kernel, when the
+ * heap region is refused. The caller holds the process address-space gate. */
+void undo_process_window() noexcept;
+
+/* Whether the host maps the guest's RAM in this layout's window. The kernel
+ * maps its RAM over the reservation with one read-write mapping and, where the
+ * host refuses it, can only exit, which ends the process; a refusal is known
+ * here, before the kernel starts, and the run fails with a result of its own.
+ *
+ * It makes that mapping, at the place the kernel does and for the RAM beyond a
+ * fixed prefix, and gives the range back to the window's reservation in place,
+ * so that the window is whole and protectionless as before and nothing is
+ * freed. The prefix (64 MiB, a margin above the kernel image and its reserved
+ * prefix, which the kernel maps by other calls) is left alone, because a
+ * signed text alias of an earlier guest in it is permanent; the kernel's own
+ * suffix begins below it, so the trial does not promise that span, nor the
+ * kernel's later metadata allocations or the wiring of the suffix's tail.
+ * The caller holds the process address-space gate and has not yet started the
+ * guest. A guest too large for the window is not mappable. */
+[[nodiscard]] bool native_guest_memory_mappable(const NativeKernelLayout &layout,
+	std::size_t guest_memory) noexcept;
 
 /* The layout for this process: the placement's window, reserved. It is invalid
  * when guest_memory does not fit the product's envelope, and with

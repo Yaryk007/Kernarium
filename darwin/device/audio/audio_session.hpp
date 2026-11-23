@@ -15,7 +15,11 @@ enum class Client : std::uint8_t {
  * from who needs it: playback alone uses the playback category, and the
  * category becomes play-and-record, still mixing with other audio, only while
  * the microphone is being captured, and returns to playback when capture
- * leaves. The session is deactivated when no client is left.
+ * leaves. Only while the microphone is captured may a Bluetooth headset be the
+ * input (audio_session_category.hpp has the options and what they cost the
+ * headset's output). The category is set only when the plan or the session's
+ * reported settings changed. The session is deactivated when no client is
+ * left.
  *
  * acquire() returns false if the system refuses the session; the client then
  * is not counted. macOS has no audio session, and both calls do nothing. */

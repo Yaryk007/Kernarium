@@ -54,7 +54,7 @@ def main():
             materialize(work, line)
             source = work / FILES[0]
             run("cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror", f"-I{fixtures}", "-c", str(source), "-o", str(work / "irq.o"))
-            run("c++", "-std=c++20", "-Wall", "-Wextra", "-Werror", str(fixtures / "driver.cpp"), str(work / "irq.o"), "-o", str(work / "check"))
+            run("c++", "-std=c++20", "-Wall", "-Wextra", "-Werror", f"-I{source.parent}", str(fixtures / "driver.cpp"), str(work / "irq.o"), "-o", str(work / "check"))
             run(str(work / "check"))
 
 

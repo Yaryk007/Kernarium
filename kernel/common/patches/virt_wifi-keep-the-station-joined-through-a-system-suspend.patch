@@ -1,0 +1,188 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 22:49:44 +0900
+Subject: [PATCH] virt_wifi: keep the station joined through a system suspend
+
+cfg80211's wiphy_suspend() leaves every network of a wiphy that has no
+wake-on-WLAN configuration. virt_wifi declares no WoWLAN support, so
+every system suspend disconnects the station during device suspend, and
+the supplicant only joins again after the resume, through virt_wifi's
+scan and connect delays. A guest whose host suspends it whenever its
+application leaves the foreground loses its network at each return for
+several seconds, and the framework then brings the station up as a new
+network: requests fail as offline and every socket on the old one is
+destroyed.
+
+A phone's Wi-Fi stays associated while the system sleeps. Offer
+wake-on-WLAN for any activity and configure it once the wiphy is
+registered, so that wiphy_suspend() keeps the connection. virt_wifi has
+no suspend operation and nothing that wakes the system; the lower
+device's frames already end a suspend the guest started itself.
+
+The configuration is allocated, because wiphy_unregister() frees it, and
+installed under the wiphy lock only after wiphy_register() succeeded:
+wiphy_register() unregisters the wiphy itself when it fails late, which
+frees the configuration, so no error path of the driver frees it. A
+configuration user space set first is kept, and an allocation failure
+leaves the old behaviour, with a warning. User space can still clear it
+with NL80211_CMD_SET_WOWLAN, which brings the old behaviour back.
+
+The leave also used to cancel a connection that was still pending, and
+that connection now survives the suspend. After a stay longer than the
+30 seconds cfg80211 keeps an entry it does not hold, the entry the
+result names is gone, and cfg80211 would warn and stay disconnected
+while user space was told it had joined. virt_wifi now informs the
+router again when the connection completes and reports that entry with
+the result, which makes cfg80211 hold it; if it cannot be added the
+connection fails, and the supplicant tries again.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ drivers/net/wireless/virtual/virt_wifi.c | 90 +++++++++++++++++++++---
+ 1 file changed, 81 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/net/wireless/virtual/virt_wifi.c b/drivers/net/wireless/virtual/virt_wifi.c
+index 03bab2641e579df48e4f80a07246b3b1e951aa1c..3e4673f3b590ed72b0dc642f736728f6b662945b 100644
+--- a/drivers/net/wireless/virtual/virt_wifi.c
++++ b/drivers/net/wireless/virtual/virt_wifi.c
+@@ -177,7 +177,8 @@ static u8 fake_router_bssid[ETH_ALEN] __ro_after_init = {};
+ #define VIRT_WIFI_SSID "VirtWifi"
+ #define VIRT_WIFI_SSID_LEN 8
+ 
+-static void virt_wifi_inform_bss(struct wiphy *wiphy)
++/* Returns the entry with a reference, or NULL if cfg80211 could not add it. */
++static struct cfg80211_bss *virt_wifi_get_informed_bss(struct wiphy *wiphy)
+ {
+ 	u64 tsf = div_u64(ktime_get_boottime_ns(), 1000);
+ 	struct cfg80211_bss *informed_bss;
+@@ -197,7 +198,12 @@ static void virt_wifi_inform_bss(struct wiphy *wiphy)
+ 					   WLAN_CAPABILITY_ESS, 0,
+ 					   (void *)&ssid, sizeof(ssid),
+ 					   DBM_TO_MBM(-50), GFP_KERNEL);
+-	cfg80211_put_bss(wiphy, informed_bss);
++	return informed_bss;
++}
++
++static void virt_wifi_inform_bss(struct wiphy *wiphy)
++{
++	cfg80211_put_bss(wiphy, virt_wifi_get_informed_bss(wiphy));
+ }
+ 
+ /* Called with the rtnl lock held. */
+@@ -337,21 +343,37 @@ static void virt_wifi_connect_complete(struct work_struct *work)
+ 	bool right_ssid = priv->connect_requested_ssid_len == VIRT_WIFI_SSID_LEN &&
+ 			  !memcmp(priv->connect_requested_ssid, VIRT_WIFI_SSID,
+ 				  priv->connect_requested_ssid_len);
++	struct cfg80211_bss *bss = NULL;
+ 	u16 status = WLAN_STATUS_SUCCESS;
+ 
+ 	if (is_zero_ether_addr(requested_bss))
+ 		requested_bss = NULL;
+ 
+-	if (!priv->is_up || (requested_bss && !right_addr) || !right_ssid)
++	if (!priv->is_up || (requested_bss && !right_addr) || !right_ssid) {
+ 		status = WLAN_STATUS_UNSPECIFIED_FAILURE;
+-	else
+-		priv->is_connected = true;
++	} else {
++		struct wiphy *wiphy = priv->upperdev->ieee80211_ptr->wiphy;
++
++		/*
++		 * A system suspend lets this work outlive the scan that found
++		 * the router, and cfg80211 drops an entry it does not hold
++		 * 30 seconds after it was seen, the suspended time included.
++		 * Inform it again and report it with the result, so that
++		 * cfg80211 holds it from here on. If it cannot be added the
++		 * connection fails, and the supplicant tries again.
++		 */
++		bss = virt_wifi_get_informed_bss(wiphy);
++		if (bss)
++			priv->is_connected = true;
++		else
++			status = WLAN_STATUS_UNSPECIFIED_FAILURE;
++	}
+ 
+ 	/* Schedules an event that acquires the rtnl lock. */
+-	cfg80211_connect_result(priv->upperdev,
+-				priv->is_connected ? fake_router_bssid : NULL,
+-				NULL, 0, NULL, 0,
+-				status, GFP_KERNEL);
++	cfg80211_connect_bss(priv->upperdev,
++			     priv->is_connected ? fake_router_bssid : NULL,
++			     bss, NULL, 0, NULL, 0, status, GFP_KERNEL,
++			     NL80211_TIMEOUT_UNSPECIFIED);
+ 	netif_carrier_on(priv->upperdev);
+ }
+ 
+@@ -641,6 +663,52 @@ virt_wifi_mgmt_stypes[NUM_NL80211_IFTYPES] = {
+ 	},
+ };
+ 
++#ifdef CONFIG_PM
++/*
++ * The station stays joined while the guest sleeps, as a phone's Wi-Fi does.
++ * cfg80211 leaves every network at suspend unless wake-on-WLAN is configured,
++ * so the radio offers waking on any activity and has it on from the start.
++ * Nothing here wakes the guest: the lower device's frames end a suspend the
++ * guest started itself, and only the host ends one it asked for. User space
++ * may turn the configuration off, which brings the leave back.
++ */
++static const struct wiphy_wowlan_support virt_wifi_wowlan_support = {
++	.flags = WIPHY_WOWLAN_ANY,
++};
++
++/*
++ * Turns the configuration on for a registered wiphy. wiphy_unregister() frees
++ * it, and wiphy_register() calls that itself when it fails late, so it is
++ * installed only once registration has succeeded and no error path of ours
++ * frees it. If the allocation fails the station leaves its network at a
++ * suspend, as it did before.
++ */
++static void virt_wifi_keep_station_joined(struct wiphy *wiphy)
++{
++	struct cfg80211_wowlan *wowlan;
++
++	wowlan = kzalloc(sizeof(*wowlan), GFP_KERNEL);
++	if (!wowlan) {
++		wiphy_warn(wiphy,
++			   "the station will not stay joined through a suspend\n");
++		return;
++	}
++	wowlan->any = true;
++
++	wiphy_lock(wiphy);
++	/* User space may have configured it already: keep what it chose. */
++	if (wiphy->wowlan_config)
++		kfree(wowlan);
++	else
++		wiphy->wowlan_config = wowlan;
++	wiphy_unlock(wiphy);
++}
++#else
++static inline void virt_wifi_keep_station_joined(struct wiphy *wiphy)
++{
++}
++#endif
++
+ static const struct cfg80211_ops virt_wifi_cfg80211_ops = {
+ 	.scan = virt_wifi_scan,
+ 
+@@ -685,6 +753,9 @@ static struct wiphy *virt_wifi_make_wiphy(void)
+ 	wiphy->flags |= WIPHY_FLAG_HAS_REMAIN_ON_CHANNEL | WIPHY_FLAG_OFFCHAN_TX;
+ 	wiphy->max_remain_on_channel_duration = VIRT_WIFI_MAX_ROC_MS;
+ 	wiphy->mgmt_stypes = virt_wifi_mgmt_stypes;
++#ifdef CONFIG_PM
++	wiphy->wowlan = &virt_wifi_wowlan_support;
++#endif
+ 
+ 	priv = wiphy_priv(wiphy);
+ 	priv->being_deleted = false;
+@@ -697,6 +768,7 @@ static struct wiphy *virt_wifi_make_wiphy(void)
+ 		return NULL;
+ 	}
+ 
++	virt_wifi_keep_station_joined(wiphy);
+ 	return wiphy;
+ }
+ 

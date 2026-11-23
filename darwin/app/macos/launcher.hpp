@@ -19,9 +19,20 @@ struct LaunchConfiguration {
 	std::string_view default_guest_memory;
 	bool top_byte_ignore{};
 	DisplayInput input_mode{DisplayInput::mouse};
+	/* Whether the guest's console says when its boot finishes (an Android
+	 * guest; a Linux desktop guest's does not). The loop guard then counts a
+	 * restart before that point as early however long the boot ran, once
+	 * init's output was seen on the console. */
+	bool console_reports_boot_completion{};
 	/* A file or directory the launcher created for this run only, removed
 	 * once the launch ends. */
 	std::filesystem::path run_scratch;
+	/* Whether this launcher states the release the guest boots to the
+	 * emulator (--aot-release=, from that release's own files), which the
+	 * ahead-of-time component trusts. Only a launcher that attaches an
+	 * Android release's disks does; any other refuses the option, so a
+	 * caller cannot name the release a guest runs. */
+	bool states_aot_release{};
 	/* The command line of the boot after the guest restarted itself, in the
 	 * form of runEmbeddedKernel's `command_line`, or empty to boot the same
 	 * command line again. It must ask for the host devices the first command
@@ -41,7 +52,10 @@ struct LaunchConfiguration {
  * are created once and kept; the Virtio services and the kernel's command
  * line are made for each boot, and the network link is reset between boots so
  * the old guest's connections end. A restart less than 15 s after its boot
- * started is early, and five in a row end the launch with status 3
+ * started is early, as is one before the boot finished where the guest's
+ * console says so (LaunchConfiguration::console_reports_boot_completion);
+ * five in a row within that time, or eight early ones in a row, end the
+ * launch with status 3
  * (emulator/src/restart_loop_guard.hpp). A power-off ends the launch as it
  * always did, and a kernel panic still ends the process. */
 int runEmbeddedKernel(const std::vector<std::string> &command_line,

@@ -12,49 +12,71 @@ import UIKit
 /// environment (`Andarium/README.md#automation`).
 struct AppEntry {
     var overrides: LaunchOverrides
+    /// Whether this launch is the person's own, the only kind that announces
+    /// the release notes with the ribbon and keeps their record. A launch
+    /// that builds an entry without `fromArguments`, as a test does, is not.
+    var announcesWhatsNew = false
+    /// The build this launch runs (`CFBundleVersion`); nil when the bundle
+    /// states none as a number.
+    var build = AppEntry.bundleBuild()
+    /// Where the release notes' record is kept.
+    var defaults = UserDefaults.standard
 
     /// The live application opens no screen directly.
     var hints: ScreenHints { ScreenHints() }
 
     static func fromArguments() -> AppEntry {
-        #if APP_STORE
-        // An App Store build reads no launch setting.
-        return AppEntry(overrides: LaunchOverrides())
-        #else
         let info = ProcessInfo.processInfo
-        return AppEntry(
-            overrides: LaunchOverrides(
-                environment: info.environment,
-                processorCount: GuestProcessorLimit.vCPUs(physicalProcessorCount: info.activeProcessorCount)
-            )
+        let overrides = LaunchOverrides(
+            environment: info.environment,
+            processorCount: GuestProcessorLimit.vCPUs(physicalProcessorCount: info.activeProcessorCount)
         )
-        #endif
+        return AppEntry(
+            overrides: overrides,
+            announcesWhatsNew: Self.isPersonsLaunch(overrides: overrides, environment: info.environment)
+        )
     }
 
     /// The adb key of the guest this launch runs.
     var adbKeyStore: AdbKeyStore {
-        #if APP_STORE
-        return AdbKeyStore()
-        #else
         return AdbKeyStore(instance: overrides.instance)
-        #endif
     }
 
     func configureTips() {
+        // The input probe's UI tests tap the side keys and Settings; a tip's
+        // popover over them is no part of what they check, but for the one
+        // that checks the first tap on the keys with the tip up.
+        let environment = ProcessInfo.processInfo.environment
+        if InputProbeLaunch.showsTip(in: environment) {
+            try? Tips.resetDatastore()
+            Tips.showTipsForTesting([SideKeysTip.self])
+        } else if InputProbeLaunch.requested(in: environment) {
+            Tips.hideAllTipsForTesting()
+        }
         try? Tips.configure([.displayFrequency(.immediate)])
     }
 
     /// The model for this launch. A copy of Andarium without its system, or
     /// with one it cannot read, still opens, and says so.
     @MainActor
-    /// `freeSpace` is the device's free space a run watches: the application's
-    /// own reading unless a test supplies another.
-    func makeModel(freeSpace: @escaping @Sendable () -> UInt64 = { AppEntry.freeStorageBytes() }) -> AppModel {
+    /// `freeSpace` is the space a run watches: the application's own reading
+    /// (`freeStorageBytes`) unless a test supplies another.
+    /// `environment` is the launch's unless a test supplies another.
+    func makeModel(
+        freeSpace: @escaping @Sendable () -> UInt64 = { AppEntry.freeStorageBytes() },
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> AppModel {
         let launch = overrides
         let bundle = Bundle.main
         let version = Self.appVersion(bundle)
-        let systemFolder = bundle.resourceURL?.appendingPathComponent(SystemFolder.name)
+        let systemFolder = SystemInstallation.installed
+            ?? bundle.resourceURL?.appendingPathComponent(SystemFolder.name)
         let host = Self.hostDevice()
+        // A UI test of the hardware keyboard and mouse opens the session with
+        // no guest behind it.
+        if InputProbeLaunch.requested(in: environment) {
+            return Self.makeInputProbeModel(host: host, version: version, environment: environment)
+        }
 
         var problem: String?
         var system = SystemInfo(
@@ -68,27 +90,44 @@ struct AppEntry {
                 system = try SystemInfo(manifest: manifest, appVersion: version)
                 carried = try SystemFolder.release(in: systemFolder)
             } catch {
-                problem = "This copy of Andarium does not carry a usable system: \(error.localizedDescription)"
+                problem = String(localized: "This copy of Andarium does not carry a usable system: \(error.localizedDescription)")
             }
         } else {
-            problem = "This copy of Andarium does not carry a system."
+            problem = String(localized: "This copy of Andarium does not carry a system.")
         }
 
-        let locations = GuestLocations(directory: Self.guestDirectory(instance: launch.instance))
+        let selectedSystem = systemFolder.flatMap(SystemInstallation.selection(in:))
+        let locations = GuestLocations(directory: Self.guestDirectory(
+            instance: launch.instance, system: selectedSystem
+        ))
+        // A custom or test guest keeps its own list of Android apps beside its disks.
+        let isCustomSystem = selectedSystem.map { $0 != .lineage } ?? false
+        if launch.instance != nil || isCustomSystem {
+            AndroidAppsHub.shared.configure(directory: locations.directory.appendingPathComponent("AndroidApps", isDirectory: true))
+        }
         let storage = TwoDiskStorage(
             locations: locations,
             release: carried?.identity ?? ReleaseIdentity(
-                releaseID: "unavailable", buildFingerprint: "unavailable", buildNumber: 1, securityPatch: "",
+                releaseID: "unavailable", buildFingerprint: "unavailable", buildNumber: BuildNumber.oldest, securityPatch: "",
                 systemDiskSHA256: String(repeating: "0", count: 64), dataLayout: 1, minimumGiB: 4, defaultGiB: 8,
                 maximumGiB: 64
             ),
             releaseDirectory: systemFolder ?? locations.directory
         )
+        // What the last process left half done in the snapshots (a restore, a
+        // create, a delete) is completed before the guest is read.
+        var snapshotRecoveryFailure: (any Error)?
+        do {
+            try storage.recoverSnapshots()
+        } catch {
+            snapshotRecoveryFailure = error
+            print("Andarium: the snapshots could not be recovered: \(error.localizedDescription)")
+        }
         var guest: Guest?
         do {
             guest = try storage.load()
         } catch {
-            problem = problem ?? "The guest\u{2019}s settings could not be read: \(error.localizedDescription)"
+            problem = problem ?? String(localized: "The virtual machine\u{2019}s settings could not be read: \(error.localizedDescription)")
         }
         // A stored memory size above the bound of its vCPU count comes down to
         // it; a size the launch states stays as stated.
@@ -97,34 +136,74 @@ struct AppEntry {
         }
 
         let model = AppModel(
-            guest: guest, host: host, system: system, capabilities: .device,
+            guest: guest, host: host, system: system, capabilities: Capabilities.device,
             createRequirementBytes: storage.createRequirementBytes
         )
+        // An iPhone's guest follows the device's orientation; a harness launch
+        // may state it for another device.
+        model.followsDeviceOrientation = launch.followsDeviceOrientation
+            ?? (UIDevice.current.userInterfaceIdiom == .phone)
+        #if !targetEnvironment(simulator)
+        // A build on a device, Debug or Release, can run the guest on the JIT
+        // engine when a debugger prepares its memory.
+        model.jitAvailable = true
+        #endif
         // The rulers offer no size the carried system's data disk would refuse.
         model.releaseMaximumGiB = storage.release.maximumGiB
-        // Retina mode is the person's choice where they made one, else on when
-        // the system lets this application use more than 4 GiB.
-        let options = DisplayOptionsStore.load()
-        model.retina = launch.retina ?? options.retina(memoryLimitBytes: MemoryLimit.bytes())
-        model.retinaChosen = options.chosenRetina != nil
-        // A value a launch states is that run's, and what the person chose
-        // stays stored.
-        model.retinaStatedByLaunch = launch.retina != nil
+        // The resolution is the person's choice where they made one (a Retina
+        // mode an earlier version stored is none), else the choice nearest 1.5
+        // where the system holds this application to 4 GiB or less and the one
+        // nearest 2.0 where it does not. A value a launch states is that run's,
+        // and what the person chose stays stored.
+        model.chosenScale = DisplayOptionsStore.load().chosenScale
+        model.launchScale = launch.displayScale
+        model.memoryLimitBytes = MemoryLimit.bytes()
         // The statistics show from the start where the person left them,
         // unless the launch is a harness's, which decides for its run alone
-        // (`StatsPreference.launch`). An App Store build carries no setting.
+        // (`StatsPreference.launch`).
         let stats = StatsPreference().launch(for: launch)
         model.session.showStats = stats.showOnScreen
         model.statsDecidedByLaunch = !stats.keepsChanges
-        #if !APP_STORE
+        // "Use the pointer as touch" is the person's last choice, unless the
+        // launch is a harness's and decides for its run alone.
+        let pointer = PointerPreference().launch(automated: !launch.isEmpty)
+        model.pointerAsTouch = pointer.isOn
+        model.pointerAsTouchDecidedByLaunch = !pointer.keepsChanges
+        // Settings' "When hot" is the person's last choice, unless the launch
+        // is a harness's and decides for its run alone (`HeatLimitPreference`).
+        let heat = HeatLimitPreference().launch(
+            automated: !launch.isEmpty || ThermalOverride.stated(in: environment) != nil,
+            stated: HeatLimitLaunch.stated(in: environment))
+        model.heatLimitOn = heat.isOn
+        model.heatLimitDecidedByLaunch = !heat.keepsChanges
+        // Home's "120 Hz" is the person's last choice, off at first, unless the
+        // launch is a harness's and decides for its run alone
+        // (`HighRefreshPreference`).
+        let refresh = HighRefreshPreference().launch(
+            automated: !launch.isEmpty || ThermalOverride.stated(in: environment) != nil,
+            stated: HighRefreshLaunch.stated(in: environment))
+        model.highRefreshOn = refresh.isOn
+        model.highRefreshDecidedByLaunch = !refresh.keepsChanges
+        // Home's AOT row exists where the build carries the translated-code
+        // framework (what Acknowledgements reads), and is the person's last
+        // choice unless the launch is a harness's, whichever way it is told.
+        model.translatedLibrariesAvailable = !isCustomSystem && Acknowledgements.carries(Acknowledgements.aotFramework)
+        let translated = Self.translatedLibrariesLaunch(overrides: launch, environment: environment)
+        model.translatedLibrariesOn = translated.isOn
+        model.translatedLibrariesDecidedByLaunch = !translated.keepsChanges
         model.printsStatistics = launch.statistics == true
-        #endif
+        // The JIT row follows the person's last choice, unless the launch is a
+        // harness's and decides for its run alone (`JitPreference.launch`).
+        let jit = JitPreference().launch(
+            stated: JitPreference.stated(in: ProcessInfo.processInfo.environment),
+            hasOtherSettings: !launch.isEmpty)
+        model.jitOn = jit.isOn
+        model.jitDecidedByLaunch = !jit.keepsChanges
+        // A harness launch can keep the device's haptics silent for its run
+        // (`HapticsLaunch`); the person's switch stays as stored.
+        model.hapticsSilencedByLaunch = HapticsLaunch.silences(in: environment)
 
-        #if APP_STORE
-        let markerDirectory = Self.supportDirectory()
-        #else
         let markerDirectory = launch.instance == nil ? Self.supportDirectory() : locations.directory
-        #endif
         let marker = PauseMarker(url: markerDirectory.appendingPathComponent("pause.json"))
         let closedInBackground = marker.consume()
         if closedInBackground, guest != nil {
@@ -137,30 +216,137 @@ struct AppEntry {
             in: markerDirectory, containers: Self.containerPaths(), endedOutOfForeground: closedInBackground)
         ExitReports.shared.start(keepingIn: markerDirectory)
         if carried != nil {
-            #if APP_STORE
-            let watched = freeSpace
-            #else
             // A harness launch of an isolated instance may state the free space.
             let watched = launch.instance == nil
                 ? freeSpace : Self.harnessFreeSpace(in: locations.directory, fallback: freeSpace)
             if launch.instance != nil {
                 Self.answerSpaceScreenFromHarness(model: model, directory: locations.directory)
             }
-            #endif
+            // The colour data's folder: the boot reads it and the planner asks the runtime
+            // about it, and the planner's figure is the boot's only while they are one value.
+            let calibration = markerDirectory.appendingPathComponent("Camera", isDirectory: true)
             let runtime = LiveRuntime(
                 model: model, storage: storage, marker: marker, keyStore: adbKeyStore,
-                sessionRecord: sessionRecord, freeSpace: watched)
+                sessionRecord: sessionRecord,
+                cameraDirectory: calibration,
+                freeSpace: watched)
+            // Root is offered only by a release that holds it; with none the
+            // row is not shown and a start boots the release's own ramdisk.
+            runtime.rootRelease = carried?.root
+            model.rootAvailable = carried?.root != nil
             model.driver = runtime
+            // A start with root that the last session's record shows ended
+            // before Android booted was found before there was a driver.
+            model.saveRootStateIfPending()
+            model.snapshotDriver = runtime
+            model.cameraReservePlanner = { policy in
+                LiveRuntime.cameraReservePlan(for: policy, calibration: calibration)
+            }
+            // The listing says why a restore that began last time is still not finished.
+            if let snapshotRecoveryFailure { runtime.snapshotRecoveryFailed(snapshotRecoveryFailure) }
+            model.fileBrowser = FileBrowserModel(backend: runtime.makeGuestFiles(hostFree: watched))
             model.refreshPlan()
             // Access the person took away while Andarium was closed takes the
             // Microphone choice with it.
             model.microphone?.refresh()
+            model.location?.refresh()
+            model.camera?.refresh()
+            // A debugger attached at launch (StikDebug) is asked for what the
+            // JIT row says at once: it spins until it is served, and the
+            // system ends it within a minute. A guest the launch is about to
+            // make is the one the memory is prepared for.
+            let offered = Self.launchGuest(launch, on: model)
+            model.prepareJitAtLaunch(
+                standard: JitShape(memoryMiB: offered.memoryMiB, processorCount: offered.cores),
+                replacingGuest: launch.erase)
         }
-        model.alert = problem.map { AppAlert(title: "Andarium is incomplete", message: $0) }
+        announceWhatsNew(
+            on: model, hasGuest: guest != nil, vCPUs: guest?.cores ?? host.processorCount)
+        model.appUpdate = makeAppUpdate(on: model)
+        model.alert = problem.map { AppAlert(title: String(localized: "Andarium is incomplete"), message: $0) }
         return model
     }
 
-    #if !APP_STORE
+    /// The model of a UI test's launch of the hardware keyboard and mouse
+    /// (`InputProbeLaunch`): a guest that exists only in memory and a session
+    /// that is open as if its run had booted, so the display takes the keys
+    /// and the pointer. The guest's keyboard and mouse send to the probe's log
+    /// instead of the runtime, and nothing is read from or written to the
+    /// application's own guest or settings.
+    @MainActor
+    private static func makeInputProbeModel(
+        host: HostDevice, version: String, environment: [String: String]
+    ) -> AppModel {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("InputProbe", isDirectory: true)
+        let locations = GuestLocations(directory: directory)
+        let storage = TwoDiskStorage(
+            locations: locations,
+            release: ReleaseIdentity(
+                releaseID: "probe", buildFingerprint: "probe", buildNumber: BuildNumber.oldest, securityPatch: "",
+                systemDiskSHA256: String(repeating: "0", count: 64), dataLayout: 1, minimumGiB: 4, defaultGiB: 8,
+                maximumGiB: 64
+            ),
+            releaseDirectory: directory
+        )
+        let system = SystemInfo(
+            version: "", release: "probe", securityPatch: nil, kernel: "", architecture: "", appVersion: version)
+        let model = AppModel(
+            guest: Guest.fresh(on: host), host: host, system: system, capabilities: Capabilities.device,
+            createRequirementBytes: 0
+        )
+        // The launch decides the setting for its own run.
+        model.pointerAsTouch = PointerPreference().launch(automated: true).isOn
+        model.pointerAsTouchDecidedByLaunch = true
+        let heat = HeatLimitPreference().launch(automated: true, stated: HeatLimitLaunch.stated(in: environment))
+        model.heatLimitOn = heat.isOn
+        model.heatLimitDecidedByLaunch = true
+        model.highRefreshOn = HighRefreshPreference().launch(
+            automated: true, stated: HighRefreshLaunch.stated(in: environment)).isOn
+        model.highRefreshDecidedByLaunch = true
+        model.translatedLibrariesDecidedByLaunch = true
+        // The side keys play their feedback here too: a launch that keeps the
+        // phone silent does so on this path as on the ordinary one.
+        model.hapticsSilencedByLaunch = HapticsLaunch.silences(in: environment)
+        let probe = InputProbe()
+        model.inputProbe = probe
+        // A probe that states iOS's thermal state runs the thermal session
+        // against a stand-in for the guest's HAL, which says what Android
+        // would be told in the probe's log.
+        let thermalStated = ThermalOverride.stated(in: environment) != nil
+        let hal = thermalStated
+            ? ThermalProbeHal { [weak probe] severity in
+                DispatchQueue.main.async { MainActor.assumeIsolated { probe?.record("heat told \(severity)") } }
+            } : nil
+        let runtime = LiveRuntime(
+            model: model, storage: storage, marker: PauseMarker(url: directory.appendingPathComponent("pause.json")),
+            keyboardMouse: KeyboardMouse.probe(
+                probe, supportsMouse: host.supportsPointer,
+                guestRegisters: InputProbeLaunch.guestRegisters(in: environment)
+            ) { [weak model] wanted in model?.pointerLockWanted = wanted },
+            thermalOpener: hal)
+        model.driver = runtime
+        model.phase = .running(.normal)
+        runtime.beginInputProbe()
+        if thermalStated { runtime.beginThermalProbe() }
+        if let script = OldAppsProbeLaunch.script(in: environment) {
+            let scripted = ScriptedOldApps(open: ["com.example.rally"])
+            switch script {
+            case .apps: break
+            case .refuse: scripted.writeAnswer = .failed
+            case .none: scripted.listingAnswer = .unavailable
+            }
+            model.scriptedOldApps = scripted
+            // What the first listing of a run does once Android's storage is up.
+            Task { await model.refreshOldApps() }
+        }
+        if AndroidAppsProbeLaunch.requested(in: environment) {
+            model.scriptedAndroidApps = ScriptedAndroidApps()
+            // What the first listing of a run does once Android's storage is up.
+            Task { await model.refreshAndroidApps() }
+        }
+        return model
+    }
+
     /// An automation launch creates the guest if there is none, erases it
     /// when asked, and starts it; a normal launch stops at Home.
     @MainActor
@@ -205,9 +391,14 @@ struct AppEntry {
         }
         return model.alert == nil
     }
-    #endif
 
     // MARK: Device
+
+    /// The build number, which orders the releases whose notes the ribbon
+    /// announces.
+    static func bundleBuild(_ bundle: Bundle = .main) -> Int? {
+        (bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String).flatMap { Int($0) }
+    }
 
     private static func appVersion(_ bundle: Bundle) -> String {
         let short = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0"
@@ -218,18 +409,19 @@ struct AppEntry {
     /// `Library/Guest/`. The disk's path goes to Linux in a kernel argument
     /// that cannot carry a space, so the guest does not live in `Application
     /// Support`; the library directory's name is safe on a device and on a Mac.
-    /// A harness launch's isolated `instance` lives beside it; an App Store
-    /// build has only the one guest.
-    static func guestDirectory(instance: String? = nil) -> URL {
+    /// A harness launch's isolated `instance` lives beside it.
+    static func guestDirectory(instance: String? = nil, system: GuestSystemChoice? = nil) -> URL {
         let library = (try? FileManager.default.url(
             for: .libraryDirectory, in: .userDomainMask, appropriateFor: nil, create: true
         )) ?? FileManager.default.temporaryDirectory
-        #if !APP_STORE
         if let instance {
             return library.appendingPathComponent("TestGuests", isDirectory: true)
                 .appendingPathComponent(instance, isDirectory: true)
         }
-        #endif
+        if let system, system != .lineage {
+            return library.appendingPathComponent("CustomGuests", isDirectory: true)
+                .appendingPathComponent(system.storageName, isDirectory: true)
+        }
         return library.appendingPathComponent("Guest", isDirectory: true)
     }
 
@@ -251,13 +443,19 @@ struct AppEntry {
     }
 
     @MainActor
-    static func hostDevice() -> HostDevice {
+    static func hostDevice(camera: CameraPlatform? = nil) -> HostDevice {
         let info = ProcessInfo.processInfo
         let name: String
+        let idiom: HostDevice.Idiom
         if info.isiOSAppOnMac {
             name = "Mac"
+            idiom = .mac
+        } else if UIDevice.current.userInterfaceIdiom == .pad {
+            name = "iPad"
+            idiom = .pad
         } else {
-            name = UIDevice.current.userInterfaceIdiom == .pad ? "iPad" : "iPhone"
+            name = "iPhone"
+            idiom = .phone
         }
         // A guest has every processor, at most the count the memory budget is
         // measured for; the memory policy has a row for each of those counts.
@@ -266,7 +464,10 @@ struct AppEntry {
             name: name, processorCount: limit,
             memory: memoryPolicy(processorCount: limit),
             freeStorageBytes: freeStorageBytes(),
-            runsGuestGraphics: drawsGuestGraphics()
+            runsGuestGraphics: drawsGuestGraphics(),
+            supportsPointer: UIDevice.current.userInterfaceIdiom != .phone,
+            idiom: idiom, hasHaptics: DeviceHaptics.isAvailable,
+            hasCompass: MotionSensors().compassAvailable, hasCamera: (camera ?? .system).hasCamera
         )
     }
 
@@ -301,13 +502,22 @@ struct AppEntry {
             safeMemory: { count in
                 Int(kernarium_runtime_loader_conservative_guest_memory_mib(UInt32(count), launchSet))
             },
+            defaultHoldsGraphics: { count in
+                kernarium_runtime_loader_default_guest_memory_holds_gpu_budget(UInt32(count), launchSet) != 0
+            },
             graphicsMemory: { memoryMiB, count in
                 Int(kernarium_runtime_loader_gpu_budget_mib(UInt32(memoryMiB), UInt32(count), launchSet))
+            },
+            cameraReserve: { budgetMiB in
+                Int(kernarium_runtime_loader_camera_reserve_mib(UInt32(clamping: budgetMiB)))
             }
         )
     }
 
-    static func freeStorageBytes() -> UInt64 {
+    /// The space a write can use on the device, the one figure the run's
+    /// watch, the start checks and every screen use. It touches no state of
+    /// the entry, so a `@Sendable` source can hold it.
+    nonisolated static func freeStorageBytes() -> UInt64 {
         HostStorage.freeBytes()
     }
 }
@@ -350,13 +560,12 @@ enum DisplayOptionsStore {
     }
 }
 
-/// The release Andarium carries: the staged directory `andarium-system` in
-/// the application bundle (`Andarium/scripts/stage-system-image.py`), laid out
-/// as an installed Android release: `release-manifest.json`,
+/// An installed Android release, or the equivalent directory carried by an
+/// older build. It holds `release-manifest.json`,
 /// `boot/kernel-command-line.txt`, `guest/system.img` (the read-only system
 /// disk) and `guest/partition-layout.json`. The runtime reads the directory
 /// itself; the application reads the release's identity.
-enum SystemFolder {
+nonisolated enum SystemFolder {
     static let name = "andarium-system"
     static let manifest = "release-manifest.json"
     static let commandLine = "boot/kernel-command-line.txt"
@@ -378,6 +587,9 @@ enum SystemFolder {
 
     struct Release {
         var identity: ReleaseIdentity
+        /// What the release holds for root (`RootRelease`), nil for none: the
+        /// manifest's `root` object with both files in `root/`.
+        var root: RootRelease?
     }
 
     static func release(in folder: URL) throws -> Release {
@@ -396,6 +608,7 @@ enum SystemFolder {
         else { throw Problem.missing("the system disk's size in \(layout)") }
         let actual = UInt64((try? folder.appendingPathComponent(systemDisk).resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
         guard actual == declared else { throw Problem.sizeDiffers(declared: declared, actual: actual) }
-        return Release(identity: identity)
+        let manifestData = try Data(contentsOf: folder.appendingPathComponent(manifest))
+        return Release(identity: identity, root: RootRelease.carried(in: folder, manifest: manifestData))
     }
 }

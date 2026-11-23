@@ -221,10 +221,9 @@ void A32Compiler::track_direct_store(unsigned address, std::size_t size) {
   emitter_.store_x(4, 3, offset + offsetof(JitStoreRange, size));
 }
 
-/* Ends the software monitor where the guest's pair ends: a CLREX, the
- * store-exclusive of a fused run and its exits. An ordinary store of the
- * guest's own leaves it standing (the monitor contract in
- * docs/architecture.md). */
+/* Ends the software monitor where the guest's pair ends: a CLREX and the
+ * store-exclusive of a fused run. An ordinary store of the guest's own leaves
+ * it standing (the monitor contract in docs/architecture.md). */
 void A32Compiler::clear_exclusive_monitor() {
   emitter_.store_b(31, 15, offsetof(CpuState, exclusive_size));
 }

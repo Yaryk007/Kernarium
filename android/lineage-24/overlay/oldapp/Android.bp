@@ -1,0 +1,33 @@
+// SPDX-License-Identifier: Apache-2.0
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+// The old-application layer. ActivityThread loads it into the process of a
+// 32-bit application that targets an API level below 14 and that the person
+// switched it on for (a frameworks/base topic); it gives such an application
+// what Dalvik gave it: a Java byte[] that reads through the object pointer at
+// the Dalvik offsets, and a heap below 2 GiB. It includes no
+// Android header (the Mac builds the same sources with -Werror for armv7), so
+// this module sets only -Wall -Wextra and keeps the platform's own warning
+// policy out of it.
+cc_library_shared {
+    name: "libkernarium_oldapp",
+    compile_multilib: "32",
+    cpp_std: "c++20",
+    srcs: [
+        "jni_shim.cpp",
+        "oldapp_android.cpp",
+        "oldapp_thunks.S",
+    ],
+    shared_libs: ["liblog"],
+    stl: "none",
+    cflags: [
+        "-Wall",
+        "-Wextra",
+        "-fno-exceptions",
+        "-fno-rtti",
+        "-fno-threadsafe-statics",
+        "-fvisibility=hidden",
+    ],
+}

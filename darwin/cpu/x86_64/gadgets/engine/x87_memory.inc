@@ -71,12 +71,22 @@ Lx86_x87_load_bcd_fault:
 	add sp, sp, #32
 	b Lx86_memory_fault
 
+/* A store of ST(0) to memory commits no status until the store cannot fail.
+ * Reading ST(0) raises a stack underflow and the conversion raises its
+ * exceptions into the status word, ahead of a store that may still fault, and
+ * a faulting instruction changes nothing: w26 keeps the status word the
+ * instruction found, and the fault exit puts it back. */
+.macro x87_store_status_keep
+	ldrh w26, [_vcpu, #UML_X86_64_CPU_X87_STATUS]
+.endm
+
 /* Store ST(0) to memory through the SoftFloat conversion `helper`. The integer
  * helpers take `truncate`, which FISTTP sets. */
 .macro x87_store_memory name, size, helper, pop, truncate=
 gadget x87_store_\name
 	effective_address
 	mov x25, x7
+	x87_store_status_keep
 	sub sp, sp, #16
 	mov w13, #0
 	x87_load_stack w13, x9, w10
@@ -90,11 +100,14 @@ gadget x87_store_\name
 	x87_leave_if_raised
 	mov x9, x0
 	add sp, sp, #16
-	x87_scalar_store \size, x9
+	x87_scalar_store \size, x9, Lx86_x87_store_memory_fault\@
 	.if \pop
 	x87_pop
 	.endif
 	finish_store \size
+Lx86_x87_store_memory_fault\@:
+	strh w26, [_vcpu, #UML_X86_64_CPU_X87_STATUS]
+	b Lx86_memory_fault
 .endm
 
 x87_store_memory f32_keep, 4, f32, 0
@@ -114,6 +127,7 @@ x87_store_memory i64_pop, 8, i64, 1, 0
 gadget x87_store_f80_pop
 	effective_address
 	mov x25, x7
+	x87_store_status_keep
 	sub sp, sp, #16
 	mov w13, #0
 	x87_load_stack w13, x9, w10
@@ -125,11 +139,13 @@ gadget x87_store_f80_pop
 	finish_store 10
 Lx86_x87_store_f80_fault:
 	add sp, sp, #16
+	strh w26, [_vcpu, #UML_X86_64_CPU_X87_STATUS]
 	b Lx86_memory_fault
 
 gadget x87_store_bcd_pop
 	effective_address
 	mov x25, x7
+	x87_store_status_keep
 	sub sp, sp, #32
 	mov w13, #0
 	x87_load_stack w13, x9, w10
@@ -146,6 +162,7 @@ gadget x87_store_bcd_pop
 	finish_store 10
 Lx86_x87_store_bcd_fault:
 	add sp, sp, #32
+	strh w26, [_vcpu, #UML_X86_64_CPU_X87_STATUS]
 	b Lx86_memory_fault
 
 gadget x87_load_control
@@ -309,4 +326,5 @@ x87_environment_save state108, 28, 1
 .purgem x87_environment_save
 .purgem x87_environment_restore
 .purgem x87_store_memory
+.purgem x87_store_status_keep
 .purgem x87_load_converted

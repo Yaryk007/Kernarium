@@ -4,6 +4,7 @@ import Foundation
 import Testing
 
 @testable import AndariumCore
+import AndariumCoreTestSupport
 
 /// The settings of a launch, answered as the application's environment
 /// reader would.
@@ -27,14 +28,14 @@ struct LaunchOverridesTests {
                 .vCPUCount: "2",
                 .memoryMiB: "1536",
                 .diskGiB: "32",
-                .retina: "1",
+                .displayScale: "native",
             ],
             processorCount: 6
         )
         #expect(overrides.vCPUCount == 2)
         #expect(overrides.memoryMiB == 1536)
         #expect(overrides.capacityGiB == 32)
-        #expect(overrides.retina == true)
+        #expect(overrides.displayScale == .native)
     }
 
     @Test func aCapacityTheLaunchStatesIsHeldToTheCarriedSystemsDisk() {
@@ -51,41 +52,11 @@ struct LaunchOverridesTests {
 
     @Test func aStoredFollowWindowValueIsIgnored() throws {
         // The guest's display always follows the window: an earlier version's
-        // stored choice is read past, not migrated.
+        // stored value is read past, and its Retina mode is no choice.
         let old = Data(#"{"retina":true,"followWindow":false}"#.utf8)
-        #expect(try JSONDecoder().decode(DisplayOptions.self, from: old) == DisplayOptions(chosenRetina: true))
-    }
-
-    @Test func retinaFollowsTheMemoryTheSystemLetsTheAppUse() {
-        let gib = UInt64(1) << 30
-        // An iPad mini 6 holds the application to 2,867 MiB.
-        #expect(!DisplayOptions.defaultRetina(memoryLimitBytes: 2867 << 20))
-        #expect(!DisplayOptions.defaultRetina(memoryLimitBytes: 4 * gib))
-        #expect(DisplayOptions.defaultRetina(memoryLimitBytes: 4 * gib + 1))
-        #expect(DisplayOptions.defaultRetina(memoryLimitBytes: 6 * gib))
-        // A Mac sets none.
-        #expect(DisplayOptions.defaultRetina(memoryLimitBytes: 0))
-    }
-
-    @Test func aChoiceOfRetinaIsNeverOverriddenByTheDefault() {
-        let gib = UInt64(1) << 30
-        #expect(DisplayOptions().retina(memoryLimitBytes: 8 * gib))
-        #expect(!DisplayOptions().retina(memoryLimitBytes: 2 * gib))
-        #expect(!DisplayOptions(chosenRetina: false).retina(memoryLimitBytes: 8 * gib))
-        #expect(DisplayOptions(chosenRetina: true).retina(memoryLimitBytes: 2 * gib))
-    }
-
-    @Test func aChosenValueSurvivesTheStoredForm() throws {
-        for options in [DisplayOptions(), DisplayOptions(chosenRetina: true), DisplayOptions(chosenRetina: false)] {
-            let data = try JSONEncoder().encode(options)
-            #expect(try JSONDecoder().decode(DisplayOptions.self, from: data) == options)
-        }
-    }
-
-    @Test func aStoredFalseFromBeforeTheDefaultIsNotAChoice() throws {
-        let old = Data(#"{"retina":false}"#.utf8)
         #expect(try JSONDecoder().decode(DisplayOptions.self, from: old) == DisplayOptions())
-        #expect(try JSONDecoder().decode(DisplayOptions.self, from: Data("{}".utf8)) == DisplayOptions())
+        let scaled = Data(#"{"scale":2,"followWindow":false}"#.utf8)
+        #expect(try JSONDecoder().decode(DisplayOptions.self, from: scaled) == DisplayOptions(chosenScale: .factor(2)))
     }
 
     @Test func ignoresValuesOutOfRangeOrOffStep() {
@@ -94,7 +65,8 @@ struct LaunchOverridesTests {
                 .vCPUCount: "9",
                 .memoryMiB: "1000",
                 .diskGiB: "x",
-                .retina: "2",
+                .displayScale: "sharpest",
+                .retinaMode: "2",
             ],
             processorCount: 6
         )
@@ -141,6 +113,15 @@ struct LaunchOverridesTests {
         #expect(launch([:]).statistics == nil)
         #expect(!launch([.stats: "1"]).isEmpty)
         #expect(!launch([.stats: "0"]).isEmpty)
+    }
+
+    @Test func aLaunchMayStateThatTheGuestFollowsTheDevicesOrientation() {
+        #expect(launch([:]).followsDeviceOrientation == nil)
+        #expect(launch([.followsOrientation: "1"]).followsDeviceOrientation == true)
+        #expect(launch([.followsOrientation: "0"]).followsDeviceOrientation == false)
+        #expect(launch([.followsOrientation: "yes"]).followsDeviceOrientation == nil)
+        // A launch that states it is a harness's.
+        #expect(!launch([.followsOrientation: "1"]).isEmpty)
     }
 
     @Test func isolatedInstanceNamesCannotEscapeTheirDirectory() {
@@ -225,14 +206,23 @@ private final class FakeEffects: PauseEffects {
     var atSuspend: (@MainActor () -> Void)?
     /// Whether a resume finishes at once, as the runtime's queue does.
     var resumesAtOnce = false
+    /// How long the hold takes, as it does when it waits for the guest to stop
+    /// its camera video first.
+    var holdTakes: TimeInterval = 0
+    /// What the write-back was given to wait until, in turn.
+    var quiesceDeadlines: [DispatchTime?] = []
 
-    func holdGuestGPU() { calls.append("hold") }
+    func holdGuestGPU() {
+        if holdTakes > 0 { Thread.sleep(forTimeInterval: holdTakes) }
+        calls.append("hold")
+    }
     func releaseGuestGPU() { calls.append("release") }
     func flushGuest(until deadline: DispatchTime?) {
         calls.append(deadline == nil ? "flush" : "flush-wait")
     }
     func quiesceGuest(reason: String, until deadline: DispatchTime?) {
         calls.append("quiesce(\(reason),\(deadline == nil ? "nowait" : "wait"))")
+        quiesceDeadlines.append(deadline)
     }
     func resumeGuest(finished: @escaping @MainActor () -> Void) {
         calls.append("resume")
@@ -288,6 +278,19 @@ struct PauseControllerTests {
         #expect(controller.phase == .foreground)
     }
 
+    @Test func theGuestIsAwakeInTheForegroundOnceResumed() throws {
+        let (controller, effects, _) = try makeController()
+        #expect(controller.guestIsAwake)
+        controller.guestDidStart()
+        #expect(controller.guestIsAwake)
+        controller.didEnterBackground()
+        #expect(!controller.guestIsAwake)
+        controller.willEnterForeground()
+        #expect(!controller.guestIsAwake)
+        effects.pendingResume?()
+        #expect(controller.guestIsAwake)
+    }
+
     @Test func nothingHappensWithoutAGuest() throws {
         let (controller, effects, marker) = try makeController()
         controller.willResignActive()
@@ -303,6 +306,39 @@ struct PauseControllerTests {
         controller.willResignActive()
         #expect(effects.calls == ["flush"])
         #expect(controller.phase == .foreground)
+    }
+
+    /// The stop's write-back (`StopSettle`, GuestHostCore's) waits as long as an
+    /// edge's own work may take.
+    @Test func theStopsWriteBackWaitsAsLongAsAnEdge() {
+        #expect(StopSettle.bound == PauseController.edgeBudget)
+    }
+
+    /// The edge's budget starts with the edge. The hold may wait for the
+    /// guest's camera video to stop (`holdGuestGPU`), and that wait is taken out
+    /// of the budget the write-back is given, never added to it.
+    @Test func theHoldsWaitIsInsideTheEdgeBudget() throws {
+        let (controller, effects, _) = try makeController()
+        effects.holdTakes = 0.3
+        controller.guestDidStart()
+        let began = DispatchTime.now()
+        controller.didEnterBackground()
+        let deadline = try #require(effects.quiesceDeadlines.first ?? nil)
+        #expect(deadline <= began + PauseController.edgeBudget + .milliseconds(100))
+        #expect(deadline >= began + PauseController.edgeBudget)
+        #expect(effects.calls == ["hold", "quiesce(background,wait)"])
+    }
+
+    /// With nothing to wait for the hold is as quick as it was, and the
+    /// write-back is given the whole budget.
+    @Test func aHoldThatWaitsForNothingLeavesTheWholeBudget() throws {
+        let (controller, effects, _) = try makeController()
+        controller.guestDidStart()
+        let began = DispatchTime.now()
+        controller.didEnterBackground()
+        let deadline = try #require(effects.quiesceDeadlines.first ?? nil)
+        #expect(deadline >= began + PauseController.edgeBudget)
+        #expect(deadline <= began + PauseController.edgeBudget + .milliseconds(100))
     }
 
     @Test func aSecondBackgroundEdgeIsIgnored() throws {

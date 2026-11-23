@@ -45,10 +45,12 @@ void createDataDisk(const Layout &layout, const std::filesystem::path &path,
 void growDataDisk(const Layout &layout, const std::filesystem::path &path,
 		  std::uint32_t gib);
 
-/* Brings the disk at `path` to the requested capacity: creates it when the
- * path is absent (`gib` 0 selects the template's default), grows it when
- * `gib` exceeds its capacity, and leaves it when `gib` is 0 or equal. A
- * capacity below the current one is an error: a data disk never shrinks. */
+/* Brings the disk at `path` to at least the requested capacity: creates it
+ * when the path is absent (`gib` 0 selects the template's default), grows it
+ * when `gib` exceeds its capacity, and leaves it when `gib` is 0 or does not
+ * exceed it, returning its own capacity. A data disk never shrinks, and a
+ * smaller request is no error, so a caller whose record lags a disk that
+ * already grew still starts. */
 PreparedDataDisk prepareDataDisk(const Layout &layout,
 				 const std::filesystem::path &path,
 				 std::uint32_t gib);

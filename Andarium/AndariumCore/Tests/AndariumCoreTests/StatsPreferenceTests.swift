@@ -68,7 +68,7 @@ struct StatsPreferenceTests {
             let preference = StatsPreference(defaults: defaults)
             preference.keep(true)
             for settings: [LaunchOverrides.Setting: String] in [
-                [.start: "normal"], [.vCPUCount: "2"], [.retina: "1"], [.instance: "legacy-test"], [.erase: "1"],
+                [.start: "normal"], [.vCPUCount: "2"], [.displayScale: "1.5"], [.instance: "legacy-test"], [.erase: "1"],
             ] {
                 let start = preference.launch(for: launch(settings))
                 #expect(!start.showOnScreen && !start.keepsChanges)
@@ -82,7 +82,7 @@ struct StatsPreferenceTests {
 
     @Test func storedDisplayOptionsFromBeforeSurviveAndAreNotRewritten() throws {
         try withDefaults { defaults in
-            // What an earlier version stored: the Retina choice, no statistics.
+            // What an earlier version stored: the Retina mode, no statistics.
             let old = Data(#"{"retina":true,"chosen":true}"#.utf8)
             defaults.set(old, forKey: DisplayOptions.storageKey)
             let preference = StatsPreference(defaults: defaults)
@@ -92,7 +92,8 @@ struct StatsPreferenceTests {
             #expect(preference.isOn)
             let stored = try #require(defaults.data(forKey: DisplayOptions.storageKey))
             #expect(stored == old)
-            #expect(try JSONDecoder().decode(DisplayOptions.self, from: stored) == DisplayOptions(chosenRetina: true))
+            // It is no resolution choice now, and stays stored as it was.
+            #expect(try JSONDecoder().decode(DisplayOptions.self, from: stored) == DisplayOptions())
         }
     }
 
@@ -100,7 +101,7 @@ struct StatsPreferenceTests {
         try withDefaults { defaults in
             let preference = StatsPreference(defaults: defaults)
             preference.keep(true)
-            defaults.set(try JSONEncoder().encode(DisplayOptions(chosenRetina: false)), forKey: DisplayOptions.storageKey)
+            defaults.set(try JSONEncoder().encode(DisplayOptions(chosenScale: .points)), forKey: DisplayOptions.storageKey)
             #expect(preference.isOn)
             #expect(StatsPreference.key != DisplayOptions.storageKey)
         }

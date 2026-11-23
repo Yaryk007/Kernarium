@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 22:25:46 +0000
+Subject: [PATCH] audio: do not throttle the primary input's reading thread
+
+The input's I/O thread reads a buffer from ALSA, which takes as long as
+the audio in it, and writes the buffer into the pipe that its client
+reads. The pipe was opened for a writer that may block, and MonoPipe
+makes a blocking write last 1.15 times the audio it is given. The thread
+thus took 24.5 ms for every 21.3 ms of audio and delivered 87% of real
+time, so a recording was missing 13% of its frames, which the client's
+read made up as silence.
+
+Open the pipe for a writer that never blocks, so that the ALSA read
+alone paces the thread. A full pipe, as the client is behind, makes the
+thread wait a millisecond and try again. A write may take part of the
+buffer: write the rest from where the first part ended, not from the
+start of the buffer.
+---
+ audio/aidl/default/alsa/StreamAlsaMonoPipe.cpp | 14 +++++++++++---
+ 1 file changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/audio/aidl/default/alsa/StreamAlsaMonoPipe.cpp b/audio/aidl/default/alsa/StreamAlsaMonoPipe.cpp
+index 625c51d6c7cf76e03fef67ec2016681b1a822b77..aab177402c05c9ed0769e24ec84d8ba32078cd2e 100644
+--- a/audio/aidl/default/alsa/StreamAlsaMonoPipe.cpp
++++ b/audio/aidl/default/alsa/StreamAlsaMonoPipe.cpp
+@@ -83,7 +83,11 @@ StreamAlsaMonoPipe::~StreamAlsaMonoPipe() {
+         return ::android::OK;
+     }
+     for (size_t i = 0; i < alsaDeviceProxies.size(); ++i) {
+-        auto sink = makeSink(mIsInput);  // Do not block the writer when it is on our thread.
++        // Never block the writer on the pipe's account. MonoPipe makes a blocking write last
++        // 1.15 times the audio it is given, which slowed the input's I/O thread, whose writer
++        // it is, to 87% of real time. The ALSA read paces that thread, and a full pipe makes it
++        // wait.
++        auto sink = makeSink(false);
+         if (sink != nullptr) {
+             sinks.push_back(sink);
+         } else {
+@@ -177,9 +181,13 @@ void StreamAlsaMonoPipe::inputIoThread(size_t idx) {
+             while (bufferFramesWritten < mBufferSizeFrames) {
+                 if (!mIoThreadIsRunning) return;
+                 ssize_t framesWrittenOrError =
+-                        mSinks[idx]->write(&buffer[0], mBufferSizeFrames - bufferFramesWritten);
+-                if (framesWrittenOrError >= 0) {
++                        mSinks[idx]->write(&buffer[bufferFramesWritten * mFrameSizeBytes],
++                                           mBufferSizeFrames - bufferFramesWritten);
++                if (framesWrittenOrError > 0) {
+                     bufferFramesWritten += framesWrittenOrError;
++                } else if (framesWrittenOrError == 0) {
++                    // The pipe is full, as the client is behind: try again soon.
++                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                 } else {
+                     LOG(WARNING) << __func__ << "[" << idx
+                                  << "]: Error while writing into the pipe: "

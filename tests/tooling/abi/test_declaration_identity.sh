@@ -131,6 +131,19 @@ expect_failure "x86_64 import audit of an arm64-only symbol" \
 	import_audit --nm-output "$TEST_ROOT/arm64.nm" --slice x86_64
 expect_failure "arm64 import audit missing an arm64-only symbol" \
 	import_audit --nm-output "$TEST_ROOT/x86.nm" --slice arm64
+# An x86_64-only symbol is imported by the x86_64 slice and by no arm64 one.
+grep -Fxq darwin_uml_vm_invalidate_code_frames "$TEST_ROOT/x86.nm.symbols" ||
+	fail "the x86_64 import set lacks darwin_uml_vm_invalidate_code_frames"
+! grep -Fxq darwin_uml_vm_invalidate_code_frames "$TEST_ROOT/arm64.nm.symbols" ||
+	fail "the arm64 import set has darwin_uml_vm_invalidate_code_frames"
+{ cat "$TEST_ROOT/arm64.nm"; printf '                 U %s\n' \
+	darwin_uml_vm_invalidate_code_frames; } > "$TEST_ROOT/arm64-x86-only.nm"
+expect_failure "arm64 import audit of an x86_64-only symbol" \
+	import_audit --nm-output "$TEST_ROOT/arm64-x86-only.nm" --slice arm64
+grep -Fxv '                 U darwin_uml_vm_invalidate_code_frames' \
+	"$TEST_ROOT/x86.nm" > "$TEST_ROOT/x86-missing-frames.nm"
+expect_failure "x86_64 import audit missing an x86_64-only symbol" \
+	import_audit --nm-output "$TEST_ROOT/x86-missing-frames.nm" --slice x86_64
 sed '1d' "$TEST_ROOT/arm64.nm" > "$TEST_ROOT/arm64-missing.nm"
 expect_failure "import audit missing an active symbol" \
 	import_audit --nm-output "$TEST_ROOT/arm64-missing.nm" --slice arm64
@@ -183,7 +196,10 @@ for row in 'darwin_uml_fixture_two_fields\tarm64-only' \
 	'darwin_uml_fixture_availability\t16k-only\tfixture' \
 	'darwin_uml_fixture_retired\t4k-only\tfixture' \
 	'darwin_uml_fixture_rationale\tarm64-only\t' \
+	'darwin_uml_fixture_x86_two_fields\tx86_64-only' \
+	'darwin_uml_fixture_x86_rationale\tx86_64-only\t' \
 	"$(sed -n 2p "$TEST_ROOT/import-policy.tsv")" \
+	"$(tail -n 1 "$TEST_ROOT/import-policy.tsv")" \
 	'uml_fixture_not_bridge\tarm64-only\tfixture'; do
 	{ cat "$TEST_ROOT/import-policy.tsv"; printf '%b\n' "$row"; } > "$POLICY"
 	expect_diagnostic 'import policy is malformed' \
@@ -194,10 +210,13 @@ done
 	> "$POLICY"
 expect_diagnostic 'import policy is malformed' \
 	copied_import_audit --nm-output "$TEST_ROOT/arm64.nm" --slice arm64
-{ cat "$TEST_ROOT/import-policy.tsv"
-	printf 'darwin_uml_fixture_undeclared\tarm64-only\tfixture\n'; } > "$POLICY"
-expect_diagnostic 'import policy names undeclared bridge symbols' \
-	copied_import_audit --nm-output "$TEST_ROOT/arm64.nm" --slice arm64
+for availability in arm64-only x86_64-only; do
+	{ cat "$TEST_ROOT/import-policy.tsv"
+		printf 'darwin_uml_fixture_undeclared\t%s\tfixture\n' \
+			"$availability"; } > "$POLICY"
+	expect_diagnostic 'import policy names undeclared bridge symbols' \
+		copied_import_audit --nm-output "$TEST_ROOT/arm64.nm" --slice arm64
+done
 cp "$TEST_ROOT/import-policy.tsv" "$POLICY"
 copied_import_audit --nm-output "$TEST_ROOT/arm64.nm" --slice arm64 >/dev/null
 

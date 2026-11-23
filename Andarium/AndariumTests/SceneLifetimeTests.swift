@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 import AndariumCore
+import AndariumCoreTestSupport
 import Foundation
 import SwiftUI
 import Testing
@@ -50,7 +51,6 @@ struct SceneLifetimeTests {
         #expect(second.model === launched)
     }
 
-    #if !APP_STORE
     @Test func theLaunchsWorkRunsOncePerModelWhateverTheSceneCount() async throws {
         let host = HostDevice(
             name: "iPad", processorCount: 6, memory: MemoryPolicy(maximumsMiB: [4096]), freeStorageBytes: 40_000_000_000
@@ -75,5 +75,4 @@ struct SceneLifetimeTests {
             #expect(driver.erased == 1, "connection \(connection)")
         }
     }
-    #endif
 }

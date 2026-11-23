@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 17:04:05 +0900
+Subject: [PATCH] Give the braille gesture hint a theme that defines its
+ colours
+
+The braille keyboard's change gesture screen colours the title of each
+hint with the Material 3 roles colorTertiaryFixed (a hint) and
+colorErrorContainer (a warning), read through
+MaterialColors.getColor(context, attr, message) from a context wrapped in
+the CustomGestureView style. That style inherited
+Theme.MaterialComponents.Light, which defines neither role, so the call
+threw IllegalArgumentException and TalkBack crashed each time the
+"Continue" button of the "How to change a gesture" dialog opened the
+screen.
+
+Of the stock themes only the Material 3 family defines the two roles. The
+style now inherits Theme.Material3.Light, so the lookup resolves to
+Material's own palette: pale roles that read the same in light and dark
+mode, because the style is a light theme whatever the system setting and
+the hint is drawn on a fixed dark scrim. Nothing else reads the style.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ braille/brailleime/src/phone/res/values/styles.xml | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/braille/brailleime/src/phone/res/values/styles.xml b/braille/brailleime/src/phone/res/values/styles.xml
+index b70d8d130b39b0f43518e9ebbeec4da85dcff4bf..e201044c466846821b12b47f56fce583fa372604 100644
+--- a/braille/brailleime/src/phone/res/values/styles.xml
++++ b/braille/brailleime/src/phone/res/values/styles.xml
+@@ -75,5 +75,5 @@
+ 
+   <style name="KeyboardDialogStyle" parent="@style/Theme.MaterialComponents.DayNight" />
+ 
+-  <style name="CustomGestureView" parent="@style/Theme.MaterialComponents.Light" />
++  <style name="CustomGestureView" parent="@style/Theme.Material3.Light" />
+ </resources>
+\ No newline at end of file

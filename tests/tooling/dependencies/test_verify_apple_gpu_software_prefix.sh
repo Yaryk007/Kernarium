@@ -31,7 +31,7 @@ copy_fixture()
 simulator_clang()
 {
 	xcrun --sdk iphonesimulator clang -arch arm64 \
-		-target arm64-apple-ios27.0-simulator "$@"
+		-target arm64-apple-ios26.0-simulator "$@"
 }
 
 # make_framework PREFIX FRAMEWORK SOURCE [CLANG-ARGUMENT...]
@@ -53,7 +53,7 @@ make_framework()
 <key>CFBundleExecutable</key><string>$framework</string>
 <key>CFBundleIdentifier</key><string>org.linux-um-darwin.fixture.$framework</string>
 <key>CFBundlePackageType</key><string>FMWK</string>
-<key>MinimumOSVersion</key><string>27.0</string>
+<key>MinimumOSVersion</key><string>26.0</string>
 </dict></plist>
 EOF
 }
@@ -245,11 +245,22 @@ expect_cmake_diagnostic \
 # A device-platform binary is not a Simulator binary.
 CASE_PREFIX="$TEST_ROOT/device-binary"
 copy_fixture "$CASE_PREFIX"
-xcrun --sdk iphoneos clang -arch arm64 -target arm64-apple-ios27.0 \
+xcrun --sdk iphoneos clang -arch arm64 -target arm64-apple-ios26.0 \
 	-dynamiclib "$TEST_ROOT/gallium.c" \
 	-Wl,-install_name,@rpath/MesaGallium.framework/MesaGallium \
 	-o "$CASE_PREFIX/Frameworks/MesaGallium.framework/MesaGallium"
 expect_failure "device-platform MesaGallium in the Simulator prefix" \
+	verify "$CASE_PREFIX"
+
+# A Simulator binary built at the macOS floor is a stale iOS binary.
+CASE_PREFIX="$TEST_ROOT/macos-floor-binary"
+copy_fixture "$CASE_PREFIX"
+xcrun --sdk iphonesimulator clang -arch arm64 \
+	-target arm64-apple-ios27.0-simulator \
+	-dynamiclib "$TEST_ROOT/gallium.c" \
+	-Wl,-install_name,@rpath/MesaGallium.framework/MesaGallium \
+	-o "$CASE_PREFIX/Frameworks/MesaGallium.framework/MesaGallium"
+expect_failure "Simulator MesaGallium built for iOS 27.0" \
 	verify "$CASE_PREFIX"
 
 printf '%s\n' "Apple GPU software prefix tests passed"

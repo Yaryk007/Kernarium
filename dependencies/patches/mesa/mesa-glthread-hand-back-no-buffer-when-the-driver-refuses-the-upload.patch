@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 19:13:01 +0900
+Subject: [PATCH] mesa/glthread: hand back no buffer when the driver refuses
+ the upload
+
+glthread copies the data of a glBufferSubData, and of a draw's client
+indices and vertex arrays, into a 1 MiB upload buffer that the driver
+allocates once and the calls share. _mesa_glthread_upload() assumed the
+allocation succeeds and added the references it hands out in advance to
+the buffer it got. A driver with a bounded memory budget refuses the
+allocation once the budget is full, the buffer is NULL, and the host
+faulted on the thread that runs the context's transfers, right after the
+driver reported that it could not allocate memory.
+
+The separate buffer for an upload larger than the shared one already
+returns no buffer when the driver refuses, and every caller handles
+that: a draw whose indices or vertices need the upload raises
+GL_OUT_OF_MEMORY and is dropped, as a driver that cannot get memory for
+a draw reports, and glBufferSubData falls back to copying its data into
+the command stream, which needs no upload buffer. The shared path now
+returns the same way. It took no reference, and the release before it
+left the private reference count at zero, so the next upload starts
+clean and asks the driver again.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/mesa/main/glthread_bufferobj.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/src/mesa/main/glthread_bufferobj.c b/src/mesa/main/glthread_bufferobj.c
+index 09b0fbebbbcceebc3d5d629433222cb7a45e3bc4..6aab79a905c544af43ae0dee25871672b65087a2 100644
+--- a/src/mesa/main/glthread_bufferobj.c
++++ b/src/mesa/main/glthread_bufferobj.c
+@@ -134,6 +134,16 @@ _mesa_glthread_upload(struct gl_context *ctx, const void *data,
+       glthread->upload_offset = 0;
+       offset = start_offset;
+ 
++      /* A driver with a bounded memory budget refuses the buffer once the
++       * budget is full. Hand the caller no buffer, as the separate-buffer
++       * path above does: every caller then takes its synchronous path or
++       * raises GL_OUT_OF_MEMORY. No reference was taken, and the release above
++       * reset upload_buffer_private_refcount, so the next upload starts from
++       * a clean state and asks the driver again.
++       */
++      if (unlikely(!glthread->upload_buffer))
++         return;
++
+       /* Since atomic operations are very very slow when 2 threads are not
+        * sharing one L3 cache (which can happen on AMD Zen), prevent using
+        * atomics as follows:

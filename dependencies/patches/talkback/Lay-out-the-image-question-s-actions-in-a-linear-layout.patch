@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 19:07:26 +0900
+Subject: [PATCH] Lay out the image question's actions in a linear layout
+
+The action buttons below an image answer sat in a FlexboxLayout from
+flexbox 3, a library the Android image's source tree carries only in an
+older release. A vertical LinearLayout holds them instead; the view
+holder only needs a ViewGroup.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .../main/res/layout/image_qna_model_message_with_actions.xml  | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/talkback/src/main/res/layout/image_qna_model_message_with_actions.xml b/talkback/src/main/res/layout/image_qna_model_message_with_actions.xml
+index 3757fb2caaabf67bd8cd6acd70f0513cec4b4baa..c2671d43026cfdf1ea2fb32841993da0cfaa8deb 100644
+--- a/talkback/src/main/res/layout/image_qna_model_message_with_actions.xml
++++ b/talkback/src/main/res/layout/image_qna_model_message_with_actions.xml
+@@ -80,9 +80,9 @@
+         android:padding="10dp"
+         android:text="@string/screen_overview_heres_the_elements" />
+ 
+-    <com.google.android.flexbox.FlexboxLayout
++    <LinearLayout
+         android:id="@+id/ui_elements"
+-        app:flexWrap="wrap"
++        android:orientation="vertical"
+         android:layout_width="match_parent"
+         android:layout_height="wrap_content"
+         android:layout_gravity="start" />

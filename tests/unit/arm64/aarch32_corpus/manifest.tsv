@@ -9,6 +9,7 @@ armv8-system-qemu	qemu	4
 branch-qemu	qemu	476
 conditions-qemu	qemu	1856
 exclusive-qemu	qemu	256
+exclusive-retry-qemu	qemu	12
 exclusive-spill-qemu	qemu	96
 fetch-qemu	qemu	994
 fpscr-qemu	qemu	252

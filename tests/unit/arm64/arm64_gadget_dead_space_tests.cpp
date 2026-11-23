@@ -74,6 +74,7 @@ void a_dead_space_goes_at_the_next_entry(unsigned long first, bool shared)
 		require(cpu.registers[0] == 3 && cpu.registers[1] == 4);
 		require(stress::live_spaces() == spaces + 2);
 		const auto translations = executor.cache_diagnostics().translations;
+		const auto pushes = stress::limbo_pushes();
 
 		dying.reset();
 		require(stress::live_spaces() == spaces + 2);
@@ -82,6 +83,10 @@ void a_dead_space_goes_at_the_next_entry(unsigned long first, bool shared)
 		require(cpu.registers[0] == 3 && cpu.registers[1] == 4);
 		require(stress::live_spaces() == spaces + 1);
 		require(executor.cache_diagnostics().translations == translations);
+		/* A space nothing can enter again goes with its last holder, which
+		 * does not tell it of each body it lets go of. */
+		require(stress::limbo_pushes() == pushes,
+			"a dead space's bodies were queued one by one");
 	}
 	require(stress::live_spaces() == spaces);
 }

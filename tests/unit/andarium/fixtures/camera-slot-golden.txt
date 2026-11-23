@@ -1,0 +1,11 @@
+camera 1
+stills failed 3
+fronts 2 square yes dynamic yes dropped 3
+mount camera 0 back type 1 angles 90 270 0 180 stated 90 turn 0 earlier no anchor 4032x3024 ratios 0 fov 63
+mount camera 1 front type 1 angles 0 180 90 270 stated 90 turn 270 earlier yes anchor 1920x1440 ratios 24 fov 85
+ratio camera 1 pinned 3x4 now 3x4 dims 1512x2016 error 0
+video camera 1 default 0 set 270 supported yes mirror 0 0 asked 1920x1440 first 1920x1440 stab standard
+photo camera 1 compensation supported yes enabled yes read after-commit default 90 set 90 mirror 0 0 max 2016x1512 exif 6 center no distortion yes
+refused camera 1 count 1 last 4
+still at 1794114290 camera 1 front stage framework-error asked 2016x1512 resolved 2016x1512 encoded - compensation supported yes enabled no read after-commit exif - error avfoundation -11800
+still at 1794114290 camera 1 front stage encoded-size asked 2016x1512 resolved 2016x1512 encoded 1512x2016 compensation supported yes enabled no read after-commit exif 6 error none

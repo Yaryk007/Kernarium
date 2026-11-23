@@ -60,8 +60,9 @@ Each artifact descriptor records the bridge identity it was built with, and
 configure rejects an artifact whose identity differs from `identity.env`.
 
 `bridge_imports.py` owns the import policy. A kernel image imports exactly
-the declared `darwin_uml_*` functions, less those `import-policy.tsv` limits
-to the arm64 slice, and never Darwin's process-wide `sigprocmask` or variadic
-`fcntl`. Every kernel build runs `bridge_imports.py --kernel-binary` on its
-image, the artifact verifier applies the same check to each bundle, and
-`--print-expected` lists the set for a slice.
+the declared `darwin_uml_*` functions, less those `import-policy.tsv` marks
+`arm64-only` for the x86_64 slice or `x86_64-only` for an arm64 slice, and
+never Darwin's process-wide `sigprocmask` or variadic `fcntl`. Every kernel
+build runs `bridge_imports.py --kernel-binary` on its image, the artifact
+verifier applies the same check to each bundle, and `--print-expected` lists
+the set for a slice.

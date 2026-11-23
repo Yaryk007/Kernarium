@@ -29,4 +29,11 @@
 
     <!-- The one virtual network is on 5 GHz channel 48 as well as 2.4 GHz. -->
     <bool name="config_wifi5ghzSupport">true</bool>
+
+    <!-- A failed internet check never disables the one network, because a
+         disabled network is never joined again and the guest has no other:
+         the platform disables it when its failure count (at least one) reaches
+         the threshold, so only the largest value is never reached. -->
+    <integer name="config_wifiDisableReasonNoInternetPermanentThreshold">2147483647</integer>
+    <integer name="config_wifiDisableReasonNoInternetTemporaryThreshold">2147483647</integer>
 </resources>

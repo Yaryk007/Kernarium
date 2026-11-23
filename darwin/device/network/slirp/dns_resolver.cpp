@@ -43,9 +43,16 @@ struct HostResolver::Pending final {
 	bool done{};
 	/* No later record changes the answer. */
 	bool closed{};
+	/* The system said "no such record" or "no such name": there is nothing
+	 * to answer with, and whether that is true depends on the host having a
+	 * network (see finish). */
+	bool negative{};
 	/* Answer now, whatever the batch: the deadline passed or the daemon
 	 * connection was lost. */
 	bool expired{};
+	/* How the query ends, for the counters: an answer unless a failure
+	 * says otherwise. */
+	DnsOutcome outcome{DnsOutcome::answered};
 };
 
 namespace {
@@ -61,6 +68,12 @@ void DNSSD_API query_reply(DNSServiceRef, DNSServiceFlags flags,
 			   void *context) noexcept
 {
 	auto *pending = static_cast<HostResolver::Pending *>(context);
+#if UML_SLIRP_TESTING
+	if (pending->owner->answers_held_for_testing()) {
+		pending->owner->count_dropped_answer_for_testing();
+		return;
+	}
+#endif
 	pending->owner->record(
 		*pending, flags, error, fullname, type, klass,
 		{static_cast<const std::uint8_t *>(data),
@@ -370,6 +383,7 @@ void HostResolver::drop_connection() noexcept
 		pending->rcode = dns::rcode_servfail;
 		pending->answers.clear();
 		pending->expired = true;
+		pending->outcome = DnsOutcome::failed;
 	}
 	DNSServiceRefDeallocate(connection_);
 	connection_ = nullptr;
@@ -407,7 +421,9 @@ void HostResolver::handle(std::optional<dns::Endpoints> datagram,
 		if (duplicate)
 			return;
 	}
-	if (pending_.size() >= dns_pending_limit || !ensure_connection()) {
+	if (pending_.size() >= pending_limit() || !ensure_connection()) {
+		if (counters_ != nullptr)
+			counters_->dns(DnsOutcome::failed);
 		respond(datagram, stream,
 			dns::build_response(parsed.query, dns::rcode_servfail,
 					    {}, limit));
@@ -419,20 +435,27 @@ void HostResolver::handle(std::optional<dns::Endpoints> datagram,
 	pending->stream = stream;
 	pending->query = std::move(parsed.query);
 	pending->tail = pending->query.name;
-	pending->deadline = Clock::now() + dns_query_deadline;
+	pending->deadline = Clock::now() + query_deadline();
 	const auto name = dns::presentation_name(pending->query.name);
 	/* Listed before the query starts: once it has, its callback may name
 	 * this entry, so nothing after that point may fail to keep it. */
 	auto &entry = *pending_.emplace_back(std::move(pending));
 	entry.reference = connection_;
-	const auto error = DNSServiceQueryRecord(
-		&entry.reference,
-		kDNSServiceFlagsShareConnection |
-			kDNSServiceFlagsReturnIntermediates,
-		interface_index_, name.c_str(), entry.query.type,
-		entry.query.klass, query_reply, &entry);
+	DNSServiceErrorType error = kDNSServiceErr_NoError;
+#if UML_SLIRP_TESTING
+	error = submit_error_for_testing_.exchange(0, std::memory_order_relaxed);
+#endif
+	if (error == kDNSServiceErr_NoError)
+		error = DNSServiceQueryRecord(
+			&entry.reference,
+			kDNSServiceFlagsShareConnection |
+				kDNSServiceFlagsReturnIntermediates,
+			interface_index_, name.c_str(), entry.query.type,
+			entry.query.klass, query_reply, &entry);
 	if (error != kDNSServiceErr_NoError) {
 		entry.reference = nullptr;
+		if (counters_ != nullptr)
+			counters_->dns(classify_dns_error(error));
 		const auto reply = dns::build_response(
 			entry.query, dns::rcode_servfail, {}, limit);
 		pending_.pop_back();
@@ -444,6 +467,35 @@ void HostResolver::handle(std::optional<dns::Endpoints> datagram,
 	}
 	if (auto *owner = find_stream(stream); owner != nullptr)
 		++owner->pending;
+#if UML_SLIRP_TESTING
+	if (const auto injected =
+		    reply_error_for_testing_.exchange(0, std::memory_order_relaxed);
+	    injected != 0) {
+		record(entry, 0, injected, nullptr, 0, 0, {}, 0);
+		complete_ready();
+	}
+#endif
+}
+
+std::chrono::milliseconds HostResolver::query_deadline() const noexcept
+{
+#if UML_SLIRP_TESTING
+	if (const auto test = deadline_for_testing_.load(std::memory_order_relaxed);
+	    test > 0)
+		return std::chrono::milliseconds{test};
+#endif
+	return dns_query_deadline;
+}
+
+std::size_t HostResolver::pending_limit() const noexcept
+{
+#if UML_SLIRP_TESTING
+	if (const auto test =
+		    pending_limit_for_testing_.load(std::memory_order_relaxed);
+	    test > 0)
+		return test;
+#endif
+	return dns_pending_limit;
 }
 
 void HostResolver::record(Pending &pending, std::uint32_t flags,
@@ -458,11 +510,13 @@ void HostResolver::record(Pending &pending, std::uint32_t flags,
 		batch_ended_ = true;
 	if (pending.closed)
 		return;
-	const auto fail = [&pending]() {
+	const auto fail = [&pending](DnsOutcome outcome =
+					     DnsOutcome::failed) {
 		pending.rcode = dns::rcode_servfail;
 		pending.answers.clear();
 		pending.done = true;
 		pending.closed = true;
+		pending.outcome = outcome;
 	};
 	switch (error) {
 	case kDNSServiceErr_NoError:
@@ -470,17 +524,20 @@ void HostResolver::record(Pending &pending, std::uint32_t flags,
 	case kDNSServiceErr_NoSuchRecord:
 		/* NODATA; the CNAMEs that led here stand. A negative answer
 		 * after a positive one (a cache change) is ignored. */
-		if (!pending.done)
+		if (!pending.done) {
 			pending.done = pending.closed = true;
+			pending.negative = true;
+		}
 		return;
 	case kDNSServiceErr_NoSuchName:
 		if (!pending.done) {
 			pending.rcode = dns::rcode_nxdomain;
 			pending.done = pending.closed = true;
+			pending.negative = true;
 		}
 		return;
 	default:
-		fail();
+		fail(classify_dns_error(error));
 		return;
 	}
 	if ((flags & kDNSServiceFlagsAdd) == 0 || fullname == nullptr)
@@ -534,6 +591,29 @@ void HostResolver::finish(Pending &pending) noexcept
 	if (auto *stream = find_stream(pending.stream);
 	    stream != nullptr && stream->pending != 0)
 		--stream->pending;
+#if UML_SLIRP_TESTING
+	if (const auto hook =
+		    before_answer_for_testing_.load(std::memory_order_acquire);
+	    hook != nullptr)
+		hook(before_answer_context_for_testing_.load(
+			std::memory_order_relaxed));
+#endif
+	/* The state at the moment of the answer decides. With no network path
+	 * the system resolver has nothing to look a name up on and says "no such
+	 * record" at once, which is not a fact about the name: the guest is told
+	 * to try again, and the count says the query failed. The rule is "no
+	 * record of the asked type": a chain of aliases that ends in a negative
+	 * answer is one too, and passing its aliases on would let the guest
+	 * conclude "no address" as it did before. A query that had a record of
+	 * the asked type, or had already failed or timed out, is as it was. */
+	if (pending.negative && pending.outcome == DnsOutcome::answered &&
+	    path_ != nullptr && !path_->usable()) {
+		pending.rcode = dns::rcode_servfail;
+		pending.answers.clear();
+		pending.outcome = DnsOutcome::failed;
+	}
+	if (counters_ != nullptr)
+		counters_->dns(pending.outcome);
 	try {
 		const std::size_t limit = pending.datagram ?
 			dns::udp_limit(pending.query) : dns::tcp_limit;
@@ -555,6 +635,9 @@ void HostResolver::expire(Clock::time_point now) noexcept
 			pending->rcode = dns::rcode_servfail;
 			pending->answers.clear();
 			pending->expired = true;
+			/* A failure that was already in stands. */
+			if (pending->outcome == DnsOutcome::answered)
+				pending->outcome = DnsOutcome::timed_out;
 			any = true;
 		}
 	if (any) {

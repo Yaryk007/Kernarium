@@ -36,6 +36,13 @@ CONFIG_UNICODE=y
 # and other writers make to the underlying file. The desktop product's FUSE
 # servers do not implement the request.
 CONFIG_FUSE_CANONICAL_PATH=y
+# MediaProvider also hands the files it serves to the underlying file system
+# (FUSE passthrough) while it keeps the writeback cache, without
+# CAP_SYS_ADMIN, and opens one file in both ways at once. Upstream FUSE refuses
+# each of the three. The option adds the changes of the Android common kernel
+# and the sysfs file by which MediaProvider finds them; desktop FUSE servers
+# keep upstream's rules.
+CONFIG_FUSE_PASSTHROUGH_ANDROID=y
 
 # --- Android memory, IPC, and allocator interfaces -------------------------
 # Android 17 shares memory through memfd: the product sets sys.use_memfd, and
@@ -197,6 +204,10 @@ CONFIG_IPV6_ROUTE_INFO=y
 CONFIG_CRYPTO_NULL=y
 CONFIG_CRYPTO_SHA512=y
 CONFIG_CRYPTO_XCBC=y
+# AES-CMAC integrity for IPsec (IpSecAlgorithm.AUTH_AES_CMAC), which an IKEv2
+# VPN server may negotiate. The base list names it, and without it the kernel
+# has no cmac(aes) for the transform.
+CONFIG_CRYPTO_CMAC=y
 CONFIG_NET_SCH_INGRESS=y
 CONFIG_NET_SCH_TBF=y
 CONFIG_NET_CLS_ACT=y
@@ -264,6 +275,12 @@ CONFIG_LEDS_CLASS=y
 CONFIG_LEDS_CLASS_MULTICOLOR=y
 CONFIG_HID_PLAYSTATION=y
 CONFIG_PLAYSTATION_FF=y
+# A game controller of the host reaches the guest as a uhid device, which the
+# kernel's own driver binds: hid-playstation for a DualSense or DualShock 4
+# above, hid-microsoft for an Xbox controller. The latter adds the force
+# feedback an Xbox controller's rumble needs and changes no input mapping.
+# Only this product has UHID and a relay to feed it.
+CONFIG_HID_MICROSOFT=y
 
 # --- Incremental install ----------------------------------------------------
 CONFIG_INCREMENTAL_FS=y

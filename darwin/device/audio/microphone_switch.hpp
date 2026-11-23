@@ -53,6 +53,15 @@ public:
     /* Whether captured audio may flow: on, and permitted right now. */
     [[nodiscard]] bool active() const;
 
+    /* A camera of the guest is open in video mode, so the guest is about to
+     * record sound: the capture source opens the microphone before the guest
+     * starts to, and the recording does not begin with the silence of the
+     * system opening it. A hint only: it changes neither the setting nor the
+     * permission, and the microphone opens only while `active()` holds. Any
+     * thread may call it; the capture source's wake-up carries the change. */
+    void setStandby(bool standby);
+    [[nodiscard]] bool standby() const;
+
     /* The capture source's wake-up for a change. */
     void setWaker(std::shared_ptr<const Waker> waker);
     void clearWaker(const Waker* expected);
@@ -65,6 +74,7 @@ private:
     std::shared_ptr<const Waker> waker_;
     bool wanted_ {};
     bool asking_ {};
+    bool standby_ {};
 };
 
 [[nodiscard]] const char* describe(MicrophoneSwitch::State state) noexcept;

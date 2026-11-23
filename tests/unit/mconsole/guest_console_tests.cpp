@@ -7,9 +7,11 @@
 #include "wait_until.hpp"
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <fcntl.h>
 #include <filesystem>
 #include <functional>
@@ -65,11 +67,16 @@ struct Heard final {
 using Reply = std::pair<std::uint32_t, std::string>;
 
 /* What a suspend-capable guest replies when it gave a suspend up, busy or
- * for another reason, and to a writeback request. */
+ * for another reason, and to a writeback request (the "sync" command, or SysRq
+ * 's' from a kernel that has no such command). */
 const Reply busySuspend {1U, "Suspend failed: -16"};
 const Reply failedSuspend {1U, "Suspend failed: -5"};
 const Reply enteredSuspend {0U, "suspended"};
-const Reply writeback {0U, "SysRq : Emergency Sync"};
+const Reply enteredSyncedSuspend {0U, "suspended, synced"};
+const Reply enteredUnsyncedSuspend {0U, "suspended, not synced"};
+const Reply sysrqWriteback {0U, "sysrq s ok"};
+const Reply synced {0U, "synced in 12 ms"};
+const Reply unknownCommand {1U, "Unknown command"};
 
 /* Answers each request with what `policy` gives for it and its index, the
  * first one only after `firstDelay`, and keeps listening for a while after the
@@ -102,14 +109,15 @@ void answerAll(int descriptor, std::chrono::milliseconds firstDelay,
 std::vector<Heard> suspendAgainst(
 	std::function<Reply(const std::string &, std::size_t)> policy,
 	std::chrono::milliseconds firstDelay,
-	::uml::device::GuestSuspension &suspension)
+	::uml::device::GuestSuspension &suspension,
+	::uml::device::GuestSuspendSync *sync = nullptr)
 {
 	const ::uml::device::GuestConsoleRun run {true};
 	const int server = bindServer(consolePath());
 	std::vector<Heard> heard;
 	std::thread observer {answerAll, server, firstDelay, std::move(policy),
 		std::ref(heard)};
-	suspension = ::uml::device::suspend_guest(0U);
+	suspension = ::uml::device::suspend_guest(sync);
 	observer.join();
 	requireOwnerOnly(consolePath());
 	(void)::close(server);
@@ -133,6 +141,8 @@ struct HeldSuspend final {
 	 * arrived; nothing when it is empty. */
 	std::optional<Reply> firstReply;
 	std::chrono::milliseconds firstReplyAfter {0};
+	/* Whether that reply is the first part of a reply whose end follows. */
+	std::uint32_t firstReplyMore {0U};
 	/* Sent to the latest suspend's address right after the first wake is
 	 * answered: the final word of a suspend the wake aborted. */
 	std::optional<Reply> replyToWake;
@@ -165,7 +175,7 @@ void serveHeldSuspend(int server, const HeldSuspend &scenario,
 			firstReplyPending = false;
 			held.sent.push_back(sendReply(server, firstClient,
 				firstClientLength, scenario.firstReply->first,
-				scenario.firstReply->second));
+				scenario.firstReply->second, scenario.firstReplyMore));
 		}
 		if (!awaitRequest(server, 20))
 			continue;
@@ -193,15 +203,13 @@ void serveHeldSuspend(int server, const HeldSuspend &scenario,
 					suspendClientLength, scenario.replyToWake->first,
 					scenario.replyToWake->second));
 			}
-		} else if (command == "sysrq s") {
-			require(sendReply(server, client, clientLength, writeback.first,
-				writeback.second));
 		}
 	}
 }
 
 /* Runs suspend_guest and the resume that follows it against such a console
- * and returns what the console heard. */
+ * and returns what the console heard. A suspend asks for no writeback: the
+ * caller does, once it knows that the guest runs. */
 Held holdSuspend(const HeldSuspend &scenario,
 	::uml::device::GuestSuspension &suspension)
 {
@@ -211,7 +219,7 @@ Held holdSuspend(const HeldSuspend &scenario,
 	std::atomic_bool done {false};
 	std::thread console {serveHeldSuspend, server, std::cref(scenario),
 		std::cref(done), std::ref(held)};
-	suspension = ::uml::device::suspend_guest(0U);
+	suspension = ::uml::device::suspend_guest();
 	::uml::device::resume_guest(suspension);
 	/* A request too many shows too. */
 	std::this_thread::sleep_for(std::chrono::milliseconds {300});
@@ -221,10 +229,8 @@ Held holdSuspend(const HeldSuspend &scenario,
 	return held;
 }
 
-const std::vector<std::string> abortedAndWritten {
-	"suspend", "wake", "sysrq s"};
-const std::vector<std::string> abortedWrittenAndWoken {
-	"suspend", "wake", "sysrq s", "wake"};
+const std::vector<std::string> aborted {"suspend", "wake"};
+const std::vector<std::string> abortedAndWoken {"suspend", "wake", "wake"};
 
 /* A suspend with no reply at its deadline is aborted with a wake, not taken
  * for a suspended guest, and the final word of the request is read from its
@@ -237,7 +243,7 @@ void aSuspendThatDoesNotReplyIsAborted()
 	const auto held = holdSuspend(
 		{.replyToWake = busySuspend}, suspension);
 	require(suspension == ::uml::device::GuestSuspension::none);
-	require(commandsOf(held.heard) == abortedAndWritten);
+	require(commandsOf(held.heard) == aborted);
 	/* One deadline for the whole suspend, from the request. */
 	require(held.heard[1].at >= std::chrono::milliseconds {9500} &&
 		held.heard[1].at < std::chrono::milliseconds {11000});
@@ -251,7 +257,7 @@ void aSilentSuspendIsUnconfirmed()
 	auto suspension = ::uml::device::GuestSuspension::system;
 	const auto held = holdSuspend({}, suspension);
 	require(suspension == ::uml::device::GuestSuspension::unconfirmed);
-	require(commandsOf(held.heard) == abortedWrittenAndWoken,
+	require(commandsOf(held.heard) == abortedAndWoken,
 		"the resume wakes an unconfirmed guest");
 	require(held.heard[1].at >= std::chrono::milliseconds {9500} &&
 		held.heard[1].at < std::chrono::milliseconds {11000});
@@ -265,9 +271,29 @@ void aSuspendedReplyAfterTheWakeIsUnconfirmed()
 	const auto held = holdSuspend(
 		{.replyToWake = enteredSuspend}, suspension);
 	require(suspension == ::uml::device::GuestSuspension::unconfirmed);
-	require(commandsOf(held.heard) == abortedWrittenAndWoken,
+	require(commandsOf(held.heard) == abortedAndWoken,
 		"the resume wakes an unconfirmed guest");
 	require(held.sent == std::vector<bool> {true});
+}
+
+/* A reply whose first part was a refusal is a refusal as a whole, though its
+ * last part, which carries no error flag, arrives only after the host's
+ * deadline and is read by itself: the guest is known to run and is not woken
+ * again, and nothing the tail says, "suspended, synced" included, confirms
+ * the suspend. */
+void aReplyRefusedInItsFirstPartStaysRefused()
+{
+	auto suspension = ::uml::device::GuestSuspension::system;
+	const auto held = holdSuspend(
+		{.firstReply = Reply {1U, "Suspend failed: "},
+		 .firstReplyMore = 1U,
+		 .replyToWake = enteredSyncedSuspend},
+		suspension);
+	require(suspension == ::uml::device::GuestSuspension::none,
+		"the end of a refused reply confirmed the suspend");
+	require(commandsOf(held.heard) == aborted);
+	require(held.sent == std::vector<bool> {true, true},
+		"the first part and the end reached the request's socket");
 }
 
 /* A busy refusal late in the wait does not start a wait of its own: the
@@ -281,7 +307,7 @@ void aBusyRetryCannotOutlastTheDeadline()
 		suspension);
 	require(suspension == ::uml::device::GuestSuspension::unconfirmed);
 	require(commandsOf(held.heard) == std::vector<std::string> {
-		"suspend", "suspend", "wake", "sysrq s", "wake"});
+		"suspend", "suspend", "wake", "wake"});
 	require(held.heard[2].at >= std::chrono::milliseconds {9500} &&
 		held.heard[2].at < std::chrono::milliseconds {10500},
 		"the wake follows the deadline, not the retry's own wait");
@@ -289,24 +315,22 @@ void aBusyRetryCannotOutlastTheDeadline()
 
 /* Every guest is refused its first suspend busy: it is asked again every
  * 250 ms for two seconds after the first refusal, nothing stops it, and when
- * it stays busy it is left running after the writeback. `refusedAt` is when
- * the first refusal reached the host. */
+ * it stays busy it is left running. `refusedAt` is when the first refusal
+ * reached the host. */
 void requireRetriedUntilTheDeadline(const std::vector<Heard> &heard,
 	std::chrono::milliseconds refusedAt)
 {
 	require(heard.size() >= 4U, "a busy guest is asked again");
 	std::size_t suspends = 0U;
 	for (const auto &entry : heard) {
-		require(entry.command == "suspend" || entry.command == "sysrq s",
-			"nothing but suspends and the writeback is sent, never a stop");
-		suspends += entry.command == "suspend" ? 1U : 0U;
+		require(entry.command == "suspend",
+			"nothing but suspends is sent, never a stop or a writeback");
+		++suspends;
 	}
-	require(heard.back().command == "sysrq s" &&
-		suspends == heard.size() - 1U, "the writeback comes last");
 	/* The first retry waits out the interval, and no retry follows the
 	 * deadline: seven fit in two seconds, whatever the host's load adds. */
 	require(heard[1].at >= refusedAt + std::chrono::milliseconds {200});
-	const auto &lastSuspend = heard[heard.size() - 2U];
+	const auto &lastSuspend = heard.back();
 	require(lastSuspend.at < refusedAt + std::chrono::milliseconds {3000},
 		"a busy guest is asked only within the deadline");
 	require(suspends <= 8U);
@@ -318,9 +342,7 @@ void aBusySuspendIsRetriedUntilTheDeadline()
 {
 	auto suspension = ::uml::device::GuestSuspension::system;
 	const auto heard = suspendAgainst(
-		[](const std::string &command, std::size_t) {
-			return command == "sysrq s" ? writeback : busySuspend;
-		},
+		[](const std::string &, std::size_t) { return busySuspend; },
 		std::chrono::milliseconds {0}, suspension);
 	require(suspension == ::uml::device::GuestSuspension::none);
 	requireRetriedUntilTheDeadline(heard, std::chrono::milliseconds {0});
@@ -333,15 +355,13 @@ void aLateBusyRefusalIsRetriedOnlyWithinTheDeadline()
 {
 	auto suspension = ::uml::device::GuestSuspension::system;
 	const auto heard = suspendAgainst(
-		[](const std::string &command, std::size_t) {
-			return command == "sysrq s" ? writeback : busySuspend;
-		},
+		[](const std::string &, std::size_t) { return busySuspend; },
 		std::chrono::milliseconds {3000}, suspension);
 	require(suspension == ::uml::device::GuestSuspension::none);
 	requireRetriedUntilTheDeadline(heard, std::chrono::milliseconds {3000});
 }
 
-/* A guest whose busy state passes suspends: no stop, no writeback. */
+/* A guest whose busy state passes suspends: no stop. */
 void aRetryThatSucceedsSuspendsTheGuest()
 {
 	auto suspension = ::uml::device::GuestSuspension::none;
@@ -355,19 +375,85 @@ void aRetryThatSucceedsSuspendsTheGuest()
 		std::vector<std::string> {"suspend", "suspend", "suspend"});
 }
 
+/* A kernel that states whether its suspend synced says it in the reply, with
+ * the word an older host looks for. Only the two whole texts state anything: a
+ * kernel that replies "suspended" (sc1 and older) says nothing, and so does a
+ * text that merely holds the statement's words, a refusal that mentions them,
+ * and a refused suspend. The statement is reported with the suspension and
+ * never without it. */
+void aSuspendStatesWhetherItSynced()
+{
+	using ::uml::device::GuestSuspendSync;
+	using ::uml::device::GuestSuspension;
+	const struct {
+		Reply reply;
+		GuestSuspension suspension;
+		GuestSuspendSync sync;
+	} cases[] = {
+		{enteredSyncedSuspend, GuestSuspension::system,
+			GuestSuspendSync::synced},
+		{enteredUnsyncedSuspend, GuestSuspension::system,
+			GuestSuspendSync::skipped},
+		{enteredSuspend, GuestSuspension::system,
+			GuestSuspendSync::unstated},
+		/* Not the statement: more text, another case, the words elsewhere. */
+		{{0U, "suspended, synced in 12 ms"}, GuestSuspension::system,
+			GuestSuspendSync::unstated},
+		{{0U, "Suspended, synced"}, GuestSuspension::system,
+			GuestSuspendSync::unstated},
+		{{0U, "suspended, synced "}, GuestSuspension::system,
+			GuestSuspendSync::unstated},
+		{{0U, "suspended, not synced, synced"}, GuestSuspension::system,
+			GuestSuspendSync::unstated},
+		/* A refusal states nothing, whatever it says. */
+		{{1U, "suspended, synced"}, GuestSuspension::none,
+			GuestSuspendSync::unstated},
+		{failedSuspend, GuestSuspension::none, GuestSuspendSync::unstated},
+	};
+	for (const auto &item : cases) {
+		auto suspension = GuestSuspension::none;
+		auto sync = GuestSuspendSync::skipped;
+		const auto heard = suspendAgainst(
+			[&item](const std::string &, std::size_t) { return item.reply; },
+			std::chrono::milliseconds {0}, suspension, &sync);
+		require(suspension == item.suspension, item.reply.second.c_str());
+		require(sync == item.sync, item.reply.second.c_str());
+		require(commandsOf(heard) == std::vector<std::string> {"suspend"},
+			item.reply.second.c_str());
+	}
+	/* A retry that succeeds after a busy refusal states what the retry did. */
+	auto suspension = GuestSuspension::none;
+	auto sync = GuestSuspendSync::unstated;
+	const auto heard = suspendAgainst(
+		[](const std::string &, std::size_t index) {
+			return index < 1U ? busySuspend : enteredSyncedSuspend;
+		},
+		std::chrono::milliseconds {0}, suspension, &sync);
+	require(suspension == GuestSuspension::system &&
+		sync == GuestSuspendSync::synced);
+	require(commandsOf(heard) ==
+		std::vector<std::string> {"suspend", "suspend"});
+	/* A caller that does not ask for the statement is not given one. */
+	suspension = GuestSuspension::none;
+	(void)suspendAgainst(
+		[](const std::string &, std::size_t) { return enteredSyncedSuspend; },
+		std::chrono::milliseconds {0}, suspension);
+	require(suspension == GuestSuspension::system);
+}
+
 /* Only a busy guest is asked again. A kernel without the suspend command, any
- * other refusal, and a retry that fails some other way leave the guest running
- * after one writeback. */
+ * other refusal, and a retry that fails some other way leave the guest
+ * running. */
 void aRefusalThatIsNotBusyIsNotRetried()
 {
 	using ::uml::device::GuestSuspension;
-	const std::vector<std::string> once {"suspend", "sysrq s"};
+	const std::vector<std::string> once {"suspend"};
 	const Reply notConfigured {1U, "System suspend is not configured"};
 	for (const auto &refusal : {notConfigured, failedSuspend}) {
 		auto suspension = GuestSuspension::system;
 		const auto heard = suspendAgainst(
-			[&refusal](const std::string &command, std::size_t) {
-				return command == "sysrq s" ? writeback : refusal;
+			[&refusal](const std::string &, std::size_t) {
+				return refusal;
 			},
 			std::chrono::milliseconds {0}, suspension);
 		require(suspension == GuestSuspension::none);
@@ -375,15 +461,13 @@ void aRefusalThatIsNotBusyIsNotRetried()
 	}
 	auto suspension = GuestSuspension::system;
 	const auto heard = suspendAgainst(
-		[](const std::string &command, std::size_t index) {
-			if (command == "sysrq s")
-				return writeback;
+		[](const std::string &, std::size_t index) {
 			return index == 0U ? busySuspend : failedSuspend;
 		},
 		std::chrono::milliseconds {0}, suspension);
 	require(suspension == GuestSuspension::none);
 	require(commandsOf(heard) ==
-		std::vector<std::string> {"suspend", "suspend", "sysrq s"});
+		std::vector<std::string> {"suspend", "suspend"});
 }
 
 /* Answers one request with `answer` and `error` after `delayMs`. A client
@@ -433,23 +517,491 @@ void aWakeSendsOneWakeRequest()
 	(void)::close(server);
 }
 
-/* A sync is one emergency sync, which counts only if the guest started it. */
-void aWritebackIsOneEmergencySync()
+/* Answers one request with `parts`, all but the last as console text that
+ * is followed by more, and returns what the console heard. */
+template<typename Request>
+auto answeredInParts(int server, Request &&request,
+	const std::vector<Reply> &parts, std::string_view expected)
 {
-	using ::uml::device::request_guest_writeback;
+	std::vector<std::string> requests;
+	std::thread observer {[&] {
+		sockaddr_un client {};
+		socklen_t clientLength {};
+		if (!awaitRequest(server, 10000))
+			return;
+		requests.push_back(
+			receiveRequest(server, client, clientLength));
+		for (std::size_t index = 0U; index < parts.size(); ++index)
+			(void)sendReply(server, client, clientLength,
+				parts[index].first, parts[index].second,
+				index + 1U < parts.size() ? 1U : 0U);
+	}};
+	const auto result = request();
+	observer.join();
+	require(requests == std::vector<std::string> {std::string {expected}});
+	return result;
+}
+
+/* What the console heard, and each request's reply socket's path, for a
+ * console that answers each request by `policy` and keeps listening a little
+ * after the last, so that a request too many shows. */
+struct Writeback final {
+	std::vector<std::string> heard;
+	std::vector<std::string> clients;
+};
+
+/* Answers each request with what `policy` says for it, after `delay`. */
+void serveWriteback(int server,
+	std::function<std::pair<Reply, std::chrono::milliseconds>(
+		const std::string &, std::size_t)> policy,
+	Writeback &writeback)
+{
+	for (int wait = 10000; awaitRequest(server, wait); wait = 600) {
+		sockaddr_un client {};
+		socklen_t clientLength {};
+		const auto command = receiveRequest(server, client, clientLength);
+		writeback.heard.push_back(command);
+		writeback.clients.emplace_back(client.sun_path);
+		const auto [reply, delay] = policy(command, writeback.heard.size() - 1U);
+		std::this_thread::sleep_for(delay);
+		(void)sendReply(server, client, clientLength, reply.first,
+			reply.second);
+	}
+}
+
+using Policy = std::function<std::pair<Reply, std::chrono::milliseconds>(
+	const std::string &, std::size_t)>;
+const std::chrono::milliseconds noDelay {0};
+
+/* Runs `request` against such a console, in a run of its own: the console is
+ * narrowed to its owner once per run. */
+template<typename Request>
+auto writebackAgainst(Policy policy, Request &&request, Writeback &writeback)
+{
 	const ::uml::device::GuestConsoleRun run {true};
-	const auto path = consolePath();
-	require(!request_guest_writeback(0U));
-	const int server = bindServer(path);
-	const auto writeback = [] { return request_guest_writeback(0U); };
-	require(answered(server, writeback, "SysRq : Emergency Sync", 0U, 0,
-		"sysrq s"));
-	requireOwnerOnly(path);
-	/* A guest with magic SysRq disabled takes the request and does nothing. */
-	require(!answered(server, writeback, "SysRq : This sysrq operation is "
-		"disabled.", 0U, 0, "sysrq s"));
-	require(!awaitRequest(server, 200));
+	const int server = bindServer(consolePath());
+	std::thread console {serveWriteback, server, std::move(policy),
+		std::ref(writeback)};
+	const auto result = request();
+	console.join();
+	requireOwnerOnly(consolePath());
 	(void)::close(server);
+	return result;
+}
+
+/* A writeback is one "sync", which counts only if the guest's final reply says
+ * that it returned. A kernel that does not know the command is asked for SysRq
+ * 's' instead, which only starts the writeback. */
+void aWritebackIsOneSync()
+{
+	using ::uml::device::GuestWriteback;
+	using ::uml::device::request_guest_writeback;
+	const std::chrono::milliseconds wait {2000};
+	{
+		/* No guest console yet: nothing is sent and nothing waits. */
+		const ::uml::device::GuestConsoleRun run {true};
+		require(request_guest_writeback(wait, 0U) ==
+			GuestWriteback::unreachable);
+	}
+	const auto writeback = [&] { return request_guest_writeback(wait, 0U); };
+	{
+		/* The guest synced and said so; nothing else is sent. */
+		Writeback heard;
+		require(writebackAgainst(
+			[](const std::string &, std::size_t) {
+				return std::pair {synced, noDelay};
+			}, writeback, heard) == GuestWriteback::done);
+		require(heard.heard == std::vector<std::string> {"sync"});
+	}
+	{
+		/* An older kernel: unknown command, then SysRq 's' accepted. The
+		 * result is that it started, which is no confirmation. */
+		Writeback heard;
+		require(writebackAgainst(
+			[](const std::string &command, std::size_t) {
+				return std::pair {
+					command == "sync" ? unknownCommand : sysrqWriteback,
+					noDelay};
+			}, writeback, heard) == GuestWriteback::started);
+		require(heard.heard == std::vector<std::string> {"sync", "sysrq s"});
+	}
+	{
+		/* An older kernel whose SysRq mask is off refuses. */
+		Writeback heard;
+		require(writebackAgainst(
+			[](const std::string &command, std::size_t) {
+				return std::pair {command == "sync" ? unknownCommand :
+					Reply {1U, "sysrq s disabled"}, noDelay};
+			}, writeback, heard) == GuestWriteback::refused);
+		require(heard.heard == std::vector<std::string> {"sync", "sysrq s"});
+	}
+	{
+		/* An older kernel that never answers SysRq 's' leaves it unconfirmed;
+		 * its sync request got an answer, so there is a second. */
+		Writeback heard;
+		require(writebackAgainst(
+			[](const std::string &command, std::size_t) {
+				return std::pair {command == "sync" ? unknownCommand :
+					sysrqWriteback, command == "sync" ? noDelay :
+					std::chrono::milliseconds {2600}};
+			}, [] {
+				return request_guest_writeback(
+					std::chrono::milliseconds {2000}, 0U);
+			}, heard) == GuestWriteback::unanswered);
+	}
+	{
+		/* Any other refusal is no confirmation and no fallback. */
+		Writeback heard;
+		require(writebackAgainst(
+			[](const std::string &, std::size_t) {
+				return std::pair {Reply {1U, "Out of memory"}, noDelay};
+			}, writeback, heard) == GuestWriteback::refused);
+		require(heard.heard == std::vector<std::string> {"sync"});
+	}
+	{
+		/* An answer that is not "synced" is not a confirmation either. */
+		Writeback heard;
+		require(writebackAgainst(
+			[](const std::string &, std::size_t) {
+				return std::pair {Reply {0U, "running"}, noDelay};
+			}, writeback, heard) == GuestWriteback::refused);
+		require(heard.heard == std::vector<std::string> {"sync"});
+	}
+}
+
+/* A guest that does not reply within the wait, as one whose sync is held up by
+ * a full host disk, is unconfirmed after that wait and not asked again by the
+ * request: no SysRq fallback follows silence. Its late reply goes to the first
+ * request's socket, which the host has removed, so the next request is
+ * answered by its own reply alone. */
+void aSyncThatIsNotAnsweredInTimeIsUnconfirmed()
+{
+	using ::uml::device::GuestWriteback;
+	using ::uml::device::request_guest_writeback;
+	Writeback heard;
+	std::vector<GuestWriteback> results;
+	const auto started = std::chrono::steady_clock::now();
+	writebackAgainst(
+		[](const std::string &, std::size_t index) {
+			/* The first reply comes after the host stopped waiting. */
+			return std::pair {synced, index == 0U ?
+				std::chrono::milliseconds {900} : noDelay};
+		},
+		[&] {
+			results.push_back(request_guest_writeback(
+				std::chrono::milliseconds {300}, 0U));
+			const auto firstEnded = std::chrono::steady_clock::now();
+			require(firstEnded - started < std::chrono::milliseconds {850},
+				"the wait ends at its bound, not with the reply");
+			/* The console is still busy with the first request. */
+			std::this_thread::sleep_for(std::chrono::milliseconds {700});
+			results.push_back(request_guest_writeback(
+				std::chrono::milliseconds {2000}, 0U));
+			return 0;
+		}, heard);
+	require(results == std::vector<GuestWriteback> {
+		GuestWriteback::unanswered, GuestWriteback::done});
+	require(heard.heard == std::vector<std::string> {"sync", "sync"},
+		"silence is not followed by SysRq");
+	require(heard.clients[0] != heard.clients[1],
+		"each request has a reply socket of its own");
+}
+
+/* What a console that answers one "sync" did, and what came after. */
+struct OneSync final {
+	::uml::device::GuestWriteback result {};
+	std::vector<std::string> heard;
+	std::chrono::milliseconds took {};
+};
+
+/* Runs request_guest_writeback(`wait`, `settle`) against a console whose
+ * answer to the first request is `serve`'s: it is handed the descriptor and the
+ * client to answer, and the console then listens for another request for a
+ * while, which is the fallback's, and answers it with `second`, if any. */
+OneSync oneSyncAgainst(
+	std::function<void(int, const sockaddr_un &, socklen_t)> serve,
+	std::chrono::milliseconds wait, unsigned int settle = 0U,
+	std::function<void(int, const sockaddr_un &, socklen_t)> second = {})
+{
+	const ::uml::device::GuestConsoleRun run {true};
+	const int server = bindServer(consolePath());
+	OneSync one;
+	std::thread console {[&] {
+		sockaddr_un client {};
+		socklen_t clientLength {};
+		if (!awaitRequest(server, 10000))
+			return;
+		one.heard.push_back(receiveRequest(server, client, clientLength));
+		serve(server, client, clientLength);
+		for (int more = 0; more < 2 && awaitRequest(server, 250); ++more) {
+			one.heard.push_back(
+				receiveRequest(server, client, clientLength));
+			if (second)
+				second(server, client, clientLength);
+		}
+	}};
+	const auto started = std::chrono::steady_clock::now();
+	one.result = ::uml::device::request_guest_writeback(wait, settle);
+	one.took = std::chrono::duration_cast<std::chrono::milliseconds>(
+		std::chrono::steady_clock::now() - started);
+	console.join();
+	(void)::close(server);
+	return one;
+}
+
+/* A datagram of `bytes` bytes of a reply whose header advertises `length`
+ * bytes of text, as a console that sends less than it says does. */
+void sendRawReply(int descriptor, const sockaddr_un &client,
+	socklen_t clientLength, std::uint32_t error, std::uint32_t length,
+	std::string_view text, std::size_t bytes)
+{
+	uml::testing::ConsoleReply reply {error, 0U, length, {}};
+	std::memcpy(reply.data.data(), text.data(), text.size());
+	require(::sendto(descriptor, &reply, bytes, 0,
+		reinterpret_cast<const sockaddr *>(&client), clientLength) ==
+		static_cast<ssize_t>(bytes));
+}
+
+/* A datagram longer than a reply can be, whose header advertises `text`: a
+ * receive that cuts it to the size of a reply would find it whole. */
+void sendOversizedReply(int descriptor, const sockaddr_un &client,
+	socklen_t clientLength, std::string_view text, std::size_t extra)
+{
+	std::vector<char> datagram(sizeof(uml::testing::ConsoleReply) + extra, '\0');
+	uml::testing::ConsoleReply reply {0U, 0U,
+		static_cast<std::uint32_t>(text.size() + 1U), {}};
+	std::memcpy(reply.data.data(), text.data(), text.size());
+	std::memcpy(datagram.data(), &reply, sizeof(reply));
+	require(::sendto(descriptor, datagram.data(), datagram.size(), 0,
+		reinterpret_cast<const sockaddr *>(&client), clientLength) ==
+		static_cast<ssize_t>(datagram.size()));
+}
+
+/* Only the guest's whole reply, "synced in <n> ms", is a confirmation: text
+ * that merely starts alike, a count that is no number, a datagram that carries
+ * less than it advertises, one shorter than a header, one longer than a reply
+ * can be, and an error flagged in any part of the reply are not, and none of them starts the SysRq fallback,
+ * which only a reply that says "Unknown command" and nothing more does. */
+void aWritebackReplyIsValidatedStrictly()
+{
+	using ::uml::device::GuestWriteback;
+	const std::chrono::milliseconds wait {1000};
+	const auto text = [](std::uint32_t error, std::string_view reply) {
+		return [error, reply](int fd, const sockaddr_un &to, socklen_t n) {
+			(void)sendReply(fd, to, n, error, reply);
+		};
+	};
+	const auto sync = [&](std::function<void(int, const sockaddr_un &,
+		socklen_t)> serve) {
+		return oneSyncAgainst(std::move(serve), wait);
+	};
+	const std::vector<std::string> onlySync {"sync"};
+	for (const char *reply : {"synced", "synced in", "synced in  ms",
+		     "synced in NaN ms", "synced in -1 ms", "synced in 3ms",
+		     "synced in 3 ms and more", "Synced in 3 ms",
+		     "synced in 99999999999999999999999 ms", "synced in 3 ms\n"}) {
+		const auto one = sync(text(0U, reply));
+		require(one.result == GuestWriteback::refused, reply);
+		require(one.heard == onlySync, reply);
+	}
+	/* A reply the guest flags as an error is a refusal, whatever it says. */
+	{
+		const auto one = sync(text(1U, "synced in 3 ms"));
+		require(one.result == GuestWriteback::refused);
+		require(one.heard == onlySync);
+	}
+	/* A kernel that does not know the command says so, and says no more. */
+	for (const char *reply : {"Unknown command: access denied",
+		     "Unknown command.", "unknown command", "Unknown"}) {
+		const auto one = sync(text(1U, reply));
+		require(one.result == GuestWriteback::refused, reply);
+		require(one.heard == onlySync,
+			"no SysRq fallback for a refusal that is not exactly it");
+	}
+	{
+		/* No error flag: not the kernel's refusal either. */
+		const auto one = sync(text(0U, "Unknown command"));
+		require(one.result == GuestWriteback::refused);
+		require(one.heard == onlySync);
+	}
+	{
+		/* The text it says, whole, with the NUL that the guest counts in its
+		 * length, is the reply. */
+		const auto one = sync([](int fd, const sockaddr_un &to, socklen_t n) {
+			constexpr std::string_view reply {"synced in 7 ms\0", 15U};
+			sendRawReply(fd, to, n, 0U, 15U, reply,
+				12U + reply.size());
+		});
+		require(one.result == GuestWriteback::done);
+	}
+	{
+		/* A datagram that advertises 40 bytes of text and carries 6. */
+		const auto one = sync([](int fd, const sockaddr_un &to, socklen_t n) {
+			sendRawReply(fd, to, n, 0U, 40U, "synced", 12U + 6U);
+		});
+		require(one.result == GuestWriteback::refused,
+			"a truncated reply is no confirmation");
+		require(one.heard == onlySync);
+	}
+	{
+		/* One whose text is whole but whose last advertised byte, the NUL
+		 * the guest counts, is not in the datagram: the zeros that fill a
+		 * receive buffer would make it read as the reply. */
+		const auto one = sync([](int fd, const sockaddr_un &to, socklen_t n) {
+			constexpr std::string_view reply {"synced in 7 ms"};
+			sendRawReply(fd, to, n, 0U, 15U, reply, 12U + reply.size());
+		});
+		require(one.result == GuestWriteback::refused,
+			"a datagram one byte short is no confirmation");
+	}
+	{
+		/* One that advertises more than a reply can carry. */
+		const auto one = sync([](int fd, const sockaddr_un &to, socklen_t n) {
+			sendRawReply(fd, to, n, 0U, 9999U, "synced in 3 ms",
+				sizeof(uml::testing::ConsoleReply));
+		});
+		require(one.result == GuestWriteback::refused);
+	}
+	for (const std::size_t extra : {std::size_t {1U}, std::size_t {64U}}) {
+		/* One longer than a reply can be, whose first 524 bytes are the
+		 * guest's whole reply: only what fits would be read. */
+		const auto one = sync([extra](int fd, const sockaddr_un &to,
+					    socklen_t n) {
+			sendOversizedReply(fd, to, n, "synced in 3 ms", extra);
+		});
+		require(one.result == GuestWriteback::refused,
+			"an oversized datagram is no confirmation");
+		require(one.heard == onlySync);
+	}
+	{
+		/* One shorter than the header. */
+		const auto one = sync([](int fd, const sockaddr_un &to, socklen_t n) {
+			sendRawReply(fd, to, n, 0U, 0U, {}, 4U);
+		});
+		require(one.result == GuestWriteback::refused);
+		require(one.heard == onlySync);
+	}
+	{
+		/* An error in the first part of a reply that goes on is kept, though
+		 * its last part carries none. */
+		const auto one = sync([](int fd, const sockaddr_un &to, socklen_t n) {
+			(void)sendReply(fd, to, n, 1U, "synced in ", 1U);
+			(void)sendReply(fd, to, n, 0U, "3 ms");
+		});
+		require(one.result == GuestWriteback::refused);
+	}
+	{
+		/* A reply in parts, none of them failed, is read whole. */
+		const auto one = sync([](int fd, const sockaddr_un &to, socklen_t n) {
+			(void)sendReply(fd, to, n, 0U, "synced in ", 1U);
+			(void)sendReply(fd, to, n, 0U, "3 ms");
+		});
+		require(one.result == GuestWriteback::done);
+	}
+	{
+		/* "Unknown command" in the kernel's own form falls back, and
+		 * SysRq's acknowledgement is only a start. */
+		const auto one = oneSyncAgainst(text(1U, "Unknown command"), wait, 0U,
+			text(0U, "sysrq s ok"));
+		require(one.result == GuestWriteback::started);
+		require(one.heard == std::vector<std::string> {"sync", "sysrq s"});
+	}
+}
+
+/* A writeback's wait is one budget from the call, shared by the wait for the
+ * console, every part of the reply, the SysRq fallback of a kernel without the
+ * command, and its settling period. */
+void aWritebackWaitsOneBudgetForEverything()
+{
+	using ::uml::device::GuestWriteback;
+	using ::uml::device::request_guest_writeback;
+	using namespace std::chrono_literals;
+	const auto later = [](std::chrono::milliseconds delay, std::uint32_t error,
+		std::string_view text, std::uint32_t more = 0U) {
+		return [=](int fd, const sockaddr_un &to, socklen_t n) {
+			std::this_thread::sleep_for(delay);
+			(void)sendReply(fd, to, n, error, text, more);
+		};
+	};
+	{
+		/* An older kernel, quick to answer both: the settling period is what
+		 * is left of the budget, not its own 1.5 s. */
+		const auto one = oneSyncAgainst(later(400ms, 1U, "Unknown command"),
+			1000ms, 1500U, later(300ms, 0U, "sysrq s ok"));
+		require(one.result == GuestWriteback::started);
+		require(one.heard == std::vector<std::string> {"sync", "sysrq s"});
+		require(one.took >= 950ms && one.took < 1400ms,
+			"the settling period ends with the budget");
+	}
+	{
+		/* An older kernel that is slow: the fallback waits only what is left
+		 * (the probe's 3 s + 1.8 s + 1.5 s took 6.3 s for 3.5 s). */
+		const auto one = oneSyncAgainst(later(700ms, 1U, "Unknown command"),
+			1000ms, 1500U, later(600ms, 0U, "sysrq s ok"));
+		require(one.result == GuestWriteback::unanswered);
+		require(one.took >= 950ms && one.took < 1400ms,
+			"the fallback's reply is waited for no longer than the budget");
+	}
+	{
+		/* A budget that the first reply uses up leaves no fallback. */
+		const auto one = oneSyncAgainst(later(1200ms, 1U, "Unknown command"),
+			1000ms, 1500U, later(0ms, 0U, "sysrq s ok"));
+		require(one.result == GuestWriteback::unanswered);
+		require(one.took < 1400ms);
+		require(one.heard == std::vector<std::string> {"sync"},
+			"nothing is sent after the budget");
+	}
+	{
+		/* A reply in many parts is waited for as one: five parts 150 ms apart
+		 * with a 400 ms budget used to take 750 ms, each part restarting the
+		 * wait. */
+		const auto one = oneSyncAgainst(
+			[](int fd, const sockaddr_un &to, socklen_t n) {
+				for (int part = 0; part < 5; ++part) {
+					std::this_thread::sleep_for(150ms);
+					(void)sendReply(fd, to, n, 0U,
+						part == 0 ? "synced in " : part == 4 ? "1 ms" : "",
+						part == 4 ? 0U : 1U);
+				}
+			}, 400ms);
+		require(one.result == GuestWriteback::unanswered);
+		require(one.took >= 350ms && one.took < 650ms,
+			"the parts of a reply share one wait");
+	}
+	{
+		/* The console may be held by another request: the wait for it counts
+		 * against the budget, and nothing is sent. */
+		const ::uml::device::GuestConsoleRun run {true};
+		const int server = bindServer(consolePath());
+		std::vector<std::string> heard;
+		std::thread console {[&] {
+			sockaddr_un client {};
+			socklen_t clientLength {};
+			while (awaitRequest(server, 1500)) {
+				heard.push_back(
+					receiveRequest(server, client, clientLength));
+				std::this_thread::sleep_for(900ms);
+				(void)sendReply(server, client, clientLength, 0U, "trimmed");
+			}
+		}};
+		std::thread trim {[] {
+			(void)::uml::device::trim_guest_page_cache(3000U);
+		}};
+		std::this_thread::sleep_for(150ms);
+		const auto started = std::chrono::steady_clock::now();
+		const auto result = request_guest_writeback(300ms, 0U);
+		const auto took =
+			std::chrono::duration_cast<std::chrono::milliseconds>(
+				std::chrono::steady_clock::now() - started);
+		trim.join();
+		console.join();
+		(void)::close(server);
+		require(result == GuestWriteback::busy);
+		require(took >= 250ms && took < 700ms,
+			"the wait for the console counts against the budget");
+		require(heard == std::vector<std::string> {"trim once"},
+			"nothing is sent to a console that was not free");
+	}
 }
 
 /* Turning trimming on or off is one request, which a kernel without the
@@ -470,6 +1022,52 @@ void trimmingIsSwitchedByOneRequest()
 			"off", 0U, 0, "trim off") == GuestRequest::done);
 	require(answered(server, [] { return set_guest_page_cache_trim(true); },
 			"Unknown command", 1U, 0, "trim on") == GuestRequest::refused);
+	require(!awaitRequest(server, 200));
+	(void)::close(server);
+}
+
+/* The request that does not wait returns at once with the guest silent or
+ * gone, leaves a request another thread has in flight alone, and reaches the
+ * guest as the ordinary one does. */
+void aNoWaitTrimRequestReturnsAtOnce()
+{
+	using ::uml::device::GuestRequest;
+	using ::uml::device::set_guest_page_cache_trim;
+	using ::uml::device::set_guest_page_cache_trim_nowait;
+	const ::uml::device::GuestConsoleRun run {true};
+	const auto path = consolePath();
+	/* No guest console yet. */
+	require(set_guest_page_cache_trim_nowait(true) ==
+		GuestRequest::unreachable);
+	const int server = bindServer(path);
+	const auto started = std::chrono::steady_clock::now();
+	require(set_guest_page_cache_trim_nowait(true) == GuestRequest::sent);
+	require(set_guest_page_cache_trim_nowait(false) == GuestRequest::sent);
+	/* The guest never answers: nothing waited for it. */
+	require(std::chrono::steady_clock::now() - started <
+		std::chrono::milliseconds {1500});
+	sockaddr_un client {};
+	socklen_t clientLength {};
+	require(awaitRequest(server, 1000));
+	require(receiveRequest(server, client, clientLength) == "trim on");
+	require(awaitRequest(server, 1000));
+	require(receiveRequest(server, client, clientLength) == "trim off");
+	requireOwnerOnly(path);
+
+	/* A request in flight on another thread holds the console: the one that
+	 * does not wait is busy and sends nothing. */
+	std::atomic<bool> inFlight {false};
+	std::thread holder {[&] {
+		inFlight = true;
+		(void)set_guest_page_cache_trim(true);
+	}};
+	require(awaitRequest(server, 5000));
+	const auto command = receiveRequest(server, client, clientLength);
+	require(command == "trim on");
+	require(set_guest_page_cache_trim_nowait(true) == GuestRequest::busy);
+	/* Let the holder's wait end with the reply. */
+	require(sendReply(server, client, clientLength, 0U, "trim on"));
+	holder.join();
 	require(!awaitRequest(server, 200));
 	(void)::close(server);
 }
@@ -502,6 +1100,108 @@ void aTrimPassIsWaitedForUpToItsBound()
 			0U, 2500,
 			"trim once") == GuestRequest::unanswered);
 	require(waited < std::chrono::milliseconds(1800));
+	(void)::close(server);
+}
+
+/* Sends datagrams to the console, which nothing reads, until its queue has
+ * no room: Darwin then refuses one (ENOBUFS) at once. Returns how many it
+ * took. */
+std::size_t fillTheConsoleQueue(const std::string &path)
+{
+	const int sender = ::socket(AF_UNIX, SOCK_DGRAM, 0);
+	require(sender >= 0);
+	sockaddr_un console {};
+	console.sun_family = AF_UNIX;
+	require(path.size() < sizeof(console.sun_path));
+	std::memcpy(console.sun_path, path.c_str(), path.size() + 1U);
+	uml::testing::ConsoleRequest filler {};
+	filler.length = 4U;
+	std::memcpy(filler.data.data(), "fill", 4U);
+	for (std::size_t sent = 0; sent < 1000U; ++sent) {
+		if (::sendto(sender, &filler, sizeof(filler), MSG_DONTWAIT,
+			    reinterpret_cast<const sockaddr *>(&console),
+			    sizeof(console)) < 0) {
+			require(errno == ENOBUFS || errno == EAGAIN,
+				"the console queue refused for another reason");
+			(void)::close(sender);
+			return sent;
+		}
+	}
+	require(false, "the console queue never filled");
+	return 0;
+}
+
+/* The console's queue holds a few requests and a full one refuses at once
+ * (ENOBUFS, blocking or not), so a request that waits for its reply waits for
+ * room too, within the same wait: it goes through once the guest has read
+ * what is ahead of it, and is not sent when the wait ends first. */
+void aRequestWaitsForRoomInAFullQueueWithinItsWait()
+{
+	using ::uml::device::GuestRequest;
+	using ::uml::device::trim_guest_page_cache;
+	const ::uml::device::GuestConsoleRun run {true};
+	const auto path = consolePath();
+	const int server = bindServer(path);
+
+	/* The guest reads again after a while: the request goes through behind
+	 * the full queue, in the wait it was given. */
+	require(fillTheConsoleQueue(path) > 0U);
+	std::thread guest {[&] {
+		std::this_thread::sleep_for(std::chrono::milliseconds {300});
+		sockaddr_un client {};
+		socklen_t clientLength {};
+		while (awaitRequest(server, 5000)) {
+			if (receiveRequest(server, client, clientLength) ==
+			    "trim once") {
+				(void)sendReply(server, client, clientLength, 0U,
+					"trimmed 0 KiB in 0 ms, compacted in 0 ms, "
+					"released 0 KiB in 0 ms");
+				return;
+			}
+		}
+	}};
+	const auto started = std::chrono::steady_clock::now();
+	require(trim_guest_page_cache(5000U) == GuestRequest::done);
+	const auto waited = std::chrono::steady_clock::now() - started;
+	guest.join();
+	require(waited >= std::chrono::milliseconds {250},
+		"the request did not wait for room");
+	require(!awaitRequest(server, 200));
+
+	/* The guest never reads: the request is not sent when its wait ends, and
+	 * the wait is not spent twice. */
+	require(fillTheConsoleQueue(path) > 0U);
+	const auto begun = std::chrono::steady_clock::now();
+	require(trim_guest_page_cache(300U) == GuestRequest::unreachable);
+	const auto spent = std::chrono::steady_clock::now() - begun;
+	require(spent >= std::chrono::milliseconds {250},
+		"the request gave up before its wait ended");
+	require(spent < std::chrono::milliseconds {1500},
+		"the request waited longer than its wait");
+	sockaddr_un client {};
+	socklen_t clientLength {};
+	while (awaitRequest(server, 200))
+		require(receiveRequest(server, client, clientLength) == "fill",
+			"a request that was not sent reached the console");
+
+	/* The guest reads after most of the wait and never answers: the time the
+	 * request spent finding room is part of its wait, not added to it. */
+	require(fillTheConsoleQueue(path) > 0U);
+	std::thread silent {[&] {
+		std::this_thread::sleep_for(std::chrono::milliseconds {600});
+		sockaddr_un from {};
+		socklen_t fromLength {};
+		while (awaitRequest(server, 200))
+			(void)receiveRequest(server, from, fromLength);
+	}};
+	const auto asked = std::chrono::steady_clock::now();
+	require(trim_guest_page_cache(1000U) == GuestRequest::unanswered);
+	const auto total = std::chrono::steady_clock::now() - asked;
+	silent.join();
+	require(total >= std::chrono::milliseconds {900},
+		"the request did not wait for its reply");
+	require(total < std::chrono::milliseconds {1400},
+		"the time spent finding room was waited for again");
 	(void)::close(server);
 }
 
@@ -633,6 +1333,29 @@ void aSilentGuestIsWaitedForUpToTheBound()
 		GuestMemoryResult::done);
 	require(figures.total_bytes == 8 && figures.available_bytes == 4);
 	observer.join();
+	(void)::close(server);
+}
+
+/* The memory request is sent under the console's lock, which a caller's
+ * lifecycle lock may wait behind: it makes one attempt, so that a console whose
+ * queue is full is answered at once and not after a wait for room. */
+void aMemoryRequestDoesNotWaitForRoomInAFullQueue()
+{
+	const ::uml::device::GuestConsoleRun run {true};
+	const auto path = consolePath();
+	const int server = bindServer(path);
+	require(fillTheConsoleQueue(path) > 0U);
+	const auto started = std::chrono::steady_clock::now();
+	auto query = GuestMemoryQuery::start();
+	const auto spent = std::chrono::steady_clock::now() - started;
+	require(!query.has_value(), "a request was sent to a full queue");
+	require(spent < std::chrono::milliseconds {300},
+		"the memory request waited for room in the console's queue");
+	sockaddr_un client {};
+	socklen_t clientLength {};
+	while (awaitRequest(server, 200))
+		require(receiveRequest(server, client, clientLength) == "fill",
+			"a memory request that was not sent reached the console");
 	(void)::close(server);
 }
 
@@ -918,6 +1641,85 @@ void aRunRemovesOnlyWhatExitedRunsLeft()
 		std::filesystem::remove_all(path);
 }
 
+/* A writeback finds the console's queue full: the retries for room run inside
+ * the request's one deadline, with the reply's wait, not before it. A guest
+ * that reads in time is asked and answers within the budget; one that never
+ * reads leaves nothing sent when the budget ends, and the budget is spent
+ * once; one that reads late and then answers later still is unanswered at the
+ * budget, not after room and a fresh wait. */
+void aWritebackFindingNoRoomStaysInItsBudget()
+{
+	using ::uml::device::GuestWriteback;
+	using ::uml::device::request_guest_writeback;
+	using namespace std::chrono_literals;
+	const ::uml::device::GuestConsoleRun run {true};
+	const auto path = consolePath();
+	const int server = bindServer(path);
+	const auto elapsed = [](std::chrono::steady_clock::time_point since) {
+		return std::chrono::duration_cast<std::chrono::milliseconds>(
+			std::chrono::steady_clock::now() - since);
+	};
+
+	/* Room comes back after 300 ms, and the guest then answers at once. */
+	require(fillTheConsoleQueue(path) > 0U);
+	std::thread reading {[&] {
+		std::this_thread::sleep_for(300ms);
+		sockaddr_un client {};
+		socklen_t clientLength {};
+		while (awaitRequest(server, 5000)) {
+			if (receiveRequest(server, client, clientLength) == "sync") {
+				(void)sendReply(server, client, clientLength, 0U,
+					"synced in 5 ms");
+				return;
+			}
+		}
+	}};
+	auto started = std::chrono::steady_clock::now();
+	require(request_guest_writeback(2000ms, 0U) == GuestWriteback::done);
+	auto took = elapsed(started);
+	reading.join();
+	require(took >= 250ms && took < 1500ms,
+		"the writeback did not wait for room, or waited past its answer");
+	require(!awaitRequest(server, 200));
+
+	/* The guest never reads: nothing is sent, and the budget is spent once. */
+	require(fillTheConsoleQueue(path) > 0U);
+	started = std::chrono::steady_clock::now();
+	require(request_guest_writeback(400ms, 0U) == GuestWriteback::unreachable);
+	took = elapsed(started);
+	require(took >= 350ms && took < 900ms,
+		"a writeback that found no room did not end with its budget");
+	sockaddr_un client {};
+	socklen_t clientLength {};
+	while (awaitRequest(server, 200))
+		require(receiveRequest(server, client, clientLength) == "fill",
+			"a writeback that was not sent reached the console");
+
+	/* Room after 300 ms, the answer only after 900: the budget of 500 ms is
+	 * all there is. */
+	require(fillTheConsoleQueue(path) > 0U);
+	std::thread late {[&] {
+		std::this_thread::sleep_for(300ms);
+		sockaddr_un from {};
+		socklen_t fromLength {};
+		while (awaitRequest(server, 3000)) {
+			if (receiveRequest(server, from, fromLength) == "sync") {
+				std::this_thread::sleep_for(600ms);
+				(void)sendReply(server, from, fromLength, 0U,
+					"synced in 5 ms");
+				return;
+			}
+		}
+	}};
+	started = std::chrono::steady_clock::now();
+	require(request_guest_writeback(500ms, 0U) == GuestWriteback::unanswered);
+	took = elapsed(started);
+	late.join();
+	require(took >= 450ms && took < 800ms,
+		"the time spent finding room was waited for again");
+	(void)::close(server);
+}
+
 /* Runs a group under a private $TMPDIR, which must hold this process's run
  * directory. */
 void runPrivately(void (*group)())
@@ -953,7 +1755,16 @@ int main(int argc, char **argv)
 	} else if (selected == "wake") {
 		runPrivately(aWakeSendsOneWakeRequest);
 	} else if (selected == "writeback") {
-		runPrivately(aWritebackIsOneEmergencySync);
+		runPrivately(aWritebackIsOneSync);
+	} else if (selected == "writeback-timeout") {
+		runPrivately(aSyncThatIsNotAnsweredInTimeIsUnconfirmed);
+	} else if (selected == "writeback-strict") {
+		runPrivately(aWritebackReplyIsValidatedStrictly);
+	} else if (selected == "writeback-budget") {
+		runPrivately([] {
+			aWritebackWaitsOneBudgetForEverything();
+			aWritebackFindingNoRoomStaysInItsBudget();
+		});
 	} else if (selected == "suspend-failure") {
 		runPrivately([] {
 			aBusySuspendIsRetriedUntilTheDeadline();
@@ -964,7 +1775,9 @@ int main(int argc, char **argv)
 	} else if (selected == "trim") {
 		runPrivately([] {
 			trimmingIsSwitchedByOneRequest();
+			aNoWaitTrimRequestReturnsAtOnce();
 			aTrimPassIsWaitedForUpToItsBound();
+			aRequestWaitsForRoomInAFullQueueWithinItsWait();
 		});
 	} else if (selected == "memory") {
 		runPrivately([] {
@@ -972,13 +1785,18 @@ int main(int argc, char **argv)
 			aMemoryRequestReadsTheGuestsFigures();
 			aSilentGuestIsWaitedForUpToTheBound();
 			aWaitingMemoryRequestDoesNotHoldTheConsole();
+			aMemoryRequestDoesNotWaitForRoomInAFullQueue();
 		});
+	} else if (selected == "suspend-statement") {
+		runPrivately(aSuspendStatesWhetherItSynced);
 	} else if (selected == "suspend-timeout") {
 		runPrivately(aSuspendThatDoesNotReplyIsAborted);
 	} else if (selected == "suspend-silent") {
 		runPrivately(aSilentSuspendIsUnconfirmed);
 	} else if (selected == "suspend-suspended-after-wake") {
 		runPrivately(aSuspendedReplyAfterTheWakeIsUnconfirmed);
+	} else if (selected == "suspend-partial-refusal") {
+		runPrivately(aReplyRefusedInItsFirstPartStaysRefused);
 	} else if (selected == "suspend-retry-deadline") {
 		runPrivately(aBusyRetryCannotOutlastTheDeadline);
 	} else {

@@ -155,10 +155,10 @@ index 6ea5ca6693da69170cbb9b5e922239c4c10a8ece..2407a1cc7262e976b840197c1223a498
  
  #endif /* KK_BO_H */
 diff --git a/src/kosmickrisp/vulkan/kk_cmd_draw.c b/src/kosmickrisp/vulkan/kk_cmd_draw.c
-index 94afc8dd3b69f76dd6655b295cfc78ec9d2d1a39..586ee352b48e24b83f2817d673ff9ad5eba5e053 100644
+index 0d455919866aa27463ab2434a215758c4a600e7b..e14b47c2e4b62c70ce59cf1219554bf0eacdb14c 100644
 --- a/src/kosmickrisp/vulkan/kk_cmd_draw.c
 +++ b/src/kosmickrisp/vulkan/kk_cmd_draw.c
-@@ -1162,8 +1162,9 @@ kk_flush_pipeline(struct kk_cmd_buffer *cmd)
+@@ -1235,8 +1235,9 @@ kk_flush_pipeline(struct kk_cmd_buffer *cmd)
   * so only 1 to 4095 MiB is honoured, and any other value keeps 16 MiB. The cap
   * is 128 MiB or the starting size, whichever is larger.
   *
@@ -170,7 +170,7 @@ index 94afc8dd3b69f76dd6655b295cfc78ec9d2d1a39..586ee352b48e24b83f2817d673ff9ad5
   * heap to it: it reserves a heap's size before creating the heap and never
   * creates one the pool refuses, so the heap never takes the pool past its
   * limit. A heap takes at most half of what the pool can still hold, except
-@@ -1205,7 +1206,7 @@ kk_heap_start_B(void)
+@@ -1278,7 +1279,7 @@ kk_heap_start_B(void)
  static bool
  kk_heap_pooled(const struct kk_device *dev)
  {
@@ -179,7 +179,7 @@ index 94afc8dd3b69f76dd6655b295cfc78ec9d2d1a39..586ee352b48e24b83f2817d673ff9ad5
  }
  
  /* The most a heap may take of the device's pool, half of what the pool can
-@@ -1216,8 +1217,7 @@ kk_heap_pool_share_B(const struct kk_device *dev)
+@@ -1289,8 +1290,7 @@ kk_heap_pool_share_B(const struct kk_device *dev)
     if (!kk_heap_pooled(dev))
        return UINT64_MAX;
  
@@ -189,7 +189,7 @@ index 94afc8dd3b69f76dd6655b295cfc78ec9d2d1a39..586ee352b48e24b83f2817d673ff9ad5
     return (headroom_B / 2u) & ~(KK_HEAP_POOL_ALIGN_B - 1u);
  }
  
-@@ -1230,8 +1230,7 @@ kk_geometry_heap_create(struct kk_device *dev, uint64_t size_B,
+@@ -1303,8 +1303,7 @@ kk_geometry_heap_create(struct kk_device *dev, uint64_t size_B,
  {
     *pool_refused = false;
     const bool pooled = kk_heap_pooled(dev);
@@ -199,7 +199,7 @@ index 94afc8dd3b69f76dd6655b295cfc78ec9d2d1a39..586ee352b48e24b83f2817d673ff9ad5
        *pool_refused = true;
        return NULL;
     }
-@@ -1244,7 +1243,7 @@ kk_geometry_heap_create(struct kk_device *dev, uint64_t size_B,
+@@ -1317,7 +1316,7 @@ kk_geometry_heap_create(struct kk_device *dev, uint64_t size_B,
     }
     /* Metal counts the heap now, or it was refused. */
     if (pooled)
@@ -208,7 +208,7 @@ index 94afc8dd3b69f76dd6655b295cfc78ec9d2d1a39..586ee352b48e24b83f2817d673ff9ad5
     if (heap == NULL)
        return NULL;
  
-@@ -1544,8 +1543,7 @@ kk_heap_return_idle(struct kk_device *dev)
+@@ -1617,8 +1616,7 @@ kk_heap_return_idle(struct kk_device *dev)
     struct kk_geometry_heap *heap = dev->heap;
     if (heap != NULL && heap->refcount == 1 &&
         heap->bo->size_B > dev->heap_start_B &&

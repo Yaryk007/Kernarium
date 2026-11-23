@@ -58,7 +58,7 @@ index 7c6969d9385d4726470146f970e119ecf53ce5b8..d524ce473cdf1376cd9b47e7a79e45d8
  VIRGL_EXPORT void *virgl_renderer_get_cursor_data(uint32_t resource_id, uint32_t *width, uint32_t *height);
  
 diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
-index 85917e0d826f4cef991ff8ec0c2c74cf17da7fcb..1114c7795b4133a49bdc25225f263035dfd55d22 100644
+index e3290b832b3741d36abf78b14038763d99f383df..98a7379bde31db995b61921fb6a34362ff07bba2 100644
 --- a/src/vrend/vrend_renderer.c
 +++ b/src/vrend/vrend_renderer.c
 @@ -7334,6 +7334,16 @@ void vrend_renderer_poll(void) {
@@ -101,7 +101,7 @@ index 85917e0d826f4cef991ff8ec0c2c74cf17da7fcb..1114c7795b4133a49bdc25225f263035
        struct vrend_context *ctx = fence->ctx;
        ctx->fence_retire(fence->fence_id, ctx->fence_retire_data);
 diff --git a/src/vrend/vrend_renderer.h b/src/vrend/vrend_renderer.h
-index ba4a0a054d84657f67aa351318e3bfe0055d1e71..a64a6dc149a3c7b6fe738159889ebf9c0fa79118 100644
+index 1c464b457aaea1af2d598482597118099c453de4..4fa8b8eed99bd1bee7001909576cd24177343b22 100644
 --- a/src/vrend/vrend_renderer.h
 +++ b/src/vrend/vrend_renderer.h
 @@ -599,6 +599,7 @@ bool format_is_copy_compatible(enum virgl_formats src, enum virgl_formats dst,

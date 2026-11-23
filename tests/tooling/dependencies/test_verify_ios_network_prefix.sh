@@ -38,9 +38,9 @@ make_prefix()
 {
 	prefix=$1
 	case "$2" in
-	ios) sdk=iphoneos target=arm64-apple-ios27.0
+	ios) sdk=iphoneos target=arm64-apple-ios26.0
 		receipt=ios-device-network-arm64.tsv ;;
-	ios-simulator) sdk=iphonesimulator target=arm64-apple-ios27.0-simulator
+	ios-simulator) sdk=iphonesimulator target=arm64-apple-ios26.0-simulator
 		receipt=ios-simulator-network-arm64.tsv ;;
 	esac
 	mkdir -p "$prefix/lib/glib-2.0/include" "$prefix/include/glib-2.0" \
@@ -88,7 +88,7 @@ expect_cmake_diagnostic "Unsupported iOS network platform" \
 expect_cmake_diagnostic "ios-device-network-arm64.tsv" \
 	verify "$SIMULATOR" ios
 
-# Every archive is an arm64 archive for the platform at iOS 27.0.
+# Every archive is an arm64 archive for the platform at iOS 26.0.
 CASE="$TEST_ROOT/simulator-as-device"
 cp -R "$SIMULATOR" "$CASE"
 cp "$ROOT_DIR/dependencies/platforms/ios-device-network-arm64.tsv" \
@@ -102,7 +102,7 @@ expect_cmake_diagnostic "lib/libpcre2-8.a" verify "$CASE" ios-simulator
 
 CASE="$TEST_ROOT/simulator-member"
 copy_fixture "$CASE"
-archive "$CASE/lib/libslirp.a" iphonesimulator arm64-apple-ios27.0-simulator
+archive "$CASE/lib/libslirp.a" iphonesimulator arm64-apple-ios26.0-simulator
 expect_cmake_diagnostic "lib/libslirp.a" verify "$CASE" ios
 
 CASE="$TEST_ROOT/old-deployment-target"
@@ -110,17 +110,23 @@ copy_fixture "$CASE"
 archive "$CASE/lib/libglib-2.0.a" iphoneos arm64-apple-ios18.0
 expect_cmake_diagnostic "lib/libglib-2.0.a" verify "$CASE" ios
 
-# The whole minimum OS version counts, so iOS 27.0.1 is not iOS 27.0.
+# A prefix built at the macOS floor is a stale iOS prefix.
+CASE="$TEST_ROOT/macos-floor-deployment-target"
+copy_fixture "$CASE"
+archive "$CASE/lib/libglib-2.0.a" iphoneos arm64-apple-ios27.0
+expect_cmake_diagnostic "lib/libglib-2.0.a: minos 27.0" verify "$CASE" ios
+
+# The whole minimum OS version counts, so iOS 26.0.1 is not iOS 26.0.
 CASE="$TEST_ROOT/patch-deployment-target"
 copy_fixture "$CASE"
-archive "$CASE/lib/libglib-2.0.a" iphoneos arm64-apple-ios27.0.1
-expect_cmake_diagnostic "lib/libglib-2.0.a: minos 27.0.1" verify "$CASE" ios
+archive "$CASE/lib/libglib-2.0.a" iphoneos arm64-apple-ios26.0.1
+expect_cmake_diagnostic "lib/libglib-2.0.a: minos 26.0.1" verify "$CASE" ios
 
 # Every member counts, not only the first one that matches. A member built
 # for iOS 11 carries a legacy minimum-version command instead of a
 # build-version command.
 for member in iphoneos:arm64-apple-ios18.0 \
-	iphonesimulator:arm64-apple-ios27.0-simulator \
+	iphonesimulator:arm64-apple-ios26.0-simulator \
 	iphoneos:arm64-apple-ios11.0; do
 	CASE="$TEST_ROOT/mixed-members-${member#*:}"
 	copy_fixture "$CASE"
@@ -132,11 +138,11 @@ done
 
 # Every member carries exactly one build-version command. Each of these
 # members, added beside a valid one, leaves every platform row in the archive
-# valid: a member without the command, a member with two iOS 27.0 commands,
+# valid: a member without the command, a member with two iOS 26.0 commands,
 # and a bitcode member, which otool cannot read as Mach-O.
 MEMBERS="$TEST_ROOT/members"
 mkdir "$MEMBERS"
-xcrun --sdk iphoneos clang -target arm64-apple-ios27.0 \
+xcrun --sdk iphoneos clang -target arm64-apple-ios26.0 \
 	-c "$TEST_ROOT/fixture.c" -o "$MEMBERS/ios.o"
 xcrun vtool -remove-build-version ios -output "$MEMBERS/no-build-version.o" \
 	"$MEMBERS/ios.o"
@@ -171,7 +177,7 @@ EOF
 [ "$(otool -l "$MEMBERS/two-build-versions.o" |
 	grep -c 'cmd LC_BUILD_VERSION$')" -eq 2 ] ||
 	fail "the fixture member lacks a second build-version command"
-xcrun --sdk iphoneos clang -target arm64-apple-ios27.0 -flto \
+xcrun --sdk iphoneos clang -target arm64-apple-ios26.0 -flto \
 	-c "$TEST_ROOT/fixture.c" -o "$MEMBERS/bitcode.o"
 for member in no-build-version two-build-versions bitcode; do
 	CASE="$TEST_ROOT/member-$member"
@@ -182,12 +188,12 @@ done
 
 CASE="$TEST_ROOT/intel-archive"
 copy_fixture "$CASE"
-archive "$CASE/lib/libffi.a" iphonesimulator x86_64-apple-ios27.0-simulator
+archive "$CASE/lib/libffi.a" iphonesimulator x86_64-apple-ios26.0-simulator
 expect_cmake_diagnostic "lib/libffi.a" verify "$CASE" ios
 
 CASE="$TEST_ROOT/universal-archive"
 copy_fixture "$CASE"
-archive "$TEST_ROOT/intel.a" iphonesimulator x86_64-apple-ios27.0-simulator
+archive "$TEST_ROOT/intel.a" iphonesimulator x86_64-apple-ios26.0-simulator
 xcrun lipo -create "$DEVICE/lib/libintl.a" "$TEST_ROOT/intel.a" \
 	-output "$CASE/lib/libintl.a"
 expect_cmake_diagnostic "lib/libintl.a" verify "$CASE" ios

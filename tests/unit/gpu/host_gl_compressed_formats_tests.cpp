@@ -263,11 +263,28 @@ void checkCopies(VirglRenderer& renderer, Pipeline& pipeline,
         "a copy from RGBA32UI to ASTC did not make the blocks");
 }
 
+// What the host holds once the renderer is idle. A texture the renderer
+// zeroed was in GPU work, and the host driver frees it, once the guest has
+// released it, when the context next reuses the state of that work's batch:
+// without further work the previous image is still counted, and is freed
+// during the next measurement. A few small textures, each zeroed in a batch of
+// its own, bring that about: eight is more than the host driver's pool of
+// batch states. Trimming the contexts as they are once idle settles it only
+// when the context had work to flush, and no completion is visible from here.
 [[nodiscard]] std::uint64_t allocatedAfter(VirglRenderer& renderer,
     std::uint64_t& fence)
 {
-    require(renderer.createFenceAndWait(contextId, 0, ++fence, nullptr) == 0,
-        "the renderer did not finish");
+    constexpr std::uint32_t scratchId = 4000;
+    for (int round = 0; round < 8; ++round) {
+        require(Image::create(renderer, scratchId, pipeTexture2d,
+                    virglFormatR8g8b8a8Unorm, virglBindRenderTarget, 4, 4,
+                    0) == 0,
+            "the scratch texture could not be created");
+        require(renderer.createFenceAndWait(contextId, 0, ++fence, nullptr) ==
+                0,
+            "the renderer did not finish");
+        renderer.unrefResource(scratchId);
+    }
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     return uml::platform::hostGpuAllocatedBytes();
 }

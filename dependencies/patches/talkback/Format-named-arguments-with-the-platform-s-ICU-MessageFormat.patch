@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 19:07:26 +0900
+Subject: [PATCH] Format named arguments with the platform's ICU MessageFormat
+
+AccessibilityMessageFormat called androidx.core.i18n.MessageFormat, a
+library the Android image's source tree does not carry. It now builds the
+android.icu.text.MessageFormat that library wraps on Android 7 and later,
+for the same pattern and named arguments. The signature stays, so no
+caller changes.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .../accessibility/utils/AccessibilityMessageFormat.java       | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/utils/src/main/java/com/google/android/accessibility/utils/AccessibilityMessageFormat.java b/utils/src/main/java/com/google/android/accessibility/utils/AccessibilityMessageFormat.java
+index 1eb0228b8e24567b8a4a680bf6fe2bb23d0de3c6..40ffe1154480df0f9b10ffb4aec7bc7d683245ba 100644
+--- a/utils/src/main/java/com/google/android/accessibility/utils/AccessibilityMessageFormat.java
++++ b/utils/src/main/java/com/google/android/accessibility/utils/AccessibilityMessageFormat.java
+@@ -1,7 +1,7 @@
+ package com.google.android.accessibility.utils;
+ 
+ import android.content.Context;
+-import androidx.core.i18n.MessageFormat;
++import android.icu.text.MessageFormat;
+ 
+ import java.util.HashMap;
+ import java.util.Locale;
+@@ -15,7 +15,7 @@ public final class AccessibilityMessageFormat {
+     for(int i = 0; i < nameValuePairs.length; i+=2) {
+       nameValueMap.put(String.valueOf(nameValuePairs[i]), nameValuePairs[i+1]);
+     }
+-    return MessageFormat.format(context, Locale.getDefault(), message, nameValueMap);
++    return new MessageFormat(message, Locale.getDefault()).format(nameValueMap);
+   }
+ 
+   private AccessibilityMessageFormat() {}

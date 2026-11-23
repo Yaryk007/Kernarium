@@ -48,12 +48,12 @@ Lx86_bmi_not_sign\@:
 .macro bmi_unary_register operation, width, load, host_register, store_register
 gadget \operation\()_\width\()_rr
 	ldr x8, [_stream], #8
-	and x22, x8, #0xffff
+	and x17, x8, #0xffff
 	ubfx x9, x8, #16, #16
 	\load \host_register\()24, [_vcpu, x9]
 	bmi_unary_compute \operation, \width, \host_register
 	bmi_flags \width, \host_register
-	str \store_register\()27, [_vcpu, x22]
+	str \store_register\()27, [_vcpu, x17]
 	retire_and_next
 .endm
 
@@ -62,10 +62,10 @@ gadget \operation\()_\width\()_rm
 	effective_address
 	mov x25, x7
 	read_operand (\width / 8), \load, \host_register, 24
-	and x22, x23, #0xffff
+	and x17, x23, #0xffff
 	bmi_unary_compute \operation, \width, \host_register
 	bmi_flags \width, \host_register
-	str \store_register\()27, [_vcpu, x22]
+	str \store_register\()27, [_vcpu, x17]
 	retire_and_next
 .endm
 
@@ -89,7 +89,7 @@ bmi_unary_family blsi
 .purgem bmi_unary_register
 .purgem bmi_unary_compute
 
-/* x24 is the first VEX source/control and x26 is the r/m source. x22 is the
+/* x24 is the first VEX source/control and x26 is the r/m source. x17 is the
  * architectural destination offset and x25 is the first-register offset,
  * which is also MULX's low destination.
  */
@@ -211,13 +211,13 @@ Lx86_pext_next\@:
 .macro bmi_ternary_register operation, width, load, host_register, store_register
 gadget \operation\()_\width\()_rrr
 	ldr x8, [_stream], #8
-	and x22, x8, #0xffff
+	and x17, x8, #0xffff
 	ubfx x25, x8, #16, #16
 	ubfx x9, x8, #32, #16
 	\load \host_register\()24, [_vcpu, x25]
 	\load \host_register\()26, [_vcpu, x9]
 	bmi_ternary_compute \operation, \width, \host_register, \store_register
-	str \store_register\()27, [_vcpu, x22]
+	str \store_register\()27, [_vcpu, x17]
 	retire_and_next
 .endm
 
@@ -226,8 +226,7 @@ gadget \operation\()_\width\()_rrm
 	effective_address
 	mov x27, x7
 	ldr x25, [_stream], #8
-	page_cross_check (\width / 8), Lx86_bmi_ternary_read_cross\@
-	translate 0, UML_X86_64_TLB_READ_PAGE, (\width / 8)
+	translate 0, UML_X86_64_TLB_READ_PAGE, (\width / 8), cross=Lx86_bmi_ternary_read_cross\@
 	\load \host_register\()26, [x7]
 	b Lx86_bmi_ternary_loaded\@
 Lx86_bmi_ternary_read_cross\@:
@@ -238,10 +237,10 @@ Lx86_bmi_ternary_read_cross\@:
 	cbz x1, Lx86_memory_fault
 	mov x26, x0
 Lx86_bmi_ternary_loaded\@:
-	and x22, x23, #0xffff
+	and x17, x23, #0xffff
 	\load \host_register\()24, [_vcpu, x25]
 	bmi_ternary_compute \operation, \width, \host_register, \store_register
-	str \store_register\()27, [_vcpu, x22]
+	str \store_register\()27, [_vcpu, x17]
 	retire_and_next
 .endm
 
@@ -274,12 +273,12 @@ bmi_ternary_family mulx
 .macro rorx_register width, load, host_register, store_register
 gadget rorx_\width\()_rri
 	ldp x8, x26, [_stream], #16
-	and x22, x8, #0xffff
+	and x17, x8, #0xffff
 	ubfx x9, x8, #16, #16
 	\load \host_register\()24, [_vcpu, x9]
 	and w26, w26, #(\width - 1)
 	rorv \host_register\()27, \host_register\()24, \host_register\()26
-	str \store_register\()27, [_vcpu, x22]
+	str \store_register\()27, [_vcpu, x17]
 	retire_and_next
 .endm
 
@@ -289,10 +288,10 @@ gadget rorx_\width\()_rmi
 	mov x25, x7
 	ldr x26, [_stream], #8
 	read_operand (\width / 8), \load, \host_register, 24
-	and x22, x23, #0xffff
+	and x17, x23, #0xffff
 	and w26, w26, #(\width - 1)
 	rorv \host_register\()27, \host_register\()24, \host_register\()26
-	str \store_register\()27, [_vcpu, x22]
+	str \store_register\()27, [_vcpu, x17]
 	retire_and_next
 .endm
 

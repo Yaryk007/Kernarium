@@ -116,7 +116,7 @@ index d87a8dc077cdb06eab7902968a3aec805e9bb356..1c5ecad4c45b7daef95a04041addbf91
  mtl_begin_command_buffer(mtl_command_buffer *command_buffer,
                           mtl_command_allocator *allocator)
 diff --git a/src/kosmickrisp/vulkan/kk_cmd_buffer.c b/src/kosmickrisp/vulkan/kk_cmd_buffer.c
-index bbe6df540b4edc5ace683dd9b078dd9b06fbf437..acbd04ccd58b65a9211b38907ef0e87ec8d8e255 100644
+index 5c0582bdc8242b3c03c85e74e444c05306bba5c3..a7395a199d02ac6aea887d068780b02f9ecc4a85 100644
 --- a/src/kosmickrisp/vulkan/kk_cmd_buffer.c
 +++ b/src/kosmickrisp/vulkan/kk_cmd_buffer.c
 @@ -102,6 +102,7 @@ kk_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
@@ -315,7 +315,7 @@ index bbe6df540b4edc5ace683dd9b078dd9b06fbf437..acbd04ccd58b65a9211b38907ef0e87e
     if (layered)
        cmd->main.queue_wait = true;
     cmd->gfx.in_main = true;
-@@ -472,13 +454,10 @@ static void
+@@ -480,13 +462,10 @@ static void
  kk_start_compute_encoder(struct kk_cmd_buffer *cmd,
                           struct kk_encoder_state *es, bool in_main)
  {
@@ -334,10 +334,10 @@ index bbe6df540b4edc5ace683dd9b078dd9b06fbf437..acbd04ccd58b65a9211b38907ef0e87e
     es->encoder = mtl_new_compute_command_encoder(es->cmd_buf);
  
 diff --git a/src/kosmickrisp/vulkan/kk_cmd_buffer.h b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
-index af62d43c89cfbd9ca95503ec6dae7ad435a3b223..5b9dc75e4ff5166029626e19b8f92bbf4e275d6c 100644
+index 051ab13d7a5c4654e3927d3f9bd8651f17340d26..e26f398c81f8713ad7c106656c124497cb8de947 100644
 --- a/src/kosmickrisp/vulkan/kk_cmd_buffer.h
 +++ b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
-@@ -336,6 +336,9 @@ struct kk_ts_sample {
+@@ -351,6 +351,9 @@ struct kk_ts_sample {
  struct kk_encoder_state {
     /* either a mtl_compute_encoder or a mtl_render_encoder */
     mtl_command_encoder *encoder;
@@ -347,7 +347,7 @@ index af62d43c89cfbd9ca95503ec6dae7ad435a3b223..5b9dc75e4ff5166029626e19b8f92bbf
     mtl_command_allocator *allocator;
     mtl_command_buffer *cmd_buf;
     /* Pending timestamp resolves and the availability words they and
-@@ -438,6 +441,10 @@ struct kk_cmd_buffer {
+@@ -453,6 +456,10 @@ struct kk_cmd_buffer {
     /* Metal command buffers are single-shot: a resubmission must re-record
      * by replaying the enqueued commands (see rerecord_cmd_buffer). */
     bool submitted;

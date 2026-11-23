@@ -80,14 +80,19 @@ if(UML_TEST_APPLE_AUDIO)
 endif()
 
 # uml_add_guest_integration_test(NAME <test> SCRIPT <runner> [ARGS <arg>...]
-#     CPUS <n> [GPUS <n>] [LABELS <label>...] [TIMEOUT <seconds>])
+#     CPUS <n> [GPUS <n>] [LABELS <label>...] [TIMEOUT <seconds>]
+#     [EMULATOR <target>])
 #
 # Registers a rootfs integration test that runs the Python <runner>, relative
-# to the calling directory, with uml-darwin and the integration rootfs and then
-# ARGS. It reserves CPUS processors, and GPUS GPUs, from the resource spec.
+# to the calling directory, with uml-darwin (or the EMULATOR target) and the
+# integration rootfs and then ARGS. It reserves CPUS processors, and GPUS GPUs,
+# from the resource spec.
 function(uml_add_guest_integration_test)
-    cmake_parse_arguments(_guest "" "NAME;SCRIPT;CPUS;GPUS;TIMEOUT"
+    cmake_parse_arguments(_guest "" "NAME;SCRIPT;CPUS;GPUS;TIMEOUT;EMULATOR"
         "ARGS;LABELS" ${ARGN})
+    if(NOT _guest_EMULATOR)
+        set(_guest_EMULATOR uml-darwin)
+    endif()
     if(NOT _guest_SCRIPT OR NOT _guest_CPUS)
         message(FATAL_ERROR
             "${_guest_NAME}: guest integration tests require SCRIPT and CPUS")
@@ -100,7 +105,7 @@ function(uml_add_guest_integration_test)
         NAME "${_guest_NAME}"
         COMMAND ${Python3_EXECUTABLE}
             "${CMAKE_CURRENT_SOURCE_DIR}/${_guest_SCRIPT}"
-            --emulator "$<TARGET_FILE:uml-darwin>"
+            --emulator "$<TARGET_FILE:${_guest_EMULATOR}>"
             --rootfs "${UML_INTEGRATION_ROOTFS}"
             ${_guest_ARGS}
         LABELS ${_guest_LABELS}
@@ -173,6 +178,83 @@ if(UML_V4L2_MMAP_CAPTURE_PROBE_BINARY)
         GPUS 1)
 endif()
 
+# The Virtio camera's capture and metadata nodes, on the synthetic camera's
+# tablet profile: live, where frames carry the chart and stills are taken, and
+# started blocked, where frames are black and a still fails. The probe builds
+# in the guest; a live session boots twice, because Bayer stills are offered
+# once the host has learned the camera's colour data.
+foreach(_camera IN ITEMS synthetic blocked)
+    if(_camera STREQUAL synthetic)
+        set(_camera_suffix "")
+        set(_camera_timeout 1500)
+    else()
+        set(_camera_suffix "-${_camera}")
+        set(_camera_timeout 900)
+    endif()
+    uml_add_guest_integration_test(
+        NAME guest-v4l2-capture${_camera_suffix}
+        SCRIPT video/run_camera_capture.py
+        ARGS --mode ${_camera}
+        LABELS guest;video
+        TIMEOUT ${_camera_timeout}
+        CPUS 2)
+endforeach()
+
+# A camera stream carries on across the guest's system suspend, by the host's
+# route and by the guest's own: the driver stops its streams first, so the
+# device holds nothing and is not reset.
+uml_add_guest_integration_test(
+    NAME guest-v4l2-capture-suspend
+    SCRIPT video/run_camera_suspend.py
+    LABELS guest;video
+    TIMEOUT 900
+    CPUS 2)
+
+# The Virtio camera driver against a device that is reset during a suspend
+# (the stream carries on, the zoom is written again, the sequences keep
+# rising) and against one that is late to stop a stream (the driver destroys
+# the stream, so the buffers it gives back are never written again, and the
+# late clears fall due with the rings disabled and are not lost), and against
+# one that is late to both the clear and the destroy (the buffers stay with the
+# device, and the stop waits for it). No switch in a production target can do
+# any of these, so the device is the production one behind the delayed-answer
+# shim, which resets it or holds its requests.
+if(TARGET UML::CameraSource)
+    uml_add_freestanding_cxx_payload(UML_GUEST_CAMERA_RESET_INIT
+        guest-video-camera-reset-init
+        video/camera_reset_init.cpp
+        COMMENT "Building the freestanding arm64 init of the camera reset tests"
+        ARCH_OPTIONS -march=armv8-a)
+    add_executable(uml_camera_reset_tests video/camera_reset_tests.cpp)
+    target_link_libraries(uml_camera_reset_tests PRIVATE
+        UML::BootInitramfs
+        UML::CameraDevice
+        UML::CameraSource
+        UML::DelayedAnswerDevice
+        UML::Emulator)
+    target_link_options(uml_camera_reset_tests PRIVATE
+        "LINKER:-export_dynamic"
+        "LINKER:-force_load,$<TARGET_FILE:uml_emulator>")
+    add_dependencies(uml_camera_reset_tests
+        "${UML_ACTIVE_KERNEL_ARTIFACT_TARGET}")
+    add_dependencies(integration-test-binaries uml_camera_reset_tests)
+    get_target_property(_uml_camera_reset_kernel
+        "${UML_ACTIVE_KERNEL_ARTIFACT_TARGET}" UML_KERNEL_IMAGE)
+    foreach(_case IN ITEMS reset slow-clear slow-stop)
+        uml_add_integration_test(
+            NAME guest-video-camera-${_case}
+            COMMAND uml_camera_reset_tests
+                ${_uml_camera_reset_kernel}
+                ${UML_GUEST_CAMERA_RESET_INIT}
+                ${CMAKE_CURRENT_BINARY_DIR}/video-camera-${_case}
+                ${_case}
+            LABELS guest;kernel;video
+            TIMEOUT 600
+            PROCESSORS 2
+            RESOURCE_GROUPS cpus:2)
+    endforeach()
+endif()
+
 set(UML_FUTEX_PROBE_BINARY "" CACHE FILEPATH
     "Static guest executable built from tests/integration/futex/futex_atomic_probe.cpp")
 if(UML_FUTEX_PROBE_BINARY)
@@ -224,7 +306,9 @@ if(UML_DRM_FLIP_PROBE_BINARY)
     if(NOT EXISTS "${UML_DRM_FLIP_PROBE_BINARY}")
         message(FATAL_ERROR "The vblank pacing test requires its compiled guest probe")
     endif()
-    # A four-vCPU guest with the GPU; the probe takes the card's first output.
+    # A four-vCPU guest with the GPU; the probe takes the card's first output,
+    # checks the pacing rate, and checks that the vblank timer keeps its grid
+    # across idle gaps, flips and mode changes against the kernel's trace.
     uml_add_guest_integration_test(
         NAME guest-drm-vblank
         SCRIPT gpu/run_gpu_guest.py
@@ -236,7 +320,7 @@ if(UML_DRM_FLIP_PROBE_BINARY)
 do
     sleep 1
 done'"
-            --command "timeout 60 /usr/local/libexec/drm-flip-probe"
+            --command "timeout 150 /usr/local/libexec/drm-flip-probe"
             --
             ncpus=4 --execution-engine=jit --gpu --gpu-display=vnc
             --gpu-vnc-bind=127.0.0.1 --gpu-vnc-port=0
@@ -391,9 +475,30 @@ uml_add_guest_integration_test(
     TIMEOUT 240
     CPUS 2)
 
+# The guest cannot reach the host's loopback through the gateway, so the
+# host half of the transfer test listens on a Unix socket behind a guest
+# forward that only the provider's test build offers, in the test launcher.
+if(TARGET uml-darwin-network-test)
+    uml_add_guest_integration_test(
+        NAME guest-slirp-network-transfer
+        SCRIPT network/run_guest_network_transfer.py
+        EMULATOR uml-darwin-network-test
+        LABELS guest;network;slirp
+        TIMEOUT 300
+        CPUS 2)
+else()
+    message(FATAL_ERROR
+        "guest-slirp-network-transfer needs the test launcher, which links "
+        "the provider's test build (UML_BUILD_TOOLING_TESTS)")
+endif()
+
+# What a guest process reaches of the host through the user network: nothing,
+# at the gateway, the broadcast address, the host's own addresses or its
+# loopback, where the probe has listeners of its own. This is the product
+# launcher.
 uml_add_guest_integration_test(
-    NAME guest-slirp-network-transfer
-    SCRIPT network/run_guest_network_transfer.py
+    NAME guest-slirp-host-isolation
+    SCRIPT network/run_guest_host_isolation.py
     LABELS guest;network;slirp
     TIMEOUT 300
     CPUS 2)
@@ -409,9 +514,23 @@ uml_add_guest_integration_test(
     TIMEOUT 600
     CPUS 2)
 
+# The Virtio GNSS receiver: /dev/gnss0 reads whole NMEA epochs of the launcher's
+# synthetic position about once a second, the host sees the power go on at the
+# first open and off at the last close, a reopen starts fresh, and a suspend the
+# guest enters by itself holds with the receiver closed and is ended by the host
+# with it open.
+uml_add_guest_integration_test(
+    NAME guest-gnss-receiver
+    SCRIPT gnss/run_guest_gnss_receiver.py
+    LABELS guest;gnss;kernel
+    TIMEOUT 600
+    CPUS 2)
+
 add_subdirectory(aarch32)
 add_subdirectory(android)
+add_subdirectory(aot)
 add_subdirectory(exclusive)
+add_subdirectory(memory_pressure)
 add_subdirectory(no_sve)
 add_subdirectory(restart)
 add_subdirectory(sme)
@@ -571,6 +690,26 @@ uml_add_guest_integration_test(
     TIMEOUT 900
     CPUS 2)
 
+# A management-console command that sends what the kernel prints to its client,
+# "sysrq s" as the host asks for it before a suspend, ends with its final reply
+# again and again while three other vCPUs keep printing, that reply names the
+# command and says it ran, and the guest runs on with no fault. A guest booted
+# with SysRq off ends the same command with an error that says so. With
+# SysRq off, a file the guest holds dirty reaches the image on the host once
+# the console's sync replies, and survives a hard kill; a guest that was not
+# asked loses it, and so does one whose kernel refuses the request. A suspend
+# asked with no sync before it states in its reply whether its own sync
+# returned, and the image holds the file exactly when the reply says so, with
+# the setting on and then off in one guest. A suspend the guest started itself,
+# which the host's request overlaps, is answered with the bare "suspended": its
+# sync is not the request's.
+uml_add_guest_integration_test(
+    NAME guest-mconsole-console-clients
+    SCRIPT kernel/run_guest_mconsole_console_clients.py
+    LABELS guest;kernel;smoke
+    TIMEOUT 300
+    CPUS 4)
+
 # Removing the Virtio video decoder and encoder by unbind, management-console
 # halt or forced power-off, while files are open and buffers queued, resets
 # each first, returns everything it held and frees nothing an open file still
@@ -581,6 +720,18 @@ uml_add_guest_integration_test(
     LABELS guest;kernel;video;smoke
     TIMEOUT 600
     CPUS 4)
+
+# A host suspend and the guest's own suspend, with the Virtio video decoder and
+# encoder idle or with a stream in progress, leave both devices as they were: a
+# descriptor opened before the suspend decodes and encodes after it, a new
+# decode session gets its source change and a picture, a stream gets its next
+# picture or coded buffer and closes, and the host resets neither device.
+uml_add_guest_integration_test(
+    NAME guest-video-suspend
+    SCRIPT kernel/run_guest_video_suspend.py
+    LABELS guest;kernel;video
+    TIMEOUT 900
+    CPUS 2)
 
 # Files of an LZ4 EROFS image with 4 KiB clusters, which EROFS decompresses
 # through vm_map_ram() aliases of page-cache folios, read back exactly, again
@@ -597,6 +748,15 @@ uml_add_guest_integration_test(
 uml_add_guest_integration_test(
     NAME guest-vhost-user-backend-gone
     SCRIPT kernel/run_guest_vhost_user_backend_gone.py
+    LABELS guest;kernel;smoke
+    TIMEOUT 300
+    CPUS 2)
+
+# A backend that goes while the guest powers off, inside the removal of its
+# device, must not have the device unregistered twice.
+uml_add_guest_integration_test(
+    NAME guest-vhost-user-power-off
+    SCRIPT kernel/run_guest_vhost_user_power_off.py
     LABELS guest;kernel;smoke
     TIMEOUT 300
     CPUS 2)
@@ -633,6 +793,29 @@ uml_add_guest_integration_test(
     NAME guest-suspend-holds
     SCRIPT kernel/run_guest_suspend_holds.py
     ARGS --server $<TARGET_FILE:uml-vhost-user-churn-server>
+    LABELS guest;kernel;smoke
+    TIMEOUT 300
+    CPUS 2)
+
+# Test support only: a library the runner inserts into the launcher
+# (DYLD_INSERT_LIBRARIES), which suspends one vCPU's carrier thread for a while
+# again and again, as a loaded host does.
+add_library(uml_cpu_hold SHARED kernel/cpu_hold.cpp)
+set_target_properties(uml_cpu_hold PROPERTIES
+    PREFIX ""
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+target_compile_options(uml_cpu_hold PRIVATE -Wall -Wextra -Werror)
+target_compile_features(uml_cpu_hold PRIVATE cxx_std_20)
+add_dependencies(integration-test-binaries uml_cpu_hold)
+
+# A host that does not run CPU0's carrier for 300 ms every second delays no
+# host event by more than a few ticks: the IRQ dispatch passes to a CPU whose
+# clock ticks, or that the IRQ notification thread wakes, with every CPU busy,
+# CPU0 only busy, and every CPU idle. A vsock echo every 20 ms is the load.
+uml_add_guest_integration_test(
+    NAME guest-irq-takeover
+    SCRIPT kernel/run_guest_irq_takeover.py
+    ARGS --hold-library $<TARGET_FILE:uml_cpu_hold>
     LABELS guest;kernel;smoke
     TIMEOUT 300
     CPUS 2)
@@ -706,6 +889,22 @@ uml_add_guest_integration_test(
     LABELS guest;input;smoke
     TIMEOUT 300
     CPUS 2)
+
+# The launcher's --hardware-input offers the guest a keyboard, a mouse and a
+# pointer that the host plugs and unplugs while it runs, and the guest's
+# virtio_input driver registers and unregisters their input devices to follow:
+# the runner is a VNC client whose keys and pointer plug them and whose
+# departure unplugs them, once more for each kind, with a key and a button held
+# across the unplug, and in quick succession. A kernel without the driver's
+# configuration handling fails the first check, which wants no input device for
+# a device that reports no event.
+uml_add_guest_integration_test(
+    NAME guest-hardware-input
+    SCRIPT input/run_guest_hardware_input.py
+    LABELS guest;input;gpu
+    TIMEOUT 600
+    CPUS 2
+    GPUS 1)
 
 # The kernel describes the virtual machine in SMBIOS tables that userspace
 # reads from sysfs, and provides no /dev/mem.
@@ -832,6 +1031,41 @@ uml_add_guest_integration_test(
     TIMEOUT 420
     CPUS 2)
 
+# An arm64 task has the guest's vDSO (kernel/common/README.md): AT_SYSINFO_EHDR
+# names an ELF shared object that /proc/self/maps shows as [vdso], its three
+# entries resolve by name and version through the SysV and the GNU hash, its
+# unwind tables cover them, each agrees with the system call it stands for
+# (every clock, an invalid clock, a bad pointer, the resolution), a fork and an
+# exec keep it, and a task that moves, unmaps, covers or writes to its own gets
+# a working one from its next exec. The caller states that the mainline guest
+# kernel does not seal its system mappings (--seal=open). The probe uses no C
+# library. A second probe, built against
+# the guest's glibc, checks that glibc's clock_gettime, gettimeofday and time
+# reach the kernel from the [vdso] mapping (guest-vdso-libc-*). An AArch32 task
+# has no vDSO (guest-aarch32-kernel), and run_android_vdso.py runs both probes
+# on Android.
+foreach(_engine IN ITEMS gadgets jit)
+    uml_add_guest_integration_test(
+        NAME guest-vdso-${_engine}
+        SCRIPT support/run_guest_probe.py
+        ARGS --probe ${PROJECT_SOURCE_DIR}/tests/integration/kernel/vdso_probe.cpp
+            "--cxxflags=-Wall -Wextra -Werror -ffreestanding -nostdlib -static -no-pie -fno-stack-protector -fno-exceptions -fno-rtti"
+            --probe-argument=--seal=open
+            --engine ${_engine} --ncpus 2 --probe-timeout 150
+        LABELS guest;kernel;${_engine}
+        TIMEOUT 420
+        CPUS 2)
+    uml_add_guest_integration_test(
+        NAME guest-vdso-libc-${_engine}
+        SCRIPT support/run_guest_probe.py
+        ARGS --probe ${PROJECT_SOURCE_DIR}/tests/integration/kernel/vdso_libc_probe.cpp
+            "--cxxflags=-Wall -Wextra -Werror -fno-exceptions -fno-rtti"
+            --engine ${_engine} --ncpus 2 --probe-timeout 150
+        LABELS guest;kernel;${_engine}
+        TIMEOUT 420
+        CPUS 2)
+endforeach()
+
 # A TLB replay that sends neighbouring user PTEs as one host call maps each
 # page to its own frame and protection, across PMD and batch boundaries and
 # while another thread's invalidations make it walk batches again.
@@ -903,8 +1137,8 @@ uml_add_guest_integration_test(
 # blob waits for the host's answer and fails with EINVAL or ENOMEM, in the
 # host3d and guest-blob branches alike, instead of returning a GEM handle that
 # no host resource stands behind. The guest has the GPU. The probe names host
-# objects that do not exist (EINVAL), and asks for a resource larger than the
-# GPU budget of a 1 GiB guest, made inside the blob's command buffer as gralloc
+# objects that do not exist (EINVAL), and asks for a resource the GPU budget of
+# a 1 GiB guest cannot hold, made inside the blob's command buffer as gralloc
 # does (ENOMEM).
 uml_add_guest_integration_test(
     NAME guest-virtgpu-blob-refusal
@@ -917,6 +1151,23 @@ uml_add_guest_integration_test(
     LABELS guest;kernel;gpu
     TIMEOUT 600
     CPUS 4
+    GPUS 1)
+
+# A system call that copies from or into a mapped host-visible Virtio-GPU blob,
+# whose frames lie in the vhost-user shared-memory aperture outside guest RAM,
+# fails with EFAULT, while the process's own access to the blob works, and the
+# guest runs on.
+uml_add_guest_integration_test(
+    NAME guest-virtgpu-blob-uaccess
+    SCRIPT support/run_guest_probe.py
+    ARGS --probe ${PROJECT_SOURCE_DIR}/tests/integration/kernel/virtgpu_blob_uaccess_probe.cpp
+        "--cxxflags=-Wall -Wextra -Werror"
+        --guest-argument=--gpu --guest-argument=--gpu-display=vnc
+        --guest-argument=--gpu-vnc-bind=127.0.0.1 --guest-argument=--gpu-vnc-port=0
+        --ncpus 2 --probe-timeout 240
+    LABELS guest;kernel;gpu
+    TIMEOUT 600
+    CPUS 2
     GPUS 1)
 
 # A Virtio-GPU context names the process that created it: the kernel appends
@@ -1212,6 +1463,26 @@ foreach(_code_change_engine IN ITEMS gadgets jit)
         ARGS --probe ${UML_GUEST_CODE_CHANGE} --cpus 4
             --engine ${_code_change_engine}
         LABELS guest;smp;dynamic-code;${_code_change_engine}
+        TIMEOUT 600
+        CPUS 4)
+endforeach()
+
+uml_add_freestanding_cxx_payload(UML_GUEST_FORK_FLUSH guest-fork-flush
+    smp/guest_fork_flush.cpp
+    COMMENT "Building the freestanding arm64 fork-flush guest probe"
+    ARCH_OPTIONS -march=armv8.1-a -mno-outline-atomics)
+
+# What a fork leaves of the parent's address space: the kernel invalidates on
+# the host only the writable private mappings fork write-protects, so each side
+# of a fork over every kind of memory must see only its own bytes, with a
+# sibling thread of the parent writing during the fork.
+foreach(_fork_flush_engine IN ITEMS gadgets jit)
+    uml_add_guest_integration_test(
+        NAME guest-fork-flush-${_fork_flush_engine}
+        SCRIPT smp/run_guest_fork_flush.py
+        ARGS --probe ${UML_GUEST_FORK_FLUSH} --cpus 4
+            --engine ${_fork_flush_engine}
+        LABELS guest;smp;memory;mmu;${_fork_flush_engine}
         TIMEOUT 600
         CPUS 4)
 endforeach()

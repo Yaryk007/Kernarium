@@ -12,7 +12,8 @@ Each case boots a guest with --session-record and ends it one way:
   records ``kernel-exit``;
 - a SIGKILL leaves the record ``running``, as a system memory-limit end does.
 
-Every record starts with the session's last memory checkpoint.
+Every record starts with the session's last memory checkpoint, and its stall
+slot says that the watch saw carriers in the idle wait the loader marks.
 
 The contract is runtime/session_record.hpp.
 """
@@ -27,6 +28,7 @@ import pathlib
 import signal
 import sys
 import tempfile
+import time
 
 
 REPOSITORY = pathlib.Path(__file__).resolve().parents[3]
@@ -45,6 +47,17 @@ def fields(record: str) -> dict[str, str]:
     return dict(
         line.split(" ", 1) for line in header.splitlines() if " " in line
     )
+
+
+def idle_markers(record: str) -> int:
+    """The carriers seen in the idle wait the loader's wrappers mark, from the
+    stall slot's header. The kernel's imports reach the wrappers when a booted
+    guest has some, whatever the load on the host."""
+    for line in record.splitlines():
+        words = line.split()
+        if words[:1] == ["stalls"] and "idle" in words:
+            return int(words[words.index("idle") + 1])
+    return 0
 
 
 def end_session(
@@ -67,6 +80,14 @@ def end_session(
         ):
             raise RuntimeError(f"{how}: a booted session is not running: "
                                f"{running}")
+        deadline = time.monotonic() + 30
+        while idle_markers(record.read_text()) == 0:
+            if time.monotonic() > deadline:
+                raise RuntimeError(
+                    f"{how}: no carrier was seen in a marked idle wait, so "
+                    "the kernel's imports do not reach the wait wrappers:\n"
+                    + record.read_text()[4096:8192])
+            time.sleep(0.5)
         if how == "panic":
             guest._write("echo c > /proc/sysrq-trigger\n")
         elif how == "poweroff":

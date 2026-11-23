@@ -1,0 +1,210 @@
+[
+  {
+    "build": 16,
+    "version": "1.1 (16)",
+    "entries": [
+      {
+        "id": "root-access",
+        "title": "Root access",
+        "text": "Apps you allow in Magisk can now run as root. Turn on Root access on Home, and the next start installs the official Magisk app.",
+        "symbol": "key.fill"
+      },
+      {
+        "id": "aot",
+        "title": "AOT",
+        "text": "Android’s system libraries now run from code translated ahead of time, so Android runs faster. It is on by default, in Performance on Home.",
+        "symbol": "books.vertical.fill"
+      },
+      {
+        "id": "high-refresh",
+        "title": "120 Hz",
+        "text": "On a ProMotion iPhone or iPad, Android can now run at 120 Hz for smoother motion, using more battery. It is off until you turn it on in Performance on Home.",
+        "symbol": "speedometer"
+      },
+      {
+        "id": "add-to-home-screen",
+        "title": "Add to Home Screen",
+        "text": "On iPhone and iPad with iOS 27, put an Android app’s icon on the Home Screen, and open the app from there, from Shortcuts or with Siri.",
+        "symbol": "plus.app.fill",
+        "place": "sessionSettings",
+        "requirement": {
+          "feature": "addToHomeScreen"
+        }
+      },
+      {
+        "id": "voiceover-talkback",
+        "title": "VoiceOver and TalkBack",
+        "text": "Andarium now works with VoiceOver. To hear Android’s screen, turn on TalkBack, Android’s screen reader, under Accessibility.",
+        "symbol": "accessibility",
+        "place": "sessionSettings"
+      },
+      {
+        "id": "frame-rate-when-hot",
+        "title": "Frame rate when hot",
+        "text": "Android now lowers the frame rate only when this device is very hot. To keep it even then, set When hot to Full frame rate under Performance.",
+        "symbol": "thermometer.medium",
+        "place": "sessionSettings"
+      },
+      {
+        "id": "text-messages",
+        "title": "Text messages",
+        "text": "Android can now receive a text message that you write. Choose Send text message… in Settings while Android is running, and it arrives as an incoming text.",
+        "symbol": "message.fill",
+        "place": "sessionSettings"
+      },
+      {
+        "id": "update-notice",
+        "title": "Update notice",
+        "text": "When a newer version of Andarium is out, Home tells you and shows how to update. It checks once a day, and you can turn it off in Info.",
+        "symbol": "arrow.down.app.fill"
+      },
+      {
+        "id": "build-16-fixes",
+        "title": "Fixes and improvements",
+        "points": [
+          "Fixed the virtual machine’s Wi-Fi dropping briefly when you return to Andarium",
+          "Fixed face scans failing in some apps that use the front camera",
+          "Fixed connections hanging after this device moves from Wi-Fi to cellular data",
+          "Fixed apps failing to reach servers for a while after the network returns",
+          "VP9 videos now play with this device’s hardware decoder"
+        ],
+        "symbol": "wrench.and.screwdriver.fill"
+      }
+    ]
+  },
+  {
+    "build": 12,
+    "version": "1.0 (12)",
+    "entries": [
+      {
+        "id": "old-app-compatibility",
+        "title": "Old app compatibility",
+        "text": "If an app built for an Android version before 4.0 crashes, turn on Old app compatibility for it. Android then runs that app more like older versions did.",
+        "symbol": "clock.arrow.2.circlepath",
+        "place": "sessionSettings"
+      },
+      {
+        "id": "fixes-and-improvements",
+        "title": "Fixes and improvements",
+        "points": [
+          "Fixed the camera preview freezing after you take a photo",
+          "Fixed the camera preview lagging behind in video mode",
+          "A camera recording now ends and is saved when you leave Andarium",
+          "Fixed the start of a video recording having no sound",
+          "Fixed 3D graphics failing to start in apps that run PC programs"
+        ],
+        "symbol": "wrench.and.screwdriver.fill"
+      }
+    ]
+  },
+  {
+    "build": 11,
+    "version": "1.0 (11)",
+    "entries": [
+      {
+        "id": "snapshots",
+        "title": "Snapshots",
+        "text": "Save the virtual machine’s data and restore it later, from Home.",
+        "symbol": "clock.arrow.circlepath"
+      },
+      {
+        "id": "resolution",
+        "title": "Resolution",
+        "text": "On Home, choose the resolution of the virtual machine’s display, up to your screen’s native resolution.",
+        "symbol": "squareshape.split.3x3"
+      },
+      {
+        "id": "ipad-rotation",
+        "title": "Rotation on iPad",
+        "text": "On iPad, the whole app now turns with the device, even while the virtual machine runs.",
+        "symbol": "rotate.right",
+        "requirement": {
+          "device": "pad"
+        }
+      },
+      {
+        "id": "keyboard-mouse-controllers",
+        "title": "Keyboard, mouse and controllers",
+        "text": "Use a hardware keyboard and game controllers with the virtual machine, and on iPad a mouse or trackpad too.",
+        "symbol": "keyboard.fill"
+      },
+      {
+        "id": "location",
+        "title": "Location",
+        "text": "Share this device’s location with the virtual machine. It is off until you turn it on in Capabilities on Home.",
+        "symbol": "location.fill"
+      },
+      {
+        "id": "camera",
+        "title": "Camera",
+        "text": "Use this device’s cameras in the virtual machine. It is off until you turn it on in Capabilities on Home.",
+        "symbol": "camera.fill",
+        "requirement": {
+          "camera": true
+        }
+      },
+      {
+        "id": "haptics",
+        "title": "Haptics",
+        "text": "On iPhone, the virtual machine’s vibration now plays on the Taptic Engine. You can turn it off in Capabilities on Home.",
+        "symbol": "iphone.radiowaves.left.and.right",
+        "requirement": {
+          "device": "haptics"
+        }
+      },
+      {
+        "id": "legacy-apk",
+        "title": "Install older Android apps",
+        "text": "Use Install APK to install an app built for a much older version of Android. Andarium warns you first that the app may not work properly.",
+        "symbol": "square.and.arrow.down.fill",
+        "place": "sessionSettings"
+      },
+      {
+        "id": "more-fixes",
+        "title": "More fixes",
+        "points": [
+          "Fixed the virtual machine not starting with more than 4 GiB of RAM",
+          "Fixed Andarium quitting when installing a very large APK",
+          "Fixed the virtual machine’s Wi-Fi not reconnecting after it drops",
+          "Fixed a crash when a network connection closes suddenly",
+          "Fixed more crashes in 3D games and apps",
+          "Fixed apps installed with Install APK not appearing on Android’s home screen"
+        ],
+        "symbol": "wrench.and.screwdriver.fill"
+      }
+    ]
+  },
+  {
+    "build": 9,
+    "version": "1.0 (9)",
+    "entries": [
+      {
+        "id": "file-browser",
+        "title": "File browser",
+        "text": "Browse the virtual machine’s internal storage, and import or export files and folders.",
+        "symbol": "folder.fill",
+        "place": "sessionSettings"
+      },
+      {
+        "id": "more-memory",
+        "title": "More memory",
+        "text": "On devices that allow it, the virtual machine’s RAM can now go above 4 GiB.",
+        "symbol": "memorychip.fill",
+        "requirement": { "memoryAboveMiB": 4096 }
+      },
+      {
+        "id": "stability-fixes",
+        "title": "Stability fixes",
+        "points": [
+          "Fixed the virtual machine crashing on many iPhones",
+          "Fixed a crash when returning to Andarium from the background",
+          "Fixed crashes in some 3D games and apps",
+          "Fixed a crash when using the gyroscope",
+          "Fixed high CPU use and heat after a network connection drops",
+          "Reduced stutters and sound dropouts under load"
+        ],
+        "symbol": "wrench.and.screwdriver.fill"
+      }
+    ]
+  }
+]

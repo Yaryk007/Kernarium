@@ -37,6 +37,18 @@ public final class AdbWatchdog: @unchecked Sendable {
         condition.withLock { cause }
     }
 
+    /// Throws what ended the operation: `AdbError.cancelled` or `.timedOut`.
+    /// For work on the operation's thread that does not wait on the
+    /// connection (reading and inflating an archive), which the transport's
+    /// shutdown cannot wake.
+    public func check() throws {
+        switch currentCause {
+        case .none: return
+        case .cancelled: throw AdbError.cancelled
+        case .timedOut: throw AdbError.timedOut
+        }
+    }
+
     /// The connection the limits end. A watchdog already triggered ends it at
     /// once.
     public func attach(_ transport: any AdbTransport) {

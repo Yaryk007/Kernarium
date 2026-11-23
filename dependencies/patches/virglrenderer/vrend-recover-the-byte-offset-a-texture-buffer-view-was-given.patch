@@ -31,7 +31,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
  1 file changed, 39 insertions(+), 9 deletions(-)
 
 diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
-index 2a95dd698b606e98104908c017e9d16cc032c52a..eab47ccf447bf0cb3fd7f1675cae9aeb4c597948 100644
+index 68b18d537b7cb1a8e96192574a5b9873caf7ffbb..a04e6eb86194a3662996dfda31ee753a4a9b1a36 100644
 --- a/src/vrend/vrend_renderer.c
 +++ b/src/vrend/vrend_renderer.c
 @@ -379,6 +379,7 @@ struct global_renderer_state {

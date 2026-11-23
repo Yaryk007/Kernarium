@@ -2,6 +2,7 @@
 
 add_library(uml_audio_device STATIC
     apple_microphone_input.mm
+    apple_microphone_tap.mm
     apple_playback_sink.mm
     audio_session.mm
     in_process_service.cpp

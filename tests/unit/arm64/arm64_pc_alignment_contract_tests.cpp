@@ -297,11 +297,276 @@ void data_alignment_contract(EngineKind kind, unsigned long generation)
 		"bridge did not preserve the FEX alignment-fault contract");
 }
 
+/* A cached return to an address the guest cannot execute from. The sites
+ * below hold two other targets in both of their cells and the gadget
+ * engine's return ring has no record for the target, which is the state a
+ * guest reaches by calling any function twice through different callers and
+ * then returning to 0xffffffffffffffff. The engine must give the guest the
+ * fault it gives for the same target reached by a cold site, never a host
+ * signal. */
+struct ReturnForm final {
+	const char *name;
+	std::uint64_t site;
+	std::uint64_t cold_site;
+	std::size_t retired;
+	/* The instruction before the form's site in the popped-ring scenario
+	 * that sets the target. */
+	std::uint32_t pop_setup;
+};
+
+constexpr std::uint32_t ret_x15 = 0xd65f'01e0U;
+constexpr std::uint32_t ret_x30 = 0xd65f'03c0U;
+constexpr std::uint32_t ldp_x29_x30_post = 0xa8c1'7bfdU;
+constexpr std::uint32_t movn_x15 = 0x9280'000fU;
+constexpr std::uint32_t movn_x30 = 0x9280'001eU;
+constexpr std::uint32_t nop = 0xd503'201fU;
+
+constexpr std::uint64_t target_one = code_base + 0x10;
+constexpr std::uint64_t target_two = code_base + 0x20;
+constexpr std::uint64_t frames = 0x800;
+constexpr std::uint64_t all_ones = ~std::uint64_t{};
+/* N and C set: a return that faults must leave the flags as they were. */
+constexpr std::uint32_t seeded_nzcv = 0xa000'0000U;
+
+constexpr std::array return_forms{
+	ReturnForm{"RET X15", code_base + 0x000, code_base + 0x080, 1, movn_x15},
+	ReturnForm{"RET", code_base + 0x030, code_base + 0x0b0, 1, movn_x30},
+	/* LDP X29, X30, [SP], #16 ; RET is one fused epilogue head. */
+	ReturnForm{"LDP X29, X30, [SP], #16 ; RET", code_base + 0x040,
+		code_base + 0x0c0, 2, nop},
+};
+
+constexpr std::uint64_t call_and_exit = code_base + 0x100;
+constexpr std::uint64_t exit_callee = code_base + 0x120;
+constexpr std::uint64_t popper_ret = code_base + 0x1a0;
+constexpr std::uint64_t popped_sequence = code_base + 0x200;
+
+[[nodiscard]] constexpr std::uint32_t branch_to(
+	std::uint64_t from, std::uint64_t to, bool link) noexcept
+{
+	const auto words = static_cast<std::int64_t>(to - from) / 4;
+	return (link ? 0x9400'0000U : 0x1400'0000U) |
+		(static_cast<std::uint32_t>(words) & 0x03ff'ffffU);
+}
+
+void put_return_code(JitBacking &backing)
+{
+	backing.put32(target_one - code_base, system_call);
+	backing.put32(target_two - code_base, system_call);
+	for (const auto &form : return_forms) {
+		for (const auto site : {form.site, form.cold_site}) {
+			if (form.retired == 2) {
+				backing.put32(site - code_base, ldp_x29_x30_post);
+				backing.put32(site - code_base + 4, ret_x30);
+			} else {
+				backing.put32(site - code_base,
+					&form == &return_forms[0] ? ret_x15 : ret_x30);
+			}
+		}
+	}
+	/* A call that leaves a return record in the ring and exits through a
+	 * guest system call. */
+	backing.put32(call_and_exit - code_base,
+		branch_to(call_and_exit, exit_callee, true));
+	backing.put32(call_and_exit - code_base + 4, system_call);
+	backing.put32(exit_callee - code_base, system_call);
+	/* A polymorphic return site that pops the record a call pushed, then
+	 * the form's site with the ring empty again, all in one run. */
+	backing.put32(popper_ret - code_base, ret_x30);
+	for (std::size_t index = 0; index < return_forms.size(); ++index) {
+		const auto &form = return_forms[index];
+		const auto base = popped_sequence + 0x20 * index;
+		backing.put32(base - code_base, branch_to(base, popper_ret, true));
+		backing.put32(base - code_base + 4, form.pop_setup);
+		backing.put32(base - code_base + 8,
+			branch_to(base + 8, form.site, false));
+	}
+}
+
+[[nodiscard]] ::uml::cpu::arm64::CpuState return_state(const ReturnForm &form,
+	JitBacking &backing, std::uint64_t site, std::uint64_t target,
+	unsigned slot, bool tbi)
+{
+	::uml::cpu::arm64::CpuState cpu;
+	cpu.pc = site;
+	cpu.nzcv = seeded_nzcv;
+	cpu.tbi_enabled = tbi;
+	if (&form == &return_forms[0]) {
+		cpu.registers[15] = target;
+	} else if (&form == &return_forms[1]) {
+		cpu.registers[30] = target;
+	} else {
+		cpu.sp = code_base + frames + 16 * slot;
+		backing.put64(frames + 16 * slot, 0);
+		backing.put64(frames + 16 * slot + 8, target);
+	}
+	return cpu;
+}
+
+[[nodiscard]] ::uml::cpu::ExecutionResult run_budget(
+	::uml::cpu::CpuEngine &engine, ::uml::cpu::arm64::CpuState &cpu,
+	::uml::memory::StaticGuestMemory &memory, unsigned long generation,
+	std::size_t budget)
+{
+	::uml::cpu::ExecutionRequest request{
+		.cpu = cpu,
+		.memory = memory,
+		.translated_memory = &memory,
+		.generation = generation,
+		.instruction_budget = budget,
+	};
+	return engine.run(request);
+}
+
+void require_same_exit(const ::uml::cpu::ExecutionResult &actual,
+	const ::uml::cpu::arm64::CpuState &actual_cpu,
+	const ::uml::cpu::ExecutionResult &cold,
+	const ::uml::cpu::arm64::CpuState &cold_cpu, std::size_t extra_retired)
+{
+	require(actual.reason == cold.reason &&
+		actual.retired_instructions ==
+			cold.retired_instructions + extra_retired &&
+		actual.fault.address == cold.fault.address &&
+		actual.fault.access == cold.fault.access &&
+		actual.fault.alignment == cold.fault.alignment &&
+		actual.syndrome == cold.syndrome &&
+		actual_cpu.pc == cold_cpu.pc,
+		"a trained return site exited differently from a cold one");
+	/* A fetch fault has no syndrome, and the flags are the guest's own. */
+	require(actual.syndrome == 0 && cold.syndrome == 0,
+		"a return fault reported a syndrome");
+	require(actual_cpu.nzcv == seeded_nzcv && cold_cpu.nzcv == seeded_nzcv,
+		"a return fault changed the flags");
+}
+
+/* One world per case, so that no site, table or ring survives from another.
+ * `popped` reaches the site with the ring emptied by the return before it;
+ * `after_call` first leaves a record in the ring and exits through a guest
+ * system call, the next entry resetting the ring. */
+enum class RingState { initial, after_call, popped };
+
+void cached_return_case(EngineKind kind, unsigned long generation,
+	JitBacking &backing, std::size_t form_index, RingState ring,
+	std::uint64_t target, bool tbi)
+{
+	const auto &form = return_forms[form_index];
+	JitMapping mapping{generation, code_base, backing, 1,
+		PROT_READ | PROT_EXEC};
+	::uml::memory::StaticGuestMemory memory;
+	memory.set_generation(generation);
+	auto engine = ::uml::cpu::make_cpu_engine(kind);
+	require(engine != nullptr && engine->kind() == kind,
+		"factory substituted a different engine");
+
+	/* The cold twin gives the exit the architecture and this engine
+	 * give for the target without any cache state. */
+	auto cold_cpu = return_state(form, backing, form.cold_site, target, 3, tbi);
+	const auto cold = run_budget(*engine, cold_cpu, memory, generation, 8);
+	require(cold.reason == ::uml::cpu::ExitReason::pc_alignment ||
+		cold.reason == ::uml::cpu::ExitReason::memory_fault,
+		"a return to an unmapped target did not fault");
+
+	/* {one, two, one} fills both cells of the site with other targets. */
+	const std::array<std::uint64_t, 3> trained{
+		target_one, target_two, target_one};
+	for (unsigned slot = 0; slot < trained.size(); ++slot) {
+		auto cpu = return_state(
+			form, backing, form.site, trained[slot], slot, false);
+		const auto result = run_budget(*engine, cpu, memory, generation, 8);
+		require(result.reason == ::uml::cpu::ExitReason::system_call,
+			"a return site did not reach its training target");
+	}
+
+	auto cpu = return_state(form, backing, form.site, target, 3, tbi);
+	std::size_t extra = 0;
+	if (ring == RingState::after_call) {
+		auto caller = return_state(form, backing, call_and_exit, 0, 0, false);
+		const auto exited = run_budget(*engine, caller, memory, generation, 8);
+		require(exited.reason == ::uml::cpu::ExitReason::system_call,
+			"the call did not exit through its system call");
+		/* The same CPU state enters again, the ring still holding the
+		 * call's record until this entry resets it. */
+		caller.pc = form.site;
+		caller.tbi_enabled = tbi;
+		caller.sp = cpu.sp;
+		caller.registers[15] = cpu.registers[15];
+		caller.registers[30] = cpu.registers[30];
+		cpu = caller;
+	} else if (ring == RingState::popped) {
+		/* Train the popper on two other targets so that it consults the
+		 * ring, which holds the record of the call that reached it. */
+		for (unsigned slot = 0; slot < trained.size(); ++slot) {
+			::uml::cpu::arm64::CpuState popper;
+			popper.pc = popper_ret;
+			popper.registers[30] = trained[slot];
+			const auto result =
+				run_budget(*engine, popper, memory, generation, 8);
+			require(result.reason == ::uml::cpu::ExitReason::system_call,
+				"the popping return did not reach its training target");
+		}
+		cpu.pc = popped_sequence + 0x20 * form_index;
+		extra = 4;
+	}
+	const auto actual = run_budget(*engine, cpu, memory, generation, 16);
+	require_same_exit(actual, cpu, cold, cold_cpu, extra);
+	if (target == all_ones) {
+		require(actual.reason == ::uml::cpu::ExitReason::pc_alignment &&
+			actual.retired_instructions == extra + form.retired &&
+			cpu.pc == all_ones &&
+			actual.fault.address == all_ones &&
+			actual.fault.access == ::uml::memory::MemoryAccess::execute,
+			"a cached return to ~0 did not report a PC-alignment exit");
+		if (form_index == 2)
+			require(cpu.registers[30] == all_ones &&
+				cpu.registers[29] == 0 &&
+				cpu.sp == code_base + frames + 16 * 3 + 16,
+				"the epilogue's restores were not retired exactly");
+	}
+}
+
+void cached_return_contract(EngineKind kind, unsigned long first_generation)
+{
+	JitBacking backing{1};
+	put_return_code(backing);
+	constexpr std::array<std::uint64_t, 12> targets{
+		all_ones,
+		/* Near all ones: one word below is aligned, the rest are not. */
+		0xffff'ffff'ffff'fffcULL,
+		0xffff'ffff'ffff'fffdULL,
+		0xffff'ffff'ffff'fff0ULL,
+		/* The values the JIT's and the tables' empty cells use. */
+		0,
+		1,
+		0x1002,
+		0xdead'beef'0000'1000ULL,
+		/* Tagged addresses. */
+		0xb100'0000'0000'1000ULL,
+		0xff00'ffff'ffff'ffffULL,
+		0xaaff'ffff'ffff'ffffULL,
+		0x0000'0000'dead'0000ULL,
+	};
+	unsigned long generation = first_generation;
+	for (std::size_t form = 0; form < return_forms.size(); ++form)
+		for (const auto ring : {RingState::initial, RingState::after_call,
+			     RingState::popped})
+			for (const auto target : targets) {
+				/* The popped sequence is the guard for the
+				 * crashing target only. */
+				if (ring == RingState::popped && target != all_ones)
+					continue;
+				for (const bool tbi : {false, true})
+					cached_return_case(kind, generation++, backing,
+						form, ring, target, tbi);
+			}
+}
+
 int run_child(EngineKind kind)
 {
 	if (!::uml::cpu::cpu_engine_available(kind))
 		return 77;
 	const auto ordinal = static_cast<unsigned long>(kind);
+	/* First: a JIT engine made after the bridge contract reports fatal. */
+	cached_return_contract(kind, 0x9000 + ordinal * 0x400);
 	direct_engine_contract(kind, 0x8d00 + ordinal * 2);
 	data_alignment_contract(kind, 0x8e00 + ordinal);
 	bridge_contract(kind, 0x8d01 + ordinal * 2);

@@ -3,6 +3,7 @@
 #include "uml_darwin_static_mmu.h"
 #include "static_mmu_test_support.hpp"
 #include "allocation_fault.hpp"
+#include "domain_registry_testing.hpp"
 #include "named_tests.hpp"
 #include "require.hpp"
 #include "scratch_backing.hpp"
@@ -171,6 +172,7 @@ public:
 
 	~Driver()
 	{
+		check_counts();
 		darwin_uml_static_vm_execution_context_destroy(context_);
 		require(darwin_uml_static_vm_destroy(model_.generation()) == 0);
 	}
@@ -280,6 +282,15 @@ public:
 		require(uml::memory::testing::active_backing_mappings() ==
 			static_cast<std::size_t>(
 				std::count(mapped.begin(), mapped.end(), true)));
+		check_counts();
+	}
+
+	/* The executable-mapping count of every record is what the generations'
+	 * words say, whichever way they came and went. */
+	void check_counts()
+	{
+		require(uml::memory::testing::audit_executable_counts() == 0);
+		require(uml::memory::testing::count_anomalies() == 0);
 	}
 
 	/* Everything the bridge says about `address` is what the model says. */
@@ -621,7 +632,8 @@ void a_change_that_fails_in_its_reserve_step_changes_nothing()
 	constexpr unsigned long c = 0x30'0000;
 
 	for (const auto site : {AllocationSite::reserve,
-		     AllocationSite::history, AllocationSite::batch_commit}) {
+		     AllocationSite::history, AllocationSite::batch_commit,
+		     AllocationSite::code_record}) {
 		for (const bool overflow : {false, true}) {
 			Driver driver{generation, backings};
 			/* In the overflow run the first 63 backings fill the slots, and
@@ -634,6 +646,7 @@ void a_change_that_fails_in_its_reserve_step_changes_nothing()
 			driver.map(b, 2 * page, {65, 2, PROT_READ | PROT_EXEC, true, false});
 			const auto before = darwin_uml_static_vm_sequences(generation);
 			const auto sweep = [&] {
+				driver.check_counts();
 				for (unsigned index = 0; index < 8; ++index) {
 					driver.check_page(a + index * page);
 					driver.check_page(b + index * page);

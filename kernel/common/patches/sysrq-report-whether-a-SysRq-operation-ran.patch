@@ -1,0 +1,102 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 10:33:00 +0900
+Subject: [PATCH] sysrq: report whether a SysRq operation ran
+
+handle_sysrq() returns nothing, so a caller cannot tell an operation
+that ran from one that SysRq, or that operation's mask, refused: it can
+only look in the console for the message the operation prints, and a
+console may print that later, from another CPU, or not at all.
+
+Add handle_sysrq_result(), which runs the operation as handle_sysrq()
+does and returns 0 when it ran, -EPERM when SysRq or the operation is
+disabled, and -EINVAL when no operation has the key. __handle_sysrq()
+keeps its behavior and its callers.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ drivers/tty/sysrq.c   | 29 ++++++++++++++++++++++++++++-
+ include/linux/sysrq.h |  1 +
+ 2 files changed, 29 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/tty/sysrq.c b/drivers/tty/sysrq.c
+index 1f78b0db3b259c3f5280f2dd36c5c268db20a971..2c5e95877cd869698b22034ff8a2c84ac0b7018d 100644
+--- a/drivers/tty/sysrq.c
++++ b/drivers/tty/sysrq.c
+@@ -580,10 +580,11 @@ static void __sysrq_put_key_op(u8 key, const struct sysrq_key_op *op_p)
+ 		sysrq_key_table[i] = op_p;
+ }
+ 
+-void __handle_sysrq(u8 key, bool check_mask)
++static int run_sysrq(u8 key, bool check_mask)
+ {
+ 	const struct sysrq_key_op *op_p;
+ 	int orig_suppress_printk;
++	int result;
+ 	int i;
+ 
+ 	orig_suppress_printk = suppress_printk;
+@@ -609,11 +610,14 @@ void __handle_sysrq(u8 key, bool check_mask)
+ 			pr_info("%s\n", op_p->action_msg);
+ 			printk_force_console_exit();
+ 			op_p->handler(key);
++			result = 0;
+ 		} else {
+ 			pr_info("This sysrq operation is disabled.\n");
+ 			printk_force_console_exit();
++			result = -EPERM;
+ 		}
+ 	} else {
++		result = -EINVAL;
+ 		pr_info("HELP : ");
+ 		/* Only print the help msg once per handler */
+ 		for (i = 0; i < ARRAY_SIZE(sysrq_key_table); i++) {
+@@ -635,6 +639,12 @@ void __handle_sysrq(u8 key, bool check_mask)
+ 	rcu_sysrq_end();
+ 
+ 	suppress_printk = orig_suppress_printk;
++	return result;
++}
++
++void __handle_sysrq(u8 key, bool check_mask)
++{
++	run_sysrq(key, check_mask);
+ }
+ 
+ void handle_sysrq(u8 key)
+@@ -644,6 +654,23 @@ void handle_sysrq(u8 key)
+ }
+ EXPORT_SYMBOL(handle_sysrq);
+ 
++/**
++ * handle_sysrq_result - run a SysRq operation as handle_sysrq() does
++ * @key: the operation's key
++ *
++ * Return: 0 when the operation ran, -EPERM when SysRq or the operation is
++ * disabled, -EINVAL when no operation has @key. A caller that must know
++ * whether the operation ran uses this rather than look for its message,
++ * which a console may print later or not at all.
++ */
++int handle_sysrq_result(u8 key)
++{
++	if (!sysrq_on())
++		return -EPERM;
++	return run_sysrq(key, true);
++}
++EXPORT_SYMBOL_GPL(handle_sysrq_result);
++
+ #ifdef CONFIG_INPUT
+ static int sysrq_reset_downtime_ms;
+ 
+diff --git a/include/linux/sysrq.h b/include/linux/sysrq.h
+index bdca467ebb77355c62dbd74b7f547a70627e0325..32b185ed9ab95f338c09289554d59a749e107c12 100644
+--- a/include/linux/sysrq.h
++++ b/include/linux/sysrq.h
+@@ -44,6 +44,7 @@ struct sysrq_key_op {
+  */
+ 
+ void handle_sysrq(u8 key);
++int handle_sysrq_result(u8 key);
+ void __handle_sysrq(u8 key, bool check_mask);
+ int register_sysrq_key(u8 key, const struct sysrq_key_op *op);
+ int unregister_sysrq_key(u8 key, const struct sysrq_key_op *op);

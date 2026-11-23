@@ -103,7 +103,9 @@ private:
       ordered_slow,
       exclusive_slow,
       deferred_exclusive_slow,
-      exclusive_compare_mismatch,
+      /* A fused compare-retry's mismatch: drop the host monitor and
+       * re-execute the load-exclusive semantically. */
+      exclusive_rollback,
       memory_slow,
       memory_copy_set_slow,
       sme_slow,

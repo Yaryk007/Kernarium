@@ -141,6 +141,8 @@ python3 -B "$COMMON_ROOT/video/sync-protocol.py" --kernel-source "$SOURCE_DIR" -
 	fail "kernel Virtio video protocol copy is stale; replay the tracked series or run kernel/common/video/sync-protocol.py"
 python3 -B "$COMMON_ROOT/gpu/sync-protocol.py" --kernel-source "$SOURCE_DIR" --verify ||
 	fail "kernel Virtio-GPU memory-report header is stale or collides; replay the tracked series or run kernel/common/gpu/sync-protocol.py"
+python3 -B "$COMMON_ROOT/input/sync-protocol.py" --kernel-source "$SOURCE_DIR" --verify ||
+	fail "kernel Virtio-input registration header is stale or collides; replay the tracked series or run kernel/common/input/sync-protocol.py"
 mkdir -p -- "$BUILD_DIR"
 SOURCE_DIR=$(CDPATH= cd -- "$SOURCE_DIR" && pwd -P)
 BUILD_DIR=$(CDPATH= cd -- "$BUILD_DIR" && pwd -P)

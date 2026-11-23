@@ -549,7 +549,7 @@ index 980b6877f18409fe5cc5e4e99d1febc30796e480..fe7543148d01dd8b73330f382be6a02c
  #include "vkr_context.h"
  
 diff --git a/src/venus/vkr_device_memory.c b/src/venus/vkr_device_memory.c
-index 7233e6024606d0c1ea1afadc903dbd376e96d03c..d0945d02dbedbe405aa532f2104cb87b792c6252 100644
+index b78b59b734981d64f066d7383d782c0b764e0c0d..530efdff06399c9f64f499faacf7967631e182b1 100644
 --- a/src/venus/vkr_device_memory.c
 +++ b/src/venus/vkr_device_memory.c
 @@ -8,7 +8,7 @@
@@ -594,7 +594,7 @@ index 2844d37d6d5524d5b12c540b704633cd6e54b9a2..5ec55ea67116efe05ffcf9a797a98dfe
      return FILE_HEADER_TEMPL.format(script=script, guard=guard,
              protocol_includes=protocol_includes).lstrip()
 diff --git a/src/venus/vkr_host_copy.c b/src/venus/vkr_host_copy.c
-index 003a94a38b107bbca81b0b2b7cfc4679b23ed61d..c0d08075939ae191816a9c5a3922d74ad7b4e408 100644
+index a505fdfc06c97cd373db8a56789f686c61b18bcc..d5a00868150800f909cdbb97f7270b2f8655cb85 100644
 --- a/src/venus/vkr_host_copy.c
 +++ b/src/venus/vkr_host_copy.c
 @@ -9,7 +9,7 @@

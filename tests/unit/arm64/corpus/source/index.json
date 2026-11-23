@@ -210,6 +210,20 @@
       "stripped_cases": 109494,
       "tbi_replacement_cases": 4284
     },
+    "control_target": {
+      "alignment_cases": 15,
+      "cases": 35,
+      "fetch_fault_cases": 20,
+      "script": "tools/arm64-tests/control-target-corpus.py",
+      "sha256": "e435a94c8d535dae9f5875d3280a8c62f0da89bb0db2e644d843e5a43b14c978"
+    },
+    "exclusive_mismatch": {
+      "cases": 8,
+      "match_cases": 4,
+      "mismatch_cases": 4,
+      "script": "tools/arm64-tests/exclusive-mismatch-corpus.py",
+      "sha256": "5108a3fa6bc106018fbf68c513fb91d1ce209b1022f13af5c578a48f64771a16"
+    },
     "exports": {
       "4k": {
         "classes": 24454,
@@ -768,7 +782,9 @@
     "arm64-floating-trap-native.jsonl",
     "arm64-sm0-vl.jsonl",
     "arm64-tbi-memory.jsonl",
-    "arm64-tbi-equivalence.jsonl"
+    "arm64-tbi-equivalence.jsonl",
+    "arm64-control-target.jsonl",
+    "arm64-exclusive-mismatch.jsonl"
   ],
   "records": [
     {
@@ -4494,6 +4510,14 @@
     {
       "name": "arm64-tbi-equivalence/4k/svl=64",
       "file": "arm64-tbi-equivalence.jsonl"
+    },
+    {
+      "name": "arm64-control-target/4k",
+      "file": "arm64-control-target.jsonl"
+    },
+    {
+      "name": "arm64-exclusive-mismatch/4k",
+      "file": "arm64-exclusive-mismatch.jsonl"
     }
   ]
 }

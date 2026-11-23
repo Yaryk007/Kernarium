@@ -140,7 +140,7 @@ def expected_imports(
         declared.update(DECLARATION_RE.findall(path.read_text(encoding="utf-8")))
     if not declared:
         raise error("shared ABI declarations are missing")
-    conditional: dict[str, set[str]] = {"arm64-only": set()}
+    conditional: dict[str, set[str]] = {"arm64-only": set(), "x86_64-only": set()}
     policy = abi_root / "import-policy.tsv"
     if not policy.is_file():
         raise error(f"ABI import policy is missing: {policy}")
@@ -166,6 +166,8 @@ def expected_imports(
     expected = set(declared)
     if kernel_slice == "x86_64":
         expected -= conditional["arm64-only"]
+    else:
+        expected -= conditional["x86_64-only"]
     return expected
 
 

@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ali Abdolahi <i@abdolahi.info>
+Date: Mon, 16 Nov 2026 02:42:56 +0330
+Subject: [PATCH] TelephonyProvider: request MANAGE_APP_OPS_MODES for itself
+
+SmsProvider checks each stored message for a one-time code and, once the
+check is done, updates the row. That update notifies the default SMS
+application through ProviderUtil.notifyIfNotDefaultSmsApp, which looks
+it up with SmsApplication.getApplication(updateIfNeeded=true). That call
+gives the application its exclusive SMS app-ops when they are not
+allowed (tryFixExclusiveSmsAppops) and then reasserts the system apps'
+modes (defaultSmsAppChanged). Both use AppOpsManager.setUidMode, which
+requires MANAGE_APP_OPS_MODES.
+
+The provider runs in the android.uid.phone shared uid and has always
+relied on TeleService, which shares that uid, to request the permission.
+A product that ships TelephonyProvider for received messages but no
+TeleService leaves the uid without it: every message carrying a code
+then throws SecurityException on the provider's executor and kills the
+com.android.phone process.
+
+Request the permission in the provider's own manifest. It is a signature
+permission and the provider is platform-signed, so it is granted; with
+TeleService present the uid already holds it, so nothing changes there.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ AndroidManifest.xml | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/AndroidManifest.xml b/AndroidManifest.xml
+index 8744212e641c037840e170b2615bab15a59c6b5f..094cd2f98286b7bd033f013c8c7e923dc2a7d6c1 100644
+--- a/AndroidManifest.xml
++++ b/AndroidManifest.xml
+@@ -53,6 +53,11 @@
+     <!-- Needed to query for whether the device is managed by an enterprise admin -->
+     <uses-permission android:name="android.permission.MANAGE_USERS"/>
+     <uses-permission android:name="android.permission.QUERY_DOMAIN_VERIFICATION" />
++    <!-- Needed to give the default SMS application its exclusive app-ops
++         (SmsApplication.getApplication), which ProviderUtil reaches through the
++         OTP check. TeleService requests it for this shared uid; a product without
++         TeleService must request it here. -->
++    <uses-permission android:name="android.permission.MANAGE_APP_OPS_MODES" />
+ 
+     <application android:process="com.android.phone"
+                  android:allowClearUserData="false"

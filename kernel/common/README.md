@@ -6,7 +6,8 @@ contracts every product shares:
 - [`abi/`](abi/README.md): the canonical plain-C host/kernel bridge, its
   identity, generated-copy authority, and import policy;
 - `config/darwin-uml.fragment`: the configuration policy every product shares
-  (4 KiB guest pages, 64 KiB task stacks). Each product applies its own overlay
+  (4 KiB guest pages, 64 KiB task stacks, the printing task or CPU on every
+  kernel message). Each product applies its own overlay
   after it, which lists only where that product differs;
 - `artifacts/`: the prebuilt-kernel bundle schema, the local read-only verifier
   (source/ABI identity, page and module policy, ELF geometry, payload inventory,
@@ -23,6 +24,8 @@ contracts every product shares:
   console PTY assertion, run by the standalone kernel build with explicit
   source and build paths (Apple product configuration consumes only bundles);
 - [`gpu/`](gpu/README.md): the private Virtio-GPU memory-report wire contract;
+- [`input/`](input/README.md): the private Virtio-input registration notice of the
+  hot-pluggable keyboard, mouse and pointer;
   and
 - [`video/`](video/README.md): the private Virtio video wire contract.
 
@@ -73,8 +76,9 @@ it. The bridge fields used below are defined by the comments in
 - A carrier reports each host signal it takes, with its pc and, for a fault,
   its address and ESR, except a fault a nofault accessor recovers
   (`guest-kernel-nofault`). A host thread that carries no vCPU takes the host's
-  default action for SIGSEGV and SIGBUS, and SIGALRM never runs a guest tick
-  there; embedders should keep SIGALRM blocked on their own threads.
+  default action for SIGSEGV, SIGBUS, SIGTRAP, SIGILL and SIGFPE, and SIGALRM
+  never runs a guest tick there (`guest-run-end-stop`); embedders should keep
+  SIGALRM blocked on their own threads.
 - An embedded run returns to its host only once no kernel thread can execute
   the image: the run end joins every carrier and stops the RTC alarm helper
   itself, since a host stop skips Linux exitcalls. A public stop reaches every
@@ -110,9 +114,26 @@ it. The bridge fields used below are defined by the comments in
 - A string copied from user memory is copied a page at a time and, as with
   `strncpy_from_user()`, leaves the destination past the terminator as it was.
   `guest-user-strings` checks it.
+- A system call's access to user memory reaches only guest RAM. One that names
+  a mapping of other memory, such as a host-visible Virtio-GPU blob in the
+  shared-memory aperture, fails with `EFAULT`; the process still reads and
+  writes the mapping itself (`guest-virtgpu-blob-uaccess`).
 
 ## arm64 task interface
 
+- An arm64 task has a `[vdso]` in addition to the `[sigpage]`, which
+  `AT_SYSINFO_EHDR` names. It is an ELF shared object shaped like native
+  arm64's vDSO (a `LINUX_2.6.39` version node, both hash tables, unwind
+  tables) with three of native's entries, `__kernel_clock_gettime`,
+  `__kernel_gettimeofday` and `__kernel_clock_getres`, each a plain system
+  call: the guest has no counter a task could read, so every clock and its
+  resolution come from the kernel. Signal return stays on the `[sigpage]`, so
+  `__kernel_rt_sigreturn` is not exported. The mapping is sealed where
+  `CONFIG_MSEAL_SYSTEM_MAPPINGS` is set, as Android's configuration does. An
+  AArch32 task and the x86_64 slice's tasks have no vDSO. `guest-vdso-gadgets`
+  and `-jit` check the object, its entries and what a task can do to its own
+  mapping with no C library, `guest-vdso-libc-gadgets` and `-jit` that glibc
+  calls them, and `android-vdso` that bionic does and the mapping is sealed.
 - A signal handler installed without `SA_RESTORER` returns to a trampoline in
   the read-only `[sigpage]` above `STACK_TOP`, where the host runs
   `rt_sigreturn`, and a frame record lets unwinders cross a signal frame as on
@@ -138,9 +159,9 @@ it. The bridge fields used below are defined by the comments in
 - The virtual CPU has no SVE outside streaming mode: there is no `NT_ARM_SVE`,
   `PR_SVE_*` fails with `EINVAL`, and the bridge tail holds no SVE state.
 - Because XNU delivers a signal to a thread in streaming mode without leaving
-  it, a carrier of an SME run blocks SIGUSR1 outside its idle `pselect()` and
-  the process-directed SIGINT, SIGTERM, SIGHUP, SIGQUIT, and SIGCHLD
-  throughout. Without SME no carrier blocks them.
+  it, a carrier of an SME run blocks SIGUSR1 and the process-directed SIGINT,
+  SIGTERM, SIGHUP, SIGQUIT, and SIGCHLD throughout, its idle wait included,
+  which its wake pipe ends. Without SME no carrier blocks them.
 
 ## Memory and address space
 
@@ -174,6 +195,19 @@ it. The bridge fields used below are defined by the comments in
   present, name consecutive frames from a 16 KiB-aligned offset of one backing,
   and agree in protection; any other slot is a host-private copy coherent with
   the frames only at a synchronization point (`guest-tlb-replay-runs`).
+- A fork invalidates on the host only the parent's writable private VMAs, the
+  entries it write-protects; every other VMA of the parent keeps its host
+  mappings and code stamps, and any other flush of an `mm` covers all of it
+  (`guest-fork-flush-*`, `guest-mmu-stress`). That rests on `dup_mmap()`
+  flushing the parent after `arch_dup_mmap()` on every path that changed one
+  of its entries; a kernel uprev rechecks it.
+- A user PTE the kernel sends as guest code carries the immutable fact, bit 1
+  of `guest_code` (bridge ABI 29), when it names an up-to-date page-cache page
+  of a file on EROFS, decided from the PTE under its page-table lock. Kernel
+  mappings, anonymous pages (a copy-on-write page of a private file mapping),
+  other file systems and DAX never carry it, and the host runs rewritten
+  code, and shares a verification between address spaces, for no other page.
+  The AOT share rows (`aot-guest-workloads`) check it.
 - Because of that slot rule, a kernel alias outside the linear map shares
   memory with the frames' other views only in whole aligned groups of four
   pages, so the architecture reports a vmap group of four. vmalloc and `vmap()`
@@ -215,8 +249,9 @@ it. The bridge fields used below are defined by the comments in
   generic `arch/um` per-task ABI hooks and the arm64 port's `arch/arm64/um`
   support. The kuser helpers and signal-return pages are ordinary code pages the
   kernel installs, and `cacheflush()` reaches the engines through
-  `darwin_uml_vm_invalidate_code()`. Mainline and Android build it; the x86_64
-  slice turns `UML_ARM64_AARCH32` off.
+  `darwin_uml_vm_invalidate_code()`, which the x86_64 kernel does not import.
+  Mainline and Android build it; the x86_64 slice turns `UML_ARM64_AARCH32`
+  off.
 - Bridge ABI 22 carries the AArch32 task (see the comments on
   `struct darwin_uml_guest_registers`). `abi.cp15_barrier` (0 to 2, default 1)
   is passed as `DARWIN_UML_DISPATCH_A32_CP15BEN`. The engines raise the
@@ -235,7 +270,42 @@ it. The bridge fields used below are defined by the comments in
   vectors at safe kernel spin, retry, TLB-walk, and `cond_resched()` boundaries
   and in `schedule()` when the caller stays runnable, so a kernel retry loop
   must service them: the IPI signal is only a wake edge. An idle virtual CPU
-  never blocks while one of its IPI vectors is pending.
+  waits in one `kevent()` on its own queue, which holds its wake pipe, the
+  host's stop descriptor and, on CPU0, the event the notification thread
+  triggers. Its deadline is a one-shot critical timer that the call adds,
+  because Darwin coalesces a wait's own timeout. An idle virtual CPU never
+  blocks while one of its IPI vectors is pending. The byte in its wake pipe
+  only ends a wait and the vectors are the pending mask, so an idle exit
+  whose wait found the pipe empty drains it only if a vector is pending, and
+  a byte that lands later costs at most one spurious wait
+  (`kernel-darwin-ipi-drain`).
+- Darwin has no per-thread SIGIO, so a CPU collects the host's descriptor
+  events at its clock tick and when it leaves idle, one CPU at a time: a
+  non-blocking token guards the dispatch, and a CPU that finds it taken skips.
+  CPU0 notes that it did, and the holder dispatches once more after it
+  releases the token, so no timed poll is needed. CPU0 always tries. Another
+  CPU tries only when no CPU has begun a dispatch for two ticks (20 ms), which
+  is how an event waits no longer when the host holds CPU0's carrier, since a
+  busy CPU0 collects at its tick only. The `uml-irq-notify` thread takes no
+  lock a CPU holds, so a stopped CPU0 cannot hold it up. It wakes a CPU0
+  that idles, and for an event no dispatch has followed within 20 ms it also
+  wakes an idle secondary through the pipe its idle wait reads. While CPU0 is
+  not idle it parks after one event until CPU0's next idle entry or its 20 ms
+  deadline, so a busy guest does not wake it per event. Handlers and
+  their softirqs therefore run on any online CPU. Still waiting for CPU0 are
+  the wake-ups the guest places on CPU0 (an RT worker kept on its previous CPU,
+  CFS preferring a previous CPU that looks idle, NAPI and timers already
+  there) and a dispatch the host stops CPU0 inside of, which holds the token.
+  During a system suspend a secondary can take the token from the platform's
+  prepare step until it goes offline, and throughout s2idle, where the
+  secondaries stay online; a dispatch does nothing while the IRQs are
+  suspended. `guest-irq-takeover` holds CPU0's carrier and checks a vsock
+  echo with every CPU busy, with CPU0 only busy and with every CPU idle.
+  CPU0's idle wait also dispatches before it sleeps, and does not sleep when
+  that dispatch collected an event (`DARWIN_IRQ_HANDLED`): a handler may have
+  made a task runnable there, which only the idle loop notices when the wait
+  returns (`kernel-darwin-ipi-drain` for the wait, `kernel-darwin-irq-edge`
+  for the result).
 - A sleeping uaccess retries its fault until the handler refuses it or the task
   is dying, as native uaccess does, so a sibling's `fork()` never fails the copy
   with `-EFAULT`.
@@ -254,6 +324,27 @@ it. The bridge fields used below are defined by the comments in
   writeback under pressure (`guest-ubd-request-memory`). The project adds no
   behavior to upstream UML's COW implementation, and Apple launchers never
   construct a COW image pair.
+- A UBD read ends each page it filled with `flush_dcache_page()`. On x86-64 a
+  page some process runs, pinned before the read (`O_DIRECT`, an io_uring fixed
+  buffer), is named to the host so that its translation is not stale; an arm64
+  program maintains its own caches (`run_guest_x86_64_pinned_code_write.py`).
+- A copy into a buffer-vector destination (a loop device's or an io_uring
+  fixed buffer's read of a file, an nbd or sunrpc receive) ends each page it
+  wrote with `flush_dcache_page()` in `iterate_bvec()`, so a page some process
+  runs is named to the host as a UBD read names it, and an arm64 kernel's call is
+  empty (`fixed-file` and `loop-fixed` of the same runner).
+- While the guest runs, a full host volume holds a direct UBD disk's I/O and
+  the file system does not see a failure. A write, a flush or a write of zeroes
+  that the host refuses with `ENOSPC` is redone, after a back-off that doubles
+  from 10 ms to 1 s, until the host has room. The driver prints one line when a
+  hold begins and one when it ends. The requests behind the held one wait, on
+  every disk, and so does whatever needs a held write: a guest's own power-off
+  or restart ends only when the host has room again. The worker sleeps as
+  `TASK_IDLE` and the driver has no timeout handler, so no watchdog reports it.
+  A discard and a COW disk are not held and fail as before. Once the kernel's
+  exitcall begins, a held request fails (the journal aborts); a host stop ends
+  the run without waiting for it. `kernel-darwin-ubd-hold` checks the
+  decisions.
 
 ## Shutdown and device removal
 
@@ -266,11 +357,40 @@ it. The bridge fields used below are defined by the comments in
   (`guest-video-teardown`). A synchronous video command waits five seconds and
   owns its response memory, so a late answer or the removal frees it
   (`guest-video-late-answer`).
+- The virtio-uml exit call stops every command-line device's connection-broken
+  work before it removes a device, and a device being removed queues none, so a
+  backend lost during the removal at power off does not have it unregistered a
+  second time (`guest-vhost-user-power-off`). One loss report per device queues
+  the work (an atomic bit), and the work holds the platform device's lock
+  around its lookup of the virtio device, so an unbind cannot free what it
+  breaks.
 
 ## Devices
 
 - The Darwin network receive path uses NAPI, and the display-mapped absolute
   pointer is a direct touchscreen.
+- The host's location is the guest's `/dev/gnssN` (type NMEA), behind a local
+  experimental Virtio device (ID 65534; the wire contract is
+  `darwin/device/gnss/README.md`). The host powers its receiver from the
+  node's first open to its last close and sends nothing while it is off. A
+  suspend disables the device's queues, so the host fills them after the
+  resume, and the host wakes a guest that suspended itself while the receiver
+  is powered; the driver is not a wake source. `guest-gnss-receiver` checks it.
+- The Virtio-input driver follows its device's configuration changes: a device
+  that reports no event type has no input device, every change reads every
+  bitmap again and registers the input device afresh when one differs, and the
+  driver answers with the private registration notice ([wire
+  contract](input/README.md)). It posts its event buffers at probe whether or
+  not it registered an input device, because the host plugs a device only after
+  that. A device that reports its events at probe registers as before.
+  `guest-hardware-input` checks it for the hot-pluggable keyboard, mouse and
+  pointer.
+- The host's cameras are `/dev/video10` and up, a capture node and a metadata
+  node for each, behind a local experimental Virtio device (ID 65533; the wire
+  and the nodes are in [`video/README.md`](video/README.md#camera-device-id-65533)).
+  Opening a node starts no capture, and a stream survives a suspend.
+  `guest-v4l2-capture` checks the nodes on the synthetic camera, live and
+  blocked, and `guest-v4l2-capture-suspend` the suspend.
 - A virtio-gpu PRIME export is always read-write. A device with 3D refuses a
   dma-buf another driver exported with `-ENODEV`; do not restore the stable
   change that routed it to the generic importer. Hardware video and Android's
@@ -289,8 +409,13 @@ it. The bridge fields used below are defined by the comments in
   `DMA_BUF_IOCTL_SYNC`; CPU access must be bracketed and a producer must flush
   its commands first. The optional `guest-gbm-dmabuf` test checks it.
 - The driver paces each CRTC with the DRM vblank timer at its mode's refresh
-  rate: a flip's event and out-fence signal at the next tick. The optional
-  `guest-drm-vblank` test checks the rate.
+  rate: a flip's event and out-fence signal at the next tick. The timer runs
+  only while something holds a vblank reference. A restart after an idle stop
+  keeps the grid: the first tick is a whole number of periods after the last
+  one, and the vblank count and timestamp the core derives for the gap stay a
+  pair on that grid. A mode change, or the CRTC being turned off and on, starts
+  a new grid. The optional `guest-drm-vblank` test checks the rate, the grid
+  across idle gaps and the kernel's vblank trace.
 - A Virtio-GPU context's debug name ends in its creating process,
   `<name>|pid=<tgid>|comm=<comm>`: the thread group ID in the initial PID
   namespace and the group leader's command name (a `|` in it becomes `?`), cut
@@ -315,11 +440,13 @@ it. The bridge fields used below are defined by the comments in
   XRGB8888 (the first format) and the host ignores the alpha byte; the
   [Android product](../mainline-6.18/README.md#android-product) offers the other
   32-bit RGB orders.
-- An in-band vhost-user kick to a Virtio GPU or sound device asks for no
-  acknowledgement, so the kicking CPU, which holds the device's socket with its
-  interrupts off, never waits for the backend's queue work. Every other
-  request on the socket, any other kick included, is a round trip that serves
-  the backend's requests while it waits.
+- An in-band vhost-user kick asks for no acknowledgement, whatever the device
+  but the console, so the kicking CPU, which holds the device's socket with its
+  interrupts off, never waits for the backend's thread. A console kick waits
+  for its answer and serves the backend's requests meanwhile, as every other
+  request on the socket does: the console driver spins on its queue after a
+  kick, and its backend may be waiting for the guest's answer to a request of
+  its own.
 - The Virtio sound driver runs a substream's elapsed-period work on its
   device's kthread worker (`virtsnd-<device>`) at the lowest real-time
   priority, not on the system workqueue.
@@ -334,6 +461,33 @@ it. The bridge fields used below are defined by the comments in
   fit Darwin's 104-byte `sun_path` is refused, never truncated.
 - The console's `mem` replies `total=<n> available=<n> free=<n>` in decimal
   bytes, so it answers where a policy keeps the console from `/proc/meminfo`.
+- The console's `sync` writes every file system and block device back, as
+  `sync(2)` does, and replies `synced in <n> ms` only once that has returned,
+  whatever the SysRq mask is; `sysrq s` only starts a writeback and is refused
+  with the mask off. It runs on a work item of its own, so a sync that has to
+  wait (the host holds a block device while its disk is full) sends no reply
+  and holds up no other request in the console's dispatcher, though a request
+  that needs the same I/O still waits for it; the host bounds its wait. The
+  reply says the pass returned, not that no I/O error occurred. A suspend syncs
+  only while the guest's `sync_on_suspend` is set, and says so in its reply:
+  `suspended, synced` once the PM core's sync of this suspend has returned,
+  `suspended, not synced` when there was none (a failed or given-up suspend
+  replies with an error and no statement). A kernel without the statement
+  replies `suspended`, which confirms nothing, and so does a request that
+  finds a suspend the guest started itself already holding the transition,
+  past its sync or not: the statement is made only for the transition the
+  request's own task runs. The host reads either text as the old reply. The
+  sync runs before tasks are frozen, so a write between the two is not
+  covered (`guest-mconsole-console-clients`).
+- A command that answers with what the kernel prints (`sysrq`, `stack`)
+  sends its client what the consoles write while it runs, whichever vCPU
+  writes it, and nothing after its final reply. The final reply names the
+  command and what it did: `sysrq s ok`, `stack ok`, or an error,
+  `sysrq s disabled` when SysRq or the operation is off and `sysrq a failed`
+  for a key without an operation. A client keys on that reply, not on the
+  printed text, which a console may write late or not at all
+  (`guest-mconsole-console-clients`). `sysrq b` replies first, since the guest
+  restarts without another chance.
 - The management console, the UML RTC alarm, VNC input, and a vhost-user device
   whose wakeup is enabled in sysfs wake any suspend. The Darwin network
   interface wakes only a suspend the guest started itself, as a phone's wireless
@@ -341,11 +495,26 @@ it. The bridge fields used below are defined by the comments in
   (`darwin_net_kern.guest_wake=0` turns this off). A suspend the host asked for
   ends only with the host's wake; a host that forwards a key also sends the
   wake, because Virtio input is not a wake source.
+- The virtual Wi-Fi station stays joined through every suspend: virt_wifi
+  offers wake-on-WLAN for any activity, so cfg80211 does not disconnect the
+  station as the guest sleeps.
 - A wake request that arrives while a suspend is being entered is answered at
-  once and still ends that suspend. A host-asked suspend that ends with `-EBUSY`
-  is entered again up to three more times, and a request that gives up replies
-  `Suspend failed`. `guest-suspend-holds` checks the host's suspend under
-  traffic, early wakes, and every guest-started wake path.
+  once and still ends that suspend. It ends every host-asked suspend that
+  arrived before it, too, including one that waits behind another console
+  request: that suspend replies `Suspend failed: -16` when its turn comes and
+  does not put the guest to sleep, in whichever order queued requests run. A
+  host-asked suspend that ends with `-EBUSY` is entered again up to three more
+  times unless a suspend of the guest's own has answered the request meanwhile,
+  and a request that gives up replies `Suspend failed`. The retries rely on the
+  kernels not being preemptible (`CONFIG_PREEMPT_NONE=y` in every
+  configuration): the worker has no scheduling point between its last look at
+  the request and the PM core's trylock but the sleep that the look follows, so
+  a suspend of the guest's own cannot answer the request in that time. A
+  configuration that enables preemption must make the look inside the PM
+  transition, with its mutex held.
+  `guest-suspend-holds` checks the host's suspend under traffic, early wakes,
+  and every guest-started wake path; `kernel-darwin-mconsole-suspend` checks
+  the bookkeeping.
 - The Virtio sound driver starts a substream afresh after a suspend and pads the
   last period of a drain with silence (`guest-virtio-sound-suspend`).
 

@@ -1,14 +1,58 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
-// The audio-session notifications iOS 27 posts when another app takes the
+// The audio-session notifications a system posts when another app takes the
 // session and gives it back, for the Simulator tests of the Apple sink and
 // the Apple microphone. The Simulator never interrupts a session, so the tests
-// post what an interruption would.
+// post what an interruption would. UML_AUDIO_LEGACY_SESSION selects what
+// systems before iOS 27 post: AVAudioSessionInterruptionNotification.
 
 #include "ios_session_notifications.hpp"
 
+#import <AVFAudio/AVFAudio.h>
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
+
+#ifdef UML_AUDIO_LEGACY_SESSION
+
+// iOS 27 deprecates the notification, which this variant exists for.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+
+void postDeactivation(DeactivationSource, bool interrupted)
+{
+    if (interrupted)
+        postInterruptionBegan();
+}
+
+void postInterruptionBegan()
+{
+    [[NSNotificationCenter defaultCenter]
+        postNotificationName:AVAudioSessionInterruptionNotification
+                      object:[AVAudioSession sharedInstance]
+                    userInfo:@{
+                        AVAudioSessionInterruptionTypeKey :
+                            @(AVAudioSessionInterruptionTypeBegan)
+                    }];
+}
+
+void postInterruptionEnded(bool shouldResume)
+{
+    [[NSNotificationCenter defaultCenter]
+        postNotificationName:AVAudioSessionInterruptionNotification
+                      object:[AVAudioSession sharedInstance]
+                    userInfo:@{
+                        AVAudioSessionInterruptionTypeKey :
+                            @(AVAudioSessionInterruptionTypeEnded),
+                        AVAudioSessionInterruptionOptionKey :
+                            @(shouldResume ?
+                                    AVAudioSessionInterruptionOptionShouldResume :
+                                    0)
+                    }];
+}
+
+#pragma clang diagnostic pop
+
+#else
 
 // iOS creates the contexts its notifications carry and offers no initializer,
 // so each is a subclass that answers the reads the sink and the
@@ -60,11 +104,12 @@ template <class Context> Context* make()
 
 } // namespace
 
-void postDeactivation(
-    AVAudioSessionDeactivationSource source, bool interrupted)
+void postDeactivation(DeactivationSource source, bool interrupted)
 {
     auto* context = make<DeactivationContextDouble>();
-    context.sourceDouble = source;
+    context.sourceDouble = source == DeactivationSource::app ?
+        AVAudioSessionDeactivationSourceApp :
+        AVAudioSessionDeactivationSourceSystem;
     context.interruptionDouble =
         interrupted ? make<InterruptionContextDouble>() : nil;
     [[NSNotificationCenter defaultCenter]
@@ -77,7 +122,7 @@ void postDeactivation(
 
 void postInterruptionBegan()
 {
-    postDeactivation(AVAudioSessionDeactivationSourceSystem, true);
+    postDeactivation(DeactivationSource::system, true);
 }
 
 void postInterruptionEnded(bool shouldResume)
@@ -93,3 +138,5 @@ void postInterruptionEnded(bool shouldResume)
                         AVAudioSessionResumptionContextKey : context
                     }];
 }
+
+#endif // UML_AUDIO_LEGACY_SESSION

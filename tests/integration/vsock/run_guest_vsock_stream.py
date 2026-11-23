@@ -20,7 +20,8 @@ and checks every body by SHA-256 on both ends:
 * a guest suspend in the middle of a stream each way, which the connections
   must survive; and
 * a guest restart, which every open stream must read as its end, and after
-  which a new boot serves again.
+  which the launcher announces no forward again and every forwarded host port
+  still serves the new boot.
 
 The contract is the device's README, darwin/device/vsock/README.md.
 """
@@ -430,13 +431,14 @@ def probe(port: int, count: int, interval: float) -> list[float]:
 
 
 def forward_ports(guest: Guest) -> dict[int, int]:
-    """Guest port to host port, from the launcher's lines at the first boot.
-    The launcher's stderr is the console's terminal, which loses what it has
-    no room for once a run is busy, so only a boot's own start can be read."""
-    found = {
-        int(guest_port): int(host_port)
-        for _, host_port, guest_port in FORWARD.findall(guest.output())
-    }
+    """Guest port to host port, from the launcher's own diagnostics, which
+    announce each forward once for the whole launch, whatever its guest does."""
+    found: dict[int, int] = {}
+    for _, host_port, guest_port in FORWARD.findall(guest.host_output()):
+        if int(guest_port) in found:
+            raise RuntimeError(
+                f"the launcher announced the forward to {guest_port} twice")
+        found[int(guest_port)] = int(host_port)
     for port in (SERVER_PORT, REFUSED_PORT):
         if port not in found:
             raise RuntimeError(f"the launcher did not report a forward to {port}")
@@ -724,7 +726,22 @@ def run_suspend(guest: Guest, console: ManagementConsole, port: int) -> dict:
     return {"echoed": echoed, "streams": outcomes}
 
 
-def run_restart(guest: Guest, port: int) -> None:
+def check_refused(port: int, what: str) -> None:
+    """A connection to the forward of a port nothing listens on in the guest:
+    the host port accepts, and the guest's refusal ends the stream."""
+    stream = socket.create_connection(("127.0.0.1", port))
+    try:
+        try:
+            stream.sendall(b"ping refused\n")
+        except OSError:
+            pass
+        expect_end(stream, REFUSED_LIMIT_SECONDS, what, True)
+    finally:
+        stream.close()
+
+
+def run_restart(guest: Guest, ports: dict[int, int]) -> None:
+    port = ports[SERVER_PORT]
     stream = open_stream(port, "echo restart")
     stream.sendall(b"p")
     if stream.recv(1) != b"p":
@@ -732,8 +749,13 @@ def run_restart(guest: Guest, port: int) -> None:
     guest.restart_to_shell(BOOT_SECONDS)
     expect_end(stream, RESTART_EOF_SECONDS, "restart", True)
     stream.close()
-    # The new boot has its own device, forwarder and server, and the forwarder
-    # listens on the same host port again.
+    # The new boot has its own device and server. The forwarder is the
+    # launch's, so the launcher announces no forward again, and the host port
+    # of every forward the first boot printed reaches the new boot.
+    drain(guest, 0.5)
+    if forward_ports(guest) != ports:
+        raise RuntimeError("restart: the launcher announced other forwards")
+    check_refused(ports[REFUSED_PORT], "restart: refused port")
     start_server(guest)
     wait_for_server(guest, port)
     outcome = Background(upload, port, "after-restart", 4 << 20).join(
@@ -752,12 +774,6 @@ def main() -> int:
     private = pathlib.Path(tempfile.mkdtemp(prefix="uml-vsock-"))
     os.environ["TMPDIR"] = str(private)
     tempfile.tempdir = str(private)
-    # The server's forward has a port of its own choosing, so that the next
-    # boot's forwarder can be found again; the refused port's is chosen by the
-    # launcher, which prints it.
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        server_port = probe.getsockname()[1]
     try:
         with Guest(
             arguments.emulator.resolve(),
@@ -766,21 +782,18 @@ def main() -> int:
             "tmpfs",
             (
                 f"ncpus={VCPUS}",
-                f"--vsock-forward=127.0.0.1:{server_port}-{SERVER_PORT}",
+                f"--vsock-forward=127.0.0.1:0-{SERVER_PORT}",
                 f"--vsock-forward=127.0.0.1:0-{REFUSED_PORT}",
             ),
             overlay_shell=True,
+            separate_host_output=True,
             payloads={SERVER: GuestFile(GUEST_SERVER.encode(), 0o755)},
         ) as guest:
             guest.boot_to_shell(BOOT_SECONDS)
             console = ManagementConsole(guest, private)
             request = len(guest.output())
             ports = forward_ports(guest)
-            if ports[SERVER_PORT] != server_port:
-                raise RuntimeError(
-                    f"the launcher reported port {ports[SERVER_PORT]} for the "
-                    f"forward asked to listen on {server_port}")
-            port = server_port
+            port = ports[SERVER_PORT]
             start_server(guest)
             wait_for_server(guest, port)
 
@@ -797,7 +810,7 @@ def main() -> int:
             if log:
                 raise RuntimeError(f"the guest server reported:\n{log}")
             require_clean(guest, "vsock", request)
-            run_restart(guest, port)
+            run_restart(guest, ports)
             print(json.dumps(report))
             if not guest.shutdown(60):
                 raise RuntimeError("the guest did not power off")

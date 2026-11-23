@@ -4,9 +4,7 @@
 
 #include "display_activity_log.hpp"
 #include "display_geometry.hpp"
-#ifndef UML_APP_STORE_RUNTIME
 #include "frame_tap_registry.hpp"
-#endif
 #include "metal_scanout_shader.hpp"
 
 #import <CoreVideo/CoreVideo.h>
@@ -14,6 +12,7 @@
 #import <MetalKit/MetalKit.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -42,13 +41,6 @@ namespace {
     });
 }
 
-#ifdef UML_APP_STORE_RUNTIME
-/* An App Store runtime reports no frame statistics. */
-[[nodiscard]] constexpr double frameStatisticsInterval() noexcept
-{
-    return 0.0;
-}
-#else
 [[nodiscard]] double frameStatisticsInterval() noexcept
 {
     static const double interval = [] {
@@ -66,7 +58,6 @@ namespace {
     }();
     return interval;
 }
-#endif
 
 } // namespace
 
@@ -137,18 +128,14 @@ struct MetalPresentationState final :
             ++latestContentGeneration;
             ++latestPresentationGeneration;
         }
-#ifndef UML_APP_STORE_RUNTIME
         markTapDirty();
-#endif
         requestRedraw();
     }
 
-#ifndef UML_APP_STORE_RUNTIME
     /* The mirror (frame_tap.hpp): a second render of the latest guest
      * content into pool-backed IOSurface buffers, on its own thread, so that
      * it runs when there is no window to draw into. Nothing here runs while
-     * no sink is set, beyond the thread's wait. An App Store runtime has no
-     * mirror. */
+     * no sink is set, beyond the thread's wait. */
 
     void startTap()
     {
@@ -387,7 +374,6 @@ struct MetalPresentationState final :
             }
         }
     }
-#endif
 
     void drawableSizeChanged() noexcept
     {
@@ -522,9 +508,10 @@ struct MetalPresentationState final :
                     "Native display: direct Metal texture presentation\n",
                     stderr);
             }
-#ifndef UML_APP_STORE_RUNTIME
             markTapDirty();
-#endif
+            /* An accepted scanout is one offered frame, counted before the
+             * redraw that shows it can look. */
+            offeredFrames.fetch_add(1, std::memory_order_release);
             requestRedraw();
             maybeReport();
             return superseded ? PresentOutcome::dropped
@@ -595,8 +582,17 @@ struct MetalPresentationState final :
     }
 
     /* Draws the newest frame into the next drawable of a view, or, with no
-     * view, of a layer that belongs to no window. */
-    void draw(MTKView* view, CAMetalLayer* layer) noexcept
+     * view, of a layer that belongs to no window. It says when the frame is
+     * owed and the view had no drawable or render pass to draw it into
+     * (DrawResult::unavailable), the one case in which the frame is neither
+     * shown nor retired and nothing else will ask for it again, how long the
+     * request for the drawable took, and the frame it claimed. It asks for a
+     * drawable once, and not at all when the waits of earlier draws of that
+     * frame have used up its budget (`budget`). */
+    DrawOutcome draw(
+        MTKView* view,
+        CAMetalLayer* layer,
+        const DrawableBudget& budget = DrawableBudget::unlimited()) noexcept
     {
         @autoreleasepool {
             std::uint64_t contentGeneration = 0;
@@ -609,13 +605,13 @@ struct MetalPresentationState final :
             id<MTLTexture> sourceTexture;
             try {
                 if (view == nil && layer == nil)
-                    return;
+                    return DrawResult::done;
                 {
                     std::lock_guard lock(presentationMutex);
                     if (presentationInFlight ||
                         latestPresentationGeneration <=
                             presentedPresentationGeneration) {
-                        return;
+                        return DrawResult::done;
                     }
                     contentGeneration = latestContentGeneration;
                     presentationGeneration = latestPresentationGeneration;
@@ -630,36 +626,49 @@ struct MetalPresentationState final :
                      * framebuffer is locked; it may have none. */
                     sourceTexture = useCpu ? nil : latestTexture;
                     if (!activeSampling || (!useCpu && sourceTexture == nil))
-                        return;
+                        return DrawResult::done;
                     presentationInFlight = true;
                 }
                 /* Acquiring a drawable can block until the display releases
                  * one, and this runs on the thread that owns the user
                  * interface. Claim the frame first so a redraw with nothing
                  * new to show never pays for it. */
-                MTLRenderPassDescriptor* pass = nil;
-                id<CAMetalDrawable> drawable = nil;
-                MTLClearColor clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
-                if (view != nil) {
-                    pass = view.currentRenderPassDescriptor;
-                    drawable = view.currentDrawable;
-                    clearColor = view.clearColor;
-                } else {
-                    drawable = [layer nextDrawable];
-                    if (drawable != nil) {
-                        pass = [MTLRenderPassDescriptor renderPassDescriptor];
-                        pass.colorAttachments[0].texture = drawable.texture;
-                        pass.colorAttachments[0].storeAction =
-                            MTLStoreActionStore;
-                    }
-                }
-                if (pass == nil || drawable == nil) {
-                    /* Release the claim without retiring the generation: the
-                     * frame was not shown, and the next guest frame asks for
-                     * this one again. */
+                if (!(budget.allowanceFor(presentationGeneration) > 0.0)) {
+                    /* The waits of this frame's draws used up its budget:
+                     * the frame stays owed and nothing asks the layer. */
                     std::lock_guard lock(presentationMutex);
                     presentationInFlight = false;
-                    return;
+                    return DrawOutcome {
+                        DrawResult::unavailable, 0.0, presentationGeneration};
+                }
+                /* One request, which is the only thing timed. The view's
+                 * render pass is made from the drawable it holds, so it asks
+                 * for no other. */
+                const auto acquireStart = std::chrono::steady_clock::now();
+                id<CAMetalDrawable> drawable = view != nil ?
+                    view.currentDrawable : [layer nextDrawable];
+                const double acquireSeconds = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - acquireStart).count();
+                if (drawable == nil) {
+                    /* Release the claim without retiring the generation: the
+                     * frame was not shown, and the next guest frame asks for
+                     * this one again. A caller that has no next frame to wait
+                     * for draws it again itself (the result). */
+                    std::lock_guard lock(presentationMutex);
+                    presentationInFlight = false;
+                    return DrawOutcome {
+                        DrawResult::unavailable, acquireSeconds, presentationGeneration};
+                }
+                /* A drawable in hand is drawn into, whatever the request
+                 * cost: the view's pass, or one made from the drawable. */
+                MTLClearColor clearColor = view != nil ?
+                    view.clearColor : MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
+                MTLRenderPassDescriptor* pass =
+                    view != nil ? view.currentRenderPassDescriptor : nil;
+                if (pass == nil) {
+                    pass = [MTLRenderPassDescriptor renderPassDescriptor];
+                    pass.colorAttachments[0].texture = drawable.texture;
+                    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
                 }
                 if (useCpu) {
                     bool current = false;
@@ -675,7 +684,7 @@ struct MetalPresentationState final :
                     if (!current) {
                         finishPresentation(
                             contentGeneration, presentationGeneration);
-                        return;
+                        return DrawResult::done;
                     }
                 }
                 /* A CPU frame with no pixels, the first after a resize or a
@@ -694,7 +703,7 @@ struct MetalPresentationState final :
                     if (fitted.width <= 0.0 || fitted.height <= 0.0) {
                         finishPresentation(
                             contentGeneration, presentationGeneration);
-                        return;
+                        return DrawResult::done;
                     }
                     viewport = {
                         .originX = fitted.x,
@@ -709,7 +718,7 @@ struct MetalPresentationState final :
                 if (buffer == nil) {
                     finishPresentation(
                         contentGeneration, presentationGeneration);
-                    return;
+                    return DrawResult::done;
                 }
                 pass.colorAttachments[0].loadAction = MTLLoadActionClear;
                 pass.colorAttachments[0].clearColor = clearColor;
@@ -718,7 +727,7 @@ struct MetalPresentationState final :
                 if (encoder == nil) {
                     finishPresentation(
                         contentGeneration, presentationGeneration);
-                    return;
+                    return DrawResult::done;
                 }
                 if (drawSource) {
                     encodeScanoutPass(
@@ -731,6 +740,16 @@ struct MetalPresentationState final :
                 }
                 [encoder endEncoding];
                 [buffer presentDrawable:drawable];
+                /* The device's Metal headers declare the drawable's presentation
+                 * handler; the Simulator's do not. */
+#if TARGET_OS_IOS && !TARGET_OS_SIMULATOR
+                if (frameStatisticsInterval() > 0.0) {
+                    auto shown = shared_from_this();
+                    [drawable addPresentedHandler:^(id<MTLDrawable> presented) {
+                        shown->notePresented(presented.presentedTime);
+                    }];
+                }
+#endif
                 auto state = shared_from_this();
                 [buffer addCompletedHandler:^(id<MTLCommandBuffer>) {
                     state->presentedFrames.fetch_add(
@@ -750,7 +769,62 @@ struct MetalPresentationState final :
                 }
             }
         }
+        return DrawResult::done;
     }
+
+#if TARGET_OS_IOS && !TARGET_OS_SIMULATOR
+    /* The drawable's own presentation time says when iOS showed a frame, where
+     * presentedFrames counts the end of the GPU work. The gaps between shown
+     * frames fall in five bins: under 10 ms, 10-14, 14-20, 20-50, 50 or more.
+     * Only a run that prints statistics keeps them. */
+    void notePresented(CFTimeInterval shownAt) noexcept
+    {
+        if (!(shownAt > 0.0)) {
+            onscreenMissed.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        onscreenFrames.fetch_add(1, std::memory_order_relaxed);
+        std::lock_guard lock(onscreenMutex);
+        if (lastShownAt > 0.0) {
+            const double gap = shownAt - lastShownAt;
+            ++onscreenGaps[gap < 0.010 ? 0 : (gap < 0.014 ? 1 : (gap < 0.020 ? 2 : (gap < 0.050 ? 3 : 4)))];
+        }
+        lastShownAt = shownAt;
+    }
+
+    void reportOnscreen(double seconds) noexcept
+    {
+        std::array<std::uint64_t, 5> gaps;
+        {
+            std::lock_guard lock(onscreenMutex);
+            gaps = onscreenGaps;
+            onscreenGaps = {};
+        }
+        const auto shown = onscreenFrames.load(std::memory_order_relaxed);
+        const auto missed = onscreenMissed.load(std::memory_order_relaxed);
+        std::fprintf(
+            stderr,
+            "Native display onscreen: shown %.1f/s missed %llu/total "
+            "shown-gap-ms <10 %llu 10-14 %llu 14-20 %llu 20-50 %llu >=50 %llu "
+            "| totals shown %llu\n",
+            static_cast<double>(shown - reportedOnscreen) / seconds,
+            static_cast<unsigned long long>(missed),
+            static_cast<unsigned long long>(gaps[0]),
+            static_cast<unsigned long long>(gaps[1]),
+            static_cast<unsigned long long>(gaps[2]),
+            static_cast<unsigned long long>(gaps[3]),
+            static_cast<unsigned long long>(gaps[4]),
+            static_cast<unsigned long long>(shown));
+        reportedOnscreen = shown;
+    }
+
+    std::atomic_uint64_t onscreenFrames {};
+    std::atomic_uint64_t onscreenMissed {};
+    std::mutex onscreenMutex;
+    std::array<std::uint64_t, 5> onscreenGaps {};
+    CFTimeInterval lastShownAt {};
+    std::uint64_t reportedOnscreen {};
+#endif
 
     DisplayStatistics snapshot() const noexcept
     {
@@ -760,6 +834,7 @@ struct MetalPresentationState final :
             .droppedFrames = droppedFrames.load(std::memory_order_relaxed),
             .cpuFallbackFrames =
                 cpuFallbackFrames.load(std::memory_order_relaxed),
+            .offeredFrames = offeredFrames.load(std::memory_order_acquire),
         };
     }
 
@@ -826,13 +901,15 @@ struct MetalPresentationState final :
             static_cast<unsigned long long>(total.presentedFrames),
             static_cast<unsigned long long>(total.droppedFrames),
             static_cast<unsigned long long>(total.cpuFallbackFrames));
+#if TARGET_OS_IOS && !TARGET_OS_SIMULATOR
+        reportOnscreen(seconds);
+#endif
     }
 
     ScanoutFramebuffer framebuffer;
     id<MTLDevice> device;
     id<MTLCommandQueue> commandQueue;
     ScanoutPipelines pipelines;
-#ifndef UML_APP_STORE_RUNTIME
     std::thread tapThread;
     std::atomic_bool tapDirty {};
     std::atomic_int tapInFlight {};
@@ -841,7 +918,6 @@ struct MetalPresentationState final :
     std::uint32_t tapPoolWidth {};
     std::uint32_t tapPoolHeight {};
     std::uint64_t tapFrames {};
-#endif
     id<MTLTexture> fallbackTexture;
     id<MTLTexture> latestTexture;
     ScanoutSampling latestSampling;
@@ -866,6 +942,7 @@ struct MetalPresentationState final :
     std::atomic_uint64_t presentedFrames {};
     std::atomic_uint64_t droppedFrames {};
     std::atomic_uint64_t cpuFallbackFrames {};
+    std::atomic_uint64_t offeredFrames {};
     std::atomic_uint64_t reportedAt {};
     std::uint64_t reportedGuestFrames {};
     std::uint64_t reportedPresentedFrames {};
@@ -877,9 +954,7 @@ MetalPresentation::MetalPresentation(
     std::uint32_t width, std::uint32_t height)
     : state_(std::make_shared<MetalPresentationState>(width, height))
 {
-#ifndef UML_APP_STORE_RUNTIME
     state_->startTap();
-#endif
 }
 
 MetalPresentation::~MetalPresentation()
@@ -942,14 +1017,15 @@ PresentOutcome MetalPresentation::present(
     return state_->present(scanout);
 }
 
-void MetalPresentation::draw(void* nativeView) noexcept
+DrawOutcome MetalPresentation::draw(
+    void* nativeView, DrawableBudget budget) noexcept
 {
-    state_->draw((__bridge MTKView*)nativeView, nil);
+    return state_->draw((__bridge MTKView*)nativeView, nil, budget);
 }
 
 void MetalPresentation::drawLayer(void* metalLayer) noexcept
 {
-    state_->draw(nil, (__bridge CAMetalLayer*)metalLayer);
+    (void)state_->draw(nil, (__bridge CAMetalLayer*)metalLayer);
 }
 
 DisplayStatistics MetalPresentation::statistics() const noexcept
@@ -962,6 +1038,11 @@ void MetalPresentation::recordCpuFallbackFrame() noexcept
     state_->cpuFallbackFrames.fetch_add(1, std::memory_order_relaxed);
 }
 
+void MetalPresentation::recordGuestUpdate() noexcept
+{
+    state_->offeredFrames.fetch_add(1, std::memory_order_release);
+}
+
 void MetalPresentation::shutdown() noexcept
 {
     if (!state_ ||
@@ -969,9 +1050,7 @@ void MetalPresentation::shutdown() noexcept
         return;
     }
     state_->reportFinal();
-#ifndef UML_APP_STORE_RUNTIME
     state_->stopTap();
-#endif
     std::lock_guard lock(state_->callbackMutex);
     state_->redrawCallback = {};
 }

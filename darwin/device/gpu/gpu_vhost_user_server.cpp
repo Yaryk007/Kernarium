@@ -24,6 +24,10 @@
 #include <utility>
 #include <vector>
 
+#if UML_GPU_DEVICE_TESTING
+#include "gpu_vhost_user_server_testing.hpp"
+#endif
+
 namespace uml::gpu {
 namespace {
 
@@ -52,12 +56,21 @@ public:
     GpuVhostUserDevice(
         std::shared_ptr<Display> display,
         std::string vncBindAddress,
-        std::uint32_t dotsPerInch)
+        std::uint32_t dotsPerInch
+#if UML_GPU_DEVICE_TESTING
+        ,
+        testing::VirtioGpuDeviceDependencies& dependencies
+#endif
+        )
         : sharedDisplay_(std::move(display))
         , display_(*sharedDisplay_)
         , vncBindAddress_(std::move(vncBindAddress))
         , gpu_(
+#if UML_GPU_DEVICE_TESTING
+              dependencies,
+#else
               display_,
+#endif
               [this](
                   std::uint64_t address,
                   std::span<std::uint8_t> destination) {
@@ -249,6 +262,15 @@ public:
         return true;
     }
 
+    /* A fenced command can still be running on the host when the guest
+     * suspends, and the guest's contexts and resources are alive across the
+     * suspend: a ring disable must not reset the device under it. The
+     * command's answer waits for the ring's enable. */
+    [[nodiscard]] bool keepsDeferredRequestsWhileDisabled() const noexcept override
+    {
+        return true;
+    }
+
     // A submission can run for hundreds of milliseconds on the host.
     [[nodiscard]] bool answersKicksBeforeRunning() const noexcept override
     {
@@ -350,6 +372,9 @@ public:
             /* A one-shot timer is gone once it has fired. */
             idleTrimTimerArmed_ = false;
             gpu_.trimIdleContexts();
+            /* What a trim gives back reaches the pool's figure without
+             * passing the ledger, so the memory report reads it again. */
+            armMemoryTick(false);
             armIdleTrimTimer();
         }
         if (!fenceTimerReady)
@@ -655,6 +680,23 @@ private:
 
 } // namespace
 
+#if UML_GPU_DEVICE_TESTING
+namespace testing {
+
+std::unique_ptr<VhostUserServer> makeGpuVhostUserServerOnDependencies(
+    std::shared_ptr<Display> display,
+    VirtioGpuDeviceDependencies& dependencies,
+    std::uint32_t dotsPerInch)
+{
+    if (!display)
+        throw std::invalid_argument("Virtio-GPU server requires a display");
+    return std::make_unique<VhostUserServer>(
+        std::make_unique<GpuVhostUserDevice>(
+            std::move(display), "127.0.0.1", dotsPerInch, dependencies));
+}
+
+} // namespace testing
+#else
 std::unique_ptr<VhostUserServer> makeGpuVhostUserServer(
     std::shared_ptr<Display> display,
     std::string vncBindAddress,
@@ -706,6 +748,7 @@ std::unique_ptr<VhostUserServer> makeGpuVhostUserServer(
         dotsPerInch,
         selfTestPattern);
 }
+#endif
 
 std::unique_ptr<Display> makeGpuDisplay(
     const std::string& vncBindAddress,
@@ -719,7 +762,8 @@ std::unique_ptr<Display> makeGpuDisplay(
     std::uint32_t dotsPerInch,
     uml::input::vnc::PointerMode pointerMode,
     bool autoResizeGuest,
-    OffscreenDisplayOptions offscreen)
+    OffscreenDisplayOptions offscreen,
+    std::uint32_t refreshRate)
 {
     return makeDisplay(
         displayMode,
@@ -735,7 +779,8 @@ std::unique_ptr<Display> makeGpuDisplay(
             protocol::maximumDisplayDimension :
             protocol::maximumEdidDimension,
         autoResizeGuest,
-        offscreen);
+        offscreen,
+        refreshRate);
 }
 
 } // namespace uml::gpu

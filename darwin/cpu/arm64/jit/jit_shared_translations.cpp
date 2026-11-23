@@ -591,14 +591,26 @@ std::size_t SharedTranslationCache::allocated_shards() const noexcept {
   });
 }
 
+namespace {
+std::atomic<bool> process_tier_created{false};
+} // namespace
+
 SharedTranslationCache &SharedTranslationCache::instance() noexcept {
   /* Intentionally leaked. Executors flush into it from their destructors,
    * which can run after a function-local static would have been destroyed.
    */
-  static auto *cache = new SharedTranslationCache{
-      unlimited_shard_entries,
-      jit_shared_translation_cache_budget()};
+  static auto *cache = [] {
+    auto *created = new SharedTranslationCache{
+        unlimited_shard_entries,
+        jit_shared_translation_cache_budget()};
+    process_tier_created.store(true, std::memory_order_release);
+    return created;
+  }();
   return *cache;
+}
+
+bool SharedTranslationCache::instance_exists() noexcept {
+  return process_tier_created.load(std::memory_order_acquire);
 }
 
 } // namespace uml::cpu::arm64

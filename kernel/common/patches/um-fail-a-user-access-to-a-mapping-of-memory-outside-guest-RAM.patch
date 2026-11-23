@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 17:07:24 +0900
+Subject: [PATCH] um: fail a user access to a mapping of memory outside guest
+ RAM
+
+UML reaches user memory through the kernel's alias of the page a PTE
+maps, and holds the page's struct page while it copies. A Virtio-GPU
+host-visible blob is mapped into its process with io_remap_pfn_range(),
+so its PTEs name frames of the vhost-user shared-memory aperture, which
+lies past guest RAM. Those frames have no struct page and their kernel
+alias is never mapped: the aperture records only which host descriptor
+backs each frame. A write() from such a buffer took a reference on
+whatever followed mem_map, then faulted on the alias, and the guest
+panicked with "Kernel mode signal 10".
+
+Fail the access instead, as get_user_pages() fails on a VM_PFNMAP
+mapping, so the system call returns -EFAULT.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ arch/um/kernel/skas/uaccess.c | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/arch/um/kernel/skas/uaccess.c b/arch/um/kernel/skas/uaccess.c
+index dad935fd36647c8278b427943d50169b6b7f3c5e..079f9ab9340beecd40d34c50b88c0fd4059ebcd0 100644
+--- a/arch/um/kernel/skas/uaccess.c
++++ b/arch/um/kernel/skas/uaccess.c
+@@ -18,6 +18,7 @@
+ #ifdef CONFIG_UML_ARM64_AARCH32
+ #include <asm/aarch32.h>
+ #endif
++#include <as-layout.h>
+ #include <mem_user.h>
+ #include <os.h>
+ #include <skas.h>
+@@ -102,6 +103,11 @@ static pte_t *user_walk_lock_pte(struct user_walk *walk, unsigned long addr,
+  * still landing in the shared page, would reach the child, and a parent that
+  * broke the copy-on-write first would lose it.  Release with
+  * unpin_user_mapping().
++ *
++ * Only guest RAM has a struct page to hold and a kernel alias to copy
++ * through. A PTE that maps past it, such as a Virtio-GPU blob in the
++ * vhost-user shared-memory aperture, has neither, so the access fails, as
++ * get_user_pages() fails on such a mapping.
+  */
+ static struct page *pin_user_mapping(struct mm_struct *mm, unsigned long addr,
+ 				     int is_write)
+@@ -122,7 +128,9 @@ static struct page *pin_user_mapping(struct mm_struct *mm, unsigned long addr,
+ 		if (pte_present(value) &&
+ 		    (is_write ? pte_write(value) : pte_read(value))) {
+ 			page = pte_page(value);
+-			if (!is_write)
++			if (pte_pfn(value) >= PHYS_PFN(__pa(high_physmem)))
++				page = ERR_PTR(-EFAULT);
++			else if (!is_write)
+ 				get_page(page);
+ 			else if (pin_folio_from_locked_pte(mm,
+ 							  page_folio(page)))

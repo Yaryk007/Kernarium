@@ -3,22 +3,25 @@ From: Yi Xie <imxieyi@users.noreply.github.com>
 Date: Sun, 23 Aug 2026 07:04:14 +0900
 Subject: [PATCH] venus: use truthful Apple external-memory capabilities
 
+A blob larger than the shared file behind it is refused when the
+renderer exports it, and the proxy answers the guest with EINVAL,
+so no mapping can reach past the end of the file.
 ---
- src/meson.build                 |  4 +-
- src/venus/vkr_buffer.c          |  1 -
- src/venus/vkr_device.c          | 36 ++++++++++--
- src/venus/vkr_device.h          |  2 +-
- src/venus/vkr_device_memory.c   | 90 +++++++++++++++++++-----------
- src/venus/vkr_device_memory.h   |  6 +-
- src/venus/vkr_host_memory.c     | 68 ++++++++++++++++++++++
- src/venus/vkr_host_memory.h     | 24 ++++++++
- src/venus/vkr_image.c           |  7 +++
- src/venus/vkr_instance.c        | 11 ----
- src/venus/vkr_metal_helpers.h   | 72 ------------------------
- src/venus/vkr_metal_helpers.m   | 99 ---------------------------------
- src/venus/vkr_physical_device.c | 56 +++++++++----------
- src/venus/vkr_physical_device.h |  2 +
- 14 files changed, 223 insertions(+), 255 deletions(-)
+ src/meson.build                 |   4 +-
+ src/venus/vkr_buffer.c          |   1 -
+ src/venus/vkr_device.c          |  36 +++++++++--
+ src/venus/vkr_device.h          |   2 +-
+ src/venus/vkr_device_memory.c   | 102 ++++++++++++++++++++++----------
+ src/venus/vkr_device_memory.h   |   6 +-
+ src/venus/vkr_host_memory.c     |  68 +++++++++++++++++++++
+ src/venus/vkr_host_memory.h     |  24 ++++++++
+ src/venus/vkr_image.c           |   7 +++
+ src/venus/vkr_instance.c        |  11 ----
+ src/venus/vkr_metal_helpers.h   |  72 ----------------------
+ src/venus/vkr_metal_helpers.m   |  99 -------------------------------
+ src/venus/vkr_physical_device.c |  56 +++++++++---------
+ src/venus/vkr_physical_device.h |   2 +
+ 14 files changed, 235 insertions(+), 255 deletions(-)
  create mode 100644 src/venus/vkr_host_memory.c
  create mode 100644 src/venus/vkr_host_memory.h
  delete mode 100644 src/venus/vkr_metal_helpers.h
@@ -147,7 +150,7 @@ index c71f08537b434fc3db6e382bd13111c5486a97f0..a8c185c6807c5ffc8be7b01b9d23a5b5
  VKR_DEFINE_OBJECT_CAST(device, VK_OBJECT_TYPE_DEVICE, VkDevice)
  
 diff --git a/src/venus/vkr_device_memory.c b/src/venus/vkr_device_memory.c
-index 7d57c7ce67a5aa1f20ffe02d5faa1e7c8abcb6b6..12ba65bda639525be12e247abbea5a784b640036 100644
+index 7d57c7ce67a5aa1f20ffe02d5faa1e7c8abcb6b6..4ef34d957d06476b5d5457e5b85358ce4bb987cf 100644
 --- a/src/venus/vkr_device_memory.c
 +++ b/src/venus/vkr_device_memory.c
 @@ -10,7 +10,7 @@
@@ -284,13 +287,25 @@ index 7d57c7ce67a5aa1f20ffe02d5faa1e7c8abcb6b6..12ba65bda639525be12e247abbea5a78
     if (mem->gbm_bo)
        vkr_gbm_bo_destroy(mem->gbm_bo);
     if (mem->udmabuf_fd >= 0)
-@@ -570,14 +594,16 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
+@@ -570,14 +594,28 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
                                        : VIRGL_RENDERER_MAP_CACHE_WC;
     }
  
 -   if (mem->mtl_shm && mem->mtl_shm->shm_fd >= 0) {
 -      mem->exported = true;
 +   if (mem->host_shm && mem->host_shm->fd >= 0) {
++      /* The resource maps blob_size bytes of this file, and a blob the file
++       * does not cover faults the host on the first access past its end.
++       * Refuse it before the memory counts as exported, as the Metal heap
++       * branch below does, so the memory can still be exported at its own
++       * size.
++       */
++      if (blob_size > mem->host_shm->size) {
++         vkr_log("blob_size %" PRIu64 " exceeds the shm size %zu", blob_size,
++                 mem->host_shm->size);
++         return false;
++      }
++
        *out_blob = (struct virgl_context_blob){
           .type = VIRGL_RESOURCE_FD_SHM,
 -         .u.fd = os_dupfd_cloexec(mem->mtl_shm->shm_fd),

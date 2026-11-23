@@ -1,9 +1,10 @@
 # arm64 JIT engine
 
 The JIT emits native blocks for A64, A32 and T32 guest code into its executable
-arena. It runs on macOS and in an explicitly opted-in, development-signed iOS
-device runtime prepared by StikDebug's universal script. Stock iOS, Simulator,
-and App Store runtimes do not expose it. The gadget engine includes none of it. Exclusives,
+arena. It runs on macOS and, in the development configurations, on an iOS
+device whose executable memory a debugger prepares
+([`docs/architecture.md`](../../../../docs/architecture.md#executable-code)).
+The gadget engine includes none of it. Exclusives,
 alignment, the SME profile, the AArch32 profile and the semantic slow path's
 role are cross-engine contracts in
 [`docs/architecture.md`](../../../../docs/architecture.md). This file records
@@ -26,13 +27,34 @@ The target is `uml_arm64_jit`.
 
 The JIT compiles a block the first time an address space runs it, and no
 translation serves another process: the private cache is keyed by the address
-space, the shared tier opens only while two executors live and is keyed by
-guest PC, and the guest's ASLR moves every image anyway. Each exec'd process
-therefore compiles its whole startup path again, several times what it costs
-the gadget engine, and the LTP runner scales its case bounds for it
-([testing](../../../../docs/testing.md#ltp)). The JIT's measured and tested
-production path remains macOS, so the cold path is not optimized
+space, the shared tier is keyed by guest PC, and the guest's ASLR moves every
+image anyway. Each exec'd process therefore compiles its whole startup path
+again, several times what it costs the gadget engine, and the LTP runner
+scales its case bounds for it
+([testing](../../../../docs/testing.md#ltp)). An Android guest never stops
+translating: its processes' working sets together outgrow the cache at any
+budget a device can afford, so the arena is emptied every few seconds and the
+guest's boot, launches and background work run several times slower than on
+gadgets, while a long single-process computation runs faster in CPU time. The
+JIT's products are macOS and iOS device builds that a debugger serves, so the
+cold path is not optimized
 ([history](../../../../docs/optimization-history.md#jit-cold-code-per-process)).
+
+## Cache budget
+
+The cache's whole-process budget is divided by the budget and the executor
+count alone, the same on every platform. Each executor's private cache takes
+min(cap, budget / executors), where the cap is 256 MiB unless a lower one is
+configured; the shared translation tier takes what is left when that is at
+least 768 MiB and the configured executor count is two or more, and does not
+exist otherwise (what is left below that is not allocated). Without a tier no
+executor looks in it, publishes to it, locks it or sweeps it, and each keeps
+its own validation words. With one, an executor still finds its entries
+whatever the count, and it admits new translations only while two executors
+live. The 768 MiB floor is where a tier paid for its lookups, publications
+and reclaim sweeps in the experiment behind it, not a bound for every
+workload. An iOS device's budget is all private
+([`jit_cache_geometry.hpp`](jit_cache_geometry.hpp)).
 
 ## Top-byte ignore
 
@@ -46,6 +68,23 @@ at all. The TLB, a page fault and the fault address a signal reports therefore
 see the untagged address, as the semantic path reports it. Exclusives, atomics
 and ordered accesses strip before they translate and record the host address,
 so the monitor guards the location and not the pointer.
+
+## Exclusive runs
+
+A block that starts at a load-exclusive runs it with its store-exclusive on the
+host's own monitor when the words between are at most four register-only
+instructions (move wide, add and subtract, logical, in immediate and register
+forms) and conditional branches that leave the run, and the executor's fetch
+reaches the store (`jit_exclusive_run.hpp` judges the words, one decoder for
+the fetch and for the compiler). Each guest register the run touches has a
+scratch host copy, taken before the load and written back after the store, so
+the host interval holds nothing but the run's own words. A branch that leaves
+discards the attempt: the load-exclusive re-executes on the software
+reservation and the guest takes the branch from there, so no exit clears the
+monitor and continues. The tracked-store variant fuses the same runs and
+records the store's range only after a host store that succeeded. A run the
+decoder or the pool of seven scratch registers cannot take is a block of one
+semantic instruction. `jit_compiler_exclusive_run.cpp` states what fuses.
 
 ## Streaming mode
 
@@ -113,7 +152,9 @@ family's lowering; these contracts span them.
 cmake --workflow --preset check-unit
 ```
 
-The JIT's automated tests run on macOS: `ctest -R '^arm64-jit-'` (the AArch32 ones
+The JIT's tests run on macOS, which also runs the iOS region route on a host
+variant of the owner (`arm64-jit-debugger-region`, `arm64-jit-memory-preparation`):
+`ctest -R '^arm64-jit-'` (the AArch32 ones
 are `arm64-jit-a32-*` and `arm64-jit-executor-paths`). Instruction coverage is
 in [`docs/a64-instruction-coverage.md`](../../../../docs/a64-instruction-coverage.md)
 and [`docs/a32-instruction-coverage.md`](../../../../docs/a32-instruction-coverage.md);

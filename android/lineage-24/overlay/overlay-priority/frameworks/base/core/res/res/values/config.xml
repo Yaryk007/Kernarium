@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<resources>
+    <!-- The guest receives the text messages the host sends (KernariumSms), and the SMS role
+         is available only on an SMS-capable device. LineageOS's Wi-Fi-only tablet overlay
+         ranks above the ordinary overlay, and this directory above it. -->
+    <bool name="config_sms_capable">true</bool>
+</resources>

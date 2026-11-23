@@ -39,6 +39,11 @@ public:
     /* Readable when any stream's encoder has output to take. */
     int eventDescriptor() const noexcept override;
     void drainEventSource() override;
+    /* A codec stream outlives a guest suspend: the buffers it holds stay
+     * with the device, and the transport keeps their completions until the
+     * ring is enabled again. */
+    bool keepsDeferredRequestsWhileDisabled() const noexcept override { return true; }
+    bool keepsRequestsOnDisabledRing() const noexcept override { return true; }
 
 private:
     class Implementation;

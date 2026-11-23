@@ -96,7 +96,7 @@ index 670b3a4007cd315321c527eae1060754189a6cad..69ceb82a67917034977cd0ea9062897f
        return false;
  
 diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
-index 1916c2fc77038d0f31675de0cf39bb8223d9b3e4..88f8076b4389004eec8d17423e3b867596366a3a 100644
+index 858360b8740ccab4c78177c4b4b64089a21f4f8a..777e9611f2eecadd9423ebb0b0d31fd8711abcac 100644
 --- a/src/vrend/vrend_renderer.c
 +++ b/src/vrend/vrend_renderer.c
 @@ -10958,7 +10958,8 @@ void vrend_renderer_resource_copy_region(struct vrend_context *ctx,
@@ -110,7 +110,7 @@ index 1916c2fc77038d0f31675de0cf39bb8223d9b3e4..88f8076b4389004eec8d17423e3b8675
        comp_flags |= VREND_COPY_COMPAT_FLAG_ONE_IS_EGL_IMAGE;
     if (dst_res->egl_image)
 diff --git a/src/vrend/vrend_renderer.h b/src/vrend/vrend_renderer.h
-index 8993593a77a7a889b2a301a1b82f3c01f58feb09..32088491c8069f41a6fea56997f47be86a3d54d8 100644
+index 4b8fe867f50404324642a62c51a5751f4a9c0074..e3b98e40ce3f46dc7d3c4ed9487dc3535b75b773 100644
 --- a/src/vrend/vrend_renderer.h
 +++ b/src/vrend/vrend_renderer.h
 @@ -595,6 +595,9 @@ bool vrend_format_is_bgra(enum virgl_formats format);

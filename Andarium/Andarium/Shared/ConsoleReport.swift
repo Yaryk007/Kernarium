@@ -3,12 +3,8 @@
 import AndariumCore
 import Foundation
 
-#if !APP_STORE
-
 /// The lines a run prints for the harness to read. Everything else on the
-/// console is the runtime's own `Kernarium:` output. An App Store build compiles this file
-/// and every call to it out, and its bundle check fails on a binary that
-/// carries one of these lines.
+/// console is the runtime's own `Kernarium:` output.
 enum ConsoleReport {
     enum ThermalPhase: String {
         case start, change, finish
@@ -24,9 +20,14 @@ enum ConsoleReport {
         }
     }
 
-    static func thermal(phase: ThermalPhase, state: ProcessInfo.ThermalState, uptime: TimeInterval) -> String {
+    /// The thermal line: iOS's real state, and Settings' "When hot" (`limit=on`
+    /// tells Android how hot the device is, `limit=off` does not).
+    static func thermal(
+        phase: ThermalPhase, state: ProcessInfo.ThermalState, uptime: TimeInterval, heatLimitOn: Bool = true
+    ) -> String {
         let seconds = String(format: "%.3f", locale: Locale(identifier: "en_US_POSIX"), uptime)
         return "Andarium thermal state: phase=\(phase.rawValue) state=\(thermalName(state)) uptime=\(seconds)"
+            + " limit=\(HeatLimitWords.state(isOn: heatLimitOn))"
     }
 
     static func runtimeReturned(_ result: Int32) -> String {
@@ -54,5 +55,3 @@ enum ConsoleReport {
             + " memory=\(guestMemoryMiB) held=\(mebibytes(meter.ramHeldBytes)) boot=\(boot)"
     }
 }
-
-#endif

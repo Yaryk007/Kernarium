@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 import AndariumCore
+import AndariumCoreTestSupport
 import Foundation
 import Testing
 @testable import Andarium
@@ -82,6 +83,29 @@ struct SessionDiagnosticsTests {
 
     // MARK: Bug report
 
+    @Test func aBugReportCarriesTheEarlierRunOnlyWhenThisProcessRetiredIt() async throws {
+        let (model, driver) = model()
+        let directory = try diagnostics()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        model.adoptDiagnostics(in: directory, containers: [], endedOutOfForeground: false)
+        // After the launch: a file there is not one a launch left in this run's name.
+        try write(
+            record("state ended\nend powered-off\nstatus 0\npid 4242\n", memory: "memory at 1 footprint 1 peak 1"),
+            to: directory.appendingPathComponent("earlier-run.txt"))
+        try write(
+            record("state running\nend running\nstatus 0\npid 4343\n", memory: "memory at 2 footprint 1 peak 1"),
+            to: directory.appendingPathComponent("session.txt"))
+        for retired in [false, true] {
+            let file = try TestZip.staged(entries: ["bugreport-test.txt": Data("android\n".utf8)])
+            driver.bugReport = { _ in file }
+            driver.retiredAnEarlierRun = retired
+            let report = try await model.bugReportWork()({ _ in })
+            let names = try TestZip.entries(of: report).map(\.name)
+            #expect(names.contains("andarium/session-earlier-run.txt") == retired, "retired \(retired)")
+            #expect(names.contains("andarium/session-current.txt"))
+        }
+    }
+
     @Test func aBugReportCarriesTheRecordsAndReportsWithoutTheContainer() async throws {
         let (model, driver) = model()
         let directory = try diagnostics()
@@ -113,6 +137,8 @@ struct SessionDiagnosticsTests {
         model.createBugReport()
         #expect(await eventually { offered != nil })
         #expect(offered == file && model.alert == nil)
+        // The share sheet is over the guest: it has the keys, not the guest.
+        #expect(model.shareSheetUp && !model.guestHasKeys)
 
         let entries = try TestZip.entries(of: file)
         #expect(entries.map(\.name) == [
@@ -130,6 +156,27 @@ struct SessionDiagnosticsTests {
         }
         finishedSharing?()
         #expect(!FileManager.default.fileExists(atPath: file.path))
+        #expect(!model.shareSheetUp && model.guestHasKeys)
+    }
+
+    @Test func aShareSheetThatCannotBeShownLeavesTheGuestItsKeys() async throws {
+        let (model, driver) = model()
+        let directory = try diagnostics()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try write("uml-session 1\nstate running\nend running\n", to: directory.appendingPathComponent("session.txt"))
+        model.diagnosticsDirectory = directory
+        model.phase = .running(.normal)
+        let file = try TestZip.staged(entries: ["bugreport-test.txt": Data("report\n".utf8)])
+        driver.bugReport = { _ in file }
+        var asked = false
+        model.presentShare = { _, _ in
+            asked = true
+            return false
+        }
+        model.createBugReport()
+        #expect(await eventually { asked })
+        #expect(await eventually { !FileManager.default.fileExists(atPath: file.path) })
+        #expect(!model.shareSheetUp && model.guestHasKeys)
     }
 
     @Test func aReportTheArchiveCannotTakeIsSharedAsAndroidMadeIt() async throws {
@@ -171,7 +218,7 @@ struct SessionDiagnosticsTests {
         let (launched, _) = model()
         launched.adoptDiagnostics(in: directory, containers: [], endedOutOfForeground: false)
         #expect(launched.notice == .sessionEnded(SessionEndNotice(
-            title: "Android's kernel panicked",
+            title: "Android’s kernel panicked",
             text: "Android stopped with a kernel panic: Attempted to kill init! exitcode=0x0000000b.")))
         #expect(launched.diagnosticsDirectory == directory)
         // The record is kept for the bug report, and the next boot writes its own.

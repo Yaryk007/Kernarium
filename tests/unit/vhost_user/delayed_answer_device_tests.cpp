@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // The delayed-answer test device holds back the answers its policy chooses,
-// wakes the transport when one falls due, drops the rest at a reset, and
-// answers in the wrapped device's place when its answerer chooses to.
+// wakes the transport when one falls due, drops the rest at a reset, answers
+// in the wrapped device's place when its answerer chooses to, and keeps a
+// request from the wrapped device until its postponer lets it through.
 #include "delayed_answer_device.hpp"
 #include "require.hpp"
 
@@ -43,6 +44,14 @@ public:
     }
 
     const char* name() const noexcept override { return "echo"; }
+    bool keepsRequestsOnDisabledRing() const noexcept override { return true; }
+    bool keepsDeferredRequestsWhileDisabled() const noexcept override { return true; }
+    bool answersKicksBeforeRunning() const noexcept override { return true; }
+    std::vector<std::uint8_t> discardedResponse(
+        std::uint32_t, std::span<const std::uint8_t> request) const override
+    {
+        return {static_cast<std::uint8_t>(request[0] ^ 0xff)};
+    }
     std::uint64_t features() const noexcept override { return 0; }
     std::size_t queueCount() const noexcept override { return 1; }
     std::vector<std::uint8_t> configuration() const override { return {}; }
@@ -52,6 +61,7 @@ public:
                                       std::span<const std::uint8_t> request,
                                       std::size_t) override
     {
+        ++requests;
         if (request[0] == 0)
             return {VhostUserQueueAction::defer, {}};
         return {VhostUserQueueAction::complete,
@@ -69,6 +79,7 @@ public:
     void signal() const { require(::write(events_[1], "x", 1) == 1); }
 
     int drains {};
+    int requests {};
 
 private:
     std::atomic_int& resets_;
@@ -188,6 +199,67 @@ void answersInTheDevicesPlace()
     require(fixture.log.size() == 1);
 }
 
+void postponesARequestUntilItFallsDue()
+{
+    Fixture fixture([](std::uint32_t, std::span<const std::uint8_t>) {
+        return std::optional<std::chrono::milliseconds> {};
+    });
+    fixture.device->setPostponer(
+        [](std::uint32_t, std::span<const std::uint8_t> request) {
+            return request[0] == 6 ?
+                std::optional {std::chrono::milliseconds {150}} : std::nullopt;
+        });
+    const auto sent = Clock::now();
+    require(send(*fixture.device, 20, 6).action == VhostUserQueueAction::defer,
+            "a postponed request is deferred");
+    require(fixture.echo->requests == 0, "the device has not heard of it");
+    require(send(*fixture.device, 21, 1).action == VhostUserQueueAction::complete,
+            "other requests go through at once");
+    require(fixture.echo->requests == 1);
+    VhostUserQueueCompletion completion;
+    require(!fixture.device->takeQueueCompletion(completion), "not due yet");
+    require(fixture.echo->requests == 1);
+
+    require(readable(*fixture.device, 5000ms), "the transport is woken when it falls due");
+    require(Clock::now() - sent >= 150ms, "the request is not handed over early");
+    fixture.device->drainEventSource();
+    require(fixture.device->takeQueueCompletion(completion));
+    require(completion.requestId == 20);
+    require(completion.response == std::vector<std::uint8_t> {7}, "the device answered it");
+    require(fixture.echo->requests == 2);
+    require(!fixture.device->takeQueueCompletion(completion), "it is delivered once");
+}
+
+void dropsAPostponedRequestAtAReset()
+{
+    Fixture fixture([](std::uint32_t, std::span<const std::uint8_t>) {
+        return std::optional<std::chrono::milliseconds> {};
+    });
+    fixture.device->setPostponer(
+        [](std::uint32_t, std::span<const std::uint8_t>) {
+            return std::optional {DelayedAnswerDevice::never};
+        });
+    require(send(*fixture.device, 1, 3).action == VhostUserQueueAction::defer);
+    require(!readable(*fixture.device, 300ms), "a request postponed for good never falls due");
+    fixture.device->reset();
+    VhostUserQueueCompletion completion;
+    require(!fixture.device->takeQueueCompletion(completion), "the reset dropped it");
+    require(fixture.echo->requests == 0, "the device never heard of it");
+}
+
+void forwardsTheTransportsPolicyQuestions()
+{
+    Fixture fixture([](std::uint32_t, std::span<const std::uint8_t>) {
+        return std::optional<std::chrono::milliseconds> {};
+    });
+    require(fixture.device->keepsRequestsOnDisabledRing());
+    require(fixture.device->keepsDeferredRequestsWhileDisabled(),
+            "the wrapped device keeps what it holds across a ring disable, and so does the shim");
+    require(fixture.device->answersKicksBeforeRunning());
+    const std::uint8_t request[] {5};
+    require(fixture.device->discardedResponse(0, request) == std::vector<std::uint8_t> {0xfa});
+}
+
 void forwardsTheDevicesOwnEvents()
 {
     Fixture fixture([](std::uint32_t, std::span<const std::uint8_t>) {
@@ -209,6 +281,9 @@ int main()
     dropsWhatItHoldsAtAReset();
     neverHoldsWhatTheDeviceDefers();
     answersInTheDevicesPlace();
+    postponesARequestUntilItFallsDue();
+    dropsAPostponedRequestAtAReset();
+    forwardsTheTransportsPolicyQuestions();
     forwardsTheDevicesOwnEvents();
     std::puts("delayed-answer device tests passed");
     return 0;

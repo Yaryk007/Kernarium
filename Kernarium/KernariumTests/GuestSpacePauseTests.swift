@@ -453,8 +453,8 @@ struct GuestSpacePauseTests {
         await until { rig.stage == .paused }
 
         rig.pause.shutDown()
-        // The suspension wrote the guest's storage back already, so nothing is
-        // asked of the guest: the run's own stop is the whole of it.
+        // The run's own stop, which asks the guest to write back first
+        // (`GuestStopTests`); the suspension is not asked for again.
         #expect(rig.run.stops == 1)
         #expect(rig.pause.pause?.working == .shuttingDown)
         #expect(rig.suspension.log == ["suspend low space"])
@@ -482,6 +482,46 @@ struct GuestSpacePauseTests {
         rig.pause.shutDown()
         #expect(rig.run.stops == 1)
         #expect(rig.pause.pause?.working == .shuttingDown)
+    }
+
+    /// Shut down is one of the ways the application ends a running guest, and
+    /// it goes through the launcher's stop, which has the guest write back
+    /// first: over a guest the suspension holds and over one that ran on.
+    @Test(arguments: [true, false])
+    func shutDownIsTheLaunchersStopWhetherOrNotTheGuestHeldStill(holdsStill: Bool) async {
+        var delivered: [RunStop] = []
+        let launcher = EmulatorLauncher(
+            configuration: .load(),
+            job: BackgroundJob(scheduler: FakeJobScheduler()),
+            deliverStop: { delivered.append($0) }
+        )
+        let latch = launcher.runBegan()
+        let suspension = Suspension()
+        suspension.holdsStill = holdsStill
+        let pause = GuestSpacePause(
+            effects: suspension,
+            freeSpace: { 800 * Bytes.mib },
+            run: launcher,
+            controller: { nil },
+            answerInterval: .milliseconds(10),
+            idleInterval: .milliseconds(10),
+            checkInterval: { _ in .milliseconds(10) },
+            wait: { _ in }
+        )
+        defer {
+            latch.end()
+            launcher.finished(result: 0)
+            pause.runEnded()
+        }
+        pause.runStarted()
+        await until { pause.pause?.stage == (holdsStill ? .paused : .notPaused) }
+        #expect(pause.pause?.stage == (holdsStill ? .paused : .notPaused))
+
+        pause.shutDown()
+        #expect(launcher.stopRequested)
+        #expect(delivered.count == 1)
+        #expect(delivered.first === latch)
+        #expect(pause.pause?.working == .shuttingDown)
     }
 
     // MARK: Check again
@@ -624,6 +664,33 @@ struct GuestSpacePauseTests {
         let harness = SpaceHarness(enabled: false, directory: directory)
         #expect(harness.freeSpace() != Bytes.mib)
         #expect(harness.answer() == nil)
+    }
+
+    @Test
+    func theDevicesOwnSpaceIsTheSpaceAWriteCanUse() throws {
+        // What the watch, the start check and the resume read when the harness
+        // states nothing: `statfs(2)`'s answer, not the larger "important
+        // usage" figure that counts purgeable space. The volume is in use by
+        // others, so the reading is held between two answers of the call.
+        func statfsBytes() -> UInt64 {
+            var volume = statfs()
+            guard statfs(NSHomeDirectory(), &volume) == 0 else { return 0 }
+            return UInt64(volume.f_bavail) * UInt64(volume.f_bsize)
+        }
+        let directory = try harnessDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let slack = 256 * Bytes.mib
+        for harness in [
+            SpaceHarness(enabled: false, directory: directory),
+            SpaceHarness(enabled: true, directory: directory),
+        ] {
+            let before = statfsBytes()
+            let figure = harness.freeSpace()
+            let after = statfsBytes()
+            #expect(before > 0)
+            #expect(figure + slack >= min(before, after))
+            #expect(figure <= max(before, after) + slack)
+        }
     }
 
     @Test

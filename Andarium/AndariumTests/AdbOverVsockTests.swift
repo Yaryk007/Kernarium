@@ -71,7 +71,7 @@ struct AdbOverVsockTests {
         while ContinuousClock.now < deadline {
             do {
                 if let identity = try store.existingIdentity() {
-                    let operations = AdbGuestOperations(identity: identity, clock: GuestRunClock(), device: "device")
+                    let operations = AdbGuestOperations(identity: identity, clock: GuestRunClock(), device: "device", run: GuestRunMark.random())
                     let booted = try await operations.shell("getprop sys.boot_completed")
                     if booted.text.hasPrefix("1") { return operations }
                     lastError = "boot_completed reads \(booted.text.debugDescription)"
@@ -204,7 +204,7 @@ struct AdbOverVsockTests {
         else { return }
         let apk = FileManager.default.temporaryDirectory.appendingPathComponent("AndariumStorageTests.apk")
         defer { try? FileManager.default.removeItem(at: apk) }
-        let bytes = try #require(try apk.resourceValues(forKeys: [.fileSizeKey]).fileSize)
+        _ = try #require(try apk.resourceValues(forKeys: [.fileSizeKey]).fileSize)
         let operations = try await readyOperations()
         // The APK is test-key signed, so its one hidden API call needs the
         // policy; the guest's own value (unset: "null") is put back.
@@ -216,7 +216,7 @@ struct AdbOverVsockTests {
                 : "settings put global hidden_api_policy \(policy)")
         }
         do {
-            try await operations.installApk(at: apk, sizeBytes: bytes) { _ in }
+            try await operations.installApk(at: apk) { _ in }
             let enabled = try await operations.shell("settings put global hidden_api_policy 1")
             #expect(enabled.exitCode == 0, "\(enabled.text)")
             let result = try await operations.shell(
@@ -587,13 +587,19 @@ struct AdbOverVsockTests {
         #expect(setting != nil)
     }
 
-    /// A computer on the network, here a loopback client of the bridge, reaches
-    /// the guest's adbd through a fresh stream: adbd answers its CNXN with an
-    /// AUTH challenge, since the computer's key is not the host's.
+    /// A computer on the network, here a loopback client of the bridge that is
+    /// given another device's addresses so that the loopback is a computer
+    /// elsewhere, reaches the guest's adbd through a fresh stream: adbd answers
+    /// its CNXN with an AUTH challenge, since the computer's key is not the
+    /// host's.
     @Test(.timeLimit(.minutes(20))) func theBridgeCarriesAComputersConnectionToAdbd() async throws {
         guard Self.enabled else { return }
-        let operations = try await readyOperations()
-        let bridge = AdbNetworkBridge(port: 0, opener: VsockConnector())
+        _ = try await readyOperations()
+        let bridge = AdbNetworkBridge(
+            port: 0,
+            deviceAddresses: {
+                [InterfaceAddress(name: "en0", isActive: true, isLoopback: false, octets: [192, 0, 2, 10])]
+            }, opener: VsockConnector())
         let port = try bridge.start()
         defer { bridge.stop() }
         let descriptor = socket(AF_INET, SOCK_STREAM, 0)
@@ -796,10 +802,11 @@ struct AdbOverVsockTests {
         try await control.setDebugging(initial ?? false)
     }
 
-    /// A real adb on the Mac against the bridge, for as long as the launch
-    /// asks (`ANDARIUM_ADB_NET_HOLD_SECONDS`, or until the file named
+    /// A real adb on another computer against the bridge (it refuses the
+    /// device's own computer), for as long as the launch asks
+    /// (`ANDARIUM_ADB_NET_HOLD_SECONDS`, or until the file named
     /// `adb-net-done` appears in the printed folder). The application's own
-    /// key is written there as `adbkey` for the Mac's adb to offer, since the
+    /// key is written there as `adbkey` for that adb to offer, since the
     /// guest authorizes that key for the boot.
     @Test(.timeLimit(.minutes(60))) func holdTheBridgeForARealAdbClient() async throws {
         guard Self.enabled,
@@ -871,7 +878,7 @@ struct AdbOverVsockTests {
             try await pull(candidate.path, to: local, operations: operations)
             do {
                 let started = ContinuousClock.now
-                try await operations.installApk(at: local, sizeBytes: candidate.size) { _ in }
+                try await operations.installApk(at: local) { _ in }
                 let elapsed = ContinuousClock.now - started
                 let seconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
                 print("ADBVSOCK: install of \(candidate.size) bytes took \(String(format: "%.1f", seconds)) s")
@@ -1055,10 +1062,10 @@ extension AdbOverVsockTests {
     fileprivate nonisolated static func receive(
         _ connection: AdbConnection, transport: any AdbTransport, seconds: Double
     ) throws -> AdbMessage? {
-        let box = ReceiveBox()
+        let box = ReceiveBox(connection)
         let done = DispatchSemaphore(value: 0)
         let thread = Thread {
-            box.set(Result { try connection.receive() })
+            box.receive()
             done.signal()
         }
         thread.start()
@@ -1071,10 +1078,18 @@ extension AdbOverVsockTests {
     }
 }
 
+/// Hands a connection to the reader thread, its only user until `receive`
+/// returns; a caller that gives up shuts the transport down and leaves the
+/// connection alone.
 private nonisolated final class ReceiveBox: @unchecked Sendable {
     private let lock = NSLock()
+    private let connection: AdbConnection
     private var result: Result<AdbMessage, Error>?
-    func set(_ result: Result<AdbMessage, Error>) { lock.withLock { self.result = result } }
+    init(_ connection: AdbConnection) { self.connection = connection }
+    func receive() {
+        let outcome = Result { try connection.receive() }
+        lock.withLock { result = outcome }
+    }
     func get() throws -> AdbMessage? {
         try lock.withLock { try result?.get() }
     }

@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 
+#include "cpu/aot_selection.hpp"
+#include "cpu/jit_memory_status.hpp"
+
 #include <cstddef>
 #include <cstdint>
 
@@ -32,6 +35,21 @@ inline constexpr unsigned maximum_guest_cpu_count = 64;
 [[nodiscard]] bool set_translation_cache_budget(std::size_t total_bytes,
 	unsigned executors, std::size_t per_executor_bytes) noexcept;
 
+/* A launch's word on ahead-of-time code (--aot=) and the release the launch
+ * boots (null for a guest that is not an Android release), before the run's
+ * first executor: false when it cannot be kept (cpu/engine_factory.hpp). */
+using AotSelection = ::uml::cpu::AotSelection;
+using AotRelease = ::uml::cpu::AotRelease;
+[[nodiscard]] bool select_aot(AotSelection selection,
+	const AotRelease *release) noexcept;
+/* The end of a session of the process: its guest was released after a clean
+ * power-off, so the next run's select_aot chooses afresh. */
+void end_aot_session() noexcept;
+/* The session's choice as it stands, and putting it back: a start that took
+ * the choice and failed before its guest ran leaves it as it was. */
+[[nodiscard]] int aot_choice() noexcept;
+void restore_aot_choice(int choice) noexcept;
+
 [[nodiscard]] bool acquire_translation_cache_run_session() noexcept;
 void release_translation_cache_run_session() noexcept;
 
@@ -62,6 +80,39 @@ void set_process_memory_limit(std::size_t bytes) noexcept;
  */
 std::size_t set_gadget_cache_budget(std::size_t guest_memory_bytes,
 	std::size_t bytes, unsigned executors) noexcept;
+
+/* JIT on an iOS device, where a debugger the user attached prepares the
+ * executable memory once per process (cpu/jit_memory/executable_memory.hpp).
+ * The JIT's cache takes the gadget cache's budget there (jit_cache_budget_for),
+ * so the memory a guest side holds, and with it the host GPU's budget, does
+ * not change with the engine.
+ */
+using JitMemoryStatus = ::uml::cpu::JitMemoryStatus;
+
+/* The whole-process budget a JIT run of `guest_memory_bytes` and `executors`
+ * vCPUs sets: the figure set_gadget_cache_budget would set. */
+[[nodiscard]] std::size_t jit_cache_budget_for(
+	std::size_t guest_memory_bytes, unsigned executors) noexcept;
+
+/* Prepares the executable memory for that budget and publishes it, so a run
+ * with the same guest memory and vCPUs, and the engine "jit", finds it ready.
+ * `per_executor_bytes` is the private cap of one executor's cache, the
+ * emulator's default unless the launch lowers it. Blocks for the seconds the
+ * debugger takes: call it from a worker thread, before the run, and never
+ * from a vCPU. */
+[[nodiscard]] JitMemoryStatus prepare_jit_memory(
+	std::size_t guest_memory_bytes, unsigned executors,
+	std::size_t per_executor_bytes) noexcept;
+
+/* Whether a debugger is attached to the process, and tells it to detach, for a
+ * process that will not use JIT. */
+[[nodiscard]] bool jit_debugger_attached() noexcept;
+void release_jit_debugger() noexcept;
+
+/* The executable memory a debugger prepared and the process keeps wired, in
+ * bytes, zero before any. A run that does not use it still carries it, so the
+ * run's memory plan counts it. */
+[[nodiscard]] std::size_t prepared_jit_region_bytes() noexcept;
 
 /* Parses a byte count with an optional K/M/G suffix. Zero if unparsable. */
 [[nodiscard]] std::size_t parse_translation_cache_quantity(

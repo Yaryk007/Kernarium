@@ -11,13 +11,26 @@ constexpr std::uint16_t ethertype_ipv4 = 0x0800;
 constexpr std::uint8_t protocol_icmp = 1;
 constexpr std::uint8_t protocol_tcp = 6;
 constexpr std::uint8_t protocol_udp = 17;
+constexpr std::uint8_t icmp_destination_unreachable = 3;
+constexpr std::uint8_t icmp_port_unreachable = 3;
 constexpr std::uint16_t dns_port = 53;
+/* The BOOTP server port, which SLiRP serves at the gateway's address. */
+constexpr std::uint16_t dhcp_server_port = 67;
 constexpr std::uint8_t tcp_fin = 0x01;
 constexpr std::uint8_t tcp_syn = 0x02;
 constexpr std::uint8_t tcp_rst = 0x04;
 constexpr std::uint8_t tcp_ack = 0x10;
+constexpr std::uint8_t tcp_urg = 0x20;
 /* SLiRP sends every IPv4 frame from its gateway's MAC (if_encap4). */
 constexpr MacAddress slirp_mac{0x52, 0x55, 0x0a, 0x00, 0x02, 0x02};
+
+/* SLiRP opens a socket for a segment whose flags, masked so, are exactly SYN
+ * (tcp_input.c); a PSH, ECE or CWR beside the SYN does not change that. */
+constexpr bool is_connect_attempt(std::uint8_t flags)
+{
+	return (flags & (tcp_syn | tcp_fin | tcp_rst | tcp_urg | tcp_ack)) ==
+		tcp_syn;
+}
 
 std::uint16_t read16(std::span<const std::uint8_t> bytes, std::size_t offset)
 {
@@ -60,6 +73,35 @@ std::uint16_t fold(std::uint32_t sum)
 	while ((sum >> 16) != 0)
 		sum = (sum & 0xffff) + (sum >> 16);
 	return static_cast<std::uint16_t>(~sum);
+}
+
+/* Whether an IPv4 packet is a service that SLiRP or the provider gives at the
+ * gateway's or the name server's own address without a host socket: ICMP
+ * (SLiRP answers an echo itself and drops every other type, so none reaches a
+ * host socket), DNS (the provider's, or SLiRP's guest forward for TCP), and
+ * DHCP at the gateway (SLiRP's bootp). Any other flow to those addresses is no
+ * service: SLiRP would connect it to the literal address
+ * on the host's network, as for any address of the virtual network but the
+ * gateway (which it refuses), so the table judges it like any other. A
+ * fragment shows no port, so only an ICMP one is a service. `ip` starts at the
+ * IPv4 header. */
+bool is_ipv4_service(const Servers &servers, std::span<const std::uint8_t> ip)
+{
+	const Ipv4Address destination{ip[16], ip[17], ip[18], ip[19]};
+	const bool gateway = destination == servers.gateway;
+	if (!gateway && destination != servers.name_server)
+		return false;
+	const std::uint8_t protocol = ip[9];
+	if (protocol == protocol_icmp)
+		return true;
+	const std::size_t header = (ip[0] & 0x0f) * 4U;
+	if ((protocol != protocol_udp && protocol != protocol_tcp) ||
+	    header < 20 || ip.size() < header + 4 ||
+	    (read16(ip, 6) & 0x3fff) != 0)
+		return false;
+	const std::uint16_t port = read16(ip, header + 2);
+	return port == dns_port ||
+		(gateway && protocol == protocol_udp && port == dhcp_server_port);
 }
 
 /* The transport checksum over the IPv4 pseudo-header and `segment`. */
@@ -213,6 +255,92 @@ Classified classify_guest_frame(std::span<const std::uint8_t> frame,
 	return result;
 }
 
+Classified classify_host_bound_frame(std::span<const std::uint8_t> frame,
+				     const HostAddresses &host,
+				     const Servers &servers)
+{
+	Classified result;
+	if (host.empty() || frame.size() < ethernet_header + 20 ||
+	    read16(frame, 12) != ethertype_ipv4)
+		return result;
+	const auto ip = frame.subspan(ethernet_header);
+	if ((ip[0] >> 4) != 4)
+		return result;
+	const Ipv4Address destination{ip[16], ip[17], ip[18], ip[19]};
+	if (!host.contains(destination) || is_ipv4_service(servers, ip))
+		return result;
+	/* From here the packet is for the host and SLiRP never sees it: what is
+	 * not refused below is dropped. */
+	result.action = FrameAction::drop;
+	const std::size_t header = (ip[0] & 0x0f) * 4U;
+	const std::size_t total = read16(ip, 2);
+	if (header < 20 || total < header || total > ip.size() ||
+	    fold(sum16(ip.first(header), 0)) != 0 ||
+	    (read16(ip, 6) & 0x3fff) != 0)
+		return result;
+	const std::uint8_t protocol = ip[9];
+	const auto transport = ip.subspan(header, total - header);
+
+	auto &endpoints = result.endpoints;
+	std::copy_n(frame.begin() + 6, 6, endpoints.guest_mac.begin());
+	std::copy_n(frame.begin(), 6, endpoints.server_mac.begin());
+	std::copy_n(ip.begin() + 12, 4, endpoints.guest_address.begin());
+	endpoints.server_address = destination;
+
+	if (protocol == protocol_udp) {
+		if (transport.size() < 8)
+			return result;
+		const std::uint16_t length = read16(transport, 4);
+		if (length < 8 || length > transport.size())
+			return result;
+		endpoints.guest_port = read16(transport, 0);
+		endpoints.server_port = read16(transport, 2);
+		result.quote = ip.first(header + 8);
+		result.action = FrameAction::unreachable;
+		return result;
+	}
+	if (protocol != protocol_tcp || transport.size() < 20)
+		return result;
+	const std::size_t offset = (transport[12] >> 4) * 4U;
+	if (offset < 20 || offset > transport.size())
+		return result;
+	/* A segment of a flow, which SLiRP serves or resets itself, is not
+	 * refused here. */
+	if (!is_connect_attempt(transport[13]))
+		return {};
+	endpoints.guest_port = read16(transport, 0);
+	endpoints.server_port = read16(transport, 2);
+	result.sequence = read32(transport, 4);
+	result.acknowledgement = read32(transport, 8);
+	result.tcp_flags = transport[13];
+	result.segment_length = transport.size() - offset + 1;
+	result.action = FrameAction::reset;
+	return result;
+}
+
+bool needs_host_check(std::span<const std::uint8_t> frame,
+		      const Servers &servers)
+{
+	if (frame.size() < ethernet_header + 20 ||
+	    read16(frame, 12) != ethertype_ipv4)
+		return false;
+	const auto ip = frame.subspan(ethernet_header);
+	if ((ip[0] >> 4) != 4)
+		return false;
+	const std::size_t header = (ip[0] & 0x0f) * 4U;
+	if (header < 20 || header > ip.size() || is_ipv4_service(servers, ip))
+		return false;
+	/* The one frame the table never changes the fate of is an unfragmented
+	 * TCP segment that is not a connect attempt, which is passed whatever
+	 * the table holds. A fragment is judged by the table, whatever it
+	 * carries (the flags byte of a first fragment is not the segment's),
+	 * and so are UDP, ICMP and the other protocols. */
+	if (ip[9] == protocol_tcp && (read16(ip, 6) & 0x3fff) == 0 &&
+	    ip.size() >= header + 14)
+		return is_connect_attempt(ip[header + 13]);
+	return true;
+}
+
 std::vector<std::uint8_t> udp_reply_frame(const Endpoints &endpoints,
 					  std::span<const std::uint8_t> payload,
 					  std::uint16_t identification)
@@ -257,6 +385,21 @@ std::vector<std::uint8_t> tcp_reset_frame(const Classified &segment,
 		transport_checksum(segment.endpoints.server_address,
 				   segment.endpoints.guest_address,
 				   protocol_tcp, {frame.data() + tcp, 20}));
+	return frame;
+}
+
+std::vector<std::uint8_t> icmp_unreachable_frame(const Classified &datagram,
+						 std::uint16_t identification)
+{
+	const std::size_t length = 8 + datagram.quote.size();
+	auto frame = ip_frame(datagram.endpoints, protocol_icmp, length,
+			      identification);
+	const std::size_t icmp = ethernet_header + 20;
+	frame[icmp] = icmp_destination_unreachable;
+	frame[icmp + 1] = icmp_port_unreachable;
+	std::ranges::copy(datagram.quote, frame.begin() + icmp + 8);
+	write16(frame, icmp + 2,
+		fold(sum16({frame.data() + icmp, length}, 0)));
 	return frame;
 }
 

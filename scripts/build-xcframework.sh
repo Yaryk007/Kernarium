@@ -104,6 +104,10 @@ verify_archive()
 		python3 -B "$project_root/scripts/check-no-fexcore.py" "$archive" ||
 			fail "$platform archive carries FEXCore"
 	fi
+
+	# The AOT runtime's diagnostics build is for tests only.
+	python3 -B "$project_root/scripts/check-no-aot-diagnostics.py" "$archive" ||
+		fail "$platform archive carries the AOT diagnostics build"
 }
 
 # Configure and build the external consumers against the package the

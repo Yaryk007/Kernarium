@@ -13,12 +13,16 @@
  *   a repeated one;
  * - CPUID and IRET, the serializing instructions user code has, end the
  *   run. Here the load of a flag stands for another vCPU, which rewrites the
- *   function and leaves its change for the next run's hand-over.
+ *   function and leaves its change for the next run's hand-over;
+ * - a vCPU that stays inside the engine for longer than a registration waits
+ *   may still land a store that publishes nothing. The code compiled while it
+ *   was stuck is dropped at each hand-over until it has left.
  *
  * Each case calls a function "mov $1, %eax; ret" so the engine translates
  * it, changes it to return 2, calls it again and makes a system call, at
  * which EAX must be 2. */
 #include "cpu/execution_types.hpp"
+#include "cpu/x86_64/code_page_registry.hpp"
 #include "cpu/x86_64/cpu_state.hpp"
 #include "cpu/x86_64/cpuid.hpp"
 #include "cpu/x86_64/jit/fex_engine.hpp"
@@ -30,7 +34,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <chrono>
 #include <initializer_list>
+#include <memory>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -68,6 +74,9 @@ public:
 	 * function already returned 2 when it was made. */
 	unsigned publications{};
 	unsigned early_publications{};
+	/* How often the engine asked for the function's bytes to translate
+	 * them. */
+	unsigned function_fetches{};
 
 	[[nodiscard]] bool read(std::uint64_t address,
 		std::span<std::byte> destination) override
@@ -99,6 +108,9 @@ public:
 		std::size_t size, MemoryAccess access) override
 	{
 		auto *pointer = locate(address, size, access);
+		if (pointer != nullptr && access == MemoryAccess::execute &&
+			(address & ~(page_size - 1)) == function_page)
+			++function_fetches;
 		if (pointer != nullptr && change_at_flag && !change_pending &&
 			(address & ~(page_size - 1)) == flag_page) {
 			function_[1] = std::byte{2};
@@ -107,6 +119,9 @@ public:
 		}
 		return pointer;
 	}
+
+	/* The function's bytes, for a store that lands without any publication. */
+	[[nodiscard]] std::byte *function_bytes() noexcept { return function_; }
 
 	[[nodiscard]] bool is_executable(std::uint64_t address) noexcept override
 	{
@@ -245,6 +260,91 @@ void test_store(std::string_view name, unsigned long generation,
 		memory.early_publications);
 }
 
+/* A vCPU of another process stays inside the engine for longer than a
+ * registration waits, and a store it translated lands afterwards without
+ * publishing anything. The runtime's hand-over drops the code compiled while
+ * the vCPU was stuck, so the call after the store runs the new code, and the
+ * code is cached again once the vCPU has left.
+ *
+ * mov $0x11000, %esi; call *%rsi; five times with "xor %eax, %eax; xor %ecx,
+ * %ecx; cpuid" between the calls, each of which ends the run; syscall. */
+void test_stuck_participant(unsigned long generation)
+{
+	using namespace std::chrono_literals;
+	constexpr std::string_view name = "stuck";
+	Memory memory{{0xbe, 0x00, 0x10, 0x01, 0x00, 0xff, 0xd6,
+		0x31, 0xc0, 0x31, 0xc9, 0x0f, 0xa2, 0xff, 0xd6,
+		0x31, 0xc0, 0x31, 0xc9, 0x0f, 0xa2, 0xff, 0xd6,
+		0x31, 0xc0, 0x31, 0xc9, 0x0f, 0xa2, 0xff, 0xd6,
+		0x31, 0xc0, 0x31, 0xc9, 0x0f, 0xa2, 0xff, 0xd6, 0x0f, 0x05}};
+	/* The registry of the generation, made before the engine's space joins
+	 * it, with a wait short enough for a test. */
+	const auto registry = x86_64::CodePageRegistry::acquire(
+		generation, {.slice = 10ms, .slices = 3});
+	x86_64::CodePageRegistry::Participant stuck;
+	registry->join(stuck);
+	stuck.engine_epoch.store(1, std::memory_order_release);
+
+	x86_64::jit::FexEngine engine{uml::platform::apple::probed_host_capabilities()};
+	engine.apply_changes(generation, x86_64::ExecutionMode::long64,
+		{.mapping_sequence = 1, .code_sequence = 1}, false);
+	x86_64::CpuState cpu{};
+	cpu.segment_selectors = {0, 0x33, 0x2b, 0, 0, 0};
+	(void)x86_64::enter_segments(cpu);
+	cpu.rip = code_page;
+	cpu.rflags = 0x202;
+	cpu.gpr(x86_64::Register::rsp) = stack_page + page_size;
+	uml::cpu::InterruptToken interrupt{};
+	unsigned fetches[6]{};
+	bool finished = false;
+	for (unsigned run = 1; run <= 5; ++run) {
+		if (run > 1) {
+			if (run == 2)
+				/* The store that lands late, publishing nothing. */
+				memory.function_bytes()[1] = std::byte{2};
+			if (run == 4)
+				stuck.engine_epoch.store(2, std::memory_order_release);
+			engine.settle_stuck_participants(generation, x86_64::ExecutionMode::long64);
+		}
+		const auto result = engine.run(cpu, memory, {
+			.generation = generation,
+			.instruction_budget = 1000,
+			.execution_context = nullptr,
+			.interrupt = &interrupt,
+			.orders_stores = false,
+		});
+		fetches[run] = memory.function_fetches;
+		finished = result.execution.reason == uml::cpu::ExitReason::system_call;
+		if (!finished && result.execution.reason != uml::cpu::ExitReason::instruction_budget &&
+			run == 5)
+			break;
+	}
+	registry->leave(stuck);
+	expect(registry->leaves_inside_engine() == 0, name,
+		"a participant left the registry inside the engine");
+	/* The program's page and the function's page both compiled beside the
+	 * stuck participant; each is dropped at the three hand-overs that found
+	 * the record, the last of which dropped it. */
+	expect(engine.diagnostics().escalation_invalidations == 6, name,
+		"the hand-overs did not drop each stuck page once");
+	expect(finished, name, "the program did not reach its system call");
+	expect(cpu.gpr(x86_64::Register::rax) == 2, name,
+		"the call after the late store ran the old code");
+	expect(fetches[1] == 1, name, "the first call did not translate the function");
+	expect(fetches[2] > fetches[1] && fetches[3] > fetches[2], name,
+		"code compiled while a vCPU was stuck survived a hand-over");
+	expect(fetches[4] > fetches[3], name,
+		"the hand-over after the vCPU left did not drop the code");
+	expect(fetches[5] == fetches[4], name,
+		"the code was not cached once the vCPU had left");
+	std::printf("%s %.*s: eax=%llu fetches=%u,%u,%u,%u,%u invalidations=%llu\n",
+		failures == 0 ? "ok" : "FAIL", static_cast<int>(name.size()), name.data(),
+		static_cast<unsigned long long>(cpu.gpr(x86_64::Register::rax)),
+		fetches[1], fetches[2], fetches[3], fetches[4], fetches[5],
+		static_cast<unsigned long long>(
+			engine.diagnostics().escalation_invalidations));
+}
+
 } // namespace
 
 int main()
@@ -289,6 +389,7 @@ int main()
 		0x48, 0x83, 0x04, 0x24, 0x08, 0x9c, 0x8c, 0xc8, 0x50, 0x48, 0x8d,
 		0x05, 0x03, 0x00, 0x00, 0x00, 0x50, 0x48, 0xcf, 0xff, 0xd6, 0x0f,
 		0x05});
+	test_stuck_participant(7);
 	std::printf("%s\n", failures == 0 ? "PASS" : "FAIL");
 	return failures == 0 ? 0 : 1;
 }

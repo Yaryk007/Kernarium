@@ -7,9 +7,10 @@
 
 namespace uml::platform {
 
-/* The smallest budget the host GPU is given: 384 MiB, which every application
- * of the launch set fits in. */
-inline constexpr std::uint64_t gpu_budget_floor_bytes = 384ULL << 20;
+/* The smallest budget the host GPU is given under a known limit: 352 MiB, the
+ * 384 MiB every application of the launch set fits in less the 32 MiB the
+ * gadget cache's cap gained (runtime/guest_memory_budget.hpp). */
+inline constexpr std::uint64_t gpu_budget_floor_bytes = 352ULL << 20;
 
 /* What the fixed GPU budget derives from, all in bytes. A, E and S are the
  * launch parameters (runtime/guest_memory_budget.hpp states the sets a launch
@@ -34,28 +35,29 @@ struct GpuBudget final {
 	/* B: what the host GPU may hold for the guest, in bytes. */
 	std::uint64_t bytes{};
 	/* L - A - G - E - S, zero when the sum passes L, and when L is not known
-	 * the guest's maximum. */
+	 * the guest's RAM, the budget without a limit. */
 	std::uint64_t available{};
 	/* Whether L is known and L - A - G - E - S is below the floor: the sum
 	 * of what the process uses leaves the GPU less than it needs, so the
-	 * process is likely to be ended. The budget is the floor (or half the
-	 * guest's RAM when that is less); the launch goes ahead. */
+	 * process is likely to be ended. The budget is the floor; the launch
+	 * goes ahead. */
 	bool short_of_floor{};
 };
 
 /* The host GPU's budget, evaluated once at launch:
  *
- *     B = clamp(L - A - G - E - S, 384 MiB, G / 2)
+ *     B = max(L - A - G - E - S, 352 MiB)
  *
- * Half the guest's RAM is the most the GPU may take, so where that is under
- * the floor it wins and B is G / 2. Without a limit the budget is G / 2 and
- * nothing is short. The sum saturates, so no input overflows it. */
+ * What the limit leaves is the whole of it: the guest's size does not bound
+ * the GPU. Without a limit there is nothing to derive a budget from, so the
+ * budget is the guest's RAM, G, and nothing is short. The sum saturates, so no
+ * input overflows it. */
 [[nodiscard]] constexpr GpuBudget compute_gpu_budget(
 	const GpuBudgetInputs &inputs) noexcept
 {
-	const std::uint64_t maximum = inputs.guest_memory / 2U;
 	if (inputs.process_limit == 0)
-		return {.bytes = maximum, .available = maximum,
+		return {.bytes = inputs.guest_memory,
+			.available = inputs.guest_memory,
 			.short_of_floor = false};
 
 	constexpr std::uint64_t unlimited =
@@ -69,11 +71,30 @@ struct GpuBudget final {
 	const std::uint64_t available = inputs.process_limit > committed ?
 		inputs.process_limit - committed : 0;
 	return {
-		.bytes = std::min(std::max(available, gpu_budget_floor_bytes),
-			maximum),
+		.bytes = std::max(available, gpu_budget_floor_bytes),
 		.available = available,
 		.short_of_floor = available < gpu_budget_floor_bytes,
 	};
+}
+
+/* The device memory pool the GPU service gets while `reserved` bytes of the
+ * process's memory are held for another device outside the GPU (the camera's
+ * host-side memory, while its session is live): B less the reserve. The
+ * reserve is taken after B has been clamped to the floor, so a budget at the
+ * floor gives a pool smaller than the floor; it is never negative. */
+[[nodiscard]] constexpr std::uint64_t gpu_pool_bytes(
+	const GpuBudget &budget, std::uint64_t reserved) noexcept
+{
+	return budget.bytes > reserved ? budget.bytes - reserved : 0;
+}
+
+/* Whether `reserved` leaves the GPU no pool. A pool of zero means no limit to
+ * the renderer, so a launch whose reserve takes the whole budget is refused
+ * rather than given none. */
+[[nodiscard]] constexpr bool gpu_pool_exhausted(
+	const GpuBudget &budget, std::uint64_t reserved) noexcept
+{
+	return reserved != 0 && reserved >= budget.bytes;
 }
 
 } // namespace uml::platform

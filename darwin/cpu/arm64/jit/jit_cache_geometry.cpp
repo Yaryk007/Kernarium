@@ -192,6 +192,28 @@ std::size_t JitCacheGeometry::total_bytes() const noexcept
 	return total;
 }
 
+std::size_t JitCacheGeometry::executable_bytes() const noexcept
+{
+	const auto granules = [](std::size_t bytes) noexcept {
+		return (bytes + mapping_granule - 1U) / mapping_granule;
+	};
+	return (granules(arena_bytes) + granules(tracked_store_arena_bytes) +
+		granules(single_instruction_arena_size)) * mapping_granule;
+}
+
+bool jit_cache_budget_publishable(std::size_t total_bytes,
+	unsigned executors, std::size_t per_executor_bytes) noexcept
+{
+	if (!derive_jit_cache_geometry(
+			total_bytes, executors, per_executor_bytes).valid())
+		return false;
+	auto &registry = budget_registry();
+	std::lock_guard lock{registry.mutex};
+	return !registry.published ||
+		*registry.published ==
+			JitCacheBudget{total_bytes, executors, per_executor_bytes};
+}
+
 bool set_jit_cache_budget(std::size_t total_bytes,
 	unsigned executors, std::size_t per_executor_bytes) noexcept
 {
@@ -217,13 +239,11 @@ JitCacheGeometry derive_jit_cache_geometry(std::size_t total_bytes,
 	    per_executor_bytes > maximum_jit_cache_budget_per_executor)
 		return {};
 	const auto minimum = minimum_jit_cache_budget_per_executor();
-	if (minimum > per_executor_bytes ||
-	    minimum > (total_bytes - std::min(
-			total_bytes, minimum_shared_translation_cache_bytes)) /
-			executors)
+	/* The private caches take the whole budget up to their cap. What the cap
+	 * leaves is the shared tier's, if it is large enough to exist. */
+	const auto available = total_bytes / executors;
+	if (minimum > per_executor_bytes || minimum > available)
 		return {};
-	const auto available =
-		(total_bytes - minimum_shared_translation_cache_bytes) / executors;
 	const auto budget = std::min(per_executor_bytes, available);
 
 	const auto per_set = sizeof(CacheSet) + sizeof(SavedGuestWordSet);
@@ -320,10 +340,13 @@ std::size_t derive_shared_translation_cache_budget(
 {
 	const auto geometry = derive_jit_cache_geometry(
 		total_bytes, executors, per_executor_bytes);
-	if (!geometry.valid() ||
+	/* One executor has nobody to share with. */
+	if (!geometry.valid() || executors < 2U ||
 	    geometry.total_bytes() > total_bytes / executors)
 		return 0;
-	return total_bytes - geometry.total_bytes() * executors;
+	const auto remainder =
+		total_bytes - geometry.total_bytes() * executors;
+	return remainder >= minimum_shared_translation_tier_bytes ? remainder : 0;
 }
 
 std::size_t minimum_jit_cache_budget_per_executor() noexcept
@@ -337,11 +360,9 @@ std::size_t minimum_jit_cache_budget(unsigned executors) noexcept
 		return 0;
 	const auto per_executor = minimum_jit_cache_budget_per_executor();
 	if (per_executor >
-	    (std::numeric_limits<std::size_t>::max() -
-	     minimum_shared_translation_cache_bytes) / executors)
+	    std::numeric_limits<std::size_t>::max() / executors)
 		return 0;
-	return per_executor * executors +
-		minimum_shared_translation_cache_bytes;
+	return per_executor * executors;
 }
 
 JitCacheGeometry jit_cache_geometry() noexcept
@@ -388,6 +409,9 @@ JitCacheExecutorLease::JitCacheExecutorLease(Admission admission) noexcept
 			budget.per_executor_bytes);
 		if (!geometry_.valid())
 			return;
+		shared_translations_ = derive_shared_translation_cache_budget(
+			budget.total_bytes, budget.executors,
+			budget.per_executor_bytes) != 0;
 		++registry.live_executors;
 		admitted_ = true;
 	}
@@ -414,10 +438,12 @@ JitCacheExecutorLease::~JitCacheExecutorLease()
 
 JitCacheExecutorLease::JitCacheExecutorLease(
 	JitCacheExecutorLease &&other) noexcept
-	: geometry_{other.geometry_}, admitted_{other.admitted_}
+	: geometry_{other.geometry_}, admitted_{other.admitted_},
+	  shared_translations_{other.shared_translations_}
 {
 	other.geometry_ = {};
 	other.admitted_ = false;
+	other.shared_translations_ = false;
 }
 
 JitCacheRunSession::JitCacheRunSession() noexcept
@@ -525,45 +551,6 @@ void release_jit_cache_run_session() noexcept
 			registry.run_session_release_pending = true;
 		}
 	}
-}
-
-std::size_t parse_byte_quantity(const char *text) noexcept
-{
-	if (text == nullptr || *text == '\0')
-		return 0;
-	std::uint64_t value = 0;
-	const char *cursor = text;
-	for (; *cursor >= '0' && *cursor <= '9'; ++cursor) {
-		const auto digit =
-			static_cast<std::uint64_t>(*cursor - '0');
-		if (value > (~std::uint64_t{} - digit) / 10U)
-			return 0;
-		value = value * 10U + digit;
-	}
-	if (cursor == text)
-		return 0;
-	std::uint64_t multiplier = 1;
-	switch (std::tolower(static_cast<unsigned char>(*cursor))) {
-	case 'k':
-		multiplier = 1024U;
-		++cursor;
-		break;
-	case 'm':
-		multiplier = 1024U * 1024U;
-		++cursor;
-		break;
-	case 'g':
-		multiplier = 1024U * 1024U * 1024U;
-		++cursor;
-		break;
-	default:
-		break;
-	}
-	if (*cursor != '\0')
-		return 0;
-	if (value > ~std::uint64_t{} / multiplier)
-		return 0;
-	return static_cast<std::size_t>(value * multiplier);
 }
 
 } // namespace uml::cpu::arm64

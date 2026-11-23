@@ -1,0 +1,1263 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 07:29:03 +0900
+Subject: [PATCH] gallium: reclaim a driver's memory and retry a refused
+ request
+
+A driver refuses an allocation when the process's budget is full, and a
+budget that is full often still holds memory for work that has finished:
+buffers a finished batch references, storage the driver caches for
+reuse. A request dropped for it is lost without a word.
+
+u_reclaim is how a caller that can run its request again does so, once.
+u_reclaim_begin() flushes the caller's context, waits for the work it
+submitted, trims the context, so that completed work releases what it
+holds, waits for the trim, and releases what the screen caches.
+u_reclaim_settle() then waits for the room to show in the host's
+budget, which a release reaches up to a quarter of a second late: 300
+ms at most, 20 ms when the reclaim freed nothing worth waiting for,
+which a screen reports through the new optional
+pipe_screen::get_freed_memory. The caller runs its request once more and
+tells u_reclaim_end(). The retry never runs inside the helper.
+
+The waiting the reclaim adds after the flush has returned is bounded by
+a deadline of 2 s that both waits for the GPU share. They poll the
+fence without blocking, so that a driver that waits for the submission
+and then for the GPU cannot give each the whole time, and a fence that
+is ready only after the deadline does not count; the scheduler and the
+driver's callbacks can run past it by what they take. The flush itself,
+and a call that synchronizes the threaded context first, wait as they
+always do. Work that does not finish in time ends the reclaim and the
+request stays refused.
+
+What a reclaim remembers is in the screen and the context, which carry
+it zeroed like the rest of them: pipe_screen::reclaim holds the one
+reclaim that runs on the screen, from its begin to its end, so that
+contexts that meet a refusal together do not all wait, and the ten
+seconds the screen's reclaims are ruled out for after work that did not
+finish, since a GPU that is not finishing is not worth waiting for again
+soon; an end that is not that of the reclaim holding the claim does
+nothing. pipe_context::reclaim_futile_until_ns rules out another
+reclaim of a context for 250 ms after one that did not help, since a
+budget that is really full gains nothing from it and a caller that keeps
+meeting the refusal would otherwise finish its context for every
+request. One context's cooldown does not rule out another's, and
+neither outlives its object or is shared with a new one at its address.
+A context that gets the claim looks at both back-offs again before it
+asks anything of the driver, since the reclaim that held the claim
+before it may have set one, and gives the claim back if one is. The
+tokens that say whose claim it is are never given twice: a screen that
+has given them all makes no more reclaims.
+
+u_texture_subdata_try() is u_default_texture_subdata() that says whether
+it wrote.
+
+The gallium-reclaim test runs u_reclaim against contexts and screens
+that answer as it says, with its times shortened: the steps of a
+reclaim, the wait for the room, the cooldowns, a reclaim whose flush is
+slow on another thread that keeps the screen until it ends while a late
+end of an earlier one changes nothing, many contexts and screens, new
+objects at old addresses, a fence that never signals, one submitted late
+with the GPU still pending, one ready just after the deadline, two waits
+that share the time, a slow flush, a reclaim that hangs between another
+context's look at the back-offs and its claim, the last token given, and
+a poll that runs over the deadline.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/gallium/auxiliary/meson.build           |  25 +
+ src/gallium/auxiliary/util/u_reclaim.c      | 232 +++++++
+ src/gallium/auxiliary/util/u_reclaim.h      |  96 +++
+ src/gallium/auxiliary/util/u_reclaim_test.c | 653 ++++++++++++++++++++
+ src/gallium/auxiliary/util/u_transfer.c     |  33 +-
+ src/gallium/auxiliary/util/u_transfer.h     |  11 +
+ src/gallium/include/pipe/p_context.h        |   8 +
+ src/gallium/include/pipe/p_screen.h         |  24 +
+ 8 files changed, 1073 insertions(+), 9 deletions(-)
+ create mode 100644 src/gallium/auxiliary/util/u_reclaim.c
+ create mode 100644 src/gallium/auxiliary/util/u_reclaim.h
+ create mode 100644 src/gallium/auxiliary/util/u_reclaim_test.c
+
+diff --git a/src/gallium/auxiliary/meson.build b/src/gallium/auxiliary/meson.build
+index 56f8b4bbb2a703fb186d8329c18910f3f66a207e..edfd87bcdaed845618cb56f434c5d9c70ed1ea05 100644
+--- a/src/gallium/auxiliary/meson.build
++++ b/src/gallium/auxiliary/meson.build
+@@ -68,6 +68,8 @@ files_libgallium = files(
+   'util/u_pstipple.h',
+   'util/u_pwr8.h',
+   'util/u_range.h',
++  'util/u_reclaim.c',
++  'util/u_reclaim.h',
+   'util/u_rect.h',
+   'util/u_resource.c',
+   'util/u_resource.h',
+@@ -541,6 +543,29 @@ if with_tests
+     timeout : 120,
+   )
+ 
++  test('gallium-reclaim',
++    executable(
++      'gallium-reclaim',
++      [
++        'util/u_reclaim.c',
++        'util/u_reclaim_test.c',
++      ],
++      include_directories : [inc_include, inc_src, inc_gallium, inc_gallium_aux],
++      dependencies : [idep_mesautil, idep_mesautilformat, dep_thread],
++      c_args : [
++        '-DU_RECLAIM_FINISH_NS=200000000ll',
++        '-DU_RECLAIM_SETTLE_NS=100000000ll',
++        '-DU_RECLAIM_GRACE_NS=10000000ll',
++        '-DU_RECLAIM_FUTILE_NS=100000000ll',
++        '-DU_RECLAIM_HUNG_NS=600000000ll',
++        '-DU_RECLAIM_SLEEP=u_reclaim_test_sleep',
++        '-DU_RECLAIM_BEFORE_CLAIM=u_reclaim_test_before_claim',
++      ],
++    ),
++    suite : 'gallium',
++    timeout : 60,
++  )
++
+   test('gallium-aux',
+     executable(
+       'gallium-aux',
+diff --git a/src/gallium/auxiliary/util/u_reclaim.c b/src/gallium/auxiliary/util/u_reclaim.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..883826e446366337a4da34665ba042ac23c23601
+--- /dev/null
++++ b/src/gallium/auxiliary/util/u_reclaim.c
+@@ -0,0 +1,232 @@
++/*
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "util/u_reclaim.h"
++
++#include "pipe/p_context.h"
++#include "pipe/p_defines.h"
++#include "pipe/p_screen.h"
++#include "util/macros.h"
++#include "util/os_time.h"
++#include "util/u_atomic.h"
++
++/* The most a reclaim waits, in all, for the GPU to finish the caller's work
++ * once the flush has returned. */
++#ifndef U_RECLAIM_FINISH_NS
++#define U_RECLAIM_FINISH_NS (2000ll * 1000 * 1000)
++#endif
++/* How long the room a reclaim freed is waited for: the budget's own
++ * accounting follows a release by a periodic sweep of a quarter of a second
++ * at most. Memory that has not been freed after a short grace is not coming,
++ * and the retry stops waiting for it. */
++#ifndef U_RECLAIM_SETTLE_NS
++#define U_RECLAIM_SETTLE_NS (300ll * 1000 * 1000)
++#endif
++#ifndef U_RECLAIM_GRACE_NS
++#define U_RECLAIM_GRACE_NS (20ll * 1000 * 1000)
++#endif
++#define U_RECLAIM_MIN_FREED (1ull << 20)
++#define U_RECLAIM_POLL_US 4000
++/* How long a reclaim that did not help rules out another of the same
++ * context, and how long one whose work did not finish in time does for the
++ * whole screen: a GPU that is not finishing is not worth waiting for again
++ * soon. */
++#ifndef U_RECLAIM_FUTILE_NS
++#define U_RECLAIM_FUTILE_NS (250ll * 1000 * 1000)
++#endif
++#ifndef U_RECLAIM_HUNG_NS
++#define U_RECLAIM_HUNG_NS (10000ll * 1000 * 1000)
++#endif
++
++/* Hooks for the test of this file, which names its own: a function that
++ * sleeps, and one called between the last look at the back-offs and the
++ * claim. */
++#ifdef U_RECLAIM_SLEEP
++void U_RECLAIM_SLEEP(int64_t us);
++#else
++#define U_RECLAIM_SLEEP os_time_sleep
++#endif
++#ifdef U_RECLAIM_BEFORE_CLAIM
++void U_RECLAIM_BEFORE_CLAIM(struct pipe_context *pipe);
++#else
++#define U_RECLAIM_BEFORE_CLAIM(pipe) ((void)0)
++#endif
++
++/* Raises *until_ns to value_ns, and never lowers it. */
++static void
++rule_out_until(int64_t *until_ns, int64_t value_ns)
++{
++   int64_t current = p_atomic_read(until_ns);
++
++   while (current < value_ns) {
++      const int64_t seen = p_atomic_cmpxchg(until_ns, current, value_ns);
++      if (seen == current)
++         return;
++      current = seen;
++   }
++}
++
++/* Whether a back-off rules out a reclaim of the context at the time. */
++static bool
++ruled_out(const struct pipe_context *pipe, int64_t now_ns)
++{
++   return now_ns < p_atomic_read(&pipe->reclaim_futile_until_ns) ||
++          now_ns < p_atomic_read(&pipe->screen->reclaim.hung_until_ns);
++}
++
++/* The next token of the screen, which no reclaim of it has had and none will
++ * have again, or 0 when they have all been given. */
++static uint64_t
++next_token(struct pipe_screen *screen)
++{
++   uint64_t current = p_atomic_read(&screen->reclaim.tokens);
++
++   while (current != UINT64_MAX) {
++      const uint64_t seen =
++         p_atomic_cmpxchg(&screen->reclaim.tokens, current, current + 1);
++      if (seen == current)
++         return current + 1;
++      current = seen;
++   }
++   return 0;
++}
++
++static uint64_t
++freed_since(const struct u_reclaim *reclaim)
++{
++   struct pipe_screen *screen = reclaim->screen;
++   return screen->get_freed_memory ?
++          screen->get_freed_memory(screen) - reclaim->freed_mark : 0;
++}
++
++/* Flushes the context and waits until the deadline for everything it
++ * submitted, which the first call sets once its flush has returned. The
++ * fence is polled, never waited on: a driver that composes its wait from a
++ * wait for the submission and one for the GPU would give each the whole time
++ * it is passed. The deadline is checked before every poll, so a fence that is
++ * ready only after it does not count, and the last sleep ends at it. Returns
++ * false when the work has not finished by the deadline. */
++static bool
++finish(struct pipe_context *pipe, int64_t *deadline_ns)
++{
++   struct pipe_screen *screen = pipe->screen;
++   struct pipe_fence_handle *fence = NULL;
++   bool finished = true;
++
++   pipe->flush(pipe, &fence, PIPE_FLUSH_ASYNC | PIPE_FLUSH_HINT_FINISH);
++   if (!*deadline_ns)
++      *deadline_ns = os_time_get_nano() + U_RECLAIM_FINISH_NS;
++   if (fence) {
++      int64_t sleep_us = 100;
++
++      for (;;) {
++         if (os_time_get_nano() >= *deadline_ns) {
++            finished = false;
++            break;
++         }
++         if (screen->fence_finish(screen, NULL, fence, 0))
++            break;
++         /* The poll took time: what is left is what it left, and a sleep is
++          * no longer than that. */
++         const int64_t left_ns = *deadline_ns - os_time_get_nano();
++         if (left_ns <= 0) {
++            finished = false;
++            break;
++         }
++         U_RECLAIM_SLEEP(MIN2(sleep_us, MAX2(left_ns / 1000, 1)));
++         sleep_us = MIN2(sleep_us * 2, 2000);
++      }
++      screen->fence_reference(screen, &fence, NULL);
++   }
++   return finished;
++}
++
++bool
++u_reclaim_begin(struct pipe_context *pipe, bool may_finish,
++                struct u_reclaim *reclaim)
++{
++   struct pipe_screen *screen = pipe->screen;
++
++   if (ruled_out(pipe, os_time_get_nano()))
++      return false;
++
++   /* One reclaim runs on the screen: the one that holds the claim, until it
++    * ends. A token that is never reused says which end() is its own. */
++   const uint64_t token = next_token(screen);
++   if (!token)
++      return false;
++   U_RECLAIM_BEFORE_CLAIM(pipe);
++   if (p_atomic_cmpxchg(&screen->reclaim.claim, 0, token) != 0)
++      return false;
++   /* The back-offs were looked at before the claim, and the reclaim that held
++    * it meanwhile may have published one: look again, now that nothing else
++    * can, and give the claim back before anything is asked of the driver. */
++   if (ruled_out(pipe, os_time_get_nano())) {
++      p_atomic_cmpxchg(&screen->reclaim.claim, token, 0);
++      return false;
++   }
++
++   reclaim->pipe = pipe;
++   reclaim->screen = screen;
++   reclaim->token = token;
++   reclaim->freed_mark = screen->get_freed_memory ?
++                         screen->get_freed_memory(screen) : 0;
++
++   if (may_finish) {
++      int64_t deadline_ns = 0;
++      bool finished = finish(pipe, &deadline_ns);
++
++      if (finished && pipe->trim) {
++         pipe->trim(pipe);
++         /* A threaded context runs the trim on its driver thread, behind
++          * what is queued: finishing again waits for it. */
++         finished = finish(pipe, &deadline_ns);
++      }
++      if (!finished) {
++         /* The GPU has not finished what it was given: what the work holds
++          * is not coming back soon, and the caller's request stays refused.
++          */
++         rule_out_until(&screen->reclaim.hung_until_ns,
++                        os_time_get_nano() + U_RECLAIM_HUNG_NS);
++         p_atomic_cmpxchg(&screen->reclaim.claim, token, 0);
++         reclaim->token = 0;
++         return false;
++      }
++   }
++   if (screen->release_cached_memory)
++      screen->release_cached_memory(screen);
++   reclaim->settled_from_ns = os_time_get_nano();
++   return true;
++}
++
++void
++u_reclaim_settle(struct u_reclaim *reclaim)
++{
++   for (;;) {
++      const int64_t age = os_time_get_nano() - reclaim->settled_from_ns;
++
++      if (age >= U_RECLAIM_SETTLE_NS)
++         return;
++      if (age >= U_RECLAIM_GRACE_NS &&
++          freed_since(reclaim) < U_RECLAIM_MIN_FREED)
++         return;
++      os_time_sleep(U_RECLAIM_POLL_US);
++   }
++}
++
++void
++u_reclaim_end(struct u_reclaim *reclaim, bool recovered)
++{
++   const uint64_t token = reclaim->token;
++
++   /* Only the reclaim that holds the claim gives it up, and only it can: what
++    * it records is seen by whoever takes the claim next. */
++   if (!token || p_atomic_read(&reclaim->screen->reclaim.claim) != token)
++      return;
++   if (!recovered)
++      rule_out_until(&reclaim->pipe->reclaim_futile_until_ns,
++                     os_time_get_nano() + U_RECLAIM_FUTILE_NS);
++   reclaim->token = 0;
++   p_atomic_cmpxchg(&reclaim->screen->reclaim.claim, token, 0);
++}
+diff --git a/src/gallium/auxiliary/util/u_reclaim.h b/src/gallium/auxiliary/util/u_reclaim.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..a2da7c81f8288b693c4debf17a734df4ae31b90d
+--- /dev/null
++++ b/src/gallium/auxiliary/util/u_reclaim.h
+@@ -0,0 +1,96 @@
++/*
++ * SPDX-License-Identifier: MIT
++ */
++
++/* Give back the memory a driver holds, and let a refused request run again.
++ *
++ * A driver refuses an allocation when the process's budget is full, and a
++ * budget that is full is often one that still holds memory for work that has
++ * finished: buffers a finished batch still references, storage the driver
++ * caches for reuse. A caller that can run its request again calls
++ * u_reclaim_begin() after the refusal, and when that says a reclaim was made,
++ * u_reclaim_settle(), then runs the request once more and tells
++ * u_reclaim_end() how it went. The request is attempted exactly once after a
++ * reclaim, whatever is freed.
++ *
++ * The room a reclaim frees can show in the budget a little after it is
++ * freed, which is why the retry follows a short wait when the reclaim freed
++ * something. A reclaim that did not help rules out another for that context
++ * for a short time, since a budget that is really full gains nothing from
++ * one, and a caller that keeps meeting the refusal would otherwise finish its
++ * context for each. A reclaim whose work does not finish in time rules out
++ * any for the screen for longer, and only one reclaim runs on a screen at a
++ * time, so that contexts that meet a refusal together do not all wait. A
++ * context that gets the claim looks at those back-offs again before it asks
++ * anything of the driver, since the reclaim that held the claim before may
++ * have set one.
++ *
++ * What it remembers lives in the screen and the context themselves
++ * (pipe_screen::reclaim, pipe_context::reclaim_futile_until_ns), and goes
++ * with them. */
++
++#ifndef U_RECLAIM_H
++#define U_RECLAIM_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++struct pipe_context;
++struct pipe_screen;
++
++struct u_reclaim {
++   struct pipe_context *pipe;
++   struct pipe_screen *screen;
++   /* the claim this reclaim holds on the screen */
++   uint64_t token;
++   uint64_t freed_mark;
++   int64_t settled_from_ns;
++};
++
++/* Gives back what the driver can for the caller's refused request: when
++ * may_finish is set, the caller's context is flushed, the work it has
++ * submitted finished, and the context trimmed, which lets completed work
++ * release the storage it holds; then the screen releases what it caches.
++ * Set may_finish only on the thread that owns the context, and not in a
++ * call that is not synchronized with it.
++ *
++ * The waiting this adds after the flush has returned is bounded: the two
++ * waits for the GPU (before and after the trim) share 2 s, and the polling
++ * that checks the fence never blocks. The flush itself, and a call that
++ * synchronizes a threaded context before it gets here, wait as they always do
++ * and are not bounded by this.
++ *
++ * The bound is a deadline: the scheduler, and the callbacks the driver is
++ * polled through, can run past it by what they take.
++ *
++ * Returns false when no reclaim was made, and the caller's request stays
++ * refused: this context's last reclaim did not help a moment ago, another
++ * reclaim is running on the screen, or the work did not finish in time, which
++ * rules out any reclaim on the screen for ten seconds. When it returns true,
++ * the caller holds the screen's one reclaim until it calls u_reclaim_end(),
++ * which it must, whatever the retry does. */
++bool
++u_reclaim_begin(struct pipe_context *pipe, bool may_finish,
++                struct u_reclaim *reclaim);
++
++/* Waits, for at most 300 ms, for the room the reclaim freed to show in the
++ * budget, which it does not at once. Waits no longer than 20 ms when the
++ * reclaim freed next to nothing. Does not run the request. */
++void
++u_reclaim_settle(struct u_reclaim *reclaim);
++
++/* Records the outcome of the retry and gives up the screen's reclaim. A
++ * struct that was not made by a successful u_reclaim_begin(), or that has
++ * ended already, does nothing. */
++void
++u_reclaim_end(struct u_reclaim *reclaim, bool recovered);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/src/gallium/auxiliary/util/u_reclaim_test.c b/src/gallium/auxiliary/util/u_reclaim_test.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..f5e7c4cefcf80b48f252b26803532dd4285356c7
+--- /dev/null
++++ b/src/gallium/auxiliary/util/u_reclaim_test.c
+@@ -0,0 +1,653 @@
++/*
++ * SPDX-License-Identifier: MIT
++ */
++
++/* What bounds a reclaim, and what one context's reclaim does to another's,
++ * against contexts and screens that count what the reclaim asks of them and
++ * answer as the test says. The times of u_reclaim.c are shortened by the
++ * build of this test, which gives them as macros. */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "c11/threads.h"
++#include "pipe/p_context.h"
++#include "pipe/p_defines.h"
++#include "pipe/p_screen.h"
++#include "util/macros.h"
++#include "util/os_time.h"
++#include "util/u_reclaim.h"
++
++#define CHECK(cond)                                                       \
++   do {                                                                   \
++      if (!(cond)) {                                                      \
++         fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #cond);       \
++         exit(1);                                                         \
++      }                                                                   \
++   } while (0)
++
++#define MIB (1ull << 20)
++#define MS (1000ll * 1000)
++
++#ifndef U_RECLAIM_FINISH_NS
++#error "this test is built with the times of u_reclaim.c shortened"
++#endif
++#if !defined(U_RECLAIM_SLEEP) || !defined(U_RECLAIM_BEFORE_CLAIM)
++#error "this test is built with the hooks of u_reclaim.c"
++#endif
++
++/* How the fence of each flush answers: it is ready this long after the flush
++ * returned, or never when negative, and the flush takes this long to return.
++ * The submission of the fence and the GPU's work are one delay here: a
++ * driver that waits for each in turn gives each the time it is passed. */
++struct script {
++   int64_t flush_takes_ns[2];
++   int64_t ready_after_ns[2];
++};
++
++static struct {
++   unsigned flushes;
++   unsigned trims;
++   unsigned releases;
++   unsigned polls;
++   int64_t ready_at_ns;
++   uint64_t freed;
++   uint64_t freed_by_release;
++   struct script script;
++
++   /* When set, the first flush starts the clock of a deadline that the
++    * polls know, and a poll that starts within 4 ms of it ends 1.5 ms after
++    * it: the poll that runs over the deadline. A sleep the helper asks for
++    * 1 ms after the deadline or later is a late one. */
++   bool straddle;
++   int64_t deadline_ns;
++   unsigned late_sleeps;
++
++   /* The context whose claim is one reclaim away from being made: when it
++    * looks for the claim, the one given runs its reclaim first. */
++   struct pipe_context *contender;
++   struct pipe_context *hanger;
++   unsigned flushes_at_hook, polls_at_hook;
++   int64_t hook_done_ns;
++} fake;
++
++static int fence_token;
++
++static void
++fake_flush(UNUSED struct pipe_context *pipe, struct pipe_fence_handle **fence,
++           unsigned flags)
++{
++   CHECK(flags & PIPE_FLUSH_ASYNC);
++   const unsigned n = MIN2(fake.flushes, 1);
++
++   fake.flushes++;
++   if (fake.script.flush_takes_ns[n] > 0)
++      os_time_sleep(fake.script.flush_takes_ns[n] / 1000);
++   fake.ready_at_ns = fake.script.ready_after_ns[n] < 0 ?
++                      INT64_MAX :
++                      os_time_get_nano() + fake.script.ready_after_ns[n];
++   if (fake.straddle && n == 0)
++      fake.deadline_ns = os_time_get_nano() + U_RECLAIM_FINISH_NS;
++   if (fence)
++      *fence = (struct pipe_fence_handle *)&fence_token;
++}
++
++static void
++fake_trim(UNUSED struct pipe_context *pipe)
++{
++   fake.trims++;
++}
++
++/* Only ever asked, never waited on: the test refuses a wait, which a driver
++ * could compose of two that each last as long as it is told to. */
++static bool
++fake_fence_finish(UNUSED struct pipe_screen *screen,
++                  UNUSED struct pipe_context *ctx,
++                  UNUSED struct pipe_fence_handle *fence, uint64_t timeout)
++{
++   CHECK(timeout == 0);
++   fake.polls++;
++   if (fake.straddle) {
++      const int64_t left_ns = fake.deadline_ns - os_time_get_nano();
++
++      if (left_ns > 0 && left_ns < 4 * MS)
++         os_time_sleep((left_ns + 3 * MS / 2) / 1000);
++   }
++   return os_time_get_nano() >= fake.ready_at_ns;
++}
++
++/* The sleeps of the helper. */
++void
++u_reclaim_test_sleep(int64_t us);
++
++void
++u_reclaim_test_sleep(int64_t us)
++{
++   if (fake.straddle && os_time_get_nano() >= fake.deadline_ns + MS)
++      fake.late_sleeps++;
++   os_time_sleep(us);
++}
++
++/* The helper looks for the claim of the screen after it has looked at the
++ * back-offs: the reclaim of another context that hangs fits between. */
++void
++u_reclaim_test_before_claim(struct pipe_context *pipe);
++
++static void
++hang(struct pipe_context *context);
++
++void
++u_reclaim_test_before_claim(struct pipe_context *pipe)
++{
++   if (!fake.contender || pipe != fake.contender)
++      return;
++   fake.contender = NULL;
++   hang(fake.hanger);
++   fake.flushes_at_hook = fake.flushes;
++   fake.polls_at_hook = fake.polls;
++   fake.hook_done_ns = os_time_get_nano();
++}
++
++static void
++fake_fence_reference(UNUSED struct pipe_screen *screen,
++                     struct pipe_fence_handle **ptr,
++                     struct pipe_fence_handle *fence)
++{
++   *ptr = fence;
++}
++
++static unsigned
++fake_release(UNUSED struct pipe_screen *screen)
++{
++   fake.releases++;
++   fake.freed += fake.freed_by_release;
++   return 1;
++}
++
++static uint64_t
++fake_freed(UNUSED struct pipe_screen *screen)
++{
++   return fake.freed;
++}
++
++/* The state of a reclaim is in the screen and the context: zero is a screen
++ * or a context that has never reclaimed, which is what every driver makes
++ * of them. */
++static struct pipe_screen screens[96];
++static struct pipe_context contexts[256];
++static unsigned screens_used, contexts_used;
++
++static void
++init_screen(struct pipe_screen *screen)
++{
++   memset(screen, 0, sizeof(*screen));
++   screen->fence_finish = fake_fence_finish;
++   screen->fence_reference = fake_fence_reference;
++   screen->release_cached_memory = fake_release;
++   screen->get_freed_memory = fake_freed;
++}
++
++static void
++init_context(struct pipe_context *context, struct pipe_screen *screen)
++{
++   memset(context, 0, sizeof(*context));
++   context->screen = screen;
++   context->flush = fake_flush;
++   context->trim = fake_trim;
++}
++
++static struct pipe_screen *
++new_screen(void)
++{
++   struct pipe_screen *screen = &screens[screens_used++];
++
++   init_screen(screen);
++   return screen;
++}
++
++static struct pipe_context *
++new_context(struct pipe_screen *screen)
++{
++   struct pipe_context *context = &contexts[contexts_used++];
++
++   init_context(context, screen);
++   return context;
++}
++
++static void
++reset(void)
++{
++   memset(&fake, 0, sizeof(fake));
++}
++
++static int64_t
++since(int64_t from_ns)
++{
++   return os_time_get_nano() - from_ns;
++}
++
++static void
++sleep_ns(int64_t ns)
++{
++   os_time_sleep(ns / 1000);
++}
++
++/* A reclaim whose work does not finish, run to the end of its wait. */
++static void
++hang(struct pipe_context *context)
++{
++   struct u_reclaim there;
++
++   fake.script.ready_after_ns[0] = -1;
++   CHECK(!u_reclaim_begin(context, true, &there));
++}
++
++struct begin_in_thread {
++   struct pipe_context *context;
++   struct u_reclaim reclaim;
++   bool began;
++};
++
++static int
++begin_thread(void *data)
++{
++   struct begin_in_thread *begin = data;
++
++   begin->began = u_reclaim_begin(begin->context, true, &begin->reclaim);
++   return 0;
++}
++
++int
++main(void)
++{
++   struct u_reclaim reclaim;
++
++   /* A reclaim finishes the context's work, trims it, finishes again for the
++    * trim, and releases what the screen caches. */
++   {
++      struct pipe_context *a = new_context(new_screen());
++
++      reset();
++      CHECK(u_reclaim_begin(a, true, &reclaim));
++      CHECK(fake.flushes == 2 && fake.polls >= 2 && fake.trims == 1);
++      CHECK(fake.releases == 1);
++      u_reclaim_end(&reclaim, true);
++   }
++
++   /* A call that does not own the context only releases the caches. */
++   {
++      struct pipe_context *a = new_context(new_screen());
++
++      reset();
++      CHECK(u_reclaim_begin(a, false, &reclaim));
++      CHECK(fake.flushes == 0 && fake.polls == 0 && fake.trims == 0);
++      CHECK(fake.releases == 1);
++      u_reclaim_end(&reclaim, true);
++   }
++
++   /* The wait for the room does not touch the context, stops after a short
++    * grace when nothing was freed, and after the time it has when something
++    * was. */
++   {
++      struct pipe_context *a = new_context(new_screen());
++
++      reset();
++      CHECK(u_reclaim_begin(a, true, &reclaim));
++      unsigned flushes = fake.flushes, polls = fake.polls;
++      int64_t from = os_time_get_nano();
++      u_reclaim_settle(&reclaim);
++      CHECK(since(from) >= U_RECLAIM_GRACE_NS - 5 * MS);
++      CHECK(since(from) < U_RECLAIM_SETTLE_NS / 2);
++      CHECK(fake.flushes == flushes && fake.polls == polls);
++      u_reclaim_end(&reclaim, true);
++
++      reset();
++      fake.freed_by_release = 2 * MIB;
++      CHECK(u_reclaim_begin(a, true, &reclaim));
++      flushes = fake.flushes;
++      polls = fake.polls;
++      from = os_time_get_nano();
++      u_reclaim_settle(&reclaim);
++      CHECK(since(from) >= U_RECLAIM_SETTLE_NS * 9 / 10);
++      CHECK(since(from) < U_RECLAIM_SETTLE_NS + 100 * MS);
++      CHECK(fake.flushes == flushes && fake.polls == polls);
++      u_reclaim_end(&reclaim, true);
++   }
++
++   /* A reclaim that did not help rules out another of its context for a
++    * moment, which neither flushes nor waits, and not for longer. */
++   {
++      struct pipe_context *a = new_context(new_screen());
++
++      reset();
++      CHECK(u_reclaim_begin(a, true, &reclaim));
++      u_reclaim_end(&reclaim, false);
++      reset();
++      CHECK(!u_reclaim_begin(a, true, &reclaim));
++      CHECK(fake.flushes == 0 && fake.polls == 0 && fake.releases == 0);
++      sleep_ns(U_RECLAIM_FUTILE_NS + 20 * MS);
++      CHECK(u_reclaim_begin(a, true, &reclaim));
++      u_reclaim_end(&reclaim, true);
++   }
++
++   /* An impossible request in one context does not rule out another's. */
++   {
++      struct pipe_screen *screen = new_screen();
++      struct pipe_context *a = new_context(screen);
++      struct pipe_context *b = new_context(screen);
++
++      reset();
++      CHECK(u_reclaim_begin(a, true, &reclaim));
++      u_reclaim_end(&reclaim, false);
++      CHECK(!u_reclaim_begin(a, true, &reclaim));
++      reset();
++      CHECK(u_reclaim_begin(b, true, &reclaim));
++      CHECK(fake.flushes == 2);
++      u_reclaim_end(&reclaim, true);
++   }
++
++   /* The cooldown of a context is its own however many others have one: no
++    * table of them forgets it. */
++   {
++      struct pipe_screen *screen = new_screen();
++      struct pipe_context *first = new_context(screen);
++
++      reset();
++      CHECK(u_reclaim_begin(first, true, &reclaim));
++      u_reclaim_end(&reclaim, false);
++      for (unsigned i = 0; i < 40; i++) {
++         struct pipe_context *other = new_context(screen);
++
++         CHECK(u_reclaim_begin(other, true, &reclaim));
++         u_reclaim_end(&reclaim, false);
++      }
++      CHECK(!u_reclaim_begin(first, true, &reclaim));
++   }
++
++   /* One reclaim runs on a screen at a time, from its begin to its end: a
++    * context that meets its refusal meanwhile leaves its request refused,
++    * without a flush, however many other screens come and go. */
++   {
++      struct pipe_screen *screen = new_screen();
++      struct pipe_context *a = new_context(screen);
++      struct pipe_context *b = new_context(screen);
++      struct u_reclaim other;
++
++      reset();
++      CHECK(u_reclaim_begin(a, true, &reclaim));
++      reset();
++      CHECK(!u_reclaim_begin(b, true, &other));
++      CHECK(fake.flushes == 0 && fake.polls == 0 && fake.releases == 0);
++      for (unsigned i = 0; i < 12; i++) {
++         struct pipe_screen *more = new_screen();
++         struct u_reclaim there;
++
++         CHECK(u_reclaim_begin(new_context(more), true, &there));
++         u_reclaim_end(&there, true);
++      }
++      CHECK(!u_reclaim_begin(b, true, &other));
++      u_reclaim_end(&reclaim, true);
++      CHECK(u_reclaim_begin(b, true, &other));
++      u_reclaim_end(&other, true);
++   }
++
++   /* A reclaim that holds the screen for longer than anything else in the
++    * helper (its flush is slow, which nothing here bounds) keeps it until it
++    * ends, however long that takes; the end of a reclaim that does not hold
++    * the claim any more gives up nothing and rules nothing out. */
++   {
++      struct pipe_screen *screen = new_screen();
++      struct pipe_context *a = new_context(screen);
++      struct pipe_context *b = new_context(screen);
++      struct pipe_context *c = new_context(screen);
++      struct begin_in_thread slow = {.context = a};
++      thrd_t thread;
++      struct u_reclaim second, third;
++
++      reset();
++      fake.script.flush_takes_ns[0] = 3 * U_RECLAIM_FINISH_NS;
++      CHECK(thrd_create(&thread, begin_thread, &slow) == thrd_success);
++      sleep_ns(U_RECLAIM_FINISH_NS);
++      CHECK(!u_reclaim_begin(b, true, &second));
++      sleep_ns(U_RECLAIM_FINISH_NS);
++      CHECK(!u_reclaim_begin(b, true, &second));
++      CHECK(thrd_join(thread, NULL) == thrd_success);
++      CHECK(slow.began);
++      /* the slow reclaim is made, and still holds the screen */
++      CHECK(!u_reclaim_begin(b, true, &second));
++      const struct u_reclaim stale = slow.reclaim;
++      u_reclaim_end(&slow.reclaim, true);
++      reset();
++      CHECK(u_reclaim_begin(b, true, &second));
++      CHECK(!u_reclaim_begin(c, true, &third));
++      /* the end of the first reclaim again changes nothing: not b's claim,
++       * and not a cooldown of a's context */
++      struct u_reclaim again = stale;
++      u_reclaim_end(&again, false);
++      CHECK(!u_reclaim_begin(c, true, &third));
++      u_reclaim_end(&second, true);
++      CHECK(u_reclaim_begin(a, true, &third));
++      u_reclaim_end(&third, true);
++      /* and an end that never began changes nothing either */
++      struct u_reclaim none;
++      memset(&none, 0, sizeof(none));
++      none.screen = screen;
++      none.pipe = a;
++      CHECK(u_reclaim_begin(c, true, &third));
++      u_reclaim_end(&none, false);
++      CHECK(!u_reclaim_begin(b, true, &second));
++      u_reclaim_end(&third, true);
++   }
++
++   /* Work that does not finish: the wait ends at its bound whatever the
++    * driver's fence does, nothing is trimmed or released, and the screen's
++    * reclaims are ruled out for longer than a failed retry rules one out,
++    * for every context of it, however many other screens come and go; a
++    * second screen is not ruled out. */
++   {
++      struct pipe_screen *screen = new_screen();
++      struct pipe_screen *other = new_screen();
++      struct pipe_context *a = new_context(screen);
++      struct pipe_context *b = new_context(screen);
++      struct pipe_context *c = new_context(other);
++
++      reset();
++      fake.script.ready_after_ns[0] = -1;
++      const int64_t from = os_time_get_nano();
++      CHECK(!u_reclaim_begin(a, true, &reclaim));
++      CHECK(since(from) >= U_RECLAIM_FINISH_NS);
++      CHECK(since(from) < U_RECLAIM_FINISH_NS + 100 * MS);
++      CHECK(fake.flushes == 1 && fake.trims == 0 && fake.releases == 0);
++
++      reset();
++      CHECK(!u_reclaim_begin(b, true, &reclaim));
++      CHECK(fake.flushes == 0 && fake.polls == 0 && fake.releases == 0);
++      CHECK(u_reclaim_begin(c, true, &reclaim));
++      u_reclaim_end(&reclaim, true);
++      for (unsigned i = 0; i < 12; i++) {
++         struct u_reclaim there;
++
++         CHECK(u_reclaim_begin(new_context(new_screen()), true, &there));
++         u_reclaim_end(&there, true);
++      }
++
++      /* the time a failed retry rules out is not enough, the hung one is */
++      sleep_ns(U_RECLAIM_FUTILE_NS + 50 * MS);
++      CHECK(!u_reclaim_begin(b, true, &reclaim));
++      sleep_ns(U_RECLAIM_HUNG_NS + 20 * MS);
++      reset();
++      CHECK(u_reclaim_begin(b, true, &reclaim));
++      u_reclaim_end(&reclaim, true);
++   }
++
++   /* A screen or a context made at the address of one that is gone is a
++    * new one: zero, whatever the old one was ruled out for. */
++   {
++      struct pipe_screen *screen = new_screen();
++      struct pipe_context *a = new_context(screen);
++
++      reset();
++      CHECK(u_reclaim_begin(a, true, &reclaim));
++      u_reclaim_end(&reclaim, false);
++      CHECK(!u_reclaim_begin(a, true, &reclaim));
++      init_context(a, screen);
++      CHECK(u_reclaim_begin(a, true, &reclaim));
++      u_reclaim_end(&reclaim, true);
++
++      reset();
++      fake.script.ready_after_ns[0] = -1;
++      CHECK(!u_reclaim_begin(a, true, &reclaim));
++      reset();
++      CHECK(!u_reclaim_begin(a, true, &reclaim));
++      init_screen(screen);
++      CHECK(u_reclaim_begin(a, true, &reclaim));
++      u_reclaim_end(&reclaim, true);
++   }
++
++   /* A fence that completes its submission late while the GPU is still
++    * pending: the wait still ends at the bound, not at twice it. */
++   {
++      struct pipe_context *a = new_context(new_screen());
++
++      reset();
++      fake.script.ready_after_ns[0] = 3 * U_RECLAIM_FINISH_NS;
++      const int64_t from = os_time_get_nano();
++      CHECK(!u_reclaim_begin(a, true, &reclaim));
++      CHECK(since(from) >= U_RECLAIM_FINISH_NS);
++      CHECK(since(from) < U_RECLAIM_FINISH_NS + 100 * MS);
++      CHECK(fake.polls > 10);
++   }
++
++   /* A fence that is ready only just after the bound does not count, and the
++    * last sleep does not run past the bound. */
++   {
++      struct pipe_context *a = new_context(new_screen());
++
++      reset();
++      fake.script.ready_after_ns[0] = U_RECLAIM_FINISH_NS + 3 * MS;
++      const int64_t from = os_time_get_nano();
++      CHECK(!u_reclaim_begin(a, true, &reclaim));
++      CHECK(since(from) >= U_RECLAIM_FINISH_NS);
++      CHECK(since(from) < U_RECLAIM_FINISH_NS + 50 * MS);
++      CHECK(fake.trims == 0);
++   }
++
++   /* The two waits of a reclaim (before and after the trim) share the time:
++    * each would take 0.6 of it, and the second is out of time. */
++   {
++      struct pipe_context *a = new_context(new_screen());
++
++      reset();
++      fake.script.ready_after_ns[0] = U_RECLAIM_FINISH_NS * 6 / 10;
++      fake.script.ready_after_ns[1] = U_RECLAIM_FINISH_NS * 6 / 10;
++      const int64_t from = os_time_get_nano();
++      CHECK(!u_reclaim_begin(a, true, &reclaim));
++      CHECK(since(from) >= U_RECLAIM_FINISH_NS);
++      CHECK(since(from) < U_RECLAIM_FINISH_NS + 100 * MS);
++      CHECK(fake.flushes == 2 && fake.trims == 1 && fake.releases == 0);
++   }
++
++   /* The bound covers the waiting after the flush returns, not the flush: a
++    * flush that takes a whole bound and a fence that is ready when it
++    * returns make a reclaim. */
++   {
++      struct pipe_context *a = new_context(new_screen());
++
++      reset();
++      fake.script.flush_takes_ns[0] = U_RECLAIM_FINISH_NS;
++      CHECK(u_reclaim_begin(a, true, &reclaim));
++      CHECK(fake.releases == 1);
++      u_reclaim_end(&reclaim, true);
++   }
++
++   /* A context that looked at the back-offs before another's reclaim hung,
++    * and took the claim after it, is refused as one that came after: it
++    * flushes nothing, waits for nothing, releases nothing, and gives the
++    * claim back for whoever may use it. */
++   for (unsigned may_finish = 0; may_finish < 2; may_finish++) {
++      struct pipe_screen *screen = new_screen();
++      struct pipe_context *a = new_context(screen);
++      struct pipe_context *b = new_context(screen);
++
++      reset();
++      fake.hanger = a;
++      fake.contender = b;
++      CHECK(!u_reclaim_begin(b, may_finish, &reclaim));
++      CHECK(!fake.contender);
++      CHECK(fake.flushes_at_hook == 1 && fake.flushes == 1);
++      CHECK(fake.polls == fake.polls_at_hook);
++      CHECK(fake.trims == 0 && fake.releases == 0);
++      CHECK(since(fake.hook_done_ns) < 20 * MS);
++      CHECK(screen->reclaim.claim == 0);
++      CHECK(!reclaim.token);
++
++      /* the hang's back-off stays, and ends as it always does */
++      reset();
++      CHECK(!u_reclaim_begin(b, may_finish, &reclaim));
++      CHECK(fake.flushes == 0 && fake.polls == 0 && fake.releases == 0);
++      sleep_ns(U_RECLAIM_HUNG_NS + 20 * MS);
++      CHECK(u_reclaim_begin(b, may_finish, &reclaim));
++      u_reclaim_end(&reclaim, true);
++   }
++
++   /* The cooldown of a reclaim that did not help is in place when its claim
++    * is free, so that whoever takes the claim next sees it. */
++   {
++      struct pipe_screen *screen = new_screen();
++      struct pipe_context *a = new_context(screen);
++      struct u_reclaim first;
++
++      reset();
++      CHECK(u_reclaim_begin(a, true, &first));
++      u_reclaim_end(&first, false);
++      CHECK(screen->reclaim.claim == 0);
++      CHECK(a->reclaim_futile_until_ns != 0);
++      CHECK(!u_reclaim_begin(a, true, &reclaim));
++   }
++
++   /* The tokens that say whose claim it is are never given twice: when they
++    * are all given, a reclaim is refused, whatever it asks. */
++   {
++      struct pipe_screen *screen = new_screen();
++      struct pipe_context *a = new_context(screen);
++      struct u_reclaim last;
++
++      screen->reclaim.tokens = UINT64_MAX - 1;
++      reset();
++      CHECK(u_reclaim_begin(a, true, &last));
++      CHECK(last.token == UINT64_MAX && screen->reclaim.claim == UINT64_MAX);
++      u_reclaim_end(&last, true);
++      CHECK(screen->reclaim.claim == 0);
++
++      reset();
++      CHECK(!u_reclaim_begin(a, true, &reclaim));
++      CHECK(!u_reclaim_begin(a, false, &reclaim));
++      CHECK(fake.flushes == 0 && fake.polls == 0 && fake.releases == 0);
++      CHECK(screen->reclaim.tokens == UINT64_MAX);
++      CHECK(screen->reclaim.claim == 0);
++      CHECK(!reclaim.token);
++      /* a reclaim that was refused ends as one that was never made */
++      u_reclaim_end(&reclaim, false);
++      CHECK(a->reclaim_futile_until_ns == 0);
++   }
++
++   /* A poll that runs over the deadline leaves no sleep of the helper's
++    * after it: the wait ends when the poll does. */
++   {
++      struct pipe_context *a = new_context(new_screen());
++
++      reset();
++      fake.straddle = true;
++      fake.script.ready_after_ns[0] = -1;
++      const int64_t from = os_time_get_nano();
++      CHECK(!u_reclaim_begin(a, true, &reclaim));
++      CHECK(since(from) >= U_RECLAIM_FINISH_NS);
++      CHECK(since(from) < U_RECLAIM_FINISH_NS + 50 * MS);
++      CHECK(fake.late_sleeps == 0);
++      CHECK(fake.trims == 0 && fake.releases == 0);
++   }
++
++   printf("u_reclaim: ok\n");
++   return 0;
++}
+diff --git a/src/gallium/auxiliary/util/u_transfer.c b/src/gallium/auxiliary/util/u_transfer.c
+index 01ca534a1b7b25b28e36febfed8fe4c862329744..5194159b1137560a9bd6dd3e5ede64973f2d2163 100644
+--- a/src/gallium/auxiliary/util/u_transfer.c
++++ b/src/gallium/auxiliary/util/u_transfer.c
+@@ -71,14 +71,14 @@ void u_default_clear_buffer(struct pipe_context *pipe,
+    pipe_buffer_unmap(pipe, transfer);
+ }
+ 
+-void u_default_texture_subdata(struct pipe_context *pipe,
+-                               struct pipe_resource *resource,
+-                               unsigned level,
+-                               unsigned usage,
+-                               const struct pipe_box *box,
+-                               const void *data,
+-                               unsigned stride,
+-                               uintptr_t layer_stride)
++bool u_texture_subdata_try(struct pipe_context *pipe,
++                           struct pipe_resource *resource,
++                           unsigned level,
++                           unsigned usage,
++                           const struct pipe_box *box,
++                           const void *data,
++                           unsigned stride,
++                           uintptr_t layer_stride)
+ {
+    struct pipe_transfer *transfer = NULL;
+    const uint8_t *src_data = data;
+@@ -98,7 +98,7 @@ void u_default_texture_subdata(struct pipe_context *pipe,
+                             usage,
+                             box, &transfer);
+    if (!map)
+-      return;
++      return false;
+ 
+    util_copy_box(map,
+                  resource->format,
+@@ -114,6 +114,21 @@ void u_default_texture_subdata(struct pipe_context *pipe,
+                  0, 0, 0);
+ 
+    pipe_texture_unmap(pipe, transfer);
++   return true;
++}
++
++
++void u_default_texture_subdata(struct pipe_context *pipe,
++                               struct pipe_resource *resource,
++                               unsigned level,
++                               unsigned usage,
++                               const struct pipe_box *box,
++                               const void *data,
++                               unsigned stride,
++                               uintptr_t layer_stride)
++{
++   u_texture_subdata_try(pipe, resource, level, usage, box, data, stride,
++                         layer_stride);
+ }
+ 
+ void u_default_transfer_flush_region(UNUSED struct pipe_context *pipe,
+diff --git a/src/gallium/auxiliary/util/u_transfer.h b/src/gallium/auxiliary/util/u_transfer.h
+index 7c4f73d787c6451a8e2bbf58aaff654956fbce8f..c5d63757ad3d349b4b87759148cc3879a827923f 100644
+--- a/src/gallium/auxiliary/util/u_transfer.h
++++ b/src/gallium/auxiliary/util/u_transfer.h
+@@ -22,6 +22,17 @@ void u_default_clear_buffer(struct pipe_context *pipe,
+                             const void *clear_value,
+                             int clear_value_size);
+ 
++/* u_default_texture_subdata() that says whether it wrote: false when the
++ * driver could not map the range, so the caller can try again. */
++bool u_texture_subdata_try(struct pipe_context *pipe,
++                           struct pipe_resource *resource,
++                           unsigned level,
++                           unsigned usage,
++                           const struct pipe_box *box,
++                           const void *data,
++                           unsigned stride,
++                           uintptr_t layer_stride);
++
+ void u_default_texture_subdata(struct pipe_context *pipe,
+                                struct pipe_resource *resource,
+                                unsigned level,
+diff --git a/src/gallium/include/pipe/p_context.h b/src/gallium/include/pipe/p_context.h
+index 3cbbddf0d7bc1fb0d239d46413b615b568ff97b6..6ea66f7087ca9c283f9e08a35fa5be9117b0ebf3 100644
+--- a/src/gallium/include/pipe/p_context.h
++++ b/src/gallium/include/pipe/p_context.h
+@@ -106,6 +106,14 @@ typedef void (*pipe_draw_func)(struct pipe_context *pipe,
+ struct pipe_context {
+    struct pipe_screen *screen;
+ 
++   /**
++    * Owned by util/u_reclaim, which reads and writes it atomically: when the
++    * context's last reclaim gave back nothing that helped, the time
++    * (os_time_get_nano()) before which another is ruled out. Zero, like the
++    * rest of the context, until then. Drivers leave it alone.
++    */
++   int64_t reclaim_futile_until_ns;
++
+    void *priv;  /**< context private data (for DRI for example) */
+    void *draw;  /**< private, for draw module (temporary?) */
+    struct u_vbuf *vbuf; /**< for cso_context, don't use in drivers */
+diff --git a/src/gallium/include/pipe/p_screen.h b/src/gallium/include/pipe/p_screen.h
+index 0645f26e5b1168a7fb57199e5c0acb689b0eb580..78e7938f6d734f91588608064f654333a1518a26 100644
+--- a/src/gallium/include/pipe/p_screen.h
++++ b/src/gallium/include/pipe/p_screen.h
+@@ -92,6 +92,22 @@ struct pipe_screen {
+    int refcnt;
+    void *winsys_priv;
+ 
++   /**
++    * Owned by util/u_reclaim, which reads and writes it atomically: zero,
++    * like the rest of the screen, until a reclaim is made. Drivers leave it
++    * alone.
++    */
++   struct {
++      /** the token of the reclaim that is running on the screen, or 0 */
++      uint64_t claim;
++      /** the tokens given to the reclaims so far: none is given twice, and
++       * when they are all given no reclaim is made */
++      uint64_t tokens;
++      /** before this time (os_time_get_nano()) no reclaim is made: the work
++       * of the last did not finish */
++      int64_t hung_until_ns;
++   } reclaim;
++
+    const struct pipe_caps caps;
+    const struct pipe_shader_caps shader_caps[MESA_SHADER_MESH_STAGES];
+    const struct pipe_compute_caps compute_caps;
+@@ -659,6 +675,14 @@ struct pipe_screen {
+     */
+    unsigned (*release_cached_memory)(struct pipe_screen *screen);
+ 
++   /**
++    * The bytes of device memory the driver has freed since the screen was
++    * created. A caller that reclaims memory for a request the driver
++    * refused compares two readings to see whether the reclaim freed
++    * anything. Optional. May be called from any thread.
++    */
++   uint64_t (*get_freed_memory)(struct pipe_screen *screen);
++
+    /**
+     * Run driver-specific NIR lowering and optimization passes.
+     *

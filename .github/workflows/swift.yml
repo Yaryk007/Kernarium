@@ -443,13 +443,6 @@ jobs:
           cmake --build --preset kernarium-ios-device-android --parallel
           Kernarium/scripts/package-ios-frameworks.sh --runtimes android
 
-      # The staged image is a copy of an accepted Android release. A release
-      # build costs hours and tens of gigabytes, so the machine this job runs on
-      # keeps them in .build/android/releases; the script checks the release it
-      # stages against the manifest and layout the acceptance names.
-      - name: Stage the system image
-        run: Andarium/scripts/stage-system-image.py
-
       - name: Build the application
         run: |
           xcodebuild -project Andarium/Andarium.xcodeproj \

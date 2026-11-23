@@ -2,6 +2,7 @@
 #include "kernel_resources.hpp"
 
 #include "uml_darwin_host.h"
+#include "platform/host_wait.hpp"
 
 #include <cerrno>
 #include <cstdio>
@@ -130,7 +131,12 @@ int kernel_dup(int descriptor)
 /* The kernel receives blob descriptors from host services by SCM_RIGHTS. */
 ssize_t kernel_recvmsg(int descriptor, msghdr *message, int flags)
 {
-	const ssize_t result = recvmsg(descriptor, message, flags);
+	ssize_t result;
+	{
+		const ::uml::platform::ScopedHostWait wait{
+			::uml::platform::HostWait::receive};
+		result = recvmsg(descriptor, message, flags);
+	}
 	if (result < 0 || message == nullptr || message->msg_control == nullptr)
 		return result;
 	const int error = errno;

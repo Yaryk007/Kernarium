@@ -45,14 +45,21 @@ RULES = {
     "R6": "agent-session: a Claude-Session: trailer at the start of a line, "
     "which links a private coding session (never allowlisted; patch export "
     "drops it)",
+    "R7": "patch-address: an email address other than a GitHub noreply "
+    "address (the configured Git identity's) or the agent co-author's, in "
+    "the header or message of a patch under dependencies/patches or "
+    "android/lineage-24/patches; an outside contributor's own patches are "
+    "allowed series by series, on their From: line only (patches of carried "
+    "upstream content elsewhere keep their authors and are not scanned)",
 }
-ALLOWLIST_RULES = ("R1", "R2", "R3", "R4")
+ALLOWLIST_RULES = ("R1", "R2", "R3", "R4", "R7")
 ALLOWLIST_REASONS = (
     "guest-image path",
     "recorded provenance of an accepted artifact",
     "fixture for a parser or validator",
     "external upstream content",
     "project signing identity",
+    "outside contributor's own patch",
 )
 # R3: bundle identifiers inside these namespaces are not site-specific.
 PROJECT_NAMESPACES = ("org.linux-um-darwin.", "com.example.", "org.example.")
@@ -83,6 +90,15 @@ PATCH_TRAILER = re.compile(
     r"Acked-by|Tested-by|Reported-by|Suggested-by|Cc):",
     re.IGNORECASE,
 )
+# R7: the patches this project exports and replays, whose headers publish an
+# identity; their addresses are the configured Git identity's or the agent's.
+PATCH_ADDRESS_FILES = re.compile(
+    r"^(?:dependencies/patches|android/lineage-24/patches)/.*\.patch$"
+)
+ADDRESS = re.compile(
+    r"(?<![\w.%+-])[\w.%+-]+@(?P<domain>[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,})\b"
+)
+PATCH_ADDRESS_DOMAINS = ("users.noreply.github.com", "anthropic.com")
 PATCH_MBOX_SEPARATOR = re.compile(r"From [0-9a-f]{40} ")
 SESSION_TRAILER = re.compile(r"^Claude-Session:", re.MULTILINE)
 
@@ -479,6 +495,29 @@ def patch_lines(text: str) -> Iterable[tuple[int, str]]:
             yield number, line
 
 
+def patch_header_lines(text: str) -> Iterable[tuple[int, str]]:
+    """Yield each patch's mail header and message, up to its diffstat."""
+    in_header = True
+    for number, line in enumerate(text.split("\n"), 1):
+        if PATCH_MBOX_SEPARATOR.match(line):
+            in_header = True
+        elif line == "---" or line.startswith("diff --git "):
+            in_header = False
+        if in_header:
+            yield number, line
+
+
+def scan_patch_addresses(path: str, text: str) -> list[Finding]:
+    found = []
+    for number, line in patch_header_lines(text):
+        for match in ADDRESS.finditer(line):
+            domain = match.group("domain").lower()
+            if not any(domain == allowed or domain.endswith("." + allowed) for allowed in PATCH_ADDRESS_DOMAINS):
+                found.append(Finding("R7", path, number, excerpt_of(line), line))
+                break
+    return found
+
+
 def scan_sessions(scan: FileScan) -> None:
     for match in SESSION_TRAILER.finditer(scan.text):
         scan.add("R6", match.start())
@@ -514,6 +553,9 @@ def scan_file(
         return []
     text = data.decode("utf-8", "surrogateescape")
     numbers: list[int] | None = None
+    addresses: list[Finding] = []
+    if PATCH_ADDRESS_FILES.match(path) and path not in SELF_PATHS:
+        addresses = scan_patch_addresses(path, text)
     if path.endswith(".patch"):
         kept = list(patch_lines(text))
         numbers = [number for number, _ in kept]
@@ -523,8 +565,8 @@ def scan_file(
         scan_rules(scan)
     scan_denylist(scan, denylist)
     if numbers is None:
-        return scan.findings
-    return [
+        return scan.findings + addresses
+    return addresses + [
         finding._replace(line=numbers[finding.line - 1])
         for finding in scan.findings
     ]

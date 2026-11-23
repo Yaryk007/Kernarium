@@ -87,8 +87,14 @@ class Walker:
         self.suspend = image.symbols["uml_arm64_gadget_sme_suspend"]
         self.resume = image.symbols["uml_arm64_gadget_sme_resume"]
         table = encodings.load()
-        self.fp_simd = [(row.mask, row.value, row.advsimd)
-                        for row in table.fp_simd]
+        fp_simd = [(row.mask, row.value, row.advsimd) for row in table.fp_simd]
+        # The rows that can match a word, by its top byte and in the table's order (the first row that
+        # matches decides), as the A64 corpus tests index their own encoding tables.
+        self.fp_simd_by_top = [
+            [row for row in fp_simd
+             if ((row[1] >> 24) ^ top) & (row[0] >> 24) & 0xFF == 0]
+            for top in range(256)]
+        self.advsimd_words: dict[int, bool] = {}
         self.names: dict[int, str] = {}
         for name, value in image.symbols.items():
             self.names.setdefault(value, name)
@@ -98,10 +104,14 @@ class Walker:
         return self.image.words(self.text, address, address + 4)[0]
 
     def advsimd(self, word: int) -> bool:
-        for mask, value, advsimd in self.fp_simd:
-            if word & mask == value:
-                return advsimd
-        return False
+        known = self.advsimd_words.get(word)
+        if known is None:
+            known = self.advsimd_words[word] = False
+            for mask, value, advsimd in self.fp_simd_by_top[word >> 24]:
+                if word & mask == value:
+                    known = self.advsimd_words[word] = advsimd
+                    break
+        return known
 
     def where(self, address: int) -> str:
         best = max((value for value in self.names

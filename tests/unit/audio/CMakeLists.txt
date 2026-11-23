@@ -14,6 +14,21 @@ target_include_directories(uml_audio_output_cycle_tests PRIVATE
 uml_add_unit_test(NAME audio-output-cycle COMMAND uml_audio_output_cycle_tests
     LABELS audio)
 
+# So is when the Apple output replaces its engine and how long it waits for a
+# route that is not there.
+add_executable(uml_audio_output_recovery_tests output_recovery_tests.cpp)
+target_include_directories(uml_audio_output_recovery_tests PRIVATE
+    ${PROJECT_SOURCE_DIR}/darwin/device/audio)
+uml_add_unit_test(NAME audio-output-recovery
+    COMMAND uml_audio_output_recovery_tests LABELS audio)
+
+# So is the audio session's category and options for the clients that need it.
+add_executable(uml_audio_session_category_tests session_category_tests.cpp)
+target_include_directories(uml_audio_session_category_tests PRIVATE
+    ${PROJECT_SOURCE_DIR}/darwin/device/audio)
+uml_add_unit_test(NAME audio-session-category
+    COMMAND uml_audio_session_category_tests LABELS audio)
+
 if(TARGET uml_audio_device)
     add_executable(uml_virtio_sound_tests virtio_sound_tests.cpp)
     target_include_directories(uml_virtio_sound_tests PRIVATE
@@ -32,4 +47,15 @@ if(TARGET uml_audio_device)
         UML::AudioDevice)
     uml_add_unit_test(NAME virtio-sound-microphone
         COMMAND uml_virtio_sound_microphone_tests LABELS audio)
+
+    # The microphone's input tap on the real converter, over buffers the test
+    # makes: no engine, session or microphone is opened.
+    add_executable(uml_virtio_sound_microphone_tap_tests
+        microphone_tap_tests.mm)
+    target_include_directories(uml_virtio_sound_microphone_tap_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(uml_virtio_sound_microphone_tap_tests PRIVATE
+        UML::AudioDevice)
+    uml_add_unit_test(NAME virtio-sound-microphone-tap
+        COMMAND uml_virtio_sound_microphone_tap_tests LABELS audio)
 endif()

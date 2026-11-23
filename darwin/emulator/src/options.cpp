@@ -191,7 +191,78 @@ namespace {
 	return true;
 }
 
+[[nodiscard]] bool parse_aot_selection(
+	std::string_view value, ::uml::runtime::AotSelection &selection)
+{
+	if (value == "auto")
+		selection = ::uml::runtime::AotSelection::automatic;
+	else if (value == "on")
+		selection = ::uml::runtime::AotSelection::on;
+	else if (value == "off")
+		selection = ::uml::runtime::AotSelection::off;
+	else
+		return false;
+	return true;
+}
+
+[[nodiscard]] bool parse_sha256(std::string_view text,
+	std::array<std::uint8_t, 32> &digest)
+{
+	if (text.size() != 2 * digest.size())
+		return false;
+	for (std::size_t index = 0; index < digest.size(); ++index) {
+		std::uint8_t byte = 0;
+		for (std::size_t half = 0; half < 2; ++half) {
+			const char character = text[2 * index + half];
+			unsigned nibble;
+			if (character >= '0' && character <= '9')
+				nibble = static_cast<unsigned>(character - '0');
+			else if (character >= 'a' && character <= 'f')
+				nibble = static_cast<unsigned>(character - 'a') + 10U;
+			else
+				return false;
+			byte = static_cast<std::uint8_t>(byte << 4U | nibble);
+		}
+		digest[index] = byte;
+	}
+	return true;
+}
+
+/* "ID,MANIFEST,SYSTEM": the ID is what the release's manifest names, at most
+ * 64 characters with no comma, and each digest 64 lowercase hex digits. */
+[[nodiscard]] bool parse_aot_release(std::string_view value,
+	EmulatorOptions &prepared)
+{
+	const auto first = value.find(',');
+	if (first == std::string_view::npos || first == 0 || first > 64)
+		return false;
+	const auto second = value.find(',', first + 1);
+	if (second == std::string_view::npos)
+		return false;
+	if (!parse_sha256(value.substr(first + 1, second - first - 1),
+		    prepared.aot_manifest_sha256) ||
+	    !parse_sha256(value.substr(second + 1), prepared.aot_system_sha256))
+		return false;
+	prepared.aot_release_id = std::string{value.substr(0, first)};
+	prepared.aot_release_stated = true;
+	return true;
+}
+
 } // namespace
+
+std::string aot_release_argument(std::string_view id,
+	std::string_view manifest_sha256, std::string_view system_sha256)
+{
+	EmulatorOptions probe;
+	std::string argument{aot_release_prefix};
+	argument.append(id).append(",").append(manifest_sha256).append(",")
+		.append(system_sha256);
+	if (!parse_aot_release(
+		    std::string_view{argument}.substr(aot_release_prefix.size()),
+		    probe))
+		return {};
+	return argument;
+}
 
 unsigned configured_guest_cpu_count(
 	const std::vector<std::string> &arguments) noexcept
@@ -259,6 +330,27 @@ EmulatorOptions prepare_emulator_options(
 		if (argument == "--execution-engine") {
 			if (++index >= argc || argv[index] == nullptr ||
 				!parse_execution_engine(argv[index], prepared.engine)) {
+				prepared.valid = false;
+				return prepared;
+			}
+			continue;
+		}
+		if (argument == "--aot") {
+			prepared.aot = ::uml::runtime::AotSelection::on;
+			continue;
+		}
+		if (argument.starts_with("--aot=")) {
+			if (!parse_aot_selection(
+					argument.substr(6), prepared.aot)) {
+				prepared.valid = false;
+				return prepared;
+			}
+			continue;
+		}
+		if (argument.starts_with(aot_release_prefix)) {
+			if (prepared.aot_release_stated ||
+			    !parse_aot_release(
+				    argument.substr(aot_release_prefix.size()), prepared)) {
 				prepared.valid = false;
 				return prepared;
 			}

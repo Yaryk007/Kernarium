@@ -56,10 +56,10 @@ index 9799d79209242d06c1daf1ca49e2397e623e6350..901239f351388235047704d96f169f94
         * We are trying to be nice to ourselves. */
        uint64_t root_addr;
 diff --git a/src/kosmickrisp/vulkan/kk_cmd_draw.c b/src/kosmickrisp/vulkan/kk_cmd_draw.c
-index 4443ca440c848bdff1da96cce4aebaef0c0ece2b..94b08bd91432cd8265637ee6f270832385fbf892 100644
+index 96b70555d79403715366b32067b07085dc3cdb1e..6c575ab92def5d751328fbe5888c4f3c1bc55a5e 100644
 --- a/src/kosmickrisp/vulkan/kk_cmd_draw.c
 +++ b/src/kosmickrisp/vulkan/kk_cmd_draw.c
-@@ -3074,6 +3074,14 @@ build_draw_data(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
+@@ -3121,6 +3121,14 @@ build_draw_data(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
  static void
  kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
  {

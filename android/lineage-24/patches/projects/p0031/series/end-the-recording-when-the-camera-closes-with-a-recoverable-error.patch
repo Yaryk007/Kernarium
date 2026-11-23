@@ -1,0 +1,249 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 06:47:20 +0900
+Subject: [PATCH] end the recording when the camera closes with a recoverable
+ error
+
+When CameraX closes the camera with a recoverable error and opens it
+again (the camera device reports ERROR_CAMERA_DEVICE, or an open that
+fails is retried), the recording in progress goes on across the gap and
+holds whatever the new session delivers, a stall and then dark frames,
+until the person stops it. CameraX ends a recording only on an explicit
+stop, a use case that is detached, a limit or an encoder error, so no
+camera error ends it alone.
+
+End the current recording where the app handles that error, through one
+view model function that the shutter uses as well. The recorder
+finalizes with no error, the clip ends where the camera did and is
+offered as for any other recording, and the app stays open and opens its
+camera again by itself. A paused recording ends the same way, and
+nothing happens when no video is recording.
+
+A stopped recording is closed, so pause, resume and mute throw on it,
+while the screen keeps showing it until it finalizes, about a second
+later when no frames come. The function marks the recording as ending,
+with its identity, until its own Finalize event has reset the state. In
+that time the pause or resume button and the call that mutes the
+recording do nothing (the microphone setting still applies to the next
+recording), and a second stop does nothing. The button pressed when no
+recording runs, as a press queued behind the Finalize is, is logged and
+ignored where it used to throw.
+
+The Finalize event retires the handle of its own recording, and before
+it publishes idle: the next recording may start as soon as the state is
+idle and store its own handle, which a late event must not take. A
+recording that finalizes before its handle is stored retires it when it
+is stored.
+
+A start that still waits for its sound has no recording to stop: it is
+cancelled, the state goes back to idle and the activity puts the shutter
+back.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .../org/lineageos/aperture/CameraActivity.kt  |  11 +-
+ .../aperture/viewmodels/CameraViewModel.kt    | 112 ++++++++++++++++--
+ 2 files changed, 115 insertions(+), 8 deletions(-)
+
+diff --git a/app/src/main/java/org/lineageos/aperture/CameraActivity.kt b/app/src/main/java/org/lineageos/aperture/CameraActivity.kt
+index a1f5caa90d4d66ca80f4fa28910d7a3d60e3a95f..38512bdf2875c8d32f91fd51aebf3116b2c95d71 100644
+--- a/app/src/main/java/org/lineageos/aperture/CameraActivity.kt
++++ b/app/src/main/java/org/lineageos/aperture/CameraActivity.kt
+@@ -804,7 +804,16 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
+                         }
+ 
+                         CameraXCameraState.ERROR_OTHER_RECOVERABLE_ERROR -> {
+-                            // Warn the user and don't do anything
++                            // The camera is closed and CameraX opens it again, so a
++                            // recording would go on across the gap: end it and save the
++                            // clip. There is nothing to end when no video is recording
++                            if (viewModel.endVideoRecording()) {
++                                // A start that was still waiting has no recording to
++                                // finalize, put the shutter back here
++                                startShutterAnimation(ShutterAnimation.VideoEnd)
++                            }
++
++                            // Warn the user
+                             showToast(R.string.error_other_recoverable_error)
+                         }
+ 
+diff --git a/app/src/main/java/org/lineageos/aperture/viewmodels/CameraViewModel.kt b/app/src/main/java/org/lineageos/aperture/viewmodels/CameraViewModel.kt
+index bc83de246e4288742eb3a6288bd4e66623dbefc4..f0879784670702f0f19af6b4821d0aa62659a5dc 100644
+--- a/app/src/main/java/org/lineageos/aperture/viewmodels/CameraViewModel.kt
++++ b/app/src/main/java/org/lineageos/aperture/viewmodels/CameraViewModel.kt
+@@ -35,6 +35,7 @@ import androidx.lifecycle.asFlow
+ import androidx.lifecycle.viewModelScope
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.ExperimentalCoroutinesApi
++import kotlinx.coroutines.Job
+ import kotlinx.coroutines.channels.awaitClose
+ import kotlinx.coroutines.delay
+ import kotlinx.coroutines.flow.MutableSharedFlow
+@@ -96,7 +97,10 @@ import org.lineageos.aperture.utils.StorageUtils
+ import java.io.ByteArrayOutputStream
+ import java.util.concurrent.ExecutorService
+ import java.util.concurrent.Executors
++import java.util.concurrent.atomic.AtomicBoolean
+ import java.util.concurrent.atomic.AtomicInteger
++import java.util.concurrent.atomic.AtomicLong
++import java.util.concurrent.atomic.AtomicReference
+ import kotlin.reflect.safeCast
+ 
+ /**
+@@ -808,6 +812,24 @@ class CameraViewModel(application: Application) : ApertureViewModel(application)
+      */
+     val videoRecording = MutableStateFlow<Recording?>(null)
+ 
++    /**
++     * The start of a video recording that still waits for its sound, see [captureVideo].
++     */
++    private var videoRecordingStart: Job? = null
++
++    /**
++     * The number of video recordings started, which gives each one its identity.
++     */
++    private val videoRecordingCount = AtomicLong()
++
++    /**
++     * The identity of the video recording that [endVideoRecording] stopped and that has not
++     * finalized yet, or 0. A stopped [Recording] is closed, pause, resume and mute throw on it.
++     * The mark counts only while it is the identity of the recording started last, so it can
++     * never hold back a recording that starts after it.
++     */
++    private val endingVideoRecording = AtomicLong()
++
+     val isVideoMicButtonEnabled = combine(
+         cameraState,
+         videoRecording,
+@@ -1169,7 +1191,7 @@ class CameraViewModel(application: Application) : ApertureViewModel(application)
+         if (cameraState.value != CameraState.IDLE) {
+             if (cameraController.isRecording) {
+                 // Stop the current recording session.
+-                videoRecording.value?.stop()
++                endVideoRecording()
+             }
+             return
+         }
+@@ -1190,11 +1212,18 @@ class CameraViewModel(application: Application) : ApertureViewModel(application)
+         // Play shutter sound
+         val delayTime = if (cameraSoundsUtils.playStartVideoRecording()) 500L else 0L
+ 
+-        viewModelScope.launch {
++        val recordingId = videoRecordingCount.incrementAndGet()
++
++        videoRecordingStart = viewModelScope.launch {
+             delay(delayTime)
+ 
++            // The handle of this recording, which only its own Finalize event retires, and
++            // whether that event came before the handle was stored
++            val started = AtomicReference<Recording?>()
++            val finalized = AtomicBoolean()
++
+             // Start recording
+-            videoRecording.value = cameraController.startRecording(
++            val recording = cameraController.startRecording(
+                 outputOptions,
+                 videoAudioConfig,
+                 cameraExecutor,
+@@ -1232,20 +1261,87 @@ class CameraViewModel(application: Application) : ApertureViewModel(application)
+                                 mediaRepository.broadcastNewVideo(it.outputResults.outputUri)
+                             }
+                         }
++                        // Retire the handle before the state goes idle: from idle on the
++                        // next recording may start and store its own at once, and the handle
++                        // retired is this recording's only
++                        finalized.set(true)
++                        videoRecording.compareAndSet(started.get(), null)
+                         cameraState.value = CameraState.IDLE
+-                        videoRecording.value = null
++
++                        // Only now is the recording over for its controls: clear its mark,
++                        // and no later recording's
++                        endingVideoRecording.compareAndSet(recordingId, 0L)
+                     }
+                 }
+             }
++
++            started.set(recording)
++            videoRecording.value = recording
++            if (finalized.get()) {
++                // It finalized before its handle was stored, retire the handle now
++                videoRecording.compareAndSet(recording, null)
++            }
+         }
+     }
+ 
++    /**
++     * End the video recording, for the shutter and for a camera that closes under it.
++     *
++     * A start that still waits for its sound is cancelled and the state goes back to idle: there
++     * is no recording to finalize, so the caller puts the shutter back. A recording that runs or
++     * is paused is stopped and marked as ending until its Finalize event, because a stopped
++     * [Recording] is closed (pause, resume and mute throw on it) while the UI keeps showing it
++     * until it finalizes, a second or so later when no frames come. Stopping it again does
++     * nothing.
++     *
++     * Call it on the main thread.
++     *
++     * @return true when it cancelled a start that was waiting
++     */
++    fun endVideoRecording(): Boolean {
++        if (videoRecordingStart?.isActive == true) {
++            videoRecordingStart?.cancel()
++            cameraState.value = CameraState.IDLE
++            Log.d(LOG_TAG, "The start of the video recording is cancelled")
++            return true
++        }
++
++        val recording = videoRecording.value ?: return false
++        val recordingId = videoRecordingCount.get()
++        if (endingVideoRecording.getAndSet(recordingId) != recordingId) {
++            Log.d(LOG_TAG, "The video recording is stopped")
++            recording.stop()
++        }
++        return false
++    }
++
++    /**
++     * Whether the video recording was stopped and has not finalized yet, see [endVideoRecording].
++     *
++     * @param what What the caller was about to do to the recording, for the log
++     */
++    private fun isVideoRecordingEnding(what: String): Boolean {
++        val endingId = endingVideoRecording.get()
++        if (endingId == 0L || endingId != videoRecordingCount.get()) {
++            return false
++        }
++
++        Log.d(LOG_TAG, "$what is ignored, the video recording ends")
++        return true
++    }
++
+     fun onVideoRecordingStateButtonPress() {
++        if (isVideoRecordingEnding("The pause or resume")) {
++            return
++        }
++
+         when (cameraState.value) {
+             CameraState.RECORDING_VIDEO -> videoRecording.value?.pause()
+             CameraState.RECORDING_VIDEO_PAUSED -> videoRecording.value?.resume()
+-            else -> error(
+-                "videoRecordingStateButton clicked while in invalid state: ${cameraState.value}"
++            // A press queued behind the Finalize finds no recording, do not throw
++            else -> Log.w(
++                LOG_TAG,
++                "The pause or resume is ignored, no recording runs (${cameraState.value})",
+             )
+         }
+     }
+@@ -1527,7 +1623,9 @@ class CameraViewModel(application: Application) : ApertureViewModel(application)
+             false -> AudioConfig.AUDIO_DISABLED
+         }
+ 
+-        videoRecording.value?.mute(!videoMicrophoneEnabled)
++        if (!isVideoRecordingEnding("Muting the recording")) {
++            videoRecording.value?.mute(!videoMicrophoneEnabled)
++        }
+ 
+         this.videoMicMode.value = videoMicrophoneEnabled
+ 

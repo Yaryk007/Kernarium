@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 16:50:39 +0900
+Subject: [PATCH] um: lock the mconsole's queue of process-context requests
+
+The management console's interrupt queues every request that needs a
+process context, and a work item runs them. The queue relied on the
+interrupt handler running only on CPU 0 and on local_irq_save() in the
+work. On an SMP guest the work runs on another CPU, so a request queued
+while the work takes the previous one off the list can corrupt it.
+
+Give the queue a spinlock, take it in the interrupt and in the work,
+and schedule the work only when the interrupt queued a request.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ arch/um/drivers/mconsole_kern.c | 30 ++++++++++++++++++++----------
+ 1 file changed, 20 insertions(+), 10 deletions(-)
+
+diff --git a/arch/um/drivers/mconsole_kern.c b/arch/um/drivers/mconsole_kern.c
+index 3f7d0caf9915a4fc6ebf4a87e992a1d59467a9f7..e646c62e091d8d749cd73c59219ab0611ebe9d7c 100644
+--- a/arch/um/drivers/mconsole_kern.c
++++ b/arch/um/drivers/mconsole_kern.c
+@@ -53,11 +53,11 @@ static struct notifier_block reboot_notifier = {
+ 	.priority		= 0,
+ };
+ 
+-/* Safe without explicit locking for now.  Tasklets provide their own
+- * locking, and the interrupt handler is safe because it can't interrupt
+- * itself and it can only happen on CPU 0.
++/*
++ * The interrupt handler queues requests on whichever CPU takes it, and the
++ * work runs them on any CPU, so the queue has a lock of its own.
+  */
+-
++static DEFINE_SPINLOCK(mc_requests_lock);
+ static LIST_HEAD(mc_requests);
+ 
+ static void mc_work_proc(struct work_struct *unused)
+@@ -65,11 +65,15 @@ static void mc_work_proc(struct work_struct *unused)
+ 	struct mconsole_entry *req;
+ 	unsigned long flags;
+ 
+-	while (!list_empty(&mc_requests)) {
+-		local_irq_save(flags);
+-		req = list_entry(mc_requests.next, struct mconsole_entry, list);
+-		list_del(&req->list);
+-		local_irq_restore(flags);
++	for (;;) {
++		spin_lock_irqsave(&mc_requests_lock, flags);
++		req = list_first_entry_or_null(&mc_requests,
++					       struct mconsole_entry, list);
++		if (req != NULL)
++			list_del(&req->list);
++		spin_unlock_irqrestore(&mc_requests_lock, flags);
++		if (req == NULL)
++			break;
+ 		req->request.cmd->handler(&req->request);
+ 		kfree(req);
+ 	}
+@@ -83,6 +87,8 @@ static irqreturn_t mconsole_interrupt(int irq, void *dev_id)
+ 	long fd;
+ 	struct mconsole_entry *new;
+ 	static struct mc_request req;	/* that's OK */
++	bool queued = false;
++	unsigned long flags;
+ 
+ 	fd = (long) dev_id;
+ 	while (mconsole_get_request(fd, &req)) {
+@@ -95,11 +101,15 @@ static irqreturn_t mconsole_interrupt(int irq, void *dev_id)
+ 			else {
+ 				new->request = req;
+ 				new->request.regs = get_irq_regs()->regs;
++				spin_lock_irqsave(&mc_requests_lock, flags);
+ 				list_add(&new->list, &mc_requests);
++				spin_unlock_irqrestore(&mc_requests_lock,
++						       flags);
++				queued = true;
+ 			}
+ 		}
+ 	}
+-	if (!list_empty(&mc_requests))
++	if (queued)
+ 		schedule_work(&mconsole_work);
+ 	return IRQ_HANDLED;
+ }

@@ -1,0 +1,192 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 16:49:54 +0900
+Subject: [PATCH] kosmickrisp: give up command allocators the device no longer
+ takes
+
+The cache of command allocators hands out the newest, so a workload
+that records fewer submissions at once than the cache holds never takes
+the oldest and their storage stays charged to the process for as long
+as the device lives: 17 MiB or more after a heavy application closed,
+returned only when a host refused an allocation.
+
+An allocator cached for a second is now released when another is
+handed back, and when a command pool's resources are released.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/kosmickrisp/vulkan/kk_cmd_pool.c          |  5 ++
+ src/kosmickrisp/vulkan/kk_device.c            | 12 ++-
+ src/kosmickrisp/vulkan/kk_device.h            |  8 ++
+ .../tests/test_command_allocator_budget.c     | 80 +++++++++++++++++++
+ 4 files changed, 104 insertions(+), 1 deletion(-)
+
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_pool.c b/src/kosmickrisp/vulkan/kk_cmd_pool.c
+index eba1f8d6aa08ad965775fef2332f0ed45f4d23bb..910f5c251f09fd53d1b96dd2a4791e961be725c1 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_pool.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_pool.c
+@@ -148,6 +148,11 @@ kk_ResetCommandPool(VkDevice device, VkCommandPool commandPool,
+        * Also return their objects and the pool's cached upload BOs. */
+       vk_command_pool_trim(&pool->vk, 0);
+       kk_cmd_pool_destroy_bos(pool);
++      /* A client that releases a pool's resources wants the device's idle
++       * storage back as well. */
++      struct kk_device *dev = kk_cmd_pool_device(pool);
++      kk_command_allocator_cache_trim(dev->allocator_cache,
++                                      KK_COMMAND_ALLOCATOR_IDLE_NS);
+    }
+    return result;
+ }
+diff --git a/src/kosmickrisp/vulkan/kk_device.c b/src/kosmickrisp/vulkan/kk_device.c
+index 1300d3663a4019d52c805625c059883464743005..167d7859c8597ad3e44e00adb3cbac93f949dc36 100644
+--- a/src/kosmickrisp/vulkan/kk_device.c
++++ b/src/kosmickrisp/vulkan/kk_device.c
+@@ -358,20 +358,30 @@ kk_command_allocator_cache_give(struct kk_command_allocator_cache *cache,
+    mtl_command_allocator_reset(allocator);
+    const uint64_t size = mtl_command_allocator_allocated_size(allocator);
+ 
++   const uint64_t now_ns = kk_monotonic_ns();
++   bool has_idle;
+    simple_mtx_lock(&cache->mutex);
+    if (cache->count < KK_COMMAND_ALLOCATOR_CACHE_MAX &&
+        size <= KK_COMMAND_ALLOCATOR_RECYCLE_MAX_B &&
+        size <= KK_COMMAND_ALLOCATOR_RETAIN_MAX_B - cache->bytes) {
+       cache->sizes[cache->count] = size;
+-      cache->given_ns[cache->count] = kk_monotonic_ns();
++      cache->given_ns[cache->count] = now_ns;
+       cache->entries[cache->count++] = allocator;
+       cache->bytes += size;
+       allocator = NULL;
+    }
++   /* The entries are in the order they were given. */
++   has_idle = cache->count &&
++              now_ns - cache->given_ns[0] >= KK_COMMAND_ALLOCATOR_IDLE_NS;
+    simple_mtx_unlock(&cache->mutex);
+ 
+    if (allocator)
+       mtl_release(allocator);
++
++   /* The thread that hands an allocator back is Metal's completion thread,
++    * not a recording one. */
++   if (has_idle)
++      kk_command_allocator_cache_trim(cache, KK_COMMAND_ALLOCATOR_IDLE_NS);
+ }
+ 
+ uint64_t
+diff --git a/src/kosmickrisp/vulkan/kk_device.h b/src/kosmickrisp/vulkan/kk_device.h
+index b601917ca76a2a4a5e87f62dd804db7658349472..aa22e62eab1d2050878966b891fcb7bd383fab87 100644
+--- a/src/kosmickrisp/vulkan/kk_device.h
++++ b/src/kosmickrisp/vulkan/kk_device.h
+@@ -127,6 +127,14 @@ struct kk_precompiled_cache {
+ #define KK_COMMAND_ALLOCATOR_RECYCLE_MAX_B (16ull << 20)
+ #define KK_COMMAND_ALLOCATOR_RETAIN_MAX_B (64ull << 20)
+ 
++/* A take returns the newest allocator, so a workload that records fewer
++ * submissions at once than the cache holds never takes the oldest, and their
++ * storage would stay charged to the process for as long as the device lives.
++ * An allocator that has been cached this long is given up when another is
++ * handed back, and when a command pool's resources are released. A workload
++ * that records every few frames takes its allocators well within it. */
++#define KK_COMMAND_ALLOCATOR_IDLE_NS (1000ull * 1000 * 1000)
++
+ struct kk_command_allocator_cache {
+    int refcount;
+    /* In the list of caches kk_release_cached_memory() walks, from creation
+diff --git a/src/kosmickrisp/vulkan/tests/test_command_allocator_budget.c b/src/kosmickrisp/vulkan/tests/test_command_allocator_budget.c
+index 343e3349d2da76bc5ec5f27851d5be4f7d5359f8..b6da8bc8822fb08f5ab1088216bb228fc16f1e60 100644
+--- a/src/kosmickrisp/vulkan/tests/test_command_allocator_budget.c
++++ b/src/kosmickrisp/vulkan/tests/test_command_allocator_budget.c
+@@ -6,6 +6,11 @@
+  * KK_COMMAND_ALLOCATOR_RETAIN_MAX_B, or the process stays charged for its
+  * largest recording ever. A command buffer that records nothing holds no
+  * allocator at all, so idle command buffers cannot pin the cached storage.
++ *
++ * A device that records fewer submissions at once than the cache holds takes
++ * the newest allocators and never the oldest, so an allocator the cache has
++ * kept for KK_COMMAND_ALLOCATOR_IDLE_NS is given up when another is handed
++ * back, and when a command pool's resources are released.
+  */
+ 
+ #define VK_NO_PROTOTYPES
+@@ -274,6 +279,81 @@ main(void)
+       }
+    }
+ 
++   /* Two recordings in flight at once take an allocator each and hand both
++    * back. A device that then records one at a time takes the newer and
++    * never the older, so the older one is given up once it has been cached
++    * for a second, when the newer is handed back; a command pool's release
++    * gives up an idle one as well. */
++   for (unsigned round = 0; round < 2; round++) {
++      for (unsigned i = 1; i <= 2; i++) {
++         VkCommandBufferBeginInfo begin = {
++            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
++         CHECK(vkBeginCommandBuffer(commands[i], &begin) == VK_SUCCESS);
++         vkCmdFillBuffer(commands[i], buffer, 0, 4096, i);
++         CHECK(vkEndCommandBuffer(commands[i]) == VK_SUCCESS);
++      }
++      VkSubmitInfo both[2] = {
++         {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++          .commandBufferCount = 1,
++          .pCommandBuffers = &commands[1]},
++         {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++          .commandBufferCount = 1,
++          .pCommandBuffers = &commands[2]}};
++      CHECK(vkQueueSubmit(queue, 2, both, VK_NULL_HANDLE) == VK_SUCCESS);
++      CHECK(vkQueueWaitIdle(queue) == VK_SUCCESS);
++
++      unsigned cached;
++      uint64_t bytes;
++      struct timespec start, now;
++      clock_gettime(CLOCK_MONOTONIC, &start);
++      for (;;) {
++         cache_state(dev, &cached, &bytes);
++         clock_gettime(CLOCK_MONOTONIC, &now);
++         if (cached >= 2 || now.tv_sec - start.tv_sec > 5)
++            break;
++         struct timespec pause = {0, 1000000};
++         nanosleep(&pause, NULL);
++      }
++      CHECK(cached == 2);
++
++      /* Not idle yet: another allocator handed back gives up nothing. */
++      struct timespec idle = {1, 100000000};
++      nanosleep(&idle, NULL);
++      if (round == 0) {
++         VkCommandBufferBeginInfo begin = {
++            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
++         CHECK(vkBeginCommandBuffer(commands[3], &begin) == VK_SUCCESS);
++         vkCmdFillBuffer(commands[3], buffer, 0, 4096, 3);
++         CHECK(vkEndCommandBuffer(commands[3]) == VK_SUCCESS);
++         VkSubmitInfo one = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++                             .commandBufferCount = 1,
++                             .pCommandBuffers = &commands[3]};
++         CHECK(vkQueueSubmit(queue, 1, &one, VK_NULL_HANDLE) == VK_SUCCESS);
++         CHECK(vkQueueWaitIdle(queue) == VK_SUCCESS);
++         clock_gettime(CLOCK_MONOTONIC, &start);
++         for (;;) {
++            cache_state(dev, &cached, &bytes);
++            clock_gettime(CLOCK_MONOTONIC, &now);
++            if (cached == 1 || now.tv_sec - start.tv_sec > 5)
++               break;
++            struct timespec pause = {0, 1000000};
++            nanosleep(&pause, NULL);
++         }
++         printf("the older allocator was given up: the cache holds %u, %.1f MiB\n",
++                cached, bytes / 1048576.0);
++         CHECK(cached == 1);
++      } else {
++         CHECK(vkResetCommandPool(device, pool,
++                                  VK_COMMAND_POOL_RESET_RELEASE_RESOURCES_BIT) ==
++               VK_SUCCESS);
++         cache_state(dev, &cached, &bytes);
++         CHECK(cached == 0 && bytes == 0);
++      }
++      kk_release_cached_memory();
++   }
++
+    vkDestroyCommandPool(device, pool, NULL);
+    vkDestroyBuffer(device, buffer, NULL);
+    vkFreeMemory(device, buffer_memory, NULL);

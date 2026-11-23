@@ -1,0 +1,177 @@
+# Golden frames of the motion wire (vsock 5556), the contract between the
+# guest's motion sub-HAL (android/lineage-24/overlay/sensors) and the host
+# (Andarium/AndariumCore, whose MotionOrientationFixture.swift reads this
+# file). The name dates from the first sensor it covered.
+#
+# One frame per line: `name: <hex bytes>`. A line that starts with `#` is a
+# comment, and the comment above a frame says what it means.
+#
+# A host-to-guest record is 20 bytes, little endian: "ANS1" (41 4e 53 31), the
+# Android sensor type as a uint16, a status byte, a byte that is always 0 and
+# three float32 values. The guest ends the connection on every `reject-` record
+# frame; the host never encodes one.
+#
+# An `orientation-` frame is a record of type 27 (DEVICE_ORIENTATION, 1b 00).
+# The first value is the orientation, exactly 0.0, 1.0, 2.0 or 3.0
+# (Surface.ROTATION_*: the device in its default orientation, turned 90
+# degrees counter-clockwise, turned 180 degrees, turned 90 degrees clockwise);
+# the other two are 0.0. The host sends one only after an "ANC2" or "ANC3"
+# frame that says the guest lists the sensor arrived on the connection.
+#
+# A `magnetic-status-N` frame is a record of type 2 (MAGNETIC_FIELD, 02 00) in
+# microtesla in the device's frame, with Android's SensorStatus N in the status
+# byte: 0 unreliable, 1 low, 2 medium, 3 high. The host sends one only while
+# the latest frame on the connection is an "ANC3" frame with bit 3 set.
+#
+# An `accelerometer-` frame (type 1, m/s^2) and a `gyroscope-` frame (type 4,
+# rad/s) carry status 0, as their records always did.
+#
+# A `control-` frame is a guest-to-host frame: "ANC1" or "ANC2" of 16 bytes, or
+# "ANC3" of 20. The mask is a uint32 of the sensors (bit 0 accelerometer, bit 1
+# gyroscope, bit 2 device orientation enabled and bit 3 magnetometer active,
+# which "ANC3" alone has, and bit 4 device orientation listed, with bit 2 only
+# when it is listed). The periods follow in microseconds: the accelerometer's
+# and the gyroscope's, and in "ANC3" the magnetometer's, which is 20 ms to 1 s.
+# "ANC1" is what an image without the orientation sensor and the magnetometer
+# sends; "ANC2" says the image takes orientation records, and "ANC3" says it
+# lists the magnetometer. The guest encodes every `control-` frame for the
+# state its comment gives; the host reads each of them, and ends the connection
+# on every `reject-control-` frame, which the guest never encodes.
+
+# The default orientation.
+orientation-0: 41 4e 53 31 1b 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# Turned 90 degrees counter-clockwise (iOS landscapeLeft).
+orientation-1: 41 4e 53 31 1b 00 00 00 00 00 80 3f 00 00 00 00 00 00 00 00
+
+# Turned 180 degrees (iOS portraitUpsideDown).
+orientation-2: 41 4e 53 31 1b 00 00 00 00 00 00 40 00 00 00 00 00 00 00 00
+
+# Turned 90 degrees clockwise (iOS landscapeRight).
+orientation-3: 41 4e 53 31 1b 00 00 00 00 00 40 40 00 00 00 00 00 00 00 00
+
+# 4.0 is no orientation.
+reject-orientation-high: 41 4e 53 31 1b 00 00 00 00 00 80 40 00 00 00 00 00 00 00 00
+
+# -1.0 is no orientation.
+reject-orientation-negative: 41 4e 53 31 1b 00 00 00 00 00 80 bf 00 00 00 00 00 00 00 00
+
+# 1.5 is between two orientations.
+reject-orientation-fraction: 41 4e 53 31 1b 00 00 00 00 00 c0 3f 00 00 00 00 00 00 00 00
+
+# The second value is not zero.
+reject-orientation-second: 41 4e 53 31 1b 00 00 00 00 00 80 3f 00 00 80 3f 00 00 00 00
+
+# The third value is not zero.
+reject-orientation-third: 41 4e 53 31 1b 00 00 00 00 00 80 3f 00 00 00 00 00 00 80 3f
+
+# NaN is never a measurement.
+reject-orientation-nan: 41 4e 53 31 1b 00 00 00 00 00 c0 7f 00 00 00 00 00 00 00 00
+
+# Status 0 is unreliable: the host's field has not been calibrated, or the
+# device has no field to give (the last field, or zeros).
+magnetic-status-0: 41 4e 53 31 02 00 00 00 00 00 00 00 00 00 c8 41 00 00 20 c2
+
+# Status 1 is low accuracy.
+magnetic-status-1: 41 4e 53 31 02 00 01 00 00 00 00 00 00 00 c8 41 00 00 20 c2
+
+# Status 2 is medium accuracy.
+magnetic-status-2: 41 4e 53 31 02 00 02 00 00 00 00 00 00 00 c8 41 00 00 20 c2
+
+# Status 3 is high accuracy.
+magnetic-status-3: 41 4e 53 31 02 00 03 00 00 00 00 00 00 00 c8 41 00 00 20 c2
+
+# Status 4 is no SensorStatus the host sends.
+reject-magnetic-status-high: 41 4e 53 31 02 00 04 00 00 00 00 00 00 00 c8 41 00 00 20 c2
+
+# Neither is 255.
+reject-magnetic-status-byte: 41 4e 53 31 02 00 ff 00 00 00 00 00 00 00 c8 41 00 00 20 c2
+
+# The byte after the status is always 0.
+reject-magnetic-reserved: 41 4e 53 31 02 00 00 01 00 00 00 00 00 00 c8 41 00 00 20 c2
+
+# NaN is never a measurement.
+reject-magnetic-nan: 41 4e 53 31 02 00 03 00 00 00 c0 7f 00 00 00 00 00 00 00 00
+
+# Nor is infinity, either way.
+reject-magnetic-infinity: 41 4e 53 31 02 00 03 00 00 00 00 00 00 00 80 7f 00 00 00 00
+reject-magnetic-negative-infinity: 41 4e 53 31 02 00 03 00 00 00 00 00 00 00 00 00 00 00 80 ff
+
+# Gravity along z (m/s^2): type 1, status 0.
+accelerometer-gravity: 41 4e 53 31 01 00 00 00 00 00 00 00 00 00 00 00 0a e8 1c 41
+
+# A rotation of +1, -2 and +0.5 rad/s: type 4, status 0.
+gyroscope-turn: 41 4e 53 31 04 00 00 00 00 00 80 3f 00 00 00 c0 00 00 00 3f
+
+# Only the magnetic field has a status.
+reject-accelerometer-status: 41 4e 53 31 01 00 01 00 00 00 00 00 00 00 00 00 0a e8 1c 41
+reject-gyroscope-status: 41 4e 53 31 04 00 03 00 00 00 80 3f 00 00 00 c0 00 00 00 3f
+reject-orientation-status: 41 4e 53 31 1b 00 01 00 00 00 80 3f 00 00 00 00 00 00 00 00
+
+# The byte after the status is always 0 for every sensor.
+reject-gyroscope-reserved: 41 4e 53 31 04 00 00 01 00 00 80 3f 00 00 00 c0 00 00 00 3f
+
+# Type 3 (the orientation angles) and 14 (the uncalibrated field) are no sensor
+# of this wire: the guest lists neither, and the framework makes the first.
+reject-type-orientation-angles: 41 4e 53 31 03 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+reject-type-uncalibrated-field: 41 4e 53 31 0e 00 00 00 00 00 00 00 00 00 c8 41 00 00 20 c2
+
+# An image without the orientation sensor, nothing in use: both periods 10 ms.
+control-v1-idle: 41 4e 43 31 00 00 00 00 10 27 00 00 10 27 00 00
+
+# An image without the sensor, the accelerometer at 20 ms and the gyroscope at 1 s.
+control-v1-motion: 41 4e 43 31 03 00 00 00 20 4e 00 00 40 42 0f 00
+
+# An image with the orientation sensor, nothing in use. The first frame of a
+# connection carries the state at that moment, so it can be any of the frames
+# below.
+control-v2-idle: 41 4e 43 32 00 00 00 00 10 27 00 00 10 27 00 00
+
+# An image with the sensor, the window manager using it.
+control-v2-orientation: 41 4e 43 32 04 00 00 00 10 27 00 00 10 27 00 00
+
+# An image with the sensor, all three in use, the accelerometer at 20 ms and
+# the gyroscope at 1 s.
+control-v2-all: 41 4e 43 32 07 00 00 00 20 4e 00 00 40 42 0f 00
+
+# "ANC1" has no bit 2: an image without the sensor never sets it.
+reject-control-v1-orientation: 41 4e 43 31 04 00 00 00 10 27 00 00 10 27 00 00
+
+# Bit 3 is the magnetometer's, which "ANC2" has no room for.
+reject-control-reserved: 41 4e 43 32 08 00 00 00 10 27 00 00 10 27 00 00
+
+# Bit 4 says an "ANC3" guest lists the orientation sensor; "ANC2" always does.
+reject-control-v2-listed: 41 4e 43 32 10 00 00 00 10 27 00 00 10 27 00 00
+
+# "ANC1" has no bit 3: an image without the magnetometer never sets it.
+reject-control-v1-magnetometer: 41 4e 43 31 08 00 00 00 10 27 00 00 10 27 00 00
+
+# An image with the magnetometer, nothing in use and no orientation sensor:
+# both periods 10 ms and the magnetometer's 20 ms.
+control-v3-idle: 41 4e 43 33 00 00 00 00 10 27 00 00 10 27 00 00 20 4e 00 00
+
+# An image with the magnetometer in use at 50 ms and no orientation sensor.
+control-v3-magnetometer: 41 4e 43 33 08 00 00 00 10 27 00 00 10 27 00 00 50 c3 00 00
+
+# An image with the magnetometer and the orientation sensor, nothing in use.
+control-v3-orientation-idle: 41 4e 43 33 10 00 00 00 10 27 00 00 10 27 00 00 20 4e 00 00
+
+# The same image with the window manager using the orientation sensor.
+control-v3-orientation: 41 4e 43 33 14 00 00 00 10 27 00 00 10 27 00 00 20 4e 00 00
+
+# The same image with all four in use: the accelerometer at 20 ms, the
+# gyroscope at 1 s and the magnetometer at 40 ms.
+control-v3-all: 41 4e 43 33 1f 00 00 00 20 4e 00 00 40 42 0f 00 40 9c 00 00
+
+# Bit 2 (orientation enabled) without bit 4 (orientation listed) is no state.
+reject-control-v3-orientation-unlisted: 41 4e 43 33 04 00 00 00 10 27 00 00 10 27 00 00 20 4e 00 00
+
+# The same with the magnetometer in use.
+reject-control-v3-orientation-unlisted-magnetometer: 41 4e 43 33 0c 00 00 00 10 27 00 00 10 27 00 00 50 c3 00 00
+
+# Bits above 4 are reserved.
+reject-control-v3-reserved: 41 4e 43 33 20 00 00 00 10 27 00 00 10 27 00 00 20 4e 00 00
+
+# The magic's last byte is 0x21 ("!"), a version this protocol never assigns:
+# the versions are 1, 2 and 3 (the magnetometer's "ANC3", 20 bytes).
+reject-control-magic: 41 4e 43 21 00 00 00 00 10 27 00 00 10 27 00 00

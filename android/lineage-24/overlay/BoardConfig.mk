@@ -87,6 +87,14 @@ BOARD_VENDOR_SEPOLICY_DIRS := $(filter-out \
     $(BOARD_VENDOR_SEPOLICY_DIRS))
 
 BOARD_VENDOR_SEPOLICY_DIRS += device/kernarium/andarium/sepolicy/vendor
+
+# One image serves devices with and without haptics, and Android learns which at
+# boot from the ODM SKU (ro.boot.product.hardware.sku, which Build.ODM_SKU also
+# reads). Only the "haptics" SKU has an ODM manifest, and its one fragment
+# declares the vibrator HAL (overlay/vibrator). The product and its parents set
+# no ODM_MANIFEST_FILES, so the fragment is that manifest's whole content.
+ODM_MANIFEST_SKUS := haptics
+ODM_MANIFEST_HAPTICS_FILES := device/kernarium/andarium/vibrator/manifest_haptics.xml
 # The Wi-Fi interface is virt_wifi, a station only: the kernel gives it no
 # access-point or peer-to-peer interface type. The inherited board offers
 # station, access point and peer-to-peer interfaces and a second station, which

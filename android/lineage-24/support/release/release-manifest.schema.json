@@ -19,7 +19,7 @@
     "inventory"
   ],
   "properties": {
-    "schema_version": { "enum": [6, 7] },
+    "schema_version": { "enum": [6, 7, 8] },
     "release_id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$" },
     "directory_name": { "type": "string" },
     "product_family": { "const": "lineage-24-mainline-6.18-4k" },
@@ -44,8 +44,56 @@
       "additionalProperties": false
     },
     "producer": { "type": "object" },
-    "inventory": { "type": "array" }
+    "inventory": { "type": "array" },
+    "root": {
+      "description": "The Magisk root files of the release, under root/: the official APK, unmodified, and a copy of the release's own init_boot that Magisk's patcher made; schema 8, optional. Both files are in the inventory.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["magisk", "apk", "boot_image"],
+      "properties": {
+        "magisk": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "version_name", "version_code"],
+          "properties": {
+            "name": { "const": "Magisk" },
+            "version_name": { "type": "string", "pattern": "^v[0-9]+\\.[0-9]+(\\.[0-9]+)?$" },
+            "version_code": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "apk": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["path", "sha256", "size"],
+          "properties": {
+            "path": { "type": "string", "pattern": "^root/Magisk-v[0-9]+\\.[0-9]+(\\.[0-9]+)?\\.apk$" },
+            "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "size": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "boot_image": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["path", "sha256", "size", "stock_init_boot_sha256", "stock_init_boot_sha1"],
+          "properties": {
+            "path": { "const": "root/init_boot-magisk.img" },
+            "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "size": { "type": "integer", "minimum": 1 },
+            "stock_init_boot_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "stock_init_boot_sha1": { "type": "string", "pattern": "^[0-9a-f]{40}$" }
+          }
+        }
+      }
+    }
   },
-  "if": { "properties": { "schema_version": { "const": 7 } } },
-  "then": { "properties": { "outer": { "required": ["input_trees"] } } }
+  "allOf": [
+    {
+      "if": { "properties": { "schema_version": { "enum": [7, 8] } } },
+      "then": { "properties": { "outer": { "required": ["input_trees"] } } }
+    },
+    {
+      "if": { "required": ["root"] },
+      "then": { "properties": { "schema_version": { "const": 8 } } }
+    }
+  ]
 }

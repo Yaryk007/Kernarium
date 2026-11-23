@@ -1,0 +1,28 @@
+# Which display sizes the guest's EDID can state as a 120 Hz mode: the contract
+# between the host's detailed timing (darwin/device/gpu/edid_timing.hpp) and the
+# application's rule for offering the 120 Hz setting
+# (Andarium/AndariumCore HighRefresh.swift). Both check every line.
+#
+# One size per line: `<width> <height> <carries>`, carries 1 when the 120 Hz
+# pixel clock fits the two bytes of the detailed timing (655.35 MHz with the
+# blanking the device always uses) and 0 when it does not, in which case the
+# size can only be the 60 Hz mode. A line that starts with `#` is a comment.
+#
+# An iPhone Pro's guest display at its default and its native resolution.
+860 1678 1
+1290 2796 1
+1206 2622 1
+# An 11-inch iPad Pro, portrait and landscape, at its native size.
+1668 2388 1
+2388 1668 1
+# A 12.9-inch and a 13-inch iPad Pro at their native size: the clock overflows.
+2048 2732 0
+2732 2048 0
+2064 2752 0
+2752 2064 0
+# The same iPads at the 1.5 resolution the settings offer.
+1536 2048 1
+2048 1536 1
+# A phone-sized and a small window.
+1366 1024 1
+320 240 1

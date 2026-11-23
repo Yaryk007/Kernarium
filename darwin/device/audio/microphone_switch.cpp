@@ -108,6 +108,23 @@ bool MicrophoneSwitch::active() const
     return authorization_->permission() == MicrophonePermission::granted;
 }
 
+void MicrophoneSwitch::setStandby(bool standby)
+{
+    {
+        const std::lock_guard lock(lock_);
+        if (standby_ == standby)
+            return;
+        standby_ = standby;
+    }
+    changed();
+}
+
+bool MicrophoneSwitch::standby() const
+{
+    const std::lock_guard lock(lock_);
+    return standby_;
+}
+
 void MicrophoneSwitch::setWaker(std::shared_ptr<const Waker> waker)
 {
     const std::lock_guard lock(lock_);

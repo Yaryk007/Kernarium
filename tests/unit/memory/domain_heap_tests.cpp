@@ -6,7 +6,9 @@
 #include "named_tests.hpp"
 #include "require.hpp"
 
+#include <mach/mach.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -202,6 +204,64 @@ void release_returns_every_byte_to_the_region()
 	 * the region hands out its lowest free range first. */
 	void *again = heap.allocate(100, 16);
 	require(again == small, "a released range was not reused lowest first");
+}
+
+#if defined(__has_feature)
+#if __has_feature(thread_sanitizer) || __has_feature(address_sanitizer)
+#define UML_HEAP_TEST_UNDER_SANITIZER 1
+#endif
+#endif
+
+/* The mapped size of this process: what RLIMIT_AS limits. */
+[[nodiscard]] rlim_t mapped_bytes()
+{
+	task_vm_info_data_t information{};
+	mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+	require(task_info(mach_task_self(), TASK_VM_INFO,
+			reinterpret_cast<task_info_t>(&information), &count) ==
+			KERN_SUCCESS,
+		"could not read the size of the process's mappings");
+	return static_cast<rlim_t>(information.virtual_size);
+}
+
+/* A host asks for the region before the first block: a process with no
+ * address space for it is refused, leaves no region behind and no block, and is
+ * answered when it has some; the reservation is then made once, a block comes
+ * from it, and asking again changes nothing. This row runs first, in a process
+ * whose region nothing has taken a block from, and limits the process's
+ * address space to what it maps (RLIMIT_AS, which a sanitizer's shadow memory
+ * defeats). */
+void the_region_can_be_reserved_before_the_first_block()
+{
+	auto &region = HeapRegion::instance();
+	require(region.base() == 0,
+		"the region was reserved before this row, which must run first");
+#ifndef UML_HEAP_TEST_UNDER_SANITIZER
+	rlimit limit{};
+	require(getrlimit(RLIMIT_AS, &limit) == 0,
+		"could not read the address space limit");
+	const rlim_t before = limit.rlim_cur;
+	limit.rlim_cur = mapped_bytes();
+	require(setrlimit(RLIMIT_AS, &limit) == 0,
+		"could not limit the address space");
+	const bool refused = !region.reserve();
+	const bool left_nothing = region.base() == 0 &&
+		region.take(host_page(), ScratchArena::vm_tag) == nullptr;
+	limit.rlim_cur = before;
+	require(setrlimit(RLIMIT_AS, &limit) == 0,
+		"could not lift the address space limit");
+	require(refused, "a process with no address space reserved its region");
+	require(left_nothing, "a refused reservation left a region or a block");
+#endif
+	require(region.reserve(), "the region was not reserved when asked for");
+	const auto base = region.base();
+	require(base != 0, "a reserved region has no base");
+	require(region.reserve() && region.base() == base,
+		"asking again moved or lost the region");
+	void *const block = region.take(host_page(), ScratchArena::vm_tag);
+	require(block != nullptr && region.contains(block),
+		"a block did not come from the reserved region");
+	region.give(block, host_page());
 }
 
 void a_released_range_stays_reserved()
@@ -516,6 +576,8 @@ void heaps_are_counted_while_they_live()
 int main()
 {
 	const uml::testing::NamedTest tests[] = {
+		{"the region can be reserved before the first block",
+			the_region_can_be_reserved_before_the_first_block},
 		{"every size class hands out aligned, distinct blocks",
 			every_size_class_hands_out_aligned_distinct_blocks},
 		{"a freed block is the next of its class",

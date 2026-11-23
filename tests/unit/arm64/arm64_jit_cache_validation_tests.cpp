@@ -910,14 +910,16 @@ void saved_word_owners_remain_inside_representative_budgets()
 		require(geometry.total_bytes() <=
 			arm64::default_jit_cache_budget_per_executor);
 		if (whole_process_budget >=
-			10U * arm64::default_jit_cache_budget_per_executor +
-			arm64::minimum_shared_translation_cache_bytes) {
+			10U * arm64::default_jit_cache_budget_per_executor) {
 			if (expected_geometry)
 				require(geometry == *expected_geometry);
 			else
 				expected_geometry = geometry;
 		}
-		require(shared > preceding_shared);
+		require(shared >= preceding_shared);
+		require((shared != 0) ==
+			(whole_process_budget - geometry.total_bytes() * 10U >=
+				arm64::minimum_shared_translation_tier_bytes));
 		require(geometry.total_bytes() * 10U + shared <=
 			whole_process_budget);
 		preceding_shared = shared;
@@ -1741,7 +1743,10 @@ int main()
 {
 	const uml::testing::RuntimeTestRoute runtime_route;
 	constexpr std::size_t gib = std::size_t{1024} * 1024U * 1024U;
-	require(arm64::set_jit_cache_budget(1U * gib, 2));
+	/* Two executors at their 256 MiB cap, and the shared tier above its floor. */
+	require(arm64::set_jit_cache_budget(2U * gib, 2));
+	require(arm64::jit_shared_translation_cache_budget() >=
+		arm64::minimum_shared_translation_tier_bytes);
 	native_translation_preserves_fault_prefixes();
 	exclusive_and_system_blocks_are_translated();
 	pointer_authentication_instructions_are_undefined();

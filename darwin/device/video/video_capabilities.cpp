@@ -53,6 +53,7 @@ std::uint32_t wireProfile(uml::platform::VideoProfile profile)
     case hevcMain10: return VIRTIO_VIDEO_PROFILE_HEVC_MAIN10;
     case jpegBaseline: return 0;
     case vp9Profile0: return VIRTIO_VIDEO_PROFILE_VP9_PROFILE0;
+    case vp9Profile2: return VIRTIO_VIDEO_PROFILE_VP9_PROFILE2;
     }
     throw std::invalid_argument("invalid video profile");
 }

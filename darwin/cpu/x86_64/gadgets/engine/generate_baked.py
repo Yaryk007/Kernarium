@@ -33,9 +33,32 @@ and overlap exits read the position, and they rebuild the RIP from it.
 PUSH and POP of a register carry no word at all: their exits leave with the
 stream pointer, and the runtime finds the instruction from it (program.cpp).
 
-Every entry keeps the ordinary family's semantics: the same lazy flag record,
-page-crossing test, translation, publication and overlap checks. Only the cold
-tails -- a crossing access, a translation miss, a publication and an
+A CMP or TEST of a 32- or 64-bit register against an immediate or a register
+and the conditional branch right after it, whose fall-through the block
+translates behind it, are one entry with the immediate or the source
+register's offset and the taken target's link as its two words: it writes the
+compare's record, retires both and branches on the host condition, so the pair
+costs one dispatch. Those entries are written to a
+second file (--tail-output), a group behind the region's last, so no other
+bank entry moves; the cold part after the bank moves by whole pages.
+
+A register-only ADD, SUB, AND, OR or XOR at 32 or 64 bits whose next
+instruction is a register-only one of those, CMP or TEST takes a twin with
+neither the flag record nor host flags: the next instruction writes the whole
+record before anything can read the first one's. The twins are a second group
+in the same file.
+
+A fused [base + displacement] entry whose base is RSP has a stack twin, which
+its table names in its place: the same prologue, then the stack's own TLB
+entry (`stack_fast`'s test, with the access's alignment folded in) before any
+hashing, and on a hit the access and the entry's epilogue, a store's without
+its publication test. A misaligned access or another page branches into the
+ordinary entry just past its prologue, so the ordinary path is the fallback
+byte for byte. The stack twins are the same file's third group.
+
+Every other entry keeps the ordinary family's semantics: the same lazy flag
+record, page-crossing test, translation, publication and overlap checks. Only
+the cold tails -- a crossing access, a translation miss, a publication and an
 overlapping store -- are shared, reached through x19 as the continuation, so
 the hot bytes of an entry stay dense.
 
@@ -45,9 +68,11 @@ high-byte registers after the sixteen low ones, and "none" after the sixteen
 bases. `native_baked.hpp` declares the tables; keep the two in step.
 """
 import argparse
+import contextlib
 import sys
 
 GPR = list(range(0, 128, 8))
+STACK_POINTER = 4 * 8
 BYTE = GPR + [1, 9, 17, 25]
 BASES = GPR + ['none']
 SCALES = [0, 1, 2, 3]
@@ -72,18 +97,33 @@ ARITH = {
 class Out:
     def __init__(self):
         self.lines = []
+        self.stack_lines = []
+        self.target = self.lines
         self.serial = 0
         self.count = 0
+        self.stack_count = 0
 
     def emit(self, text=''):
-        self.lines.append(text)
+        self.target.append(text)
+
+    @contextlib.contextmanager
+    def stack_group(self):
+        """Emit into the stack twins' group instead."""
+        previous, self.target = self.target, self.stack_lines
+        try:
+            yield
+        finally:
+            self.target = previous
 
     def label(self, stem):
         self.serial += 1
         return f'Lx86_bk_{stem}_{self.serial}'
 
     def gadget(self, name):
-        self.count += 1
+        if self.target is self.stack_lines:
+            self.stack_count += 1
+        else:
+            self.count += 1
         self.emit(f'gadget b_{name}')
 
     def table(self, name, entries):
@@ -92,7 +132,8 @@ class Out:
         self.emit(f'\t.globl CSYM(uml_x86_64_baked_{name})')
         self.emit(f'CSYM(uml_x86_64_baked_{name}):')
         for entry in entries:
-            self.emit(f'\t.quad CSYM(uml_x86_64_gadget_b_{entry})')
+            self.emit('\t.quad 0' if entry is None else
+                      f'\t.quad CSYM(uml_x86_64_gadget_b_{entry})')
         self.emit('\t.popsection')
 
 
@@ -132,18 +173,23 @@ def base_address(o, base):
         o.emit('\tadd x7, x14, x10')
 
 
-def translate(o, write, size, record_stack=False, miss='Lx86_baked_miss'):
-    """The ordinary translation with its miss tail shared; x19 carries the continuation."""
+def translate(o, write, size, record_stack=False, miss='Lx86_baked_miss', cross=None):
+    """The ordinary translation with its miss tail shared; x19 carries the continuation.
+    `cross` names the site's crossing path, as `translate`'s does in common.inc:
+    the key is then the access's last byte, and a crossing access, which can only
+    miss, leaves for `cross` from the miss path."""
     hit, done = o.label('hit'), o.label('done')
+    keyed = cross is not None and size > 1
     o.emit('\tx86_marks_guest_memory')
     if write:
         o.emit('\tand x23, x23, #~(1 << 60)')
-    o.emit('\tand x9, x7, #0xfffffffffffff000')
-    o.emit('\tlsr x10, x7, #12')
-    o.emit('\teor x10, x10, x10, lsr #15')
-    o.emit('\tand w10, w10, #0x7fff')
-    o.emit('\tldr x11, [_context, #UML_X86_64_CONTEXT_TLB]')
-    o.emit('\tadd x11, x11, x10, lsl #5')
+    if keyed:
+        o.emit(f'\tadd x9, x7, #{size - 1}')
+        o.emit('\tand x9, x9, #0xfffffffffffff000')
+    else:
+        o.emit('\tand x9, x7, #0xfffffffffffff000')
+    o.emit('\tubfx x10, x7, #12, #UML_X86_64_TLB_INDEX_BITS')
+    o.emit('\tadd x11, _tlb, x10, lsl #5')
     if record_stack:
         o.emit('\tstr x11, [_context, #UML_X86_64_CONTEXT_STACK_ENTRY]')
     o.emit(f'\tldp x12, x13, [x11, #{16 if write else 0}]')
@@ -156,6 +202,8 @@ def translate(o, write, size, record_stack=False, miss='Lx86_baked_miss'):
     else:
         o.emit('\teor x14, x9, x12')
     o.emit(f'\tcbz x14, {hit}')
+    if keyed:
+        page_cross(o, size, cross)
     o.emit(f'\tadr x19, {done}')
     o.emit(f'\tb {miss}_{1 if write else 0}_{size}')
     o.emit(f'{hit}:')
@@ -193,19 +241,24 @@ def translate(o, write, size, record_stack=False, miss='Lx86_baked_miss'):
         o.emit('\t.popsection')
 
 
-def finish_store(o, size, check=None, overlap_tail=None):
+def finish_store(o, size, check=None, overlap_tail=None, settled=False):
     """The ordinary store epilogue with its publication and overlap tails shared.
     x25 is the guest address and x23 the access word. `check` names the
-    overlap test for a caller that has already settled publication.
+    overlap test for a caller that has already settled publication; a
+    `settled` store, which `stack_fast` proved owes none, has only that test.
     """
     done, overlap = o.label('sdone'), o.label('soverlap')
     if check is None:
         check = o.label('check')
-    o.emit(f'\ttbnz x23, #60, {check}')
-    o.emit('\tldrb w8, [_context, #UML_X86_64_CONTEXT_WRITE_CODE]')
-    o.emit(f'\tcbz w8, {check}')
-    o.emit(f'\tadr x19, {check}')
-    o.emit(f'\tb Lx86_baked_publish_{size}')
+    if not settled:
+        o.emit(f'\ttbnz x23, #60, {check}')
+        o.emit('\tldrb w8, [_context, #UML_X86_64_CONTEXT_WRITE_CODE]')
+        o.emit(f'\tcbz w8, {check}')
+        o.emit(f'\tadr x19, {check}')
+        # A push has no word of its own to name the instruction, so its
+        # publication leaves through the stack exit.
+        o.emit('\tb Lx86_baked_stack_publish' if overlap_tail is not None
+               else f'\tb Lx86_baked_publish_{size}')
     o.emit(f'{check}:')
     # Guest addresses and block bounds lie below 2^63, so the sign of a
     # difference is their unsigned order and NZCV stays untouched.
@@ -260,6 +313,55 @@ def access_prologue(o):
     o.emit('\tmov x25, x7')
 
 
+def stack_body(o, base):
+    """The label the stack twin of this fused entry falls back to, right after
+    its prologue, or None for any other base."""
+    if base != STACK_POINTER:
+        return None
+    body = o.label('stackbody')
+    o.emit(f'{body}:')
+    return body
+
+
+def stack_twin(o, entry, body, emit):
+    """The stack twin of `entry`, whose fallback is `body`; `emit(fall)` emits
+    its prologue and fast path, which branch to `fall` for the ordinary one.
+    Returns the name the entry's table holds."""
+    if body is None:
+        return entry
+    name = f'stack_{entry}'
+    fall = o.label('stackfall')
+    with o.stack_group():
+        o.gadget(name)
+        emit(fall)
+        o.emit(f'{fall}:')
+        o.emit(f'\tb {body}')
+    return name
+
+
+def stack_translate(o, write, size, fall):
+    """The fast path's translation: `stack_fast` with the access's alignment
+    in its compare, so only an aligned access hits, which cannot cross its
+    page; anything else falls back. The alignment bits go to the top of the
+    difference, where neither the page nor a tag's own low bits are. x7 is
+    the host address after it."""
+    # The fold tests the low log2(size) bits, which is alignment only for a
+    # power of two.
+    assert size > 0 and size & (size - 1) == 0, size
+    o.emit('\tx86_marks_guest_memory')
+    o.emit('\tldr x11, [_context, #UML_X86_64_CONTEXT_STACK_ENTRY]')
+    o.emit('\tand x9, x25, #0xfffffffffffff000')
+    o.emit(f'\tldp x12, x13, [x11, #{16 if write else 0}]')
+    o.emit('\teor x14, x9, x12')
+    if size > 1:
+        o.emit(f'\torr x14, x14, x25, lsl #{64 - (size.bit_length() - 1)}')
+    if write:
+        o.emit('\tldrb w15, [_context, #UML_X86_64_CONTEXT_WRITE_CODE]')
+        o.emit('\torr x14, x14, x15')
+    o.emit(f'\tcbnz x14, {fall}')
+    o.emit('\tadd x7, x25, x13')
+
+
 def memory_immediate(o, register, base):
     """The immediate of a memory,immediate access: in the access word, except
     for a base-less access, whose word is the 64-bit address's neighbour and
@@ -277,12 +379,12 @@ def packed_immediate(o, register):
 def shared_tails(o):
     # Every tail belongs to a guest memory access, whichever gadget reaches it.
     o.emit('\tx86_marks_guest_memory')
-    # The ordinary fault exit reports the RIP from x22, which a baked access
+    # The ordinary fault exit reports the RIP from x8, which a baked access
     # rebuilds from its access word's position and the block's start, wrapped
     # at 4 GiB in compatibility mode.
     o.emit('\t.p2align 2')
     o.emit('Lx86_baked_memory_fault:')
-    o.emit('\tinstruction_rip x22, 0, 32')
+    o.emit('\tinstruction_rip x8, 0, 32')
     o.emit('\tb Lx86_memory_fault_at')
     for write in (0, 1):
         for size in (1, 2, 4, 8):
@@ -345,6 +447,9 @@ def shared_tails(o):
         o.emit('\thelper_call uml_x86_64_gadget_publish_code_write')
         o.emit('\tldr x9, [sp], #16')
         o.emit('\tmsr nzcv, x9')
+        # The helper reports a store that wrote, through another address of its
+        # frame, into the block that is running: leave as for an overlap.
+        o.emit(f'\tcbnz w0, Lx86_baked_store_overlap_exit_{size}')
         o.emit('\tbr x19')
         # The store landed inside the running block: leave through the store's
         # own exit as the ordinary epilogue does.
@@ -576,10 +681,16 @@ def addresses(o):
     o.table('ea', entries)
 
 
+def load_fast(o, size, ld, lr, st, sr, v, fall):
+    stack_translate(o, False, size, fall)
+    o.emit(f'\t{ld} {lr}11, [x7]')
+    o.emit(f'\t{st} {sr}11, [_vcpu, #{v}]')
+    o.emit('\tretire_and_next')
+
+
 def load_body(o, size, ld, lr, cross, st, sr, v):
     crossed, write = o.label('lcross'), o.label('lwrite')
-    page_cross(o, size, crossed)
-    translate(o, False, size)
+    translate(o, False, size, cross=crossed)
     o.emit(f'\t{ld} {lr}11, [x7]')
     o.emit(f'{write}:')
     o.emit(f'\t{st} {sr}11, [_vcpu, #{v}]')
@@ -606,8 +717,13 @@ def loads(o):
                 entry = f'{name}_rm_{v}_{base}'
                 o.gadget(entry)
                 memory_prologue(o, base)
+                body = stack_body(o, base)
                 load_body(o, source_width // 8, ld, lr, cross, st, sr, v)
-                entries.append(entry)
+
+                def fast(fall, base=base, source_width=source_width, ld=ld, lr=lr, st=st, sr=sr, v=v):
+                    memory_prologue(o, base)
+                    load_fast(o, source_width // 8, ld, lr, st, sr, v, fall)
+                entries.append(stack_twin(o, entry, body, fast))
         o.table(f'{name}_rm', entries)
         entries = []
         for v in values:
@@ -619,10 +735,15 @@ def loads(o):
         o.table(f'{name}_xm', entries)
 
 
+def store_fast(o, size, st, hr, fall):
+    stack_translate(o, True, size, fall)
+    o.emit(f'\t{st} {hr}24, [x7]')
+    finish_store(o, size, settled=True)
+
+
 def store_body(o, size, st, hr):
     crossed, finish = o.label('scross'), o.label('sfinish')
-    page_cross(o, size, crossed)
-    translate(o, True, size)
+    translate(o, True, size, cross=crossed)
     o.emit(f'\t{st} {hr}24, [x7]')
     o.emit(f'{finish}:')
     finish_store(o, size)
@@ -644,8 +765,14 @@ def stores(o):
                 o.gadget(entry)
                 memory_prologue(o, base)
                 o.emit(f'\t{ld} {hr}24, [_vcpu, #{v}]')
+                body = stack_body(o, base)
                 store_body(o, width // 8, st, hr)
-                entries.append(entry)
+
+                def fast(fall, base=base, width=width, ld=ld, st=st, hr=hr, v=v):
+                    memory_prologue(o, base)
+                    o.emit(f'\t{ld} {hr}24, [_vcpu, #{v}]')
+                    store_fast(o, width // 8, st, hr, fall)
+                entries.append(stack_twin(o, entry, body, fast))
         o.table(f'move_{width}_mr', entries)
         entries = []
         for v in values:
@@ -662,8 +789,14 @@ def stores(o):
             o.gadget(entry)
             memory_prologue(o, base)
             memory_immediate(o, 'x24', base)
+            body = stack_body(o, base)
             store_body(o, width // 8, st, hr)
-            entries.append(entry)
+
+            def fast(fall, base=base, width=width, st=st, hr=hr):
+                memory_prologue(o, base)
+                memory_immediate(o, 'x24', base)
+                store_fast(o, width // 8, st, hr, fall)
+            entries.append(stack_twin(o, entry, body, fast))
         o.table(f'move_{width}_mi', entries)
         entry = f'move_{width}_xmi'
         o.gadget(entry)
@@ -674,13 +807,16 @@ def stores(o):
     o.table('move_xmi', immediates)
 
 
-def arith_source_body(o, op, width, v):
-    """op reg, [mem]: the memory operand is the right-hand side."""
+def arith_source_body(o, op, width, v, fall=None):
+    """op reg, [mem]: the memory operand is the right-hand side. With `fall`,
+    the stack twin's fast path."""
     ld, st, hr, sr = WIDTHS[width]
     host, flagop, writes = instr_for(op, width)
     crossed, loaded, from_cross = o.label('rmcross'), o.label('rmloaded'), o.label('rmfromcross')
-    page_cross(o, width // 8, crossed)
-    translate(o, False, width // 8)
+    if fall:
+        stack_translate(o, False, width // 8, fall)
+    else:
+        translate(o, False, width // 8, cross=crossed)
     o.emit(f'\t{ld} {hr}12, [x7]')
     o.emit(f'{loaded}:')
     o.emit(f'\t{ld} {hr}11, [_vcpu, #{v}]')
@@ -691,6 +827,8 @@ def arith_source_body(o, op, width, v):
         o.emit(f'\t{st} {sr}13, [_vcpu, #{v}]')
     record(o, flagop, width)
     o.emit('\tretire_and_next')
+    if fall:
+        return
     o.emit(f'{crossed}:')
     o.emit(f'\tadr x19, {from_cross}')
     o.emit(f'\tb Lx86_baked_cross_load_{width}')
@@ -699,17 +837,19 @@ def arith_source_body(o, op, width, v):
     o.emit(f'\tb {loaded}')
 
 
-def arith_destination_body(o, op, width):
+def arith_destination_body(o, op, width, fall=None):
     """op [mem], reg and op [mem], imm with the right-hand side already in
     x26. One write translation serves the read and the write: a writable x86
     page is readable, and a read-modify-write to an unwritable one faults as a
-    write."""
+    write. With `fall`, the stack twin's fast path."""
     ld, st, hr, _ = WIDTHS[width]
     host, flagop, writes = instr_for(op, width)
     size = width // 8
     crossed, computed = o.label('mrcross'), o.label('mrcomputed')
-    page_cross(o, size, crossed)
-    translate(o, writes, size)
+    if fall:
+        stack_translate(o, writes, size, fall)
+    else:
+        translate(o, writes, size, cross=crossed)
     o.emit(f'\t{ld} {hr}24, [x7]')
     o.emit(f'\t{host} {hr}27, {hr}24, {hr}26')
     normalize(o, width, f'{hr}27')
@@ -723,30 +863,40 @@ def arith_destination_body(o, op, width):
     o.emit('\tmov x13, x27')
     record(o, flagop, width)
     if writes:
-        finish_store(o, size)
+        finish_store(o, size, settled=bool(fall))
     else:
         o.emit('\tretire_and_next')
+    if fall:
+        return
     o.emit(f'{crossed}:')
     loaded = o.label('mrloaded')
     o.emit(f'\tadr x19, {loaded}')
     o.emit(f'\tb Lx86_baked_cross_load_{width}')
     o.emit(f'{loaded}:')
-    o.emit('\tmov x24, x11')
-    o.emit(f'\t{host} {hr}27, {hr}24, {hr}26')
-    normalize(o, width, f'{hr}27')
     if not writes:
+        o.emit('\tmov x24, x11')
+        o.emit(f'\t{host} {hr}27, {hr}24, {hr}26')
+        normalize(o, width, f'{hr}27')
         flag_form(o, op, width, 24, 26)
         o.emit(f'\tb {computed}')
         return
+    # The crossing store can still fault, and a faulting instruction changes
+    # no flag: the old operand waits in x27, which the helper keeps, and the
+    # record is taken once the store is behind us. x27 is free here: the
+    # result moves to x24, the store's value, and the record reads it there.
+    # The run's TLB base register is not a scratch register.
     stored = o.label('mrstored')
-    o.emit('\tmov x11, x24')
-    o.emit('\tmov x12, x26')
-    o.emit('\tmov x13, x27')
-    record(o, flagop, width)
+    o.emit(f'\t{host} {hr}27, {hr}11, {hr}26')
+    normalize(o, width, f'{hr}27')
     o.emit('\tmov x24, x27')
+    o.emit('\tmov x27, x11')
     o.emit(f'\tadr x19, {stored}')
     o.emit(f'\tb Lx86_baked_cross_store_{size}')
     o.emit(f'{stored}:')
+    o.emit('\tmov x11, x27')
+    o.emit('\tmov x12, x26')
+    o.emit('\tmov x13, x24')
+    record(o, flagop, width)
     finish_store(o, size)
 
 
@@ -761,8 +911,13 @@ def memory_arith(o):
                     entry = f'{op}_{width}_rm_{v}_{base}'
                     o.gadget(entry)
                     memory_prologue(o, base)
+                    body = stack_body(o, base)
                     arith_source_body(o, op, width, v)
-                    entries.append(entry)
+
+                    def fast(fall, base=base, op=op, width=width, v=v):
+                        memory_prologue(o, base)
+                        arith_source_body(o, op, width, v, fall)
+                    entries.append(stack_twin(o, entry, body, fast))
             o.table(f'{op}_{width}_rm', entries)
             entries = []
             for v in values:
@@ -779,8 +934,14 @@ def memory_arith(o):
                     o.gadget(entry)
                     memory_prologue(o, base)
                     o.emit(f'\t{ld} {hr}26, [_vcpu, #{v}]')
+                    body = stack_body(o, base)
                     arith_destination_body(o, op, width)
-                    entries.append(entry)
+
+                    def fast(fall, base=base, op=op, width=width, ld=ld, hr=hr, v=v):
+                        memory_prologue(o, base)
+                        o.emit(f'\t{ld} {hr}26, [_vcpu, #{v}]')
+                        arith_destination_body(o, op, width, fall)
+                    entries.append(stack_twin(o, entry, body, fast))
             o.table(f'{op}_{width}_mr', entries)
             entries = []
             for v in values:
@@ -797,8 +958,14 @@ def memory_arith(o):
                 o.gadget(entry)
                 memory_prologue(o, base)
                 memory_immediate(o, 'x26', base)
+                body = stack_body(o, base)
                 arith_destination_body(o, op, width)
-                entries.append(entry)
+
+                def fast(fall, base=base, op=op, width=width):
+                    memory_prologue(o, base)
+                    memory_immediate(o, 'x26', base)
+                    arith_destination_body(o, op, width, fall)
+                entries.append(stack_twin(o, entry, body, fast))
             o.table(f'{op}_{width}_mi', entries)
             entry = f'{op}_{width}_xmi'
             o.gadget(entry)
@@ -890,6 +1057,21 @@ def stack_tails(o):
     o.emit('\tmsr nzcv, x9')
     o.emit('\tcbz w0, Lx86_baked_stack_fault')
     o.emit('\tbr x19')
+    # The publication of a push: a store through another address of its frame
+    # may have written into the running block, which then leaves as for an
+    # overlap at the push's own address.
+    o.emit('\t.p2align 2')
+    o.emit('Lx86_baked_stack_publish:')
+    o.emit('\tmrs x9, nzcv')
+    o.emit('\tstr x9, [sp, #-16]!')
+    o.emit('\tmov x0, _context')
+    o.emit('\tmov x1, x25')
+    o.emit('\tmov w2, #8')
+    o.emit('\thelper_call uml_x86_64_gadget_publish_code_write')
+    o.emit('\tldr x9, [sp], #16')
+    o.emit('\tmsr nzcv, x9')
+    o.emit('\tcbnz w0, Lx86_baked_stack_overlap_exit')
+    o.emit('\tbr x19')
     # The store landed inside the running block: it retires and the run
     # leaves for the instruction after it, which the runtime names.
     o.emit('\t.p2align 2')
@@ -972,9 +1154,99 @@ def push_pop(o):
     stack_tails(o)
 
 
+# x86 condition code -> the host condition a subtraction's NZCV answers it with; parity has none.
+CONDITIONS = [('o', 'vs'), ('no', 'vc'), ('b', 'lo'), ('ae', 'hs'), ('e', 'eq'), ('ne', 'ne'),
+              ('be', 'ls'), ('a', 'hi'), ('s', 'mi'), ('ns', 'pl'), ('p', None), ('np', None),
+              ('l', 'lt'), ('ge', 'ge'), ('le', 'le'), ('g', 'gt')]
+# After a logical operation C is clear where x86's CF is clear, and ARM reads a clear C as a borrow.
+CARRY_CONDITIONS = ('b', 'ae', 'be', 'a')
+
+
+def compare_branch(o):
+    """CMP or TEST reg, imm or reg, reg and the inline conditional branch after
+    it. A table per operation, width and source, condition-major in x86's
+    condition-code order, then the destination register; a condition the pair
+    cannot answer from NZCV is a zero. The first stream word is the immediate,
+    or the source register's CpuState offset."""
+    for source in ('ri', 'rr'):
+        for op in ('cmp', 'test'):
+            for width in (32, 64):
+                compare_branch_table(o, source, op, width)
+
+
+def compare_branch_table(o, source, op, width):
+    host, flagop, _ = instr_for(op, width)
+    hr = 'x' if width == 64 else 'w'
+    entries = []
+    for condition, host_condition in CONDITIONS:
+        answered = host_condition is not None and not (
+            op == 'test' and condition in CARRY_CONDITIONS)
+        for d in GPR:
+            if not answered:
+                entries.append(None)
+                continue
+            name = f'{op}_{width}_{source}_j{condition}_{d}'
+            taken = o.label('taken')
+            o.gadget(name)
+            o.emit('\tldp x12, x16, [_stream], #16')
+            if source == 'rr':
+                o.emit(f'\tldr {hr}12, [_vcpu, x12]')
+            o.emit(f'\tldr {hr}11, [_vcpu, #{d}]')
+            o.emit(f'\t{host} {hr}13, {hr}11, {hr}12')
+            record(o, flagop, width)
+            o.emit('\tadd _executed, _executed, #2')
+            o.emit(f'\tb.{host_condition} {taken}')
+            o.emit('\tnext_gadget')
+            o.emit(f'{taken}:')
+            o.emit('\tfollow_block_link x16')
+            entries.append(name)
+    o.table(f'{op}_{width}_{source}_jcc', entries)
+
+
+# The producers that take a twin with no record when the next instruction replaces their flags.
+UNRECORDED = ('add', 'sub', 'and', 'or', 'xor')
+
+
+def unrecorded(o):
+    """ADD, SUB, AND, OR and XOR reg, reg and reg, imm at 32 and 64 bits
+    without the flag record or host flags, for a producer whose flags the next
+    instruction replaces before anything can read them. Tables as
+    arith_register's."""
+    for op in UNRECORDED:
+        host = ARITH[op][0]
+        for width in (32, 64):
+            ld, st, hr, sr = WIDTHS[width]
+            entries = []
+            for d in GPR:
+                for s in GPR:
+                    name = f'{op}_{width}_rr_unrecorded_{d}_{s}'
+                    o.gadget(name)
+                    o.emit(f'\t{ld} {hr}11, [_vcpu, #{d}]')
+                    o.emit(f'\t{ld} {hr}12, [_vcpu, #{s}]')
+                    o.emit(f'\t{host} {hr}13, {hr}11, {hr}12')
+                    normalize(o, width, f'{hr}13')
+                    o.emit(f'\t{st} {sr}13, [_vcpu, #{d}]')
+                    o.emit('\tretire_and_next')
+                    entries.append(name)
+            o.table(f'{op}_{width}_rr_unrecorded', entries)
+            entries = []
+            for d in GPR:
+                name = f'{op}_{width}_ri_unrecorded_{d}'
+                o.gadget(name)
+                o.emit('\tldr x12, [_stream], #8')
+                o.emit(f'\t{ld} {hr}11, [_vcpu, #{d}]')
+                o.emit(f'\t{host} {hr}13, {hr}11, {hr}12')
+                normalize(o, width, f'{hr}13')
+                o.emit(f'\t{st} {sr}13, [_vcpu, #{d}]')
+                o.emit('\tretire_and_next')
+                entries.append(name)
+            o.table(f'{op}_{width}_ri_unrecorded', entries)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('--output', required=True)
+    parser.add_argument('--tail-output', required=True)
     options = parser.parse_args()
     o = Out()
     o.emit('/* SPDX-License-Identifier: GPL-2.0-or-later */')
@@ -988,6 +1260,20 @@ def main():
     o.emit(f'/* {o.count} baked entries */')
     with open(options.output, 'w') as output:
         output.write('\n'.join(o.lines) + '\n')
+    # The families behind the region's last group, which grow without moving it.
+    t = Out()
+    t.emit('/* SPDX-License-Identifier: GPL-2.0-or-later */')
+    t.emit('/* Generated by generate_baked.py; do not edit. */')
+    for family in (compare_branch, unrecorded):
+        t.emit(f'\tgadget_group baked_{family.__name__}')
+        family(t)
+    t.emit(f'/* {t.count} baked entries */')
+    # The stack twins, which the families above collected as they went.
+    t.emit('\tgadget_group baked_stack')
+    t.lines.extend(o.stack_lines)
+    t.emit(f'/* {o.stack_count} stack twins */')
+    with open(options.tail_output, 'w') as output:
+        output.write('\n'.join(t.lines) + '\n')
     return 0
 
 

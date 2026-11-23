@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!--
+     The vendor manifest fragment of the thermal HAL (vintf_fragments of
+     android.hardware.thermal-service.andarium). Every device declares it.
+-->
+<manifest version="1.0" type="device">
+    <hal format="aidl">
+        <name>android.hardware.thermal</name>
+        <version>3</version>
+        <fqname>IThermal/default</fqname>
+    </hal>
+</manifest>

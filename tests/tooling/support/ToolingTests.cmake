@@ -9,3 +9,15 @@ uml_add_tooling_test(
         ${PROJECT_SOURCE_DIR}/tests/tooling/support/test_macho.py
     LABELS cpu;emulator
     TIMEOUT 60)
+
+# The interruption runner reads a booted Simulator device's processes from
+# `ps`, whose rows of a process with multi-line arguments include lines that
+# are no process; the runner ignores them rather than failing before it runs
+# either test binary.
+uml_add_tooling_test(
+    NAME apple-audio-interruption-runner
+    COMMAND ${Python3_EXECUTABLE} -B
+        ${PROJECT_SOURCE_DIR}/tests/tooling/support/test_run_ios_interruption.py
+        --runner ${PROJECT_SOURCE_DIR}/tests/integration/audio/run_ios_interruption.py
+    LABELS device;audio
+    TIMEOUT 60)

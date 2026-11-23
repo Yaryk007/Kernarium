@@ -54,9 +54,6 @@ std::uint64_t configured_process_memory_limit_bytes() noexcept
 	if (const auto stated = option_limit_bytes.load(std::memory_order_relaxed);
 	    stated != 0)
 		return stated;
-#ifdef UML_APP_STORE_RUNTIME
-	return 0;
-#else
 	const char *text = std::getenv(memory_limit_variable);
 	if (text == nullptr || *text == '\0')
 		return 0;
@@ -70,7 +67,6 @@ std::uint64_t configured_process_memory_limit_bytes() noexcept
 				memory_limit_variable, text);
 	}
 	return bytes;
-#endif
 }
 
 void set_configured_process_memory_limit(std::uint64_t bytes) noexcept

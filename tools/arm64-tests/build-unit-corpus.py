@@ -479,6 +479,20 @@ def runs_between(initial: bytes, expected: bytes) -> tuple[tuple[int, bytes], ..
 # Export reader
 
 
+# Little-endian structs by format, compiled once: a pack holds millions of fields.
+_STRUCTS: dict[str, struct.Struct] = {}
+_U16 = struct.Struct("<H")
+_U32 = struct.Struct("<I")
+_U64 = struct.Struct("<Q")
+
+
+def compiled(fmt: str) -> struct.Struct:
+    packed = _STRUCTS.get(fmt)
+    if packed is None:
+        packed = _STRUCTS[fmt] = struct.Struct("<" + fmt)
+    return packed
+
+
 class ByteReader:
     def __init__(self, data: bytes) -> None:
         self.data = data
@@ -492,20 +506,41 @@ class ByteReader:
         return value
 
     def unpack(self, fmt: str):
-        size = struct.calcsize("<" + fmt)
-        return struct.unpack("<" + fmt, self.take(size))
+        packed = _STRUCTS.get(fmt) or compiled(fmt)
+        offset = self.offset
+        end = offset + packed.size
+        if end > len(self.data):
+            fail("truncated input")
+        self.offset = end
+        return packed.unpack_from(self.data, offset)
 
     def u8(self) -> int:
-        return self.take(1)[0]
+        offset = self.offset
+        if offset >= len(self.data):
+            fail("truncated input")
+        self.offset = offset + 1
+        return self.data[offset]
 
     def u16(self) -> int:
-        return self.unpack("H")[0]
+        offset = self.offset
+        if offset + 2 > len(self.data):
+            fail("truncated input")
+        self.offset = offset + 2
+        return _U16.unpack_from(self.data, offset)[0]
 
     def u32(self) -> int:
-        return self.unpack("I")[0]
+        offset = self.offset
+        if offset + 4 > len(self.data):
+            fail("truncated input")
+        self.offset = offset + 4
+        return _U32.unpack_from(self.data, offset)[0]
 
     def u64(self) -> int:
-        return self.unpack("Q")[0]
+        offset = self.offset
+        if offset + 8 > len(self.data):
+            fail("truncated input")
+        self.offset = offset + 8
+        return _U64.unpack_from(self.data, offset)[0]
 
     def string32(self) -> str:
         return self.take(self.u32()).decode()
@@ -861,12 +896,30 @@ def encode_sparse(writer: ByteWriter, sparse: tuple, svl: int) -> None:
         writer.pack("B" + fmt, identifier, value)
 
 
+def set_bits(mask: int, count: int) -> Iterable[int]:
+    """The indexes below |count| of the bits set in |mask|, ascending."""
+    mask &= (1 << count) - 1
+    while mask:
+        lowest = mask & -mask
+        yield lowest.bit_length() - 1
+        mask ^= lowest
+
+
 def decode_sparse(reader: ByteReader, svl: int) -> tuple:
+    # The lowest set bit, `mask & -mask`, is the next index: only the registers present are visited.
+    gprs = []
     mask = reader.u32()
-    gprs = tuple((index, reader.u64()) for index in range(32) if mask >> index & 1)
+    while mask:
+        lowest = mask & -mask
+        gprs.append((lowest.bit_length() - 1, reader.u64()))
+        mask ^= lowest
+    vectors = []
     mask = reader.u32()
-    vectors = tuple((index, reader.take(16)) for index in range(32)
-                    if mask >> index & 1)
+    while mask:
+        lowest = mask & -mask
+        vectors.append((lowest.bit_length() - 1, reader.take(16)))
+        mask ^= lowest
+    gprs, vectors = tuple(gprs), tuple(vectors)
     sme = NO_SME
     if svl:
         parts = []
@@ -874,8 +927,8 @@ def decode_sparse(reader: ByteReader, svl: int) -> tuple:
                                         (P_REGISTERS, 2, svl // 8),
                                         (svl, svl // 8, svl)):
             mask = int.from_bytes(reader.take(mask_bytes), "little")
-            parts.append(tuple((index, reader.take(size))
-                               for index in range(count) if mask >> index & 1))
+            parts.append(tuple([(index, reader.take(size))
+                                for index in set_bits(mask, count)]))
         flag = reader.u8()
         if flag > 1:
             fail("invalid ZT0 flag")
@@ -1157,11 +1210,19 @@ def hex64(value: int) -> str:
     return f"0x{value:016x}"
 
 
+def ordered(items: dict) -> dict:
+    """|items| with its keys sorted, the order json.dumps(sort_keys=True) writes them in: a row built
+    with it is what json.loads reads back from the row's text."""
+    return dict(sorted(items.items()))
+
+
+# The keys of the general registers in a sparse state: x0 to x30, then the stack pointer.
+GPR_KEYS = tuple(f"x{index}" for index in range(31)) + ("sp",)
+
+
 def dump_sparse(sparse: tuple) -> dict:
     gprs, vectors, others, (z, p, za, zt0) = sparse
-    result = {}
-    for index, value in gprs:
-        result["sp" if index == 31 else f"x{index}"] = hex64(value)
+    result = {GPR_KEYS[index]: f"0x{value:016x}" for index, value in gprs}
     for index, value in vectors:
         result[f"v{index}"] = value.hex()
     for prefix, items in (("z", z), ("p", p), ("za", za)):
@@ -1171,7 +1232,7 @@ def dump_sparse(sparse: tuple) -> dict:
         result["zt0"] = zt0.hex()
     for name, value in others:
         result[name] = value.hex() if isinstance(value, bytes) else hex64(value)
-    return result
+    return ordered(result)
 
 
 def load_sparse(values: dict) -> tuple:
@@ -1216,7 +1277,19 @@ def dump_corpus(corpus: Corpus, tokens: tuple[str, ...]) -> Iterable[str]:
     for digest, data in corpus.blobs.items():
         yield json.dumps({"blob": digest,
                           "zlib": zlib.compress(data, 9).hex()}, sort_keys=True)
+    for item in dump_records(corpus):
+        yield json.dumps(item, sort_keys=True)
+
+
+def dump_records(corpus: Corpus, producers: Iterable[str] | None = None) -> Iterable[dict]:
+    """The record rows of dump_corpus as json.loads reads them (the same values, keys in the same
+    order), without writing and reading their text. The header and the blob rows are not among them.
+    With |producers|, only the records of those producers: a caller that reads no other need not
+    build them."""
+    wanted = None if producers is None else frozenset(producers)
     for record in corpus.records:
+        if wanted is not None and record.producer not in wanted:
+            continue
         item = {
             "record": record.name, "producer": record.producer,
             "site": record.site,
@@ -1230,7 +1303,7 @@ def dump_corpus(corpus: Corpus, tokens: tuple[str, ...]) -> Iterable[str]:
         }
         if record.svl:
             item["svl"] = record.svl
-        yield json.dumps(item, sort_keys=True)
+        yield ordered(item)
 
 
 def dump_case(program: int, case: Case) -> dict:
@@ -1246,25 +1319,25 @@ def dump_case(program: int, case: Case) -> dict:
     if case.retired[0] == "exact":
         result["retired"] = case.retired[1]
     elif case.retired[0] == "pattern":
-        result["retired"] = {"minimum": case.retired[1], "step": case.retired[2],
-                             "maximum": case.retired[3]}
+        result["retired"] = ordered({"minimum": case.retired[1], "step": case.retired[2],
+                                     "maximum": case.retired[3]})
     else:
         result["retired"] = None
     if case.fault:
-        result["fault"] = {"address": hex64(case.fault[0]), "access": case.fault[1]}
+        result["fault"] = ordered({"address": hex64(case.fault[0]), "access": case.fault[1]})
     if case.event == "floating-point-trap":
         result["syndrome"] = f"0x{case.syndrome:08x}"
     if case.validator is not None:
         result["validator"] = case.validator
     if case.memory:
-        result["memory"] = [{
+        result["memory"] = [ordered({
             "address": hex64(region.address), "size": region.size,
             "flags": region.flags, "blob": region.blob,
             "expected": [[offset, data.hex()] for offset, data in region.runs],
             "tags": [list(tag) for tag in region.tags],
             "expected_tags": [list(tag) for tag in region.expected_tags],
-        } for region in case.memory]
-    return result
+        }) for region in case.memory]
+    return ordered(result)
 
 
 def load_dump(lines: Iterable[str]) -> tuple[Corpus, tuple[str, ...]]:
@@ -1547,6 +1620,10 @@ def metadata(corpus: Corpus, pack: bytes) -> dict[str, bytes]:
            if "sm0_vl" in corpus.meta else {}),
         **({"tbi_memory": corpus.meta["tbi_memory"]}
            if "tbi_memory" in corpus.meta else {}),
+        **({"control_target": corpus.meta["control_target"]}
+           if "control_target" in corpus.meta else {}),
+        **({"exclusive_mismatch": corpus.meta["exclusive_mismatch"]}
+           if "exclusive_mismatch" in corpus.meta else {}),
         **({"retired_16k": corpus.meta["retired_16k"]}
            if "retired_16k" in corpus.meta else {}),
         **({"invalid_encoding": corpus.meta["invalid_encoding"]}
@@ -1639,9 +1716,16 @@ def build(options: argparse.Namespace) -> int:
     return 0
 
 
+@functools.lru_cache(maxsize=1)
+def decoded_pack(data: bytes) -> tuple[Corpus, tuple[str, ...]]:
+    """decode_pack of the same bytes once in a process. Whoever asks shares the result and does not
+    change it."""
+    return decode_pack(data)
+
+
 def check(options: argparse.Namespace) -> int:
     pack = (options.output / PACK_NAME).read_bytes()
-    corpus, tokens = decode_pack(pack)
+    corpus, tokens = decoded_pack(pack)
     if not set(tokens) <= set(feature_tokens()):
         fail("the pack names a feature the runtime no longer defines")
     stale = []
@@ -1736,6 +1820,19 @@ def check(options: argparse.Namespace) -> int:
             (REPOSITORY / memory["script"]).read_bytes()) != memory["sha256"]:
         stale.append(memory["script"] + " (not the top-byte-ignore memory "
                      "records' script)")
+    # And the indirect-branch target records.
+    target = corpus.meta.get("control_target")
+    if target is not None and sha256(
+            (REPOSITORY / target["script"]).read_bytes()) != target["sha256"]:
+        stale.append(target["script"] + " (not the indirect-branch target "
+                     "records' script)")
+    # And the compare-retry exclusive records.
+    mismatch = corpus.meta.get("exclusive_mismatch")
+    if mismatch is not None and sha256(
+            (REPOSITORY / mismatch["script"]).read_bytes()) != \
+            mismatch["sha256"]:
+        stale.append(mismatch["script"] + " (not the compare-retry "
+                     "exclusive records' script)")
     if stale:
         fail("stale corpus files: " + ", ".join(stale))
     # Every inventory entry has a case, or an illegal-instruction case.

@@ -87,6 +87,17 @@ sh_binary {
     init_rc: ["kernarium_time_zone.rc"],
 }
 
+// Moves a guest that started with an older release to the product's on-screen
+// keyboard default, once. It runs `cmd settings`, so it is installed on
+// system_ext for a core domain of its own (kernarium_keyboard_default).
+sh_binary {
+    name: "kernarium_keyboard_default_script",
+    src: "kernarium_keyboard_default.sh",
+    system_ext_specific: true,
+    filename_from_src: true,
+    init_rc: ["kernarium_keyboard_default.rc"],
+}
+
 cc_binary {
     name: "kernarium_vk_ahb_import",
     srcs: ["kernarium_vk_ahb_import.cpp"],

@@ -3,6 +3,7 @@
 #include "native_window_test_support.hpp"
 #include "options.hpp"
 #include "require.hpp"
+#include "runtime/guest_memory_budget.hpp"
 #include "runtime/native_kernel_layout.hpp"
 
 #include <algorithm>
@@ -289,6 +290,94 @@ void test_gadget_cache_budget_option()
 		"the gadget cache budget ignored trailing text");
 }
 
+void test_aot_option()
+{
+	using uml::runtime::AotSelection;
+	const char *absent[]{"uml-test"};
+	require(uml::emulator::prepare_emulator_options(
+		1, absent, "/tmp/rootfs.erofs").aot == AotSelection::automatic,
+		"ahead-of-time code was not left to the default");
+	const char *bare[]{"uml-test", "--aot", "ip=dhcp"};
+	auto options = uml::emulator::prepare_emulator_options(
+		3, bare, "/tmp/rootfs.erofs");
+	require(options.valid && options.aot == AotSelection::on &&
+		!contains(options, "--aot") && contains(options, "ip=dhcp"),
+		"--aot was not consumed as on");
+	const char *off[]{"uml-test", "--aot=on", "--aot=off"};
+	options = uml::emulator::prepare_emulator_options(
+		3, off, "/tmp/rootfs.erofs");
+	require(options.valid && options.aot == AotSelection::off &&
+		!contains(options, "--aot=on") && !contains(options, "--aot=off"),
+		"the last --aot= did not win");
+	const char *automatic[]{"uml-test", "--aot=off", "--aot=auto"};
+	require(uml::emulator::prepare_emulator_options(
+		3, automatic, "/tmp/rootfs.erofs").aot == AotSelection::automatic,
+		"--aot=auto did not restore the default");
+	const char *unknown[]{"uml-test", "--aot=maybe"};
+	require(!uml::emulator::prepare_emulator_options(
+		2, unknown, "/tmp/rootfs.erofs").valid,
+		"an unknown --aot value was accepted");
+	const char *empty[]{"uml-test", "--aot="};
+	require(!uml::emulator::prepare_emulator_options(
+		2, empty, "/tmp/rootfs.erofs").valid,
+		"an empty --aot value was accepted");
+}
+
+/* The release a launch boots, which the launcher states: the ID and the two
+ * digests (--aot-release=), consumed by the options and never forwarded to the
+ * kernel. A launch that states none boots no Android release. */
+void test_aot_release_option()
+{
+	const std::string manifest(64, 'a');
+	const std::string system(64, '0');
+	const auto stated = uml::emulator::aot_release_argument(
+		"20261115-los24-r28", manifest, system);
+	require(stated == "--aot-release=20261115-los24-r28," + manifest + "," +
+		system, "the stated release is not the argument's form");
+
+	const char *absent[]{"uml-test", "ip=dhcp"};
+	auto options = uml::emulator::prepare_emulator_options(
+		2, absent, "/tmp/rootfs.erofs");
+	require(options.valid && !options.aot_release_stated,
+		"a release was stated without being asked for");
+
+	const char *given[]{"uml-test", stated.c_str(), "ip=dhcp"};
+	options = uml::emulator::prepare_emulator_options(
+		3, given, "/tmp/rootfs.erofs");
+	require(options.valid && options.aot_release_stated &&
+		options.aot_release_id == "20261115-los24-r28" &&
+		options.aot_manifest_sha256[0] == 0xaa &&
+		options.aot_manifest_sha256[31] == 0xaa &&
+		options.aot_system_sha256[0] == 0 &&
+		options.aot_system_sha256[31] == 0 &&
+		!contains(options, stated) && contains(options, "ip=dhcp"),
+		"--aot-release= was not consumed as the release a launch boots");
+
+	const char *twice[]{"uml-test", stated.c_str(), stated.c_str()};
+	require(!uml::emulator::prepare_emulator_options(
+		3, twice, "/tmp/rootfs.erofs").valid,
+		"two releases were accepted for one launch");
+
+	/* What is not a release is not stated: no ID, a short digest, an upper
+	 * case digest, a non-hex digest, a missing digest, text after them. */
+	for (const std::string &bad : std::initializer_list<std::string>{
+		std::string{"--aot-release="},
+		"--aot-release=," + manifest + "," + system,
+		"--aot-release=id," + manifest.substr(1) + "," + system,
+		"--aot-release=id," + std::string(64, 'A') + "," + system,
+		"--aot-release=id," + std::string(63, 'a') + "g," + system,
+		"--aot-release=id," + manifest,
+		"--aot-release=id," + manifest + "," + system + ",x",
+		"--aot-release=" + std::string(65, 'x') + "," + manifest + "," + system}) {
+		const char *arguments[]{"uml-test", bad.c_str()};
+		require(!uml::emulator::prepare_emulator_options(
+			2, arguments, "/tmp/rootfs.erofs").valid,
+			"a malformed release was accepted");
+	}
+	require(uml::emulator::aot_release_argument("id", "ab", system).empty(),
+		"a short digest made an argument");
+}
+
 void test_memory_limit_option()
 {
 	const char *absent[]{"uml-test"};
@@ -458,6 +547,47 @@ void test_scalable_native_kernel_layout_geometry()
 		"the largest guest did not exactly fill the signed envelope");
 	require(!Device::derive(envelope_fill + 4ULL * kib).valid,
 		"RAM and its capped auxiliary window exceeded the signed envelope");
+	/* The most RAM an iOS device admits is the budget's named bound: one
+	 * step more does not fit the envelope. */
+	constexpr std::uint64_t device_maximum =
+		std::uint64_t{uml::runtime::guest_memory::
+				      device_window_guest_memory_maximum_mib} * mib;
+	constexpr std::uint64_t step =
+		std::uint64_t{uml::runtime::guest_memory::guest_memory_step_mib} *
+		mib;
+	require(Device::derive(device_maximum).valid &&
+		!Device::derive(device_maximum + step).valid,
+		"the budget's bound is not the largest RAM the device window admits");
+	require(device_maximum <= envelope_fill &&
+		device_maximum + step > envelope_fill,
+		"the device bound is not the envelope's fill taken down to the steps");
+	/* The budget keeps the window's arithmetic for the address space a process
+	 * has (address_space_guest_memory_mib): it is the layout's, figure for
+	 * figure and for every size a run starts. */
+	namespace budget = uml::runtime::guest_memory;
+	static_assert(budget::native_window_floor_bytes ==
+		DARWIN_UML_NATIVE_LINK_ADDRESS);
+	static_assert(budget::native_window_allowance_minimum_bytes ==
+		DARWIN_UML_NATIVE_AUXILIARY_MINIMUM);
+	static_assert(budget::native_window_allowance_maximum_bytes ==
+		DARWIN_UML_NATIVE_AUXILIARY_MAXIMUM);
+	static_assert(budget::native_window_fixed_bytes == product_reserved);
+	for (std::uint64_t size = budget::guest_memory_minimum_mib;
+	     size <= budget::device_window_guest_memory_maximum_mib;
+	     size += budget::guest_memory_step_mib) {
+		const auto window = Device::derive(size * mib);
+		require(window.valid &&
+			window.window_end - window.window_start ==
+				budget::native_window_bytes(size * mib),
+			"the budget's window length is not the layout's");
+	}
+	/* A macOS window sits in the 128 TiB range: the largest RAM any range
+	 * holds fits there. */
+	require(uml::runtime::MacosNativeKernelGeometry::derive_at(
+			std::uint64_t{uml::runtime::guest_memory::
+					      guest_memory_range_maximum_mib} * mib,
+			96ULL * 1024ULL * gib).valid,
+		"a macOS window does not admit the largest RAM of the range");
 	const auto rounded = Device::derive(1);
 	require(rounded.valid && rounded.window_end - rounded.window_start ==
 		gib + 4ULL * kib + product_reserved,
@@ -581,6 +711,67 @@ void test_process_native_window_is_one_reservation()
 	require(!uml::runtime::reserve_process_native_window({},
 			uml::runtime::WindowPlacement::exact).valid,
 		"an invalid geometry took the process's window");
+}
+
+/* The check before the kernel starts maps the guest's RAM in the window as the
+ * kernel does and gives it back: the window is whole and protectionless
+ * afterwards, and a host that will not map the RAM is told so. */
+void test_native_guest_memory_trial_leaves_the_window_whole()
+{
+	constexpr std::uint64_t gib = 1024ULL * 1024ULL * 1024ULL;
+	constexpr std::uintptr_t start = uml::testing::native_test_window_start;
+	using Macos = uml::runtime::MacosNativeKernelGeometry;
+	const auto geometry = Macos::derive_at(2U * gib, start);
+	require(geometry.valid, "the test window did not derive");
+	const auto window = uml::runtime::reserve_process_native_window(
+		geometry, uml::runtime::WindowPlacement::exact);
+	require(window.valid && window.window_start == start,
+		"the test window was not reserved");
+	const auto whole = [&](const char *what) {
+		mach_vm_address_t cursor = window.window_start;
+		while (cursor < window.window_end) {
+			const auto query = uml::testing::query_vm_region(
+				static_cast<std::uintptr_t>(cursor));
+			require(query.status == KERN_SUCCESS &&
+				query.region.start == cursor &&
+				query.region.size != 0 &&
+				query.region.protection == VM_PROT_NONE, what);
+			cursor = query.region.start + query.region.size;
+		}
+	};
+	require(uml::runtime::native_guest_memory_mappable(window, 2U * gib),
+		"a host that has the address space did not map a guest's RAM");
+	whole("the trial left the window with a gap or an accessible range");
+	require(uml::runtime::native_guest_memory_mappable(window, gib) &&
+		uml::runtime::native_guest_memory_mappable(window, 512U << 20),
+		"the trial refused a smaller guest in the same window");
+	whole("the smaller trials left the window with a gap or an accessible "
+		"range");
+
+	/* RAM longer than the window, and nothing at all, have nothing to map. */
+	require(!uml::runtime::native_guest_memory_mappable(window,
+			window.window_end - window.window_start + 1U),
+		"a guest larger than its window was mappable");
+	require(!uml::runtime::native_guest_memory_mappable(window, 0),
+		"a guest without RAM was mappable");
+	require(!uml::runtime::native_guest_memory_mappable({}, gib),
+		"an invalid layout was mappable");
+
+	/* A window where the host has no address space maps nothing, and the
+	 * trial leaves nothing behind there. */
+	constexpr std::uintptr_t beyond = 1ULL << 48;
+	const uml::runtime::NativeKernelLayout unreachable{
+		.load_bias = beyond - DARWIN_UML_NATIVE_LINK_ADDRESS,
+		.window_start = beyond,
+		.window_end = beyond + 4U * gib,
+		.valid = true,
+		.reserved = true,
+	};
+	require(!uml::runtime::native_guest_memory_mappable(unreachable, 2U * gib),
+		"a host without the address space mapped a guest's RAM");
+	require(uml::testing::query_vm_region(beyond + gib).status !=
+			KERN_SUCCESS,
+		"the refused trial left a mapping behind");
 }
 
 void test_guest_cpu_count_matches_kernel_policy()
@@ -745,12 +936,15 @@ int main()
 		test_x86_64_kernel_memory_accounting_policy();
 		test_guest_memory_budget_matches_kernel_memparse();
 		test_gadget_cache_budget_option();
+		test_aot_option();
+		test_aot_release_option();
 		test_memory_limit_option();
 		test_jit_tier_option();
 		test_guest_hibernation_option();
 		test_session_record_option();
 		test_scalable_native_kernel_layout_geometry();
 		test_process_native_window_is_one_reservation();
+		test_native_guest_memory_trial_leaves_the_window_whole();
 		test_guest_cpu_count_matches_kernel_policy();
 		test_application_default_cpu_count_is_the_physical_cores_at_most_eight();
 		test_launch_guest_cpu_count_is_the_count_the_launch_boots_with();

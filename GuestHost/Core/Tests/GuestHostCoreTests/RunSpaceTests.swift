@@ -204,7 +204,73 @@ struct StartSpaceTests {
 }
 
 struct HostStorageTests {
-    @Test func theVolumeOfADirectoryHasSomeFreeSpace() {
-        #expect(HostStorage.freeBytes(on: URL(fileURLWithPath: NSTemporaryDirectory())) > 0)
+    /// What `statfs(2)` itself says a write can use on `path`.
+    private func statfsBytes(_ path: String) -> UInt64? {
+        var volume = statfs()
+        guard statfs(path, &volume) == 0 else { return nil }
+        return UInt64(volume.f_bavail) * UInt64(volume.f_bsize)
+    }
+
+    @Test func theFigureIsTheAvailableBlocksTimesTheBlockSize() {
+        var volume = statfs()
+        volume.f_bsize = 4096
+        volume.f_bavail = 1_000
+        // Blocks only the system may use (f_bfree) and the volume's size
+        // (f_blocks) are not in it.
+        volume.f_bfree = 5_000
+        volume.f_blocks = 9_000
+        #expect(HostStorage.writableBytes(of: volume) == 4_096_000)
+        volume.f_bavail = 0
+        #expect(HostStorage.writableBytes(of: volume) == 0)
+    }
+
+    @Test func aFigureTooLargeForABytesCountSaysSoNotWrapsAround() {
+        var volume = statfs()
+        volume.f_bsize = .max
+        volume.f_bavail = .max
+        #expect(HostStorage.writableBytes(of: volume) == .max)
+    }
+
+    @Test func aVolumesFigureIsWhatStatfsStatesForItsDirectory() throws {
+        let directory = NSTemporaryDirectory()
+        // The volume is in use by others, so the figure moves between calls;
+        // the system call before and after bracket it.
+        let before = try #require(statfsBytes(directory))
+        let figure = HostStorage.freeBytes(on: URL(fileURLWithPath: directory))
+        let after = try #require(statfsBytes(directory))
+        let slack = 64 * Bytes.mib
+        #expect(figure > 0)
+        #expect(figure + slack >= min(before, after))
+        #expect(figure <= max(before, after) + slack)
+    }
+
+    @Test func theDefaultIsTheVolumeOfTheApplicationsContainer() throws {
+        let home = NSHomeDirectory()
+        let before = try #require(statfsBytes(home))
+        let figure = HostStorage.freeBytes()
+        let after = try #require(statfsBytes(home))
+        let slack = 64 * Bytes.mib
+        #expect(figure + slack >= min(before, after))
+        #expect(figure <= max(before, after) + slack)
+    }
+
+    @Test func aFileAnswersForItsVolume() throws {
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("host-storage-\(UUID().uuidString)")
+        try Data([1]).write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+        let slack = 64 * Bytes.mib
+        let volume = HostStorage.freeBytes(on: file.deletingLastPathComponent())
+        let figure = HostStorage.freeBytes(on: file)
+        #expect(figure > 0)
+        #expect(figure + slack >= volume && volume + slack >= figure)
+    }
+
+    @Test func aPathThatCannotBeReadIsFull() {
+        let missing = URL(fileURLWithPath: "/nonexistent-\(UUID().uuidString)/volume")
+        let figure = HostStorage.freeBytes(on: missing)
+        #expect(figure == 0)
+        #expect(RunSpace.verdict(freeBytes: figure) == .pause)
+        #expect(!RunSpace.allowsResume(freeBytes: figure))
     }
 }

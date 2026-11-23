@@ -9,13 +9,16 @@ import UIKit
 /// each switching to another test wherever it awaits. A test that puts its
 /// own root view controller in that window, or connects a window of its own,
 /// would replace the root another test is waiting on, and restore a stale
-/// root afterwards. The scene applies the orientation lock of the root it has
-/// at that moment, so a test of the lock then waits on a preference nobody
+/// root afterwards. The scene reads the preferences of the root it has at that
+/// moment, so a test of a root's preferences then waits on a root nobody
 /// holds, for as long as the other test keeps the window.
 ///
 /// A test that does either takes the window with `HostWindow.take()` for its
 /// whole body and gives it back with `defer`: one test at a time, with the
-/// original root back in place for the next.
+/// original root and the window's own backing back in place for the next. A
+/// root of the application paints that backing black while a guest phase is
+/// up and gives it back only when the phase ends, which a test that is done
+/// with the window mid-phase never sees.
 @MainActor
 enum HostWindow {
     enum Failure: Error, CustomStringConvertible {
@@ -72,20 +75,24 @@ enum HostWindow {
         let scene: UIWindowScene
         let window: UIWindow
         private let original: UIViewController?
+        private let originalBacking: UIColor?
         private var given = false
 
         fileprivate init(scene: UIWindowScene, window: UIWindow) {
             self.scene = scene
             self.window = window
             original = window.rootViewController
+            originalBacking = window.backgroundColor
         }
 
-        /// Puts the original root back, makes the window key again if a
-        /// window the test connected took that over, and frees the window.
+        /// Puts the original root and the window's backing back, makes the
+        /// window key again if a window the test connected took that over, and
+        /// frees the window.
         func give() {
             guard !given else { return }
             given = true
             window.rootViewController = original
+            window.backgroundColor = originalBacking
             if !window.isKeyWindow { window.makeKey() }
             HostWindow.held = false
         }

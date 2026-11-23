@@ -1,0 +1,694 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 15:30:32 +0900
+Subject: [PATCH] virtio_input: follow configuration changes
+
+The Kernarium host plugs and unplugs a hardware keyboard, mouse and
+pointer while the guest runs, as devices that always exist and whose
+configuration changes. The driver read the device once at probe and had
+no config_changed, so a plug could never reach it.
+
+Read the identity, every event bitmap and the range of every absolute
+axis into one configuration, register the input device from it when the
+device reports at least one event type, and have none otherwise. A
+configuration change schedules a work item that reads everything again,
+every time, since nothing ties the reads of one change together. When
+the device reports no event type the input device is unregistered, which
+releases its keys in the input core; when anything differs from what was
+registered, the input device is registered again. Event delivery uses
+RCU so that a delivery in progress never sees an input device go.
+
+Post the event buffers at probe even when there is no input device: the
+host answers a device as unplugged until its driver has done so, so a
+driver that waited for the plug would never see one.
+
+Answer with the private registration notice of virtio_input_uml.h on the
+status queue: at probe when it registers an input device, on every
+configuration change that leaves one registered (also one that finds it
+registered already), and with value 0 for an unregistration. The header
+is the host's copy, synchronized by the project's sync-protocol tool. A
+resume schedules the same work, because the device was reset and may
+have changed meanwhile.
+
+A device that reports its events at probe registers as before.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ drivers/virtio/virtio_input.c     | 460 ++++++++++++++++++++++++------
+ drivers/virtio/virtio_input_uml.h |  35 +++
+ 2 files changed, 401 insertions(+), 94 deletions(-)
+ create mode 100644 drivers/virtio/virtio_input_uml.h
+
+diff --git a/drivers/virtio/virtio_input.c b/drivers/virtio/virtio_input.c
+index 698cbaef9eec17322bf91eacc754c6e85fc8a1bd..b911ccfd2b423d2d18ad324e56e5f2095c9d7be5 100644
+--- a/drivers/virtio/virtio_input.c
++++ b/drivers/virtio/virtio_input.c
+@@ -4,16 +4,53 @@
+ #include <linux/virtio_config.h>
+ #include <linux/input.h>
+ #include <linux/slab.h>
++#include <linux/delay.h>
++#include <linux/rcupdate.h>
++#include <linux/workqueue.h>
+ 
+ #include <uapi/linux/virtio_ids.h>
+ #include <uapi/linux/virtio_input.h>
+ #include <linux/input/mt.h>
+ 
++#include "virtio_input_uml.h"
++
++/*
++ * What the device reports about itself: the identity, every bitmap and the
++ * range of every absolute axis, as one read of its configuration left them.
++ */
++struct virtinput_absinfo {
++	u32 min, max, res, fuzz, flat;
++};
++
++struct virtinput_config {
++	char name[64];
++	char serial[64];
++	u16 bustype, vendor, product, version;
++	unsigned long propbit[BITS_TO_LONGS(INPUT_PROP_CNT)];
++	unsigned long evbit[BITS_TO_LONGS(EV_CNT)];
++	unsigned long keybit[BITS_TO_LONGS(KEY_CNT)];
++	unsigned long relbit[BITS_TO_LONGS(REL_CNT)];
++	unsigned long absbit[BITS_TO_LONGS(ABS_CNT)];
++	unsigned long mscbit[BITS_TO_LONGS(MSC_CNT)];
++	unsigned long swbit[BITS_TO_LONGS(SW_CNT)];
++	unsigned long ledbit[BITS_TO_LONGS(LED_CNT)];
++	unsigned long sndbit[BITS_TO_LONGS(SND_CNT)];
++	struct virtinput_absinfo abs[ABS_CNT];
++};
++
+ struct virtio_input {
+ 	struct virtio_device       *vdev;
+-	struct input_dev           *idev;
+-	char                       name[64];
+-	char                       serial[64];
++	/*
++	 * The input device, or NULL while the device reports no event type.
++	 * Only the configuration work, probe and remove change it.
++	 */
++	struct input_dev __rcu     *idev;
++	/*
++	 * What idev was registered from, and the owner of the strings it
++	 * names: set exactly while idev is.
++	 */
++	struct virtinput_config    *config;
++	struct work_struct         config_work;
+ 	char                       phys[64];
+ 	struct virtqueue           *evt, *sts;
+ 	struct virtio_input_event  evts[64];
+@@ -34,6 +71,7 @@ static void virtinput_recv_events(struct virtqueue *vq)
+ {
+ 	struct virtio_input *vi = vq->vdev->priv;
+ 	struct virtio_input_event *event;
++	struct input_dev *idev;
+ 	unsigned long flags;
+ 	unsigned int len;
+ 
+@@ -41,10 +79,18 @@ static void virtinput_recv_events(struct virtqueue *vq)
+ 	if (vi->ready) {
+ 		while ((event = virtqueue_get_buf(vi->evt, &len)) != NULL) {
+ 			spin_unlock_irqrestore(&vi->lock, flags);
+-			input_event(vi->idev,
+-				    le16_to_cpu(event->type),
+-				    le16_to_cpu(event->code),
+-				    le32_to_cpu(event->value));
++			/*
++			 * Without an input device the event has nowhere to
++			 * go, and its buffer is posted again all the same.
++			 */
++			rcu_read_lock();
++			idev = rcu_dereference(vi->idev);
++			if (idev)
++				input_event(idev,
++					    le16_to_cpu(event->type),
++					    le16_to_cpu(event->code),
++					    le32_to_cpu(event->value));
++			rcu_read_unlock();
+ 			spin_lock_irqsave(&vi->lock, flags);
+ 			if (!vi->ready)
+ 				continue;
+@@ -61,6 +107,7 @@ static void virtinput_recv_events(struct virtqueue *vq)
+  * this is typically used for stuff like keyboard leds.
+  */
+ static int virtinput_send_status(struct virtio_input *vi,
++				 struct input_dev *idev,
+ 				 u16 type, u16 code, s32 value)
+ {
+ 	struct virtio_input_event *stsbuf;
+@@ -80,7 +127,7 @@ static int virtinput_send_status(struct virtio_input *vi,
+ 	 *   >>> Each new frame becomes larger and larger.
+ 	 * Disable EV_MSC/MSC_TIMESTAMP forwarding for MT.
+ 	 */
+-	if (vi->idev->mt && type == EV_MSC && code == MSC_TIMESTAMP)
++	if (idev && idev->mt && type == EV_MSC && code == MSC_TIMESTAMP)
+ 		return 0;
+ 
+ 	stsbuf = kzalloc(sizeof(*stsbuf), GFP_ATOMIC);
+@@ -124,7 +171,48 @@ static int virtinput_status(struct input_dev *idev, unsigned int type,
+ {
+ 	struct virtio_input *vi = input_get_drvdata(idev);
+ 
+-	return virtinput_send_status(vi, type, code, value);
++	return virtinput_send_status(vi, idev, type, code, value);
++}
++
++/*
++ * Read the configuration again. The queue is freezable, so that an input
++ * device is never registered or unregistered while the system suspends.
++ */
++static void virtinput_queue_config(struct virtio_input *vi)
++{
++	queue_work(system_freezable_wq, &vi->config_work);
++}
++
++/*
++ * Tell the device whether the input device exists, so that it holds the
++ * events it has for it until it does (virtio_input_uml.h). The status queue
++ * can be full for a moment, and a notice that is lost leaves the device
++ * holding its events, so wait a little for room. When there is still none,
++ * the configuration work runs again, which answers the change once more
++ * rather than leave it unanswered. Returns the result of the last try.
++ */
++static int virtinput_notify_registration(struct virtio_input *vi,
++					 bool registered)
++{
++	int rc = 0, tries;
++
++	for (tries = 0; tries < 20; tries++) {
++		rc = virtinput_send_status(vi, NULL, VIRTIO_INPUT_UML_EV_NOTICE,
++					   VIRTIO_INPUT_UML_NOTICE_REGISTRATION,
++					   registered);
++		if (rc != -ENOSPC && rc != -ENOMEM)
++			break;
++		msleep(5);
++	}
++	if (rc == -ENOSPC || rc == -ENOMEM) {
++		virtinput_queue_config(vi);
++	} else if (rc && rc != -ENODEV) {
++		/* -ENODEV is the device going away, at removal or freeze. */
++		dev_warn(&vi->vdev->dev,
++			 "cannot tell the device about its input device: %d\n",
++			 rc);
++	}
++	return rc;
+ }
+ 
+ static u8 virtinput_cfg_select(struct virtio_input *vi,
+@@ -139,7 +227,8 @@ static u8 virtinput_cfg_select(struct virtio_input *vi,
+ }
+ 
+ static void virtinput_cfg_bits(struct virtio_input *vi, int select, int subsel,
+-			       unsigned long *bits, unsigned int bitcount)
++			       unsigned long *bits, unsigned int bitcount,
++			       unsigned long *evbit)
+ {
+ 	unsigned int bit;
+ 	u8 *virtio_bits;
+@@ -169,21 +258,23 @@ static void virtinput_cfg_bits(struct virtio_input *vi, int select, int subsel,
+ 	kfree(virtio_bits);
+ 
+ 	if (select == VIRTIO_INPUT_CFG_EV_BITS)
+-		__set_bit(subsel, vi->idev->evbit);
++		__set_bit(subsel, evbit);
+ }
+ 
+-static void virtinput_cfg_abs(struct virtio_input *vi, int abs)
++static void virtinput_cfg_abs(struct virtio_input *vi, int abs,
++			      struct virtinput_absinfo *info)
+ {
+-	u32 mi, ma, re, fu, fl;
+-
+ 	virtinput_cfg_select(vi, VIRTIO_INPUT_CFG_ABS_INFO, abs);
+-	virtio_cread_le(vi->vdev, struct virtio_input_config, u.abs.min, &mi);
+-	virtio_cread_le(vi->vdev, struct virtio_input_config, u.abs.max, &ma);
+-	virtio_cread_le(vi->vdev, struct virtio_input_config, u.abs.res, &re);
+-	virtio_cread_le(vi->vdev, struct virtio_input_config, u.abs.fuzz, &fu);
+-	virtio_cread_le(vi->vdev, struct virtio_input_config, u.abs.flat, &fl);
+-	input_set_abs_params(vi->idev, abs, mi, ma, fu, fl);
+-	input_abs_set_res(vi->idev, abs, re);
++	virtio_cread_le(vi->vdev, struct virtio_input_config, u.abs.min,
++			&info->min);
++	virtio_cread_le(vi->vdev, struct virtio_input_config, u.abs.max,
++			&info->max);
++	virtio_cread_le(vi->vdev, struct virtio_input_config, u.abs.res,
++			&info->res);
++	virtio_cread_le(vi->vdev, struct virtio_input_config, u.abs.fuzz,
++			&info->fuzz);
++	virtio_cread_le(vi->vdev, struct virtio_input_config, u.abs.flat,
++			&info->flat);
+ }
+ 
+ static int virtinput_init_vqs(struct virtio_input *vi)
+@@ -219,122 +310,295 @@ static void virtinput_fill_evt(struct virtio_input *vi)
+ 	spin_unlock_irqrestore(&vi->lock, flags);
+ }
+ 
+-static int virtinput_probe(struct virtio_device *vdev)
++/* Read everything the device reports about itself, in one pass. */
++static void virtinput_read_config(struct virtio_input *vi,
++				  struct virtinput_config *cfg)
+ {
+-	struct virtio_input *vi;
+-	unsigned long flags;
++	struct virtio_device *vdev = vi->vdev;
+ 	size_t size;
+-	int abs, err, nslots;
+-
+-	if (!virtio_has_feature(vdev, VIRTIO_F_VERSION_1))
+-		return -ENODEV;
+-
+-	vi = kzalloc(sizeof(*vi), GFP_KERNEL);
+-	if (!vi)
+-		return -ENOMEM;
+-
+-	vdev->priv = vi;
+-	vi->vdev = vdev;
+-	spin_lock_init(&vi->lock);
+-
+-	err = virtinput_init_vqs(vi);
+-	if (err)
+-		goto err_init_vq;
+-
+-	vi->idev = input_allocate_device();
+-	if (!vi->idev) {
+-		err = -ENOMEM;
+-		goto err_input_alloc;
+-	}
+-	input_set_drvdata(vi->idev, vi);
++	int abs;
+ 
+ 	size = virtinput_cfg_select(vi, VIRTIO_INPUT_CFG_ID_NAME, 0);
+-	virtio_cread_bytes(vi->vdev, offsetof(struct virtio_input_config,
+-					      u.string),
+-			   vi->name, min(size, sizeof(vi->name)));
++	virtio_cread_bytes(vdev, offsetof(struct virtio_input_config,
++					  u.string),
++			   cfg->name, min(size, sizeof(cfg->name)));
+ 	size = virtinput_cfg_select(vi, VIRTIO_INPUT_CFG_ID_SERIAL, 0);
+-	virtio_cread_bytes(vi->vdev, offsetof(struct virtio_input_config,
+-					      u.string),
+-			   vi->serial, min(size, sizeof(vi->serial)));
+-	snprintf(vi->phys, sizeof(vi->phys),
+-		 "virtio%d/input0", vdev->index);
+-	vi->idev->name = vi->name;
+-	vi->idev->phys = vi->phys;
+-	vi->idev->uniq = vi->serial;
++	virtio_cread_bytes(vdev, offsetof(struct virtio_input_config,
++					  u.string),
++			   cfg->serial, min(size, sizeof(cfg->serial)));
+ 
+ 	size = virtinput_cfg_select(vi, VIRTIO_INPUT_CFG_ID_DEVIDS, 0);
+ 	if (size >= sizeof(struct virtio_input_devids)) {
+-		virtio_cread_le(vi->vdev, struct virtio_input_config,
+-				u.ids.bustype, &vi->idev->id.bustype);
+-		virtio_cread_le(vi->vdev, struct virtio_input_config,
+-				u.ids.vendor, &vi->idev->id.vendor);
+-		virtio_cread_le(vi->vdev, struct virtio_input_config,
+-				u.ids.product, &vi->idev->id.product);
+-		virtio_cread_le(vi->vdev, struct virtio_input_config,
+-				u.ids.version, &vi->idev->id.version);
++		virtio_cread_le(vdev, struct virtio_input_config,
++				u.ids.bustype, &cfg->bustype);
++		virtio_cread_le(vdev, struct virtio_input_config,
++				u.ids.vendor, &cfg->vendor);
++		virtio_cread_le(vdev, struct virtio_input_config,
++				u.ids.product, &cfg->product);
++		virtio_cread_le(vdev, struct virtio_input_config,
++				u.ids.version, &cfg->version);
+ 	} else {
+-		vi->idev->id.bustype = BUS_VIRTUAL;
++		cfg->bustype = BUS_VIRTUAL;
+ 	}
+ 
+ 	virtinput_cfg_bits(vi, VIRTIO_INPUT_CFG_PROP_BITS, 0,
+-			   vi->idev->propbit, INPUT_PROP_CNT);
++			   cfg->propbit, INPUT_PROP_CNT, cfg->evbit);
+ 	size = virtinput_cfg_select(vi, VIRTIO_INPUT_CFG_EV_BITS, EV_REP);
+ 	if (size)
+-		__set_bit(EV_REP, vi->idev->evbit);
+-
+-	vi->idev->dev.parent = &vdev->dev;
+-	vi->idev->event = virtinput_status;
++		__set_bit(EV_REP, cfg->evbit);
+ 
+ 	/* device -> kernel */
+ 	virtinput_cfg_bits(vi, VIRTIO_INPUT_CFG_EV_BITS, EV_KEY,
+-			   vi->idev->keybit, KEY_CNT);
++			   cfg->keybit, KEY_CNT, cfg->evbit);
+ 	virtinput_cfg_bits(vi, VIRTIO_INPUT_CFG_EV_BITS, EV_REL,
+-			   vi->idev->relbit, REL_CNT);
++			   cfg->relbit, REL_CNT, cfg->evbit);
+ 	virtinput_cfg_bits(vi, VIRTIO_INPUT_CFG_EV_BITS, EV_ABS,
+-			   vi->idev->absbit, ABS_CNT);
++			   cfg->absbit, ABS_CNT, cfg->evbit);
+ 	virtinput_cfg_bits(vi, VIRTIO_INPUT_CFG_EV_BITS, EV_MSC,
+-			   vi->idev->mscbit, MSC_CNT);
++			   cfg->mscbit, MSC_CNT, cfg->evbit);
+ 	virtinput_cfg_bits(vi, VIRTIO_INPUT_CFG_EV_BITS, EV_SW,
+-			   vi->idev->swbit,  SW_CNT);
++			   cfg->swbit,  SW_CNT, cfg->evbit);
+ 
+ 	/* kernel -> device */
+ 	virtinput_cfg_bits(vi, VIRTIO_INPUT_CFG_EV_BITS, EV_LED,
+-			   vi->idev->ledbit, LED_CNT);
++			   cfg->ledbit, LED_CNT, cfg->evbit);
+ 	virtinput_cfg_bits(vi, VIRTIO_INPUT_CFG_EV_BITS, EV_SND,
+-			   vi->idev->sndbit, SND_CNT);
++			   cfg->sndbit, SND_CNT, cfg->evbit);
++
++	if (test_bit(EV_ABS, cfg->evbit)) {
++		for (abs = 0; abs < ABS_CNT; abs++) {
++			if (test_bit(abs, cfg->absbit))
++				virtinput_cfg_abs(vi, abs, &cfg->abs[abs]);
++		}
++	}
++}
++
++/* A device that reports no event type has no input device. */
++static bool virtinput_config_empty(const struct virtinput_config *cfg)
++{
++	return bitmap_empty(cfg->evbit, EV_CNT);
++}
++
++/*
++ * Register an input device from cfg, which stays the owner of the strings
++ * the device names and must outlive it.
++ */
++static int virtinput_register(struct virtio_input *vi,
++			      struct virtinput_config *cfg)
++{
++	struct input_dev *idev;
++	int abs, err, nslots;
+ 
+-	if (test_bit(EV_ABS, vi->idev->evbit)) {
++	idev = input_allocate_device();
++	if (!idev)
++		return -ENOMEM;
++	input_set_drvdata(idev, vi);
++
++	snprintf(vi->phys, sizeof(vi->phys),
++		 "virtio%d/input0", vi->vdev->index);
++	idev->name = cfg->name;
++	idev->phys = vi->phys;
++	idev->uniq = cfg->serial;
++	idev->id.bustype = cfg->bustype;
++	idev->id.vendor = cfg->vendor;
++	idev->id.product = cfg->product;
++	idev->id.version = cfg->version;
++
++	bitmap_copy(idev->propbit, cfg->propbit, INPUT_PROP_CNT);
++	bitmap_copy(idev->evbit, cfg->evbit, EV_CNT);
++	bitmap_copy(idev->keybit, cfg->keybit, KEY_CNT);
++	bitmap_copy(idev->relbit, cfg->relbit, REL_CNT);
++	bitmap_copy(idev->absbit, cfg->absbit, ABS_CNT);
++	bitmap_copy(idev->mscbit, cfg->mscbit, MSC_CNT);
++	bitmap_copy(idev->swbit, cfg->swbit, SW_CNT);
++	bitmap_copy(idev->ledbit, cfg->ledbit, LED_CNT);
++	bitmap_copy(idev->sndbit, cfg->sndbit, SND_CNT);
++
++	idev->dev.parent = &vi->vdev->dev;
++	idev->event = virtinput_status;
++
++	if (test_bit(EV_ABS, idev->evbit)) {
+ 		for (abs = 0; abs < ABS_CNT; abs++) {
+-			if (!test_bit(abs, vi->idev->absbit))
++			if (!test_bit(abs, idev->absbit))
+ 				continue;
+-			virtinput_cfg_abs(vi, abs);
++			input_set_abs_params(idev, abs, cfg->abs[abs].min,
++					     cfg->abs[abs].max,
++					     cfg->abs[abs].fuzz,
++					     cfg->abs[abs].flat);
++			input_abs_set_res(idev, abs, cfg->abs[abs].res);
+ 		}
+ 
+-		if (test_bit(ABS_MT_SLOT, vi->idev->absbit)) {
+-			nslots = input_abs_get_max(vi->idev, ABS_MT_SLOT) + 1;
+-			err = input_mt_init_slots(vi->idev, nslots, 0);
++		if (test_bit(ABS_MT_SLOT, idev->absbit)) {
++			nslots = input_abs_get_max(idev, ABS_MT_SLOT) + 1;
++			err = input_mt_init_slots(idev, nslots, 0);
+ 			if (err)
+-				goto err_mt_init_slots;
++				goto err_free;
+ 		}
+ 	}
+ 
++	err = input_register_device(idev);
++	if (err)
++		goto err_free;
++
++	vi->config = cfg;
++	rcu_assign_pointer(vi->idev, idev);
++	return 0;
++
++err_free:
++	input_free_device(idev);
++	return err;
++}
++
++/*
++ * Remove the input device, which releases its keys in the input core. Its
++ * configuration goes with it. The events that arrive after this are dropped.
++ */
++static void virtinput_unregister(struct virtio_input *vi)
++{
++	struct input_dev *idev = rcu_dereference_protected(vi->idev, true);
++
++	if (!idev)
++		return;
++	rcu_assign_pointer(vi->idev, NULL);
++	/* Wait out the event delivery that may still be using it. */
++	synchronize_rcu();
++	input_unregister_device(idev);
++	kfree(vi->config);
++	vi->config = NULL;
++}
++
++/*
++ * The host plugs and unplugs the device while the guest runs and raises a
++ * configuration change for each. The device answers what it can do when it is
++ * read and nothing ties the reads of one change together, so read it all
++ * again, and register the input device afresh when anything differs from what
++ * it was registered with. Answer every change that leaves a registered input
++ * device, also one that finds it registered already (virtio_input_uml.h).
++ */
++static void virtinput_config_work(struct work_struct *work)
++{
++	struct virtio_input *vi =
++		container_of(work, struct virtio_input, config_work);
++	struct virtinput_config *cfg;
++	unsigned long flags;
++	bool ready;
++	int err;
++
++	spin_lock_irqsave(&vi->lock, flags);
++	ready = vi->ready;
++	spin_unlock_irqrestore(&vi->lock, flags);
++	if (!ready)
++		return;
++
++	cfg = kzalloc(sizeof(*cfg), GFP_KERNEL);
++	if (!cfg) {
++		/* The change must not go unanswered; try again shortly. */
++		msleep(10);
++		virtinput_queue_config(vi);
++		return;
++	}
++	virtinput_read_config(vi, cfg);
++
++	/*
++	 * A change that came in while the device was read may have split the
++	 * reads between two states of it, and the work queued for that change
++	 * reads and answers it all again, so drop this one.
++	 */
++	if (work_pending(work)) {
++		kfree(cfg);
++		return;
++	}
++
++	if (rcu_access_pointer(vi->idev)) {
++		if (!memcmp(cfg, vi->config, sizeof(*cfg))) {
++			kfree(cfg);
++			virtinput_notify_registration(vi, true);
++			return;
++		}
++		virtinput_unregister(vi);
++		virtinput_notify_registration(vi, false);
++	}
++
++	if (virtinput_config_empty(cfg)) {
++		kfree(cfg);
++		return;
++	}
++	err = virtinput_register(vi, cfg);
++	if (err) {
++		dev_err(&vi->vdev->dev,
++			"cannot register the input device: %d\n", err);
++		kfree(cfg);
++		return;
++	}
++	virtinput_notify_registration(vi, true);
++}
++
++static void virtinput_config_changed(struct virtio_device *vdev)
++{
++	struct virtio_input *vi = vdev->priv;
++
++	/* Called with the configuration lock held, and reading is a request. */
++	virtinput_queue_config(vi);
++}
++
++static int virtinput_probe(struct virtio_device *vdev)
++{
++	struct virtinput_config *cfg;
++	struct virtio_input *vi;
++	unsigned long flags;
++	int err;
++
++	if (!virtio_has_feature(vdev, VIRTIO_F_VERSION_1))
++		return -ENODEV;
++
++	vi = kzalloc(sizeof(*vi), GFP_KERNEL);
++	if (!vi)
++		return -ENOMEM;
++
++	vdev->priv = vi;
++	vi->vdev = vdev;
++	spin_lock_init(&vi->lock);
++	INIT_WORK(&vi->config_work, virtinput_config_work);
++
++	err = virtinput_init_vqs(vi);
++	if (err)
++		goto err_init_vq;
++
++	cfg = kzalloc(sizeof(*cfg), GFP_KERNEL);
++	if (!cfg) {
++		err = -ENOMEM;
++		goto err_config_alloc;
++	}
++	virtinput_read_config(vi, cfg);
++
+ 	virtio_device_ready(vdev);
+ 	vi->ready = true;
+-	err = input_register_device(vi->idev);
+-	if (err)
+-		goto err_input_register;
++	if (virtinput_config_empty(cfg)) {
++		kfree(cfg);
++	} else {
++		err = virtinput_register(vi, cfg);
++		if (err) {
++			kfree(cfg);
++			goto err_register;
++		}
++	}
+ 
++	/*
++	 * Post the event buffers whether or not there is an input device: the
++	 * host answers a device as unplugged until its driver has done so, and
++	 * the change that plugs it follows.
++	 */
+ 	virtinput_fill_evt(vi);
++	if (rcu_access_pointer(vi->idev))
++		virtinput_notify_registration(vi, true);
+ 	return 0;
+ 
+-err_input_register:
++err_register:
+ 	spin_lock_irqsave(&vi->lock, flags);
+ 	vi->ready = false;
+ 	spin_unlock_irqrestore(&vi->lock, flags);
+ 	virtio_reset_device(vdev);
+-err_mt_init_slots:
+-	input_free_device(vi->idev);
+-err_input_alloc:
++err_config_alloc:
+ 	vdev->config->del_vqs(vdev);
+ err_init_vq:
+ 	kfree(vi);
+@@ -351,9 +615,10 @@ static void virtinput_remove(struct virtio_device *vdev)
+ 	vi->ready = false;
+ 	spin_unlock_irqrestore(&vi->lock, flags);
+ 
++	cancel_work_sync(&vi->config_work);
+ 	/* Callbacks use vi->idev. */
+ 	virtio_reset_device(vdev);
+-	input_unregister_device(vi->idev);
++	virtinput_unregister(vi);
+ 	while ((buf = virtqueue_detach_unused_buf(vi->sts)) != NULL)
+ 		kfree(buf);
+ 	vdev->config->del_vqs(vdev);
+@@ -371,6 +636,7 @@ static int virtinput_freeze(struct virtio_device *vdev)
+ 	vi->ready = false;
+ 	spin_unlock_irqrestore(&vi->lock, flags);
+ 
++	cancel_work_sync(&vi->config_work);
+ 	virtio_reset_device(vdev);
+ 	while ((buf = virtqueue_detach_unused_buf(vi->sts)) != NULL)
+ 		kfree(buf);
+@@ -390,6 +656,11 @@ static int virtinput_restore(struct virtio_device *vdev)
+ 	virtio_device_ready(vdev);
+ 	vi->ready = true;
+ 	virtinput_fill_evt(vi);
++	/*
++	 * The device was reset and may have been plugged or unplugged while
++	 * the guest slept without a change reaching it.
++	 */
++	virtinput_queue_config(vi);
+ 	return 0;
+ }
+ #endif
+@@ -409,6 +680,7 @@ static struct virtio_driver virtio_input_driver = {
+ 	.id_table            = id_table,
+ 	.probe               = virtinput_probe,
+ 	.remove              = virtinput_remove,
++	.config_changed      = virtinput_config_changed,
+ #ifdef CONFIG_PM_SLEEP
+ 	.freeze	             = virtinput_freeze,
+ 	.restore             = virtinput_restore,
+diff --git a/drivers/virtio/virtio_input_uml.h b/drivers/virtio/virtio_input_uml.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..9244559b93fd7cb6ed6eb2eed9b94dddf3671f9b
+--- /dev/null
++++ b/drivers/virtio/virtio_input_uml.h
+@@ -0,0 +1,35 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * Private Virtio-input registration notice.
++ *
++ * The Kernarium hardware keyboard, mouse and pointer are Virtio-input devices
++ * that the host plugs and unplugs while the guest runs. The host raises a
++ * configuration change and the driver reads the device's event bitmaps again:
++ * a device that reports no event type has no input device, and one that
++ * reports events has one. The host has to know when the input device exists,
++ * because the first events after a plug must not reach the guest before it
++ * does, so after the driver registers or unregisters the input device it
++ * sends one event on the status queue, in the wire format of every other
++ * status event (struct virtio_input_event).
++ *
++ * The status queue carries only what the input core sends a device: EV_LED and
++ * EV_SND. A notice is in neither, so a host that does not know it cannot take
++ * it for a LED or a sound. Its type is one no evdev driver defines (EV_MAX is
++ * 0x1f, and the highest type input-event-codes.h defines is 0x17).
++ */
++#ifndef VIRTIO_INPUT_UML_H
++#define VIRTIO_INPUT_UML_H
++
++/* The type of a notice, in the type field of struct virtio_input_event. */
++#define VIRTIO_INPUT_UML_EV_NOTICE 0x1e
++
++/*
++ * The notice codes. A notice is sent in answer to every configuration change
++ * that leaves the driver with a registered input device, including the change
++ * that finds it registered already, so that every plug is answered, and once
++ * at probe when the probe registers an input device.
++ */
++/* value 1: the input device is registered; value 0: it is not. */
++#define VIRTIO_INPUT_UML_NOTICE_REGISTRATION 0x00
++
++#endif /* VIRTIO_INPUT_UML_H */

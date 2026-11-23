@@ -1,0 +1,383 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 23:07:01 +0900
+Subject: [PATCH] gnss: add the Kernarium host receiver
+
+The emulator offers the Apple host's location as a GNSS receiver, so the
+guest sees an ordinary Linux GNSS device: /dev/gnssN of type NMEA, which
+Android's GNSS HAL and gpsd read as they read any receiver.
+
+The transport is a local experimental Virtio device, ID 65534, the
+backwards-growing ID after the battery's 65535, with no feature bits and
+no configuration space. The receive queue carries the NMEA byte stream
+from the host while the receiver is powered. The control queue carries
+{le32 version; le32 power}, which the driver sends on the first open of
+the node and on the last close, so the receiver is powered as a real one
+is. Bytes that arrive while the node is closed are dropped, as the GNSS
+core requires.
+
+A suspend disables the queues, so the buffers the driver posted wait in
+the ring and the host fills them after the resume. The driver is not a
+wake source: the host wakes a guest that suspended itself.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ drivers/gnss/Kconfig     |  14 ++
+ drivers/gnss/Makefile    |   3 +
+ drivers/gnss/kernarium.c | 313 +++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 330 insertions(+)
+ create mode 100644 drivers/gnss/kernarium.c
+
+diff --git a/drivers/gnss/Kconfig b/drivers/gnss/Kconfig
+index d7fe265c2869657e8ffc3f555c59e83eacce8259..5a2ef6a2d3a9b7b74965cdfee470ed788e7bd56d 100644
+--- a/drivers/gnss/Kconfig
++++ b/drivers/gnss/Kconfig
+@@ -65,4 +65,18 @@ config GNSS_USB
+ 
+ 	  If unsure, say N.
+ 
++config GNSS_KERNARIUM_VIRTIO
++	tristate "Kernarium host GNSS receiver over Virtio"
++	depends on VIRTIO
++	help
++	  Say Y here to expose the location of the Apple host, which the
++	  Kernarium emulator provides as a local experimental Virtio device, as
++	  an NMEA GNSS receiver. The receiver is powered while its node is
++	  open.
++
++	  To compile this driver as a module, choose M here: the module will
++	  be called gnss-kernarium.
++
++	  If unsure, say N.
++
+ endif # GNSS
+diff --git a/drivers/gnss/Makefile b/drivers/gnss/Makefile
+index bb2cbada34359b73c2402a72b46820b3ef231922..4731a392542bc9838ab9be33a6237e2203f2b020 100644
+--- a/drivers/gnss/Makefile
++++ b/drivers/gnss/Makefile
+@@ -20,3 +20,6 @@ gnss-ubx-y := ubx.o
+ 
+ obj-$(CONFIG_GNSS_USB)			+= gnss-usb.o
+ gnss-usb-y := usb.o
++
++obj-$(CONFIG_GNSS_KERNARIUM_VIRTIO)	+= gnss-kernarium.o
++gnss-kernarium-y := kernarium.o
+diff --git a/drivers/gnss/kernarium.c b/drivers/gnss/kernarium.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..3c491b2fea50bc4d5caaf6a40fba138c2af8b607
+--- /dev/null
++++ b/drivers/gnss/kernarium.c
+@@ -0,0 +1,313 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Kernarium host GNSS receiver over Virtio.
++ *
++ * The Kernarium emulator offers the location of the Apple host as a GNSS
++ * receiver that speaks NMEA 0183, so the guest sees an ordinary Linux GNSS
++ * device: /dev/gnssN with the type NMEA, which Android's GNSS HAL and gpsd
++ * read as they read any other receiver.
++ *
++ * This is a local experimental Virtio protocol. Device ID 65534 is the
++ * backwards-growing experimental ID after the battery's 65535. The device has
++ * no feature bits and no configuration space, and two queues:
++ *
++ *   0 receive: the driver posts empty buffers and the device fills them with
++ *     the NMEA byte stream, a sentence or a part of one at a time, while the
++ *     receiver is powered. A buffer filled while the node is closed is
++ *     dropped.
++ *   1 control: the driver sends {le32 version; le32 power}. Power 1 asks the
++ *     host to start the receiver, 0 to stop it; the host sends nothing while
++ *     the receiver is off.
++ *
++ * The receiver is powered from the first open of the node to the last close,
++ * as a real receiver is. A suspend disables the queues: the posted buffers
++ * wait in the ring and the host fills them after the resume. The driver is
++ * not a wake source; the host wakes a guest that suspended itself.
++ *
++ * Virtio devices of UML are not frozen for hibernation, so the driver has no
++ * freeze and restore.
++ */
++
++#include <linux/device.h>
++#include <linux/err.h>
++#include <linux/gnss.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/scatterlist.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <linux/virtio.h>
++#include <linux/virtio_config.h>
++
++#define VIRTIO_ID_KERNARIUM_GNSS	65534
++#define KERNARIUM_GNSS_VERSION		1
++#define KERNARIUM_GNSS_RX_BUFFERS	8
++#define KERNARIUM_GNSS_RX_SIZE		256
++
++struct kernarium_gnss_control {
++	__le32 version;
++	__le32 power;
++} __packed;
++
++struct kernarium_gnss {
++	struct virtio_device *vdev;
++	struct gnss_device *gdev;
++	struct virtqueue *rx_vq;
++	struct virtqueue *control_vq;
++	u8 *rx_buffers;
++	/*
++	 * Serializes the queues with the open state: the GNSS core must not be
++	 * given bytes while its node is closed, and a close returns only after
++	 * the last callback that saw it open has finished.
++	 */
++	spinlock_t lock;
++	bool ready;
++	bool open;
++};
++
++/* Takes the control messages the host has consumed. Called with the lock. */
++static void kernarium_gnss_reap_control(struct kernarium_gnss *gnss)
++{
++	unsigned int length;
++	void *message;
++
++	while ((message = virtqueue_get_buf(gnss->control_vq, &length)) != NULL)
++		kfree(message);
++}
++
++static void kernarium_gnss_control_done(struct virtqueue *vq)
++{
++	struct kernarium_gnss *gnss = vq->vdev->priv;
++	unsigned long flags;
++
++	spin_lock_irqsave(&gnss->lock, flags);
++	kernarium_gnss_reap_control(gnss);
++	spin_unlock_irqrestore(&gnss->lock, flags);
++}
++
++static int kernarium_gnss_post_rx(struct kernarium_gnss *gnss, void *buffer)
++{
++	struct scatterlist sg;
++
++	sg_init_one(&sg, buffer, KERNARIUM_GNSS_RX_SIZE);
++	return virtqueue_add_inbuf(gnss->rx_vq, &sg, 1, buffer, GFP_ATOMIC);
++}
++
++static void kernarium_gnss_rx_done(struct virtqueue *vq)
++{
++	struct kernarium_gnss *gnss = vq->vdev->priv;
++	unsigned long flags;
++	unsigned int length;
++	bool posted = false;
++	void *buffer;
++
++	spin_lock_irqsave(&gnss->lock, flags);
++	while (gnss->ready &&
++	       (buffer = virtqueue_get_buf(vq, &length)) != NULL) {
++		if (gnss->open && length <= KERNARIUM_GNSS_RX_SIZE)
++			gnss_insert_raw(gnss->gdev, buffer, length);
++		if (kernarium_gnss_post_rx(gnss, buffer) == 0)
++			posted = true;
++	}
++	if (posted)
++		virtqueue_kick(vq);
++	spin_unlock_irqrestore(&gnss->lock, flags);
++}
++
++static int kernarium_gnss_set_power(struct kernarium_gnss *gnss, bool on)
++{
++	struct kernarium_gnss_control *message;
++	struct scatterlist sg;
++	unsigned long flags;
++	int error = -ENODEV;
++
++	message = kmalloc(sizeof(*message), GFP_KERNEL);
++	if (!message)
++		return -ENOMEM;
++	message->version = cpu_to_le32(KERNARIUM_GNSS_VERSION);
++	message->power = cpu_to_le32(on);
++	sg_init_one(&sg, message, sizeof(*message));
++
++	spin_lock_irqsave(&gnss->lock, flags);
++	if (gnss->ready) {
++		error = virtqueue_add_outbuf(gnss->control_vq, &sg, 1, message,
++					     GFP_ATOMIC);
++		if (error == -ENOSPC) {
++			kernarium_gnss_reap_control(gnss);
++			error = virtqueue_add_outbuf(gnss->control_vq, &sg, 1,
++						     message, GFP_ATOMIC);
++		}
++		if (error == 0) {
++			/* The host owns the message now, even if it is not told. */
++			message = NULL;
++			if (!virtqueue_kick(gnss->control_vq))
++				error = -EIO;
++		}
++	}
++	spin_unlock_irqrestore(&gnss->lock, flags);
++	kfree(message);
++	return error;
++}
++
++static int kernarium_gnss_open(struct gnss_device *gdev)
++{
++	struct kernarium_gnss *gnss = gnss_get_drvdata(gdev);
++	unsigned long flags;
++	int error;
++
++	spin_lock_irqsave(&gnss->lock, flags);
++	gnss->open = true;
++	spin_unlock_irqrestore(&gnss->lock, flags);
++
++	error = kernarium_gnss_set_power(gnss, true);
++	if (error) {
++		spin_lock_irqsave(&gnss->lock, flags);
++		gnss->open = false;
++		spin_unlock_irqrestore(&gnss->lock, flags);
++		return error;
++	}
++	return 0;
++}
++
++static void kernarium_gnss_close(struct gnss_device *gdev)
++{
++	struct kernarium_gnss *gnss = gnss_get_drvdata(gdev);
++	unsigned long flags;
++
++	/* The core resets the read FIFO once this returns. */
++	spin_lock_irqsave(&gnss->lock, flags);
++	gnss->open = false;
++	spin_unlock_irqrestore(&gnss->lock, flags);
++
++	kernarium_gnss_set_power(gnss, false);
++}
++
++static const struct gnss_operations kernarium_gnss_ops = {
++	.open	= kernarium_gnss_open,
++	.close	= kernarium_gnss_close,
++};
++
++static int kernarium_gnss_init_vqs(struct kernarium_gnss *gnss)
++{
++	struct virtqueue_info vqs_info[] = {
++		{ "receive", kernarium_gnss_rx_done },
++		{ "control", kernarium_gnss_control_done },
++	};
++	struct virtqueue *vqs[2];
++	int error;
++
++	error = virtio_find_vqs(gnss->vdev, 2, vqs, vqs_info, NULL);
++	if (error)
++		return error;
++	gnss->rx_vq = vqs[0];
++	gnss->control_vq = vqs[1];
++	return 0;
++}
++
++static void kernarium_gnss_fill_rx(struct kernarium_gnss *gnss)
++{
++	unsigned long flags;
++	int count = min_t(int, virtqueue_get_vring_size(gnss->rx_vq),
++			  KERNARIUM_GNSS_RX_BUFFERS);
++	int i;
++
++	spin_lock_irqsave(&gnss->lock, flags);
++	for (i = 0; i < count; i++)
++		kernarium_gnss_post_rx(gnss, gnss->rx_buffers +
++				       i * KERNARIUM_GNSS_RX_SIZE);
++	virtqueue_kick(gnss->rx_vq);
++	spin_unlock_irqrestore(&gnss->lock, flags);
++}
++
++static int kernarium_gnss_probe(struct virtio_device *vdev)
++{
++	struct kernarium_gnss *gnss;
++	unsigned long flags;
++	int error;
++
++	gnss = devm_kzalloc(&vdev->dev, sizeof(*gnss), GFP_KERNEL);
++	if (!gnss)
++		return -ENOMEM;
++	gnss->rx_buffers = devm_kzalloc(&vdev->dev,
++					KERNARIUM_GNSS_RX_BUFFERS *
++					KERNARIUM_GNSS_RX_SIZE, GFP_KERNEL);
++	if (!gnss->rx_buffers)
++		return -ENOMEM;
++	gnss->vdev = vdev;
++	spin_lock_init(&gnss->lock);
++	vdev->priv = gnss;
++
++	error = kernarium_gnss_init_vqs(gnss);
++	if (error)
++		return dev_err_probe(&vdev->dev, error,
++				     "could not create the receiver queues\n");
++
++	gnss->gdev = gnss_allocate_device(&vdev->dev);
++	if (!gnss->gdev) {
++		error = -ENOMEM;
++		goto err_del_vqs;
++	}
++	gnss->gdev->ops = &kernarium_gnss_ops;
++	gnss->gdev->type = GNSS_TYPE_NMEA;
++	gnss_set_drvdata(gnss->gdev, gnss);
++
++	virtio_device_ready(vdev);
++	spin_lock_irqsave(&gnss->lock, flags);
++	gnss->ready = true;
++	spin_unlock_irqrestore(&gnss->lock, flags);
++	kernarium_gnss_fill_rx(gnss);
++
++	error = gnss_register_device(gnss->gdev);
++	if (error)
++		goto err_reset;
++	return 0;
++
++err_reset:
++	spin_lock_irqsave(&gnss->lock, flags);
++	gnss->ready = false;
++	spin_unlock_irqrestore(&gnss->lock, flags);
++	virtio_reset_device(vdev);
++	gnss_put_device(gnss->gdev);
++err_del_vqs:
++	vdev->config->del_vqs(vdev);
++	return error;
++}
++
++static void kernarium_gnss_remove(struct virtio_device *vdev)
++{
++	struct kernarium_gnss *gnss = vdev->priv;
++	unsigned long flags;
++	void *message;
++
++	/* Closes the node if it is open, which powers the receiver off. */
++	gnss_deregister_device(gnss->gdev);
++
++	spin_lock_irqsave(&gnss->lock, flags);
++	gnss->ready = false;
++	gnss->open = false;
++	spin_unlock_irqrestore(&gnss->lock, flags);
++
++	virtio_reset_device(vdev);
++	while ((message = virtqueue_detach_unused_buf(gnss->control_vq)) != NULL)
++		kfree(message);
++	vdev->config->del_vqs(vdev);
++	gnss_put_device(gnss->gdev);
++}
++
++static const struct virtio_device_id kernarium_gnss_id_table[] = {
++	{ VIRTIO_ID_KERNARIUM_GNSS, VIRTIO_DEV_ANY_ID },
++	{ },
++};
++MODULE_DEVICE_TABLE(virtio, kernarium_gnss_id_table);
++
++static struct virtio_driver kernarium_gnss_driver = {
++	.driver.name = KBUILD_MODNAME,
++	.driver.owner = THIS_MODULE,
++	.id_table = kernarium_gnss_id_table,
++	.probe = kernarium_gnss_probe,
++	.remove = kernarium_gnss_remove,
++};
++module_virtio_driver(kernarium_gnss_driver);
++
++MODULE_DESCRIPTION("Kernarium host GNSS receiver Virtio driver");
++MODULE_LICENSE("GPL");

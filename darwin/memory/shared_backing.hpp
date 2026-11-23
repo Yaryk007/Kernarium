@@ -131,6 +131,11 @@ struct AnonymousBackingMemory final {
 [[nodiscard]] bool host_range_kept(
 	const void *address, std::size_t length) noexcept;
 
+/* Whether any range the host keeps overlaps [address, address + length): a
+ * span with one in it cannot be unmapped as a whole. */
+[[nodiscard]] bool host_range_kept_within(
+	const void *address, std::size_t length) noexcept;
+
 /* Keep a retiring domain's guest RAM page mapped while a view borrows it.
  *
  * A view of the anonymous root borrows the root's own mapping, and its holder

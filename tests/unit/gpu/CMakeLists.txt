@@ -74,6 +74,14 @@ if(TARGET uml_gpu_memory_pressure)
         LIBRARIES UML::GpuMemoryPressure)
 endif()
 
+# Whether a refused Venus allocation waits for the guest's reclaimer: the
+# policy needs no GPU device either.
+if(TARGET uml_gpu_reclaim_wait)
+    uml_add_gpu_unit_test(gpu-reclaim-wait
+        uml_gpu_reclaim_wait_tests reclaim_wait_tests.cpp
+        LIBRARIES UML::GpuReclaimWait Threads::Threads)
+endif()
+
 uml_add_gpu_unit_test(gpu-metal-submit-timing-collector
     uml_gpu_metal_submit_timing_tests metal_submit_timing_tests.cpp
     LIBRARIES Threads::Threads
@@ -111,6 +119,13 @@ if(TARGET uml_gpu_device_memory_pool)
         TIMEOUT 60)
 endif()
 
+# Whether the pool's reclaim hook has a free to wait for.
+if(TARGET uml_gpu_freed_memory_watch)
+    uml_add_gpu_unit_test(gpu-freed-memory-watch
+        uml_gpu_freed_memory_watch_tests freed_memory_watch_tests.cpp
+        LIBRARIES UML::GpuFreedMemoryWatch Threads::Threads)
+endif()
+
 # The graphics footprint counts host GPU memory that Metal's allocated size
 # omits.
 uml_add_gpu_unit_test(gpu-host-graphics-footprint
@@ -131,6 +146,27 @@ if(TARGET uml_third_party_kosmickrisp)
         kosmickrisp_timestamp_availability_tests.cpp
         LIBRARIES UML::ThirdPartyKosmicKrisp
         VULKAN TIMEOUT 120)
+
+    # A transfer that names an image or buffer with no Metal object, because it
+    # was never bound or its bind was refused, is refused by the command, not
+    # passed to Metal as nil, which ends the process; a refused bind logs the
+    # reason once.
+    uml_add_gpu_unit_test(gpu-kosmickrisp-unbound-transfers
+        uml_gpu_kosmickrisp_unbound_transfer_tests
+        kosmickrisp_unbound_transfer_tests.cpp
+        LIBRARIES UML::ThirdPartyKosmicKrisp
+        VULKAN TIMEOUT 120)
+
+    # What a caller of the pipeline binary commands chooses is checked before
+    # it is read, copied or dereferenced: the size of an imported key, the
+    # size of its data, and which of the three sources a create request
+    # names, and what chain a pipeline key request begins with. Each row runs in
+    # a process of its own.
+    uml_add_gpu_unit_test(gpu-kosmickrisp-pipeline-binary-requests
+        uml_gpu_kosmickrisp_pipeline_binary_requests_tests
+        kosmickrisp_pipeline_binary_requests_tests.cpp
+        LIBRARIES UML::ThirdPartyKosmicKrisp
+        VULKAN TIMEOUT 300)
 
     add_library(uml_gpu_vulkan_draw_test_support STATIC
         vulkan_draw_test.cpp)
@@ -193,7 +229,7 @@ if(TARGET uml_gpu_vulkan_draw_test_support)
             kosmickrisp_point_clipping kosmickrisp_tessellation_feedback
             kosmickrisp_raster_polygon
             kosmickrisp_raster_line kosmickrisp_raster_state
-            kosmickrisp_geometry_side_effects)
+            kosmickrisp_geometry_side_effects kosmickrisp_provoking_unroll)
         string(REPLACE "_" "-" test_name "gpu-${stem}")
         uml_add_gpu_unit_test(${test_name} uml_gpu_${stem}_tests
             ${stem}_tests.cpp
@@ -205,6 +241,14 @@ if(TARGET uml_gpu_vulkan_draw_test_support)
     uml_add_gpu_unit_test(gpu-kosmickrisp-command-storage
         uml_gpu_kosmickrisp_command_storage_tests
         kosmickrisp_command_storage_tests.mm
+        LIBRARIES uml_gpu_vulkan_draw_test_support
+            "-framework Foundation" "-framework Metal"
+        VULKAN)
+    # The transform feedback pass guard counts the Metal command buffers and
+    # encoders a chain of render passes costs, which is Objective-C++ as well.
+    uml_add_gpu_unit_test(gpu-kosmickrisp-transform-feedback-passes
+        uml_gpu_kosmickrisp_transform_feedback_passes_tests
+        kosmickrisp_transform_feedback_passes_tests.mm
         LIBRARIES uml_gpu_vulkan_draw_test_support
             "-framework Foundation" "-framework Metal"
         VULKAN)
@@ -225,6 +269,92 @@ if(TARGET uml_gpu_service AND UML_TARGET_MACOS)
 endif()
 
 if(TARGET uml_gpu_service)
+    # A guest that destroys a framebuffer's attachment image view, or its
+    # image, and then begins a render pass on that framebuffer must lose its
+    # context, not crash the host in the driver's render-pass setup.
+    uml_add_gpu_unit_test(gpu-venus-render-pass-lifetime
+        uml_gpu_venus_render_pass_lifetime_tests
+        venus_render_pass_lifetime_tests.cpp
+        LIBRARIES ${_uml_host_gl_libraries}
+        VULKAN UNIT_DIRECTORY TIMEOUT 120)
+
+    # A bind the host driver refused is invisible to the guest, whose binds are
+    # asynchronous. The guest's context must end there, and a copy that names
+    # an image the driver never bound must be refused, not crash the host in
+    # Metal's copy encoder.
+    uml_add_gpu_unit_test(gpu-venus-bind-failure
+        uml_gpu_venus_bind_failure_tests
+        venus_bind_failure_tests.cpp
+        LIBRARIES ${_uml_host_gl_libraries}
+        VULKAN UNIT_DIRECTORY TIMEOUT 120)
+
+    # The renderer serves no VK_KHR_pipeline_binary, which imports a binary under
+    # a key and data the guest names and builds a pipeline from it: it does not
+    # offer the extension, and every command of it, and every pipeline creation
+    # that chains binaries, ends the context of a guest that enabled it by name
+    # anyway. The rows of the renderer's object table that the binaries once
+    # served as the vehicle of stay. The faults lie past the end of a heap block
+    # or in freed memory, so the test runs each row in a child under Guard
+    # Malloc, and the rows that name an object the renderer must free again under
+    # the leak checker.
+    uml_add_gpu_unit_test(gpu-venus-pipeline-binary-requests
+        uml_gpu_venus_pipeline_binary_requests_tests
+        venus_pipeline_binary_requests_tests.cpp
+        LIBRARIES ${_uml_host_gl_libraries}
+        VULKAN UNIT_DIRECTORY TIMEOUT 600)
+    set_tests_properties(gpu-venus-pipeline-binary-requests PROPERTIES
+        SKIP_RETURN_CODE 77)
+
+    # A guest chooses the data of a pipeline cache, which the host driver parses
+    # as if its own serializer had written it, so the renderer makes every cache
+    # empty and answers a read of one with the blob of an empty cache. The
+    # faults lie past the end of a heap block or at address zero, so the test
+    # runs each row in a child under Guard Malloc.
+    uml_add_gpu_unit_test(gpu-venus-pipeline-cache-bytes
+        uml_gpu_venus_pipeline_cache_bytes_tests
+        venus_pipeline_cache_bytes_tests.cpp
+        LIBRARIES ${_uml_host_gl_libraries}
+        VULKAN UNIT_DIRECTORY TIMEOUT 600)
+    set_tests_properties(gpu-venus-pipeline-cache-bytes PROPERTIES
+        SKIP_RETURN_CODE 77)
+
+    # A handle the specification does not allow to be VK_NULL_HANDLE reaches its
+    # handler as a null pointer when the guest sends object id 0, because the
+    # codec refuses id 0 only for the first argument of a command; a shader
+    # stage that names no shader or entry point reaches the runtime's hash, and
+    # a host image copy names a mip level, aspect, region and row length the
+    # image does not have. Each is refused and the host lives on, and a request
+    # the specification allows is served. The faults lie past the end of a
+    # heap block, so the test runs each row in a child under Guard Malloc.
+    uml_add_gpu_unit_test(gpu-venus-required-handles
+        uml_gpu_venus_required_handles_tests
+        venus_required_handles_tests.cpp
+        LIBRARIES ${_uml_host_gl_libraries}
+        VULKAN UNIT_DIRECTORY TIMEOUT 900)
+    set_tests_properties(gpu-venus-required-handles PROPERTIES
+        SKIP_RETURN_CODE 77)
+
+    # A blob larger than the shared memory behind it is refused where it is
+    # created, for Venus memory (POSIX shared memory and the unlinked files iOS
+    # uses) and for a coherent GL buffer. The render server is a thread of the
+    # host, so a resource it kept past the end of its file ends the host, and a
+    # refused blob leaves no mapping behind.
+    uml_add_gpu_unit_test(gpu-blob-size-bounds
+        uml_gpu_blob_size_bounds_tests
+        blob_size_bounds_tests.cpp
+        LIBRARIES ${_uml_host_gl_libraries}
+        INCLUDES ${_uml_gpu_device_directory}
+        VULKAN UNIT_DIRECTORY TIMEOUT 240)
+    # The GL case is the same binary's gl-coherent-buffer mode, run by itself:
+    # a renderer without pinned host memory skips it with status 77.
+    uml_add_unit_test(NAME gpu-blob-size-bounds-gl
+        COMMAND uml_gpu_blob_size_bounds_tests gl-coherent-buffer
+        LABELS gpu
+        WORKING_DIRECTORY "${_uml_unit_binary_directory}"
+        TIMEOUT 120)
+    set_tests_properties(gpu-blob-size-bounds PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(gpu-blob-size-bounds-gl PROPERTIES SKIP_RETURN_CODE 77)
+
     uml_add_gpu_unit_test(gpu-host-gl-provider-lifetime
         uml_gpu_host_gl_provider_tests host_gl_provider_lifetime_tests.cpp
         LIBRARIES uml_gpu_renderer UML::ThirdPartyVirglrenderer
@@ -282,6 +412,31 @@ if(TARGET uml_gpu_service)
         UNIT_DIRECTORY
         TIMEOUT 180)
 
+    # A context the renderer trims right after it flushed, and that another
+    # context then replaces on its thread, in a share group that holds an EGL
+    # image: the path on which the threaded context's fence check once read the
+    # driver thread's stores out of order. It keeps that path exercised under
+    # load; Mesa's util test u_queue_fence_order_test discriminates the fix.
+    uml_add_gpu_unit_test(gpu-host-gl-trim-unbind
+        uml_gpu_host_gl_trim_unbind_tests
+        host_gl_trim_unbind_tests.cpp
+        LIBRARIES ${_uml_host_gl_libraries} Threads::Threads
+        INCLUDES ${_uml_gpu_device_directory}
+        UNIT_DIRECTORY
+        TIMEOUT 120)
+
+    # A context that draws a framebuffer-fetch fragment shader another context
+    # created, and that the screen's shader cache served, must still have the
+    # descriptor binding the shader reads. The read is past the end of a heap
+    # block, so the test runs its body in a child under Guard Malloc.
+    uml_add_gpu_unit_test(gpu-host-gl-fbfetch-shader-cache
+        uml_gpu_host_gl_fbfetch_shader_cache_tests
+        host_gl_fbfetch_shader_cache_tests.cpp
+        LIBRARIES ${_uml_host_gl_libraries}
+        INCLUDES ${_uml_gpu_device_directory}
+        UNIT_DIRECTORY
+        TIMEOUT 120)
+
     # A transfer a context refuses must not leave that context refusing every
     # later transfer: Android's gralloc mapper only ever transfers.
     uml_add_gpu_unit_test(gpu-transfer-context-error
@@ -317,6 +472,38 @@ if(TARGET uml_gpu_service)
     uml_add_gpu_unit_test(gpu-texture-zero-fill
         uml_gpu_texture_zero_fill_tests
         host_gl_texture_zero_fill_tests.cpp
+        LIBRARIES ${_uml_host_gl_libraries}
+        INCLUDES ${_uml_gpu_device_directory}
+        UNIT_DIRECTORY)
+
+    # A new multisampled texture, which the renderer's clear reaches, and a
+    # new compressed texture, which no clear reaches, show nothing a released
+    # one held.
+    uml_add_gpu_unit_test(gpu-texture-zero-fill-special
+        uml_gpu_texture_zero_fill_special_tests
+        host_gl_texture_zero_fill_special_tests.cpp
+        LIBRARIES ${_uml_host_gl_libraries}
+        INCLUDES ${_uml_gpu_device_directory}
+        UNIT_DIRECTORY)
+
+    # The zero fill of a new compressed texture has several steps that the
+    # host driver can refuse room for. A refused step fails the creation with
+    # ENOMEM, which the renderer retries after giving back what it can, and
+    # no texture is left partly written.
+    uml_add_gpu_unit_test(gpu-compressed-zero-refusal
+        uml_gpu_compressed_zero_refusal_tests
+        host_gl_compressed_zero_refusal_tests.cpp
+        LIBRARIES ${_uml_host_gl_libraries}
+        INCLUDES ${_uml_gpu_device_directory}
+        UNIT_DIRECTORY)
+
+    # A gralloc BLOB buffer no GPU unit uses, such as a camera's JPEG output,
+    # is created at any size within the renderer's bound without host storage,
+    # keeps the bytes the guest wrote through the transfers, and is no resource
+    # a command can name.
+    uml_add_gpu_unit_test(gpu-hostless-buffer
+        uml_gpu_hostless_buffer_tests
+        host_gl_hostless_buffer_tests.cpp
         LIBRARIES ${_uml_host_gl_libraries}
         INCLUDES ${_uml_gpu_device_directory}
         UNIT_DIRECTORY)
@@ -371,6 +558,44 @@ if(TARGET uml_gpu_service)
     uml_add_gpu_unit_test(gpu-host-gl-upload-refusal
         uml_gpu_host_gl_upload_refusal_tests
         host_gl_upload_refusal_tests.cpp
+        LIBRARIES ${_uml_host_gl_libraries}
+        INCLUDES ${_uml_gpu_device_directory}
+        UNIT_DIRECTORY TIMEOUT 240)
+
+    # A draw's upload, a texture's staged upload or a buffer's update that the
+    # budget refuses is made again once after the host gave back what it
+    # could: they are not lost for memory that finished work holds, a refusal
+    # leaves nothing behind, and an upload no memory can make room for is
+    # dropped without harm.
+    foreach(_shape draw sustained upload buffer persist cycle)
+        uml_add_gpu_unit_test(gpu-host-gl-refusal-retry-${_shape}
+            uml_gpu_host_gl_refusal_retry_${_shape}_tests
+            host_gl_refusal_retry_tests.cpp
+            LIBRARIES ${_uml_host_gl_libraries}
+            INCLUDES ${_uml_gpu_device_directory}
+            UNIT_DIRECTORY TIMEOUT 240)
+    endforeach()
+    foreach(_shape sustained upload buffer persist cycle)
+        string(TOUPPER ${_shape} _define)
+        target_compile_definitions(uml_gpu_host_gl_refusal_retry_${_shape}_tests
+            PRIVATE UML_REFUSAL_RETRY_${_define}=1)
+    endforeach()
+
+    # A texture shared with another context is written into its segment by a
+    # read-back; one the full budget refuses is tried again at the next fence.
+    uml_add_gpu_unit_test(gpu-host-gl-shm-export-refusal
+        uml_gpu_host_gl_shm_export_refusal_tests
+        host_gl_shm_export_refusal_tests.cpp
+        LIBRARIES ${_uml_host_gl_libraries} UML::HostGpuMemory
+        INCLUDES ${_uml_gpu_device_directory}
+        UNIT_DIRECTORY TIMEOUT 240)
+
+    # glthread's shared upload buffer is refused with the rest of the budget;
+    # a glBufferSubData that meets the refusal neither faults the host nor
+    # blocks uploads once the memory is back.
+    uml_add_gpu_unit_test(gpu-host-gl-glthread-upload-refusal
+        uml_gpu_host_gl_glthread_upload_refusal_tests
+        host_gl_glthread_upload_refusal_tests.cpp
         LIBRARIES ${_uml_host_gl_libraries} UML::HostGpuMemory
         INCLUDES ${_uml_gpu_device_directory}
         UNIT_DIRECTORY TIMEOUT 240)
@@ -380,6 +605,15 @@ if(TARGET uml_gpu_service)
     uml_add_gpu_unit_test(gpu-host-gl-batch-storage
         uml_gpu_host_gl_batch_storage_tests
         host_gl_batch_storage_tests.cpp
+        LIBRARIES ${_uml_host_gl_libraries} UML::HostGpuMemory
+        INCLUDES ${_uml_gpu_device_directory}
+        UNIT_DIRECTORY TIMEOUT 120)
+
+    # What the driver caches for a context that is idle or destroyed goes
+    # back while other contexts go on drawing.
+    uml_add_gpu_unit_test(gpu-host-gl-idle-release
+        uml_gpu_host_gl_idle_release_tests
+        host_gl_idle_release_tests.cpp
         LIBRARIES ${_uml_host_gl_libraries} UML::HostGpuMemory
         INCLUDES ${_uml_gpu_device_directory}
         UNIT_DIRECTORY TIMEOUT 120)
@@ -520,15 +754,22 @@ if(TARGET uml_gpu_service)
     # A host without a usable GL stack or renderer skips these with status 77.
     set_tests_properties(
         gpu-transfer-context-error gpu-blob-copy-transfer
-        gpu-texture-zero-fill gpu-scanout-caps gpu-import-bounds
+        gpu-texture-zero-fill gpu-texture-zero-fill-special
+        gpu-compressed-zero-refusal gpu-hostless-buffer gpu-scanout-caps
+        gpu-import-bounds
         gpu-resource-metal-texture gpu-cross-context-readback
         gpu-depth-format-advertisement gpu-stencil-only-target
         gpu-line-loop-statistics gpu-statistics-availability
         gpu-packed-yuv-planes gpu-texture-barrier-clear gpu-padded-row-transfer
         gpu-host-context-trim gpu-host-context-trim-concurrent
+        gpu-host-gl-trim-unbind gpu-host-gl-fbfetch-shader-cache
         gpu-host-gl-device-memory-budget gpu-host-gl-allocation-burst
         gpu-host-gl-surface-and-command-storage
         gpu-host-gl-reclaim-retry gpu-host-imported-memory
+        gpu-host-gl-shm-export-refusal
+        gpu-host-gl-refusal-retry-draw gpu-host-gl-refusal-retry-sustained
+        gpu-host-gl-refusal-retry-upload gpu-host-gl-refusal-retry-buffer
+        gpu-host-gl-refusal-retry-persist gpu-host-gl-refusal-retry-cycle
         PROPERTIES SKIP_RETURN_CODE 77)
 
     # The renderer and the same-process render server share one fence table.
@@ -622,11 +863,37 @@ if(TARGET uml_gpu_service)
         LIBRARIES
             uml_gpu_protocol_device_test_variant
             uml_test_allocation_failure
+            UML::PublishedFigures
+        INCLUDES ${_uml_gpu_device_directory} ${CMAKE_CURRENT_SOURCE_DIR}
+        UNIT_DIRECTORY)
+
+    # A guest's suspend with a fenced command still on the host: the device
+    # keeps its context, and a driver that ends resets it.
+    uml_add_gpu_unit_test(gpu-device-suspend-held-fence
+        uml_gpu_device_suspend_tests
+        virtio_gpu_suspend_tests.cpp
+        LIBRARIES uml_gpu_server_device_test_variant
         INCLUDES ${_uml_gpu_device_directory} ${CMAKE_CURRENT_SOURCE_DIR}
         UNIT_DIRECTORY)
 endif()
 
 if(TARGET uml_gpu_display)
+    # The decisions of the 120 Hz display link: a state machine, no clock.
+    uml_add_gpu_unit_test(gpu-present-pacer
+        uml_gpu_present_pacer_tests present_pacer_tests.cpp
+        LIBRARIES uml_gpu_display
+        UNIT_DIRECTORY)
+
+    # The sizes whose 120 Hz mode the EDID can state, against the table that
+    # the application's offer reads too (the fixture's path is the test's
+    # argument, so the file has one copy).
+    add_executable(uml_gpu_edid_timing_tests edid_timing_tests.cpp)
+    target_link_libraries(uml_gpu_edid_timing_tests PRIVATE uml_gpu_display)
+    uml_add_unit_test(NAME gpu-edid-timing
+        COMMAND uml_gpu_edid_timing_tests
+            ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/edid-120hz-sizes.txt
+        LABELS gpu)
+
     # The resize path's objects come from the shipped display library.
     uml_add_gpu_unit_test(gpu-display-resize
         uml_gpu_display_resize_tests display_resize_tests.cpp

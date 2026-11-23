@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# The GNSS HAL (overlay/gnss) holds a system-suspend wakelock for the whole of
+# a positioning session, so that a guest that suspends itself with its display
+# off does not suspend and wake once an epoch for as long as a client listens.
+# The platform's rules already let the domain read the receiver node
+# (gnss_device); this adds the wakelock.
+wakelock_use(hal_gnss_default);

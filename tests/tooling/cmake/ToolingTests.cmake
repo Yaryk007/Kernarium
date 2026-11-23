@@ -49,6 +49,84 @@ uml_add_tooling_test(
     LABELS audit;package
     TIMEOUT 120)
 
+# The AOT runtime's diagnostics build (counters, a report writer, test
+# switches) is never packaged. The packaging scripts run this check; the
+# fixtures show it finds the diagnostics namespace and the report name in an
+# object, an archive member, a stripped binary and a nested framework.
+uml_add_tooling_test(
+    NAME packaged-products-carry-no-aot-diagnostics
+    COMMAND ${Python3_EXECUTABLE} -B
+        ${PROJECT_SOURCE_DIR}/tests/tooling/cmake/test_check_no_aot_diagnostics.py
+        --checker ${PROJECT_SOURCE_DIR}/scripts/check-no-aot-diagnostics.py
+    LABELS audit;package
+    TIMEOUT 60)
+
+# The archive switch of the AOT component (cmake/UmlAotArchives.cmake): an iOS
+# device runtime takes the accepted artifact only when the accepted descriptor
+# says yes, macOS and the Simulator take it under either value, and a module
+# whose predicate is turned round fails the rows; darwin/cpu/CMakeLists.txt
+# selects the artifact through that module.
+uml_add_tooling_test(
+    NAME aot-archive-switch
+    COMMAND ${Python3_EXECUTABLE} -B
+        ${PROJECT_SOURCE_DIR}/tests/tooling/cmake/test_aot_archive_switch.py
+        --cmake ${CMAKE_COMMAND}
+        --module ${PROJECT_SOURCE_DIR}/cmake/UmlAotArchives.cmake
+        --cpu-lists ${PROJECT_SOURCE_DIR}/darwin/cpu/CMakeLists.txt
+    LABELS audit;package
+    TIMEOUT 120)
+
+# The memory layer's executable-mapping count audit (darwin/memory/
+# count_audit.hpp) belongs to the diagnostics compilation of the AOT runtime.
+# The production compilation of the static MMU holds none of it in any
+# configuration, and the packaging check refuses the compilation that does.
+if(TARGET uml_static_mmu)
+    uml_add_tooling_test(
+        NAME memory-product-carries-no-count-audit
+        COMMAND ${Python3_EXECUTABLE} -B
+            ${PROJECT_SOURCE_DIR}/scripts/check-no-aot-diagnostics.py
+            $<TARGET_PROPERTY:uml_static_mmu,BINARY_DIR>/CMakeFiles/uml_static_mmu.dir
+        LABELS audit;package
+        TIMEOUT 60)
+endif()
+# The audited compilation is built as a probe wherever the unit tests are
+# (darwin/memory/CMakeLists.txt), so these rows run in the check-unit gate,
+# and a diagnostics composition adds the row for the compilation it links. A
+# row that expects the checker to refuse an input reads the checker's own
+# message: an absent or empty directory also makes it exit nonzero, and must
+# not pass for the audit having been found.
+if(TARGET uml_static_mmu_audit_probe)
+    uml_add_tooling_test(
+        NAME memory-audit-compilation-fails-packaging
+        COMMAND ${Python3_EXECUTABLE} -B
+            ${PROJECT_SOURCE_DIR}/scripts/check-no-aot-diagnostics.py
+            $<TARGET_PROPERTY:uml_static_mmu_audit_probe,BINARY_DIR>/CMakeFiles/uml_static_mmu_audit_probe.dir
+        LABELS audit;package
+        TIMEOUT 60)
+    set_tests_properties(memory-audit-compilation-fails-packaging
+        PROPERTIES PASS_REGULAR_EXPRESSION "the memory layer's count audit")
+    uml_add_tooling_test(
+        NAME memory-audit-symbols-are-refused
+        COMMAND ${Python3_EXECUTABLE} -B
+            ${PROJECT_SOURCE_DIR}/tests/tooling/cmake/test_audit_symbols_refused.py
+            --checker ${PROJECT_SOURCE_DIR}/scripts/check-no-aot-diagnostics.py
+            --audited $<TARGET_PROPERTY:uml_static_mmu_audit_probe,BINARY_DIR>/CMakeFiles/uml_static_mmu_audit_probe.dir
+            --production $<TARGET_PROPERTY:uml_static_mmu,BINARY_DIR>/CMakeFiles/uml_static_mmu.dir
+        LABELS audit;package
+        TIMEOUT 60)
+endif()
+if(TARGET uml_static_mmu_audited)
+    uml_add_tooling_test(
+        NAME memory-audited-target-fails-packaging
+        COMMAND ${Python3_EXECUTABLE} -B
+            ${PROJECT_SOURCE_DIR}/scripts/check-no-aot-diagnostics.py
+            $<TARGET_PROPERTY:uml_static_mmu_audited,BINARY_DIR>/CMakeFiles/uml_static_mmu_audited.dir
+        LABELS audit;package
+        TIMEOUT 60)
+    set_tests_properties(memory-audited-target-fails-packaging
+        PROPERTIES PASS_REGULAR_EXPRESSION "the memory layer's count audit")
+endif()
+
 # The software renderer is the Simulator's alone. The Kernarium framework
 # packaging runs this check on every device slice, and requires it in the
 # Simulator's GL provider; the fixtures show it finds either Gallium screen as a
@@ -63,8 +141,7 @@ uml_add_tooling_test(
     TIMEOUT 120)
 
 # A bundle's privacy manifest declares every required-reason API the bundle
-# uses. The framework packaging and the Andarium App Store build run this
-# check; the fixtures show it finds a C symbol, an Objective-C class, a
+# uses. The framework packaging runs this check; the fixtures show it finds a C symbol, an Objective-C class, a
 # selector with no symbol, a missing or malformed manifest and an
 # Info.plist with an empty version or no MinimumOSVersion.
 uml_add_tooling_test(
@@ -83,6 +160,18 @@ uml_add_tooling_test(
     COMMAND ${Python3_EXECUTABLE} -B
         ${PROJECT_SOURCE_DIR}/tests/tooling/cmake/test_check_run_location.py
         --checker ${PROJECT_SOURCE_DIR}/scripts/check-run-location.py
+    LABELS audit;package
+    TIMEOUT 60)
+
+# The iPad applications offered on a Mac take the Mac's minimum from the
+# processed Info.plist's LSMinimumSystemVersion, and from the iOS minimum
+# otherwise, which is now below the macOS floor. Each plist, processed as the
+# build does, names the macOS floor of the toolchain.
+uml_add_tooling_test(
+    NAME ipad-apps-mac-minimum
+    COMMAND ${Python3_EXECUTABLE} -B
+        ${PROJECT_SOURCE_DIR}/tests/tooling/cmake/test_ipad_apps_mac_minimum.py
+        --repository ${PROJECT_SOURCE_DIR}
     LABELS audit;package
     TIMEOUT 60)
 

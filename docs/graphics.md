@@ -34,6 +34,10 @@ guest Mesa -> Virtio-GPU/Virgl -> vhost-user -> virglrenderer
 - Destroying a GL context returns the Metal pipelines and generated MSL it
   caused, so closing a guest application does not keep them for the life of
   the process.
+- All GL contexts share one Zink screen and its shader cache, so a context
+  that binds a cached fragment shader reading the framebuffer (advanced blend
+  is lowered to it) makes its own descriptor layout ready at the bind, not at
+  the creation that another context did (`gpu-host-gl-fbfetch-shader-cache`).
 
 Presentation:
 
@@ -48,6 +52,16 @@ Presentation:
   readback path. Venus scanouts keep their native Metal textures. Presentation
   needs no host fence of its own: the guest flushes a scanout only after the
   fence of the rendering it shows has retired.
+- The iOS display presents on each guest flush at its one 60 Hz mode. When the
+  boot asks for the 120 Hz mode (Andarium's "120 Hz" setting) and the runtime
+  grants it for the boot view's screen and size, the mode's EDID says 120 and a
+  display link (`darwin/device/gpu/present_pacer.hpp`) paces the presents
+  instead, following the rate the guest renders at, retrying a present that
+  found no drawable and pausing when no frame waits
+  ([Display refresh rate](../Kernarium/README.md#display-refresh-rate)). A
+  refused run, macOS and visionOS keep the flush-driven path. The statistics'
+  `offered_frames` count every accepted guest update once (direct scanout,
+  2-D flush and readback).
 - VNC is a macOS consumer of the same renderer for diagnostics and remote
   display, not a second backend. Its framebuffer keeps the size it was created
   with and aspect-fits every guest mode. Readback is asynchronous and never
@@ -59,10 +73,40 @@ Presentation:
 
 Guest-visible guarantees:
 
-- A texture the renderer creates reads as zeros until the guest writes it,
+- A texture the renderer creates holds zeros until the guest writes it,
   because the host driver hands out a released resource's memory with its old
-  pixels, which may have belonged to another guest process. Imported and
-  compressed-format textures keep their content.
+  pixels, which may have belonged to another guest process. That holds for
+  every level and layer of every format, multisampled ones included. A
+  compressed texture holds zero blocks, which its format decodes as it
+  defines, not always to a zero texel (sRGB ASTC to its error colour); a
+  creation whose fill the host driver refuses room for fails with ENOMEM like
+  one whose storage it refuses, and a host without `glCopyImageSubData`
+  (none of the product hosts) leaves compressed textures as the driver found
+  them. Only an imported texture keeps the content it was imported with.
+  While the device memory budget is full the host driver can refuse the
+  staging buffer of a later upload, which is then dropped without an error, so
+  a texture can keep its older pixels until it is written again.
+- A classic resource that is a plain byte buffer, which is R8, one row, and
+  bind flags that name only shared, linear and the software, camera or codec
+  use (the JPEG buffer Android allocates through gralloc), has no host storage
+  and no size limit but 1 GiB. Only the guest's own creation request makes
+  one; a blob a context creates, a typed blob and an image import keep every
+  texture check. At most 16,384 are alive at once. Its attached backing is the
+  only copy: a transfer, from the virtio-gpu request or as TRANSFER3D in a
+  command buffer, checks its box and backing and moves nothing, and any other
+  command that names it reports an illegal resource. It cannot be exported or
+  shown.
+- A texture exported to another context through shared memory is written into
+  its segment at the next fence after it is drawn. A read-back into client
+  memory that the host driver refuses at a fence leaves the texture the newer
+  copy, and the next fence tries again; a read-back into a pinned segment is
+  not checked. The read-back of the first export leaves the texture clean when
+  it is refused, because the importer may write the segment before any fence:
+  an importer that reads the segment first, and GL's own next read of the
+  texture, see zeros until GL draws it again, and an importer's own frame is
+  never replaced by an older texture. The retry cannot see an importer write,
+  so a buffer with a GL writer and an importer writer can lose the importer's
+  frame to the retry.
 - Images shared through native Metal heaps keep tiled storage but disable
   lossless compression, so a compositor can sample a render target. A Virgl
   import of such a blob is bounded by what backs it; an import that does not
@@ -190,10 +234,11 @@ point and Retina geometry is in
 - Only the CPU path keeps host copies of a mode's pixels; they are allocated on
   first use, released on a mode change or clear, and an allocation failure
   reaches the flush that needed it as an out-of-memory response.
-- Rendering and input share one centred aspect-fit rectangle. A pointer or
-  touch in a letterbox bar reaches the guest only as part of a gesture begun
-  inside the rectangle, and a guest mode change releases held buttons and
-  contacts.
+- Rendering and input share one centred aspect-fit rectangle, and iOS keeps
+  the last frame aspect-fit in its view, in black bars, while the view
+  resizes. A pointer or touch in a letterbox bar reaches the guest only as
+  part of a gesture begun inside the rectangle, and a guest mode change
+  releases held buttons and contacts.
 
 ## Vulkan
 
@@ -225,7 +270,32 @@ only a resource's attached backing reaches guest RAM, a control-queue reply is
 never written past the descriptors the guest supplied (a command whose reply
 does not fit does not run), a Venus reply stream ends at the window the guest
 declared, and the driver bounds a transform feedback store by the buffer range
-bound for it.
+bound for it. Nor can a guest make the host read freed memory: a render pass
+begun on a framebuffer whose attachment view, or the view's image, the guest
+has destroyed marks the context lost before the command reaches the driver
+(`gpu-venus-render-pass-lifetime`). Nor can it make the host call a driver
+entry point that is not there: a command the device's version and enabled
+extensions do not expose marks the context lost (same test). Nor can it hand a
+driver a null it reads: a handle the specification requires that arrives as
+object id 0 marks the context lost, a pipeline stage that names no shader is
+refused, and a host image copy, between memory and an image or between two
+images, is bounded by the images' mip levels, aspects, layers and extent and by
+the memory the guest gave it, and returns no host bytes the driver did not write
+(`gpu-venus-required-handles`). Nor can a guest hand the driver the serialized
+pipeline forms it parses: the renderer ignores the data a guest gives
+`vkCreatePipelineCache`, answers `vkGetPipelineCacheData` with the empty cache
+of its own (never the driver's serialized pipelines), and does not expose
+`VK_KHR_pipeline_binary`, so a pipeline create info or a command that names a
+pipeline binary marks the context lost (`gpu-venus-pipeline-cache-bytes`,
+`gpu-venus-pipeline-binary-requests`). The host driver's on-disk pipeline
+variants are written and read by the host driver alone; a guest has no way to
+hand it one. A guest's SPIR-V still reaches the driver's SPIR-V to NIR
+conversion.
+The guest binds image and buffer memory without
+waiting for the answer, so a bind the driver refused marks the context lost
+before the next command runs (`gpu-venus-bind-failure`), and a copy that names
+an image or buffer the driver never bound is refused by the driver
+([contracts](#kosmickrisp-driver-contracts)).
 
 ### Host-visible memory is bounded by the blob aperture
 
@@ -235,10 +305,21 @@ one fixed guest-physical region of `protocol::hostVisibleSharedMemoryRegionSize`
 That constant and the kernel's `UML_VHOST_USER_SHMEM_SIZE` are one value, so
 changing it is a change to the kernel as well as to the host.
 
+A blob is refused when it is larger than the whole host pages of shared memory
+behind it, by the renderer where it is created and by the device when it maps
+one (`gpu-blob-size-bounds`, `gpu-device-command-atomicity`), so a guest never
+maps bytes past the end of the file that backs them.
+
 The aperture, not host memory, bounds host-visible memory: the host-visible
 memory type gets its own heap sized to it. A mapping near the aperture's size
 can fail at `vkMapMemory` with `VK_ERROR_OUT_OF_DEVICE_MEMORY` until the guest's
 released nodes retire.
+
+The aperture also holds every Venus shared-memory region of the guest: the ring
+and the command and reply pools. A reply larger than 16 MiB gets a region of its own that is
+unmapped when the reply is consumed; the Android guest's Venus port carries
+that rule, and a guest without it keeps the oversized pool region mapped, so the
+heap the application is shown is larger than the room it has left.
 
 ### Device memory budget
 
@@ -267,13 +348,21 @@ Metal makes it, so allocations that each fit alone never together take the
 process past B. The ledger counts a heap only once its pages are resident, so
 the driver makes each heap resident before its reservation ends, and a burst of
 creations with no work between them is refused at the ceiling
-(`gpu-host-gl-allocation-burst`). A reservation that does not fit first frees
-the buffers the host GL driver caches, and the command storage it has left
+(`gpu-host-gl-allocation-burst`). A heap is in the driver's resident tally
+while its pages arrive, so the pool is over by at most the heap's size while a
+heap is made resident, not twice that. A reservation that does not fit first
+frees the buffers the host GL driver caches, and the command storage it has left
 unused for a while, and is decided again. Memory the host frees leaves Metal's
 counter at once but the ledger only later, within milliseconds or at its next
-sweep. The pool sees the release in Metal's counter, and when the request would
-fit once the ledger had caught up with it, waits for the ledger (re-reading it
-every millisecond, for 300 ms at most) rather than refuse. A request that
+sweep. A freed heap that was made resident stays in the ledger until the process
+next asks Metal to make an allocation resident. The reclaim makes that request
+for a small buffer of its own and, when memory was freed since its last run,
+waits up to 10 ms for the ledger to fall, so a refusal with nothing to give back
+fails at once; the release after a guest context is destroyed makes the request
+without waiting (`retireFreedGpuMemory`, `freed_memory_watch.hpp`). The pool
+sees the release in Metal's counter, and when the request would fit once the
+ledger had caught up with it, waits for the ledger (re-reading it every
+millisecond, for 300 ms at most) rather than refuse. A request that
 follows no release, or would not fit even then, is refused at once, and a wait
 that reached its bound is not repeated until Metal's counter falls again.
 
@@ -308,17 +397,47 @@ that reached its bound is not repeated until Metal's counter falls again.
   and fails before the guest holds a handle (`-ENOMEM` for an out-of-memory
   answer, `-EINVAL` for any other error), so gralloc fails the allocation and
   no refusal leaves a buffer another process can import
-  (`guest-virtgpu-blob-refusal`). A driver's own
-  staging buffer that is refused inside a transfer is not retried. The buffers
-  a draw uploads, the program's constants and the attributes it has no array
-  for, come from the driver too: a draw whose upload is refused is skipped and
-  raises `GL_OUT_OF_MEMORY`, and the next draw sets its state up again
-  (`gpu-host-gl-upload-refusal`).
+  (`guest-virtgpu-blob-refusal`). The staging buffer of a buffer or texture
+  upload, and the buffers a draw uploads (the program's constants and the
+  attributes it has no array for), come from the driver and are refused there.
+  Mesa then gives back what it can and makes the request once more, once and
+  not again: it flushes the context, waits for its work, trims it and waits
+  for the trim, releases what the screen caches, and waits for the freed
+  memory to reach the pool (`gpu-host-gl-refusal-retry-draw`, `-sustained`,
+  `-upload`, `-buffer`). The waits for the GPU share a deadline of 2 s that
+  starts once the flush has returned: the flush, and the synchronization of a
+  threaded context ahead of a large image upload, wait as they always do, and
+  the deadline is subject to the scheduler and to what the driver's fence
+  callback takes. The wait for the pool is up to 300 ms, 20 ms when little
+  was freed, and is spent on the calling thread: for a texture upload that
+  is synchronous it is inside the share group's texture lock, which other
+  texture operations of the group wait behind. The retry covers the draws,
+  the staged uploads of a texture, and the buffer updates of the threaded
+  context, large and small. An upload made without synchronizing with the
+  context's thread only releases what the screen caches, and never waits for
+  the GPU. Work that does not finish in time leaves the request refused and
+  rules out every reclaim on the screen for ten seconds. A reclaim that did
+  not help rules out another of the same context for a quarter of a second,
+  and does not affect another context's. One reclaim runs on a screen, from
+  its start to its end; a context that meets a refusal meanwhile leaves its
+  request refused. The screen and the context carry what this remembers. A
+  map or an uploader that the driver refused releases what it had taken, so
+  that refusals leave nothing behind (`gpu-host-gl-refusal-retry-cycle`).
+  What still does not fit is dropped: an upload is lost without an error
+  (`gpu-host-gl-refusal-retry-persist`), and a draw whose upload is refused is
+  skipped and raises `GL_OUT_OF_MEMORY`, and the next draw sets its state up
+  again (`gpu-host-gl-upload-refusal`). The
+  upload buffer glthread shares between a context's `glBufferSubData` calls is
+  refused at the driver too and is not retried: the write then copies its data
+  through the command stream and needs no buffer
+  (`gpu-host-gl-glthread-upload-refusal`).
 - Venus: the guest driver submits `vkAllocateMemory` asynchronously, so a
   refusal reaches the guest as a failed context at the next command naming the
   allocation, and only that guest process aborts. The Android guest allocates
   synchronously, so there the application gets `VK_ERROR_OUT_OF_DEVICE_MEMORY`
-  and keeps its device. A refused Venus allocation is not retried.
+  and keeps its device. While a guest reclaimer is armed, a refused Venus
+  allocation may first wait for it to end a cached holder and be tried again
+  (see the memory report below); an OpenGL refusal never waits on the host.
 - A device's first geometry heap is made at its floor size even when the pool
   refuses it, so a full pool can leave the process one floor per device past
   the ceiling.
@@ -330,7 +449,9 @@ live memory is below B.
 The device counts each OpenGL resource creation or blob it answers with out of
 memory, and each Venus allocation the pool refuses, on the display
 (`Display::memoryRefusals`), so a refusal the host reclaimed and retried past
-is not counted and a restarted guest does not reset the count. The applications
+is not counted and a restarted guest does not reset the count; neither is a
+Venus allocation that waited for the guest's reclaimer and was then made. The
+applications
 read it as `gpu_memory_refusals` of the runtime's statistics, and the macOS
 launchers print it as `gpu-refusals` with `--stats`. The renderer reports a
 Venus refusal through the pool's `refused` callback, which the device
@@ -348,7 +469,12 @@ the renderer's per-context report (the pool's `account` callback). The guest
 kernel names a context's creating process in the context's debug name
 (`<name>|pid=<tgid>|comm=<comm>`, the
 [kernel contract](../kernel/common/README.md#devices)); a kernel that does not
-leaves the holders unnamed and nothing acts on them. `read_graphics_memory`
+leaves the holders unnamed and nothing acts on them. A holder is quiet while
+none of its contexts has run a command; freeing memory is not activity: a
+command whose effect on the context's memory is to release it (a resource goes,
+a Venus allocation is freed, a resource shrinks) does not reset the holder's
+idle time unless it also allocated, so a cached application that trims itself
+stays eligible, and one that draws or allocates does not. `read_graphics_memory`
 (runtime API 28) lists the quiet holders by process, and the macOS launchers
 print them with `--stats`. Andarium ends the cached background app that holds
 the most when the budget is nearly full (`GraphicsReclaim`).
@@ -379,14 +505,29 @@ when a refusal was counted; the guest then asks again.
   still refused first, which the refusal edge reports.
 - Nothing is periodic and nothing wakes an idle device: the ledger's change
   observer arms a coalescing 250 ms timer on the transport thread, a refusal
-  moves that timer to the next millisecond, and the evaluator arms one
-  deadline for its own next change.
+  moves that timer to the next millisecond, an idle trim of the contexts arms it
+  too (the ledger does not see what that gives back), and the evaluator arms
+  one deadline for its own next change.
 - A query that sets `GUEST_RECLAIMS` records that a reclaimer in the guest is
   armed. The flag belongs to the connection, is cleared by a query without it
   and by a new connection, and reaches the applications as `guest_reclaims` of
   `read_graphics_memory` (runtime API 29) and the launchers' `--stats` line as
   `guest-reclaim=on`. While it is set `GraphicsReclaim` stands down and does not
   end an app.
+- While the reclaimer is armed, a Venus allocation the pool refused waits up to
+  1.5 s on the render-server thread that runs it, so only that context's
+  commands wait, and is tried again once room shows or a quiet holder has gone
+  (`device/gpu/reclaim_wait.*`, through the pool's `wait` and `waited`
+  callbacks). It waits only when the reclaimer could make the room in time: the
+  largest holder that meets the reclaimer's armed terms, other than the
+  requesting process, holds at least what the pool lacks, fewer than three
+  holders have gone in the reclaimer's episode, none went in the last 1.5 s,
+  and no wait in the last 10 s saw nothing go; otherwise the allocation is
+  refused at once. The guest is told of a wait as of a refusal, at once, so
+  its reclaimer acts; `Display::memoryRefusals` counts only the allocations
+  refused in the end. OpenGL allocations run on the transport thread, which
+  also carries the guest's memory query and the dying holder's context
+  destruction, so they never wait.
 
 ### Android guest requirements
 
@@ -399,7 +540,7 @@ OpenGL ES 3.2 claim, lives in
 [`../android/lineage-24/README.md`](../android/lineage-24/README.md#graphics).
 
 The Linux Venus guest meets the API version, limits, formats and capability
-groups of Khronos's `VP_ANDROID_17_requirements` profile except for three
+groups of Khronos's `VP_ANDROID_17_requirements` profile except for four
 standing limits of this stack:
 
 - `protectedMemory` has no Metal equivalent.
@@ -408,6 +549,9 @@ standing limits of this stack:
 - `shaderFloat16` is withheld on purpose, because native half arithmetic can
   time out Apple GPUs when NaN-heavy graphics shaders run concurrently. The
   16-bit storage classes are supported.
+- `VK_KHR_pipeline_binary` is not exposed, because the renderer takes no
+  pipeline binary from a guest (see the
+  [guest memory boundary](#guest-memory-boundary)).
 
 The renderer owns the window-system prerequisites.
 `VK_EXT_image_drm_format_modifier` offers `DRM_FORMAT_MOD_LINEAR` only, because
@@ -436,6 +580,21 @@ project's Mesa series patches it; the series and its regression suites are in
   2D or 2D-array texture the image is. A 2D view of a 3D image renders through
   the image's own texture and is sampled through a 2D-array alias; a level too
   deep for the alias is made for rendering alone.
+- A buffer or image copy that names a buffer or image plane with no Metal
+  object (never bound, or its bind refused) records
+  `VK_ERROR_VALIDATION_FAILED_EXT` on its command buffer, and an image clear
+  of an image without storage records its view's
+  `VK_ERROR_OUT_OF_DEVICE_MEMORY`; neither hands Metal the missing object,
+  which Apple's GPU drivers dereference unchecked. A copy of several regions
+  may have recorded the regions before the first one without storage. Fills,
+  updates and query-result copies reach the GPU by the buffer's address and
+  are not guarded. A bind that Metal refuses fails with
+  `VK_ERROR_OUT_OF_DEVICE_MEMORY`, reported in `VkBindMemoryStatus` and logged
+  as one line that names the path that refused it
+  (`gpu-kosmickrisp-unbound-transfers`).
+- An input-attachment load, which Zink's framebuffer fetch (and so advanced
+  blend) uses, reads the attachment's stored texture: what a clear or draw of
+  the same render pass wrote is not visible to it.
 - A point is clipped against user clip and cull distances and the depth planes,
   never the view-volume side planes (`VK_POINT_CLIPPING_BEHAVIOR_USER_CLIP_PLANES_ONLY`).
 - Unsatisfied timeline waits are gated on the CPU before native Metal
@@ -454,6 +613,9 @@ project's Mesa series patches it; the series and its regression suites are in
   with the in-flight work of every process on the GPU.
 - A buffer load never covers more than sixteen bytes, because Apple's backend
   compiler can crash on a wider vector.
+- A render pass that only loads its attachments may start its Metal render
+  encoder late and stop it between draws; consecutive such passes share one
+  main command buffer (`gpu-kosmickrisp-transform-feedback-passes`).
 
 ### Apple8 (A15) device behaviour
 
@@ -491,10 +653,19 @@ host side little headroom, so guest RAM cannot be raised to make room for a
 workload. The per-device geometry heap starts small and grows within the pool, a
 grown heap is freed once nothing holds it, Zink's buffer cache is bounded, a
 destroyed context's command storage is released with it
-(`gpu-host-gl-batch-storage`) and an idle Virgl context is trimmed. virglrenderer's shared-memory segments are
-unlinked container files outside the footprint on iOS and POSIX shared memory
-inside it on macOS. A baked device campaign leaves out the groups its guest
-memory cannot hold ([`testing.md`](testing.md)).
+(`gpu-host-gl-batch-storage`) and an idle Virgl context is trimmed. What the
+host driver caches for a context that is gone or idle goes back without a
+request while other contexts run: Zink frees a slab once every entry has been
+free for a second; KosmicKrisp gives up a command allocator it has not been
+handed for a second; and the renderer releases the host driver's caches about
+two seconds after a guest context is destroyed (`gpu-host-gl-idle-release`).
+KosmicKrisp keeps the MSL text of a pipeline compressed with libcompression's
+LZFSE, since only a pipeline cache write and a render pass that binds fewer
+attachments read it again; a pipeline cache carries the compressed text, and
+its format number is part of the cache UUID. virglrenderer's shared-memory
+segments are unlinked container files outside the footprint on iOS and POSIX
+shared memory inside it on macOS. A baked device campaign leaves out the groups
+its guest memory cannot hold ([`testing.md`](testing.md)).
 
 ## Metal shader cache
 
@@ -525,6 +696,22 @@ file older than an hour is a dead writer's and is replaced. iOS ends a process
 it suspends while it holds a file lock, and a cache write can be in flight at
 the suspension. The database and single-file formats lock their files and stay
 off.
+
+KosmicKrisp keeps the variants of its dynamic vertex-input pipelines in the same
+cache, so a first draw that finds one builds its Metal pipelines from the
+stored MSL instead of translating the shaders again, in a later process as well
+as in a later boot. An entry is a small descriptor and the MSL texts it names;
+texts are stored once under the hash of their content, and most variants share
+all but one. The key is the stripped NIR the variant is built from, the device
+and driver identity, the pipeline's lowered state and layout hashes, and the
+vertex-input state. A missing entry, one of another build, one that is
+truncated or damaged, one that is not what its key names, one that holds a
+shader description no writer wrote, and one that is not a variant of the
+pipeline asking for it are each a miss: the variant is translated and stored
+again, and an entry's lengths and counts are checked before they are used. No
+behavior depends on a variant entry surviving. `MESA_KK_VARIANT_CACHE=0` turns
+the variant cache off and `MESA_KK_VARIANT_LOG=1` logs each lookup; the apps and
+emulators set neither.
 
 ## Validation
 

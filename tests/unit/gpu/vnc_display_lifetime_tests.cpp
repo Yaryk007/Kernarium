@@ -310,10 +310,67 @@ void memoryRefusalsBelongToTheDisplay()
         "a new guest or a cleared display reset the refusals");
 }
 
+/* The size of the guest's scanout belongs to the display: the device sets it
+ * with the scanout, and it goes when the scanout does. */
+void theGuestScanoutModeGoesWithTheScanout()
+{
+    uml::gpu::VncDisplay display {"127.0.0.1", 0, {}, 64, 64};
+    require(!display.guestScanoutMode());
+    display.setGuestScanoutMode(1920, 1080);
+    display.setGuestScanoutActive(true);
+    auto mode = display.guestScanoutMode();
+    require(mode && mode->width == 1920 && mode->height == 1080);
+    display.setGuestScanoutMode(1080, 1920);
+    mode = display.guestScanoutMode();
+    require(mode && mode->width == 1080 && mode->height == 1920);
+    display.setGuestScanoutActive(false);
+    require(!display.guestScanoutMode());
+    /* A scanout of no size is no scanout. */
+    display.setGuestScanoutMode(0, 0);
+    require(!display.guestScanoutMode());
+}
+
+/* The observer hears each change of the number of clients, on the display's
+ * event thread, and none once it is cleared. */
+void theClientObserverHearsEveryChange()
+{
+    uml::gpu::VncDisplay display {"127.0.0.1", 0, {}, 64, 64};
+    std::mutex mutex;
+    std::vector<std::uint32_t> counts;
+    display.setClientObserver([&](std::uint32_t clients) {
+        std::lock_guard lock(mutex);
+        counts.push_back(clients);
+    });
+    const auto heard = [&] {
+        std::lock_guard lock(mutex);
+        return counts;
+    };
+
+    int first = connectClient(display.port());
+    awaitClientEvent(display);
+    int second = connectClient(display.port());
+    awaitClientEvent(display);
+    require((heard() == std::vector<std::uint32_t> {1, 2}));
+    disconnectClient(first);
+    awaitClientEvent(display);
+    disconnectClient(second);
+    awaitClientEvent(display);
+    require((heard() == std::vector<std::uint32_t> {1, 2, 1, 0}));
+
+    display.setClientObserver({});
+    int third = connectClient(display.port());
+    awaitClientEvent(display);
+    disconnectClient(third);
+    awaitClientEvent(display);
+    require(heard().size() == 4);
+}
+
 } // namespace
 
 int main()
 {
+    theGuestScanoutModeGoesWithTheScanout();
+    theClientObserverHearsEveryChange();
     memoryRefusalsBelongToTheDisplay();
     packedBgraUpdatesRespectOffsetsAndPaddedStride();
     dimensionsMustFitLibVncServerAbi();

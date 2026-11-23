@@ -1,0 +1,130 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 04:52:41 +0900
+Subject: [PATCH] um: say in a suspend's reply whether it synced file systems
+
+The host asks the guest to sync, trims it and then suspends it, and
+counts the storage as settled from the sync's reply alone, because
+the suspend's reply, "suspended", says only that the guest reached
+the sleep boundary: the PM core syncs on the way only while
+sync_on_suspend is set, and the reply did not say whether it did.
+
+Reply "suspended, synced" when the suspend's own sync ran to its
+return before this reply, and "suspended, not synced" otherwise (sync
+disabled).  A suspend that failed or was given up replies as before,
+with an error and no statement.  Both texts still contain "suspended"
+and carry no error flag, which is all an older host looks for, so it
+takes them as it took the old reply.  A kernel without this change
+replies "suspended", which says nothing, and the host keeps treating
+that as nothing confirmed.
+
+Only the task that runs the request's pm_suspend() makes the
+statement.  The request is claimed before that task has the PM
+transition mutex, so a suspend the guest began earlier, already past
+its sync, can reach the enter callback first and find the request; its
+sync may predate the host's request.  Such a suspend replies
+"suspended".  The requester is recorded after the claim and cleared
+before the request is released, and the console runs its requests one
+after the other, so a stale requester never meets a later request.
+
+The request's retries stop once the request is gone: the guest's own
+suspend that answered it has the guest asleep for the host's wake, and
+a retry that began another suspend after the first one ended would put
+the guest to sleep with nobody waiting to wake it.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ arch/um/drivers/mconsole_kern.c | 45 ++++++++++++++++++++++++++++++---
+ 1 file changed, 42 insertions(+), 3 deletions(-)
+
+diff --git a/arch/um/drivers/mconsole_kern.c b/arch/um/drivers/mconsole_kern.c
+index d9753c60ac429c5b1fdb3a556c38934c89112357..8ea8da2987580eab09eb6eb8ba042db5821115f6 100644
+--- a/arch/um/drivers/mconsole_kern.c
++++ b/arch/um/drivers/mconsole_kern.c
+@@ -222,7 +222,9 @@ void mconsole_proc(struct mc_request *req)
+     cad - invoke the Ctrl-Alt-Del handler \n\
+     stop - pause the UML; it will do nothing until it receives a 'go' \n\
+     go - continue the UML after a 'stop' \n\
+-    suspend - enter system suspend until the host sends 'wake' \n\
++    suspend - enter system suspend until the host sends 'wake'; replies\n\
++        'suspended, synced' or 'suspended, not synced', by whether the\n\
++        suspend synced the file systems \n\
+     wake - resume a system-suspended UML \n\
+     log <string> - make UML enter <string> into the kernel log\n\
+     proc <file> - returns the contents of the UML's /proc/<file>\n\
+@@ -264,6 +266,11 @@ void mconsole_go(struct mc_request *req)
+ 
+ #ifdef CONFIG_SUSPEND
+ static struct mc_request *suspend_request;
++/*
++ * The task that runs pm_suspend() for suspend_request: set after the request
++ * is claimed, and cleared before it is released.
++ */
++static struct task_struct *suspend_requester;
+ /* A wake arrived while the host's suspend request was in progress. */
+ static bool suspend_woken;
+ /* The wake requests answered so far; only a change between two reads counts. */
+@@ -300,12 +307,35 @@ static bool mconsole_overtaken(const struct mc_request *req)
+ 	return atomic_read(&mconsole_wakes) != req->wakes;
+ }
+ 
++/*
++ * The host's suspend is answered once the guest has reached the sleep
++ * boundary, after the PM core's own sync, which it does only while
++ * sync_on_suspend is set (pm_suspend_synced()).  "suspended, synced" says
++ * that sync returned for this suspend; "suspended, not synced" says there was
++ * none.  Tasks are frozen after the sync, so a write between the two is not
++ * covered.
++ *
++ * Only the task that runs the request's pm_suspend() states it.  The request
++ * is claimed before that task has the PM transition mutex, so a suspend the
++ * guest began earlier can enter first and find the request: its sync may
++ * predate the host's request and say nothing of what the host asked, so it
++ * answers "suspended", as does a kernel without this statement, which the
++ * host takes as nothing confirmed.  The console runs its requests one after
++ * the other and clears the requester before it releases the request, so a
++ * stale requester never meets a later request.
++ */
+ void um_suspend_notify_entered(void)
+ {
+ 	struct mc_request *req = xchg(&suspend_request, NULL);
+ 
+-	if (req != NULL)
++	if (req == NULL)
++		return;
++	if (READ_ONCE(suspend_requester) != current)
+ 		mconsole_reply(req, "suspended", 0, 0);
++	else
++		mconsole_reply(req, pm_suspend_synced() ?
++			       "suspended, synced" : "suspended, not synced",
++			       0, 0);
+ }
+ 
+ int um_suspend_wake_requested(void)
+@@ -355,16 +385,25 @@ void mconsole_suspend(struct mc_request *req)
+ 	 * one of them sees it, in whichever order the requests run.
+ 	 */
+ 	if (!mconsole_overtaken(req)) {
++		WRITE_ONCE(suspend_requester, current);
+ 		error = pm_suspend(PM_SUSPEND_MEM);
+ 		while (error == -EBUSY && retries++ < MCONSOLE_SUSPEND_RETRIES &&
+ 		       !READ_ONCE(suspend_woken) &&
+ 		       READ_ONCE(suspend_request) != NULL) {
+ 			msleep(MCONSOLE_SUSPEND_RETRY_MS);
+-			if (READ_ONCE(suspend_woken))
++			/*
++			 * A suspend of the guest's own may have taken the
++			 * request at its entry meanwhile, and the host has its
++			 * answer: another suspend would put the guest to sleep
++			 * with nobody waiting to wake it.
++			 */
++			if (READ_ONCE(suspend_woken) ||
++			    READ_ONCE(suspend_request) == NULL)
+ 				break;
+ 			error = pm_suspend(PM_SUSPEND_MEM);
+ 		}
+ 	}
++	WRITE_ONCE(suspend_requester, NULL);
+ 	pending = xchg(&suspend_request, NULL);
+ 	WRITE_ONCE(suspend_woken, false);
+ 	if (pending == NULL)

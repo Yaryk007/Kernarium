@@ -87,6 +87,28 @@ void powerAndOrdinaryKeysDoNotShareAnInterval()
         "Power used up the key's first wake");
 }
 
+/* A game controller's button going down wakes like an ordinary key: at its
+ * first press, then at most once per interval, in the keyboard's interval. */
+void aControllerButtonWakesLikeAnOrdinaryKey()
+{
+    KeyWakePolicy policy(1s);
+    require(policy.shouldWakeForButtonDown(origin),
+        "the first controller button did not wake");
+    require(!policy.shouldWakeForButtonDown(origin + 1ms),
+        "a second button a millisecond later woke");
+    require(!policy.shouldWake(ordinary, down, origin + 500ms),
+        "a key woke inside the interval a button started");
+    require(policy.shouldWakeForButtonDown(origin + 1s),
+        "a button an interval later did not wake");
+    require(policy.shouldWake(power, down, origin + 1s + 1ms),
+        "Power waited for the button's interval");
+
+    KeyWakePolicy other(1s);
+    require(other.shouldWake(ordinary, down, origin), "the first key did not wake");
+    require(!other.shouldWakeForButtonDown(origin + 10ms),
+        "a button woke inside the interval a key started");
+}
+
 /* Callers on several threads at one instant share the interval: one wins. */
 void oneCallerWinsAnInterval()
 {
@@ -118,7 +140,8 @@ int main()
     anOrdinaryKeyWakesOncePerInterval();
     aBurstIsOneWake();
     powerAndOrdinaryKeysDoNotShareAnInterval();
+    aControllerButtonWakesLikeAnOrdinaryKey();
     oneCallerWinsAnInterval();
-    std::puts("PASS: key wake policy wakes Power at every press and other keys once an interval");
+    std::puts("PASS: key wake policy wakes Power at every press and other keys and controller buttons once an interval");
     return EXIT_SUCCESS;
 }

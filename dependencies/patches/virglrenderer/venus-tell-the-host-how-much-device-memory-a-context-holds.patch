@@ -23,7 +23,7 @@ Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
  6 files changed, 45 insertions(+)
 
 diff --git a/src/venus/vkr_device_memory.c b/src/venus/vkr_device_memory.c
-index 2e77f9820349807e0d771b9500cda41338bc91f3..ae27ca53cb96673ead3843bcc20fe3c88972557c 100644
+index 3b38f1a3c1a6975bdeb9dd18a8b9c79b7f083018..44234cfc8acfcf4fb8606be75e5a4a36c9c8a2c0 100644
 --- a/src/venus/vkr_device_memory.c
 +++ b/src/venus/vkr_device_memory.c
 @@ -570,6 +570,16 @@ vkr_device_memory_allocate(struct vn_dispatch_context *dispatch,

@@ -1042,7 +1042,7 @@ void test_stated_memory_limit_sizes_the_gadget_cache_budget()
 			"the budget changed with no limit stated");
 		/* The iPad mini 6's 2,867 MiB: an eighth of it, 358 MiB, is under a
 		 * quarter of either guest, and above the cap of up to eight vCPUs
-		 * and of up to fifteen. */
+		 * and under the cap of sixteen. */
 		uml::runtime::set_process_memory_limit(2867 * mib);
 		constexpr std::size_t eighth = 2867 * mib / 8;
 		require(eighth / mib == 358,
@@ -1050,10 +1050,10 @@ void test_stated_memory_limit_sizes_the_gadget_cache_budget()
 		require(budget(1536, 0, 16) == eighth &&
 			budget(2048, 0, 16) == eighth,
 			"a stated limit did not cap the budget");
-		require(budget(1536, 0, 1) == 128 * mib &&
-			budget(1536, 0, 4) == 224 * mib &&
-			budget(2048, 0, 6) == 240 * mib &&
-			budget(2048, 0, 8) == 272 * mib,
+		require(budget(1536, 0, 1) == 160 * mib &&
+			budget(1536, 0, 4) == 256 * mib &&
+			budget(2048, 0, 6) == 272 * mib &&
+			budget(2048, 0, 8) == 304 * mib,
 			"a stated limit did not cap the budget by the vCPU count");
 		/* A budget the launch gives is its own. */
 		require(budget(1536, 96 * mib, 4) == 96 * mib &&
@@ -1064,7 +1064,7 @@ void test_stated_memory_limit_sizes_the_gadget_cache_budget()
 		::setenv(uml::platform::memory_limit_variable, "2867", 1);
 		require(budget(1536, 0, 16) == eighth,
 			"the environment did not state the limit");
-		require(budget(1536, 0, 2) == 160 * mib,
+		require(budget(1536, 0, 2) == 192 * mib,
 			"the environment's limit did not cap by the vCPU count");
 		uml::runtime::set_process_memory_limit(1024 * mib);
 		require(budget(1536, 0, 12) == 128 * mib,

@@ -31,7 +31,6 @@ __import__("sys").dont_write_bytecode = True
 
 import hashlib
 import importlib.util
-import json
 import pathlib
 import sys
 
@@ -166,10 +165,8 @@ def main() -> int:
     native = load_generator()
     builder = native.corpus
     pack = pathlib.Path(sys.argv[1])
-    corpus, tokens = builder.decode_pack(pack.read_bytes())
-    records = [item for item in map(json.loads,
-                                    builder.dump_corpus(corpus, tokens))
-               if item.get("producer") == native.PRODUCER]
+    corpus, _tokens = builder.decode_pack(pack.read_bytes())
+    records = list(builder.dump_records(corpus, [native.PRODUCER]))
     meta = corpus.meta.get("sme_native")
     if meta is None and not records:
         raise SystemExit("the pack holds no native SME records")

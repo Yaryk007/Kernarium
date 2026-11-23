@@ -8,11 +8,11 @@ import UIKit
 
 /// The notice that Android ran out of graphics memory, on a real guest with a
 /// real refusal. Runs alone with ANDARIUM_GRAPHICS_NOTICE_TESTS=1 and
-/// ANDARIUM_GUEST_INSTANCE=graphics-notice, on a Mac (Designed for iPad: the
-/// host GPU budget there is half the guest's RAM at the default 1536 MiB) or
-/// an iPad, with an isolated guest whose Android has Chrome installed and
-/// its terms accepted. The test installs nothing and deletes nothing: erase
-/// the guest with an ANDARIUM_ERASE=1 launch (README).
+/// ANDARIUM_GUEST_INSTANCE=graphics-notice, on a Mac (Designed for iPad: with no
+/// limit the host GPU budget there is the guest's RAM, 4096 MiB at most for a
+/// new guest) or an iPad, with an isolated guest whose Android has Chrome
+/// installed and its terms accepted. The test installs nothing and deletes
+/// nothing: erase the guest with an ANDARIUM_ERASE=1 launch (README).
 ///
 /// Chrome opens a page, served by the guest's own netcat on its loopback,
 /// that creates mipmapped 1024 by 1024 textures until it has taken more than
@@ -93,9 +93,10 @@ struct GraphicsNoticeGuestTests {
             #expect(within == 0)
             #expect(!model.graphicsNotice.isShowing)
 
-            // Chrome takes more than the budget: the host refuses, and the
-            // notice shows within a few readings.
-            try await serve(Self.page(textures: 600), with: operations)
+            // Chrome takes more than the budget (1000 textures are 5.6 GiB, more
+            // than a new guest's memory): the host refuses, and the notice shows
+            // within a few readings.
+            try await serve(Self.page(textures: 1000), with: operations)
             try await open(load: 2, with: operations)
             let deadline = ContinuousClock.now + .seconds(240)
             while !model.graphicsNotice.isShowing, ContinuousClock.now < deadline {

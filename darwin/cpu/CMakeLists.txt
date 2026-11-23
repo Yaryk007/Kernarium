@@ -14,6 +14,148 @@ add_subdirectory(jit_memory)
 # The AArch32 decoder both arm64 engines and the semantic library share.
 add_subdirectory(arm64/aarch32)
 
+# Ahead-of-time native code for the Android image's libraries is built only
+# from an accepted release; without one there is no AOT component and the
+# gadget executor compiles none of its hooks.
+set(UML_AOT_IMAGE "" CACHE PATH
+    "An accepted Android release directory to generate the AOT framework from; empty builds without AOT")
+set(UML_AOT_FSCK_EROFS "" CACHE FILEPATH
+    "An fsck.erofs that decodes Zstandard, used to unpack UML_AOT_IMAGE")
+# What the rewriter translates is tools/aot/libraries.txt, which the release
+# artifact tool reads too. A build that names UML_AOT_LIBRARIES or
+# UML_AOT_BOOT_CODE measures another set; an empty UML_AOT_BOOT_CODE leaves
+# the boot image out.
+set(_uml_aot_list ${PROJECT_SOURCE_DIR}/tools/aot/libraries.txt)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${_uml_aot_list}")
+file(STRINGS "${_uml_aot_list}" _uml_aot_list_lines)
+set(_uml_aot_default_libraries)
+set(_uml_aot_default_boot)
+foreach(_line IN LISTS _uml_aot_list_lines)
+    if(_line MATCHES "^library (/[^ ]+)$")
+        list(APPEND _uml_aot_default_libraries "${CMAKE_MATCH_1}")
+    elseif(_line MATCHES "^boot (/[^ ]+)$")
+        list(APPEND _uml_aot_default_boot "${CMAKE_MATCH_1}")
+    elseif(NOT _line MATCHES "^(#.*)?$")
+        message(FATAL_ERROR "${_uml_aot_list}: unrecognised line: ${_line}")
+    endif()
+endforeach()
+set(UML_AOT_LIBRARIES "" CACHE STRING
+    "Libraries of the release to rewrite, as absolute guest paths; empty takes tools/aot/libraries.txt")
+if(NOT UML_AOT_LIBRARIES)
+    set(UML_AOT_LIBRARIES ${_uml_aot_default_libraries})
+endif()
+# Not a cache entry unless a build names it, so a build tree that cached an
+# older list builds the current one too.
+if(NOT DEFINED UML_AOT_BOOT_CODE)
+    set(UML_AOT_BOOT_CODE ${_uml_aot_default_boot})
+endif()
+option(UML_AOT_DIAGNOSTICS
+    "Compose the AOT runtime variant with its counters, report and test switches (never for a product)" OFF)
+set(UML_AOT_INSTANCE_CAPACITY 2048 CACHE STRING
+    "How many library instances each executor thread's AOT binder holds before it replaces the oldest")
+if(NOT UML_AOT_INSTANCE_CAPACITY MATCHES "^[0-9]+$" OR
+   UML_AOT_INSTANCE_CAPACITY LESS 1 OR UML_AOT_INSTANCE_CAPACITY GREATER 16384)
+    message(FATAL_ERROR
+        "UML_AOT_INSTANCE_CAPACITY must be an integer from 1 to 16384")
+endif()
+option(UML_AOT_SHARED_VERDICTS
+    "Let address spaces share what they verified about a page the kernel declares immutable; OFF hashes every page in every address space (a measurement variant)" ON)
+option(UML_AOT_COUNT_RETIRED
+    "With UML_AOT_DIAGNOSTICS, rewrite the libraries to count each instruction an entry runs (the blob then differs from the product's)" OFF)
+# Which blob the component carries (UML_AOT_SOURCE): the one a release
+# artifact holds, which is the product, or one generated from a release's
+# image, which qualifies a release or measures a variant. UML_AOT_MODE says
+# whether to build the component at all: AUTO builds it when a blob is
+# available and the product supports it, ON requires one, OFF builds none.
+set(UML_AOT_MODE AUTO CACHE STRING
+    "AUTO builds the AOT component when an artifact or UML_AOT_IMAGE is available, ON requires one, OFF builds none")
+set_property(CACHE UML_AOT_MODE PROPERTY STRINGS AUTO ON OFF)
+set(UML_AOT_ARTIFACT "" CACHE PATH
+    "A release's AOT artifact directory (tools/aot/release_artifact.py); empty takes the accepted artifact installed below .build/android/aot when android/lineage-24/metadata/accepted-aot.env names one")
+if(NOT UML_AOT_MODE MATCHES "^(AUTO|ON|OFF)$")
+    message(FATAL_ERROR "UML_AOT_MODE must be AUTO, ON or OFF")
+endif()
+set(UML_AOT OFF)
+set(UML_AOT_SOURCE "")
+set(UML_AOT_ARTIFACT_DIR "")
+set(UML_AOT_ARTIFACT_ACCEPTED "")
+# Every Apple product that runs Android carries it: macOS, the iOS Simulator
+# and the iOS device.
+if(UML_AOT_MODE STREQUAL "OFF")
+    if(UML_AOT_IMAGE OR UML_AOT_ARTIFACT)
+        message(STATUS "UML_AOT_MODE=OFF: building without the AOT component")
+    endif()
+elseif(UML_AOT_IMAGE AND UML_AOT_ARTIFACT)
+    message(FATAL_ERROR
+        "UML_AOT_IMAGE and UML_AOT_ARTIFACT name two blobs; name one")
+elseif(UML_AOT_IMAGE OR UML_AOT_ARTIFACT)
+    if(UML_AOT_IMAGE)
+        if(NOT UML_TARGET_MACOS)
+            message(FATAL_ERROR
+                "UML_AOT_IMAGE generates a blob for the macOS tests; an iOS "
+                "product wraps an artifact (UML_AOT_ARTIFACT)")
+        endif()
+        set(UML_AOT_SOURCE image)
+    else()
+        set(UML_AOT_SOURCE artifact)
+        set(UML_AOT_ARTIFACT_DIR "${UML_AOT_ARTIFACT}")
+    endif()
+elseif(UML_TARGET_MACOS OR UML_KERNEL_PRODUCT STREQUAL "android-17")
+    # The accepted artifact: the descriptor names the release it was built
+    # from, and it is installed beside the accepted release. An iOS runtime
+    # of the Linux product has no Android library to rewrite and takes none.
+    # An iOS device runtime, the one an archive of Andarium's Release
+    # configuration embeds, takes it only when the descriptor says so
+    # (LINEAGE24_ACCEPTED_AOT_ARCHIVES); macOS and the Simulator take every
+    # accepted artifact (cmake/UmlAotArchives.cmake).
+    include(UmlAotArchives)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${PROJECT_SOURCE_DIR}/android/lineage-24/metadata/accepted-aot.env"
+        "${PROJECT_SOURCE_DIR}/android/lineage-24/metadata/accepted-release.env")
+    uml_aot_accepted_artifact("${PROJECT_SOURCE_DIR}" "${UML_APPLE_PLATFORM}"
+        "${UML_AOT_MODE}"
+        UML_AOT_SOURCE UML_AOT_ARTIFACT_DIR UML_AOT_ARTIFACT_ACCEPTED)
+endif()
+if(UML_AOT_MODE STREQUAL "ON" AND NOT UML_AOT_SOURCE)
+    message(FATAL_ERROR
+        "UML_AOT_MODE=ON needs an AOT artifact (UML_AOT_ARTIFACT, or the "
+        "accepted one installed below .build/android/aot), or UML_AOT_IMAGE, "
+        "and a macOS product")
+endif()
+if(UML_AOT_SOURCE STREQUAL "artifact")
+    if(UML_AOT_DIAGNOSTICS)
+        message(FATAL_ERROR
+            "UML_AOT_DIAGNOSTICS needs the tables of a generated blob: "
+            "name UML_AOT_IMAGE, not an artifact")
+    endif()
+    if(NOT EXISTS "${UML_AOT_ARTIFACT_DIR}/artifact.json")
+        message(FATAL_ERROR
+            "${UML_AOT_ARTIFACT_DIR} is not an AOT artifact directory")
+    endif()
+    set(_uml_aot_verify_command
+        ${Python3_EXECUTABLE} -B
+        ${PROJECT_SOURCE_DIR}/tools/aot/release_artifact.py verify
+        --artifact "${UML_AOT_ARTIFACT_DIR}")
+    if(UML_AOT_ARTIFACT_ACCEPTED)
+        list(APPEND _uml_aot_verify_command
+            --accepted "${UML_AOT_ARTIFACT_ACCEPTED}")
+    endif()
+    execute_process(COMMAND ${_uml_aot_verify_command}
+        RESULT_VARIABLE _uml_aot_verify_status
+        OUTPUT_VARIABLE _uml_aot_verify_output
+        ERROR_VARIABLE _uml_aot_verify_output)
+    if(NOT _uml_aot_verify_status EQUAL 0)
+        message(FATAL_ERROR
+            "The AOT artifact ${UML_AOT_ARTIFACT_DIR} does not verify: "
+            "${_uml_aot_verify_output}")
+    endif()
+endif()
+if(UML_AOT_SOURCE)
+    set(UML_AOT ON)
+    add_subdirectory(arm64/aot)
+endif()
+
 # A private cache holds one translation per slot, so the slot count is the
 # working set an executor can keep. Counted on Geekbench 6 Clang, the workload
 # with the largest code footprint, one executor reaches about 194,000 distinct
@@ -124,15 +266,6 @@ _uml_add_cpu_objects(uml_arm64_execution_helpers shared
 option(UML_GADGET_EXECUTION_HISTOGRAM
     "Count executed gadget entries (diagnostic builds only)"
     OFF)
-# An App Store runtime carries no diagnostic instrumentation, so it refuses the
-# two diagnostic builds instead of silently ignoring them.
-if(UML_APP_STORE_RUNTIME AND
-   (UML_GADGET_CACHE_CENSUS OR UML_GADGET_EXECUTION_HISTOGRAM))
-    message(FATAL_ERROR
-        "UML_APP_STORE_RUNTIME conflicts with UML_GADGET_CACHE_CENSUS and "
-        "UML_GADGET_EXECUTION_HISTOGRAM: an App Store runtime has no "
-        "diagnostic instrumentation")
-endif()
 # GadgetExecutor's layout follows this switch, so every consumer of the gadget
 # headers must see the value the library was built with, and
 # execution_histogram.hpp refuses to compile without one. The CPU contract
@@ -242,12 +375,8 @@ set(_uml_arm64_gadget_a32_sources
 set(UML_GADGET_BLOCK_INSTRUCTIONS "64" CACHE STRING
     "Guest instructions fetched per translation attempt")
 # The guest sampler suspends the vCPU carriers and reads their registers
-# (guest_sampler.hpp); an App Store runtime has the disabled stand-in.
-if(UML_APP_STORE_RUNTIME)
-    set(_uml_arm64_guest_sampler arm64/gadgets/guest_sampler_disabled.cpp)
-else()
-    set(_uml_arm64_guest_sampler arm64/gadgets/guest_sampler.cpp)
-endif()
+# (guest_sampler.hpp).
+set(_uml_arm64_guest_sampler arm64/gadgets/guest_sampler.cpp)
 _uml_add_cpu_objects(uml_arm64_gadgets gadget
     arm64/gadgets/afp_twin.cpp
     arm64/gadgets/gadget_memory_selection.cpp
@@ -287,7 +416,7 @@ set(_uml_gadget_region_options)
 foreach(_uml_gadget_region_section IN ITEMS
         __a64_bank __a64_forward __a64_vforward __a64_cold __a64_afp
         __a64_veneer __a64_sme __a32_bank __a32_cold __a32_veneer
-        __x86_bank __x86_cold)
+        __a64_runs __x86_bank __x86_cold)
     list(APPEND _uml_gadget_region_options
         "LINKER:-rename_section,__TEXT,${_uml_gadget_region_section},__TEXT,__text")
 endforeach()
@@ -319,6 +448,8 @@ else()
     message(STATUS
         "gadget translation IPO unavailable: ${_uml_gadget_ipo_error}")
 endif()
+
+# The arm64 JIT engine.
 
 # JIT SME sources: the compiler's SME sources and the streaming-mode
 # transitions in the first list (absolute paths, like the compiler's),
@@ -353,6 +484,7 @@ set(_uml_cpu_jit_sources
     ${CMAKE_CURRENT_SOURCE_DIR}/arm64/jit/jit_arena.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/arm64/jit/jit_compiler.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/arm64/jit/jit_compiler_decode.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/arm64/jit/jit_compiler_exclusive_run.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/arm64/jit/jit_compiler_families.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/arm64/jit/jit_compiler_crypto.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/arm64/jit/jit_compiler_floating.cpp
@@ -382,6 +514,7 @@ set(_uml_cpu_jit_executor_sources
     arm64/jit/jit_executor_pool.cpp
     arm64/jit/jit_executor_linking.cpp
     arm64/jit/jit_linking.cpp
+    arm64/jit/jit_memory_preparation.cpp
     arm64/jit/jit_publication_state.cpp
     arm64/jit/jit_semantic_atomic.cpp
     arm64/jit/jit_semantic_classes.cpp
@@ -442,6 +575,13 @@ if(UML_BUILD_UNIT_TESTS)
     target_link_libraries(uml_arm64_jit_test_support PUBLIC
         uml_arm64_jit
         uml_arm64_execution_helpers)
+
+    # The arena and its link tables, for the host test that composes them with
+    # the executable-memory owner's region route
+    # (uml_cpu_executable_memory_region_test) instead of its macOS window.
+    _uml_add_cpu_objects(uml_arm64_jit_arena_region_test native
+        arm64/jit/jit_arena.cpp
+        arm64/jit/jit_linking.cpp)
 endif()
 
 # The gadget executor with SLOTS cache slots; ARGN adds definitions after the
@@ -450,7 +590,18 @@ function(_uml_add_gadget_executor TARGET SLOTS)
     _uml_add_cpu_objects(${TARGET} gadget arm64/gadgets/executor.cpp)
     # The program slabs and record tables come from the memory layer's heaps.
     target_link_libraries(${TARGET} PUBLIC uml_arm64_gadgets UML::MemoryHeap)
+    if(UML_AOT)
+        get_property(_aot_runtime GLOBAL PROPERTY UML_AOT_RUNTIME_TARGET)
+        target_link_libraries(${TARGET} PUBLIC ${_aot_runtime})
+    endif()
+    # A diagnostics build's executor carries the hooks that count what the
+    # engine ran in place of rewritten code (aot_diagnostics.hpp); a product
+    # build compiles none of them.
+    if(UML_AOT AND UML_AOT_DIAGNOSTICS)
+        target_compile_definitions(${TARGET} PRIVATE UML_AOT_DIAGNOSTICS=1)
+    endif()
     target_compile_definitions(${TARGET} PRIVATE
+        UML_AOT=$<BOOL:${UML_AOT}>
         UML_GADGET_CACHE_CENSUS=$<BOOL:${UML_GADGET_CACHE_CENSUS}>
         UML_GADGET_CACHE_SLOTS=${SLOTS}
         UML_GADGET_BLOCK_INSTRUCTIONS=${UML_GADGET_BLOCK_INSTRUCTIONS}
@@ -476,8 +627,11 @@ endif()
 _uml_add_cpu_objects(uml_arm64_gadget_engine gadget
     arm64/gadgets/engine_adapter.cpp)
 target_link_libraries(uml_arm64_gadget_engine PUBLIC uml_arm64_gadget_executor)
+target_compile_definitions(uml_arm64_gadget_engine PRIVATE
+    UML_AOT=$<BOOL:${UML_AOT}>)
 
-_uml_add_cpu_objects(uml_arm64_jit_engine native arm64/jit/engine_adapter.cpp)
+_uml_add_cpu_objects(uml_arm64_jit_engine native
+    arm64/jit/engine_adapter.cpp)
 target_link_libraries(uml_arm64_jit_engine PUBLIC
     uml_arm64_jit
     uml_arm64_jit_executor)
@@ -485,8 +639,8 @@ target_link_libraries(uml_arm64_jit_engine PUBLIC
 _uml_add_cpu_objects(uml_cpu_engine_factory mixed engine_factory.cpp)
 target_link_libraries(uml_cpu_engine_factory PUBLIC
     uml_arm64_gadget_engine
-    uml_arm64_jit_engine
     uml_arm64_execution_helpers)
+target_link_libraries(uml_cpu_engine_factory PUBLIC uml_arm64_jit_engine)
 
 # OBJECT libraries avoid duplicate compilation, but CMake does not propagate
 # their contents transitively. These link components expose the supported
@@ -519,14 +673,23 @@ target_sources(uml_cpu_engine_objects INTERFACE
     $<TARGET_OBJECTS:uml_cpu_engine_factory>
     $<TARGET_OBJECTS:uml_arm64_gadget_engine>
     $<TARGET_OBJECTS:uml_arm64_gadget_executor>
+    $<TARGET_OBJECTS:uml_arm64_aarch32_decoder>
+    $<TARGET_OBJECTS:uml_arm64_aarch32_semantics>
+    $<TARGET_OBJECTS:uml_arm64_gadgets>
+    $<TARGET_OBJECTS:uml_arm64_execution_helpers>)
+if(UML_AOT)
+    get_property(_aot_runtime GLOBAL PROPERTY UML_AOT_RUNTIME_TARGET)
+    target_link_libraries(uml_cpu_engine_objects INTERFACE
+        uml_arm64_aot_framework)
+    target_sources(uml_cpu_engine_objects INTERFACE
+        $<TARGET_OBJECTS:${_aot_runtime}>)
+endif()
+# The JIT engine's objects, and the executable-memory owner they alone link.
+target_sources(uml_cpu_engine_objects INTERFACE
     $<TARGET_OBJECTS:uml_arm64_jit_engine>
     $<TARGET_OBJECTS:uml_cpu_executable_memory>
     $<TARGET_OBJECTS:uml_arm64_jit>
-    $<TARGET_OBJECTS:uml_arm64_aarch32_decoder>
-    $<TARGET_OBJECTS:uml_arm64_aarch32_semantics>
-    $<TARGET_OBJECTS:uml_arm64_jit_executor>
-    $<TARGET_OBJECTS:uml_arm64_gadgets>
-    $<TARGET_OBJECTS:uml_arm64_execution_helpers>)
+    $<TARGET_OBJECTS:uml_arm64_jit_executor>)
 if(TARGET uml_x86_64_gadgets)
     target_link_libraries(uml_cpu_engine_objects INTERFACE
         UML::ThirdPartyCephes128)

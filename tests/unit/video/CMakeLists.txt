@@ -3,6 +3,17 @@ add_executable(uml_virtio_video_tests virtio_video_tests.cpp)
 target_link_libraries(uml_virtio_video_tests PRIVATE UML::VideoDevice)
 uml_add_unit_test(NAME virtio-video-protocol COMMAND uml_virtio_video_tests LABELS video)
 
+# The decoder behind the real transport, across the ring disable and enable of
+# a guest's suspend. The front end it needs is the GPU tests', so their support
+# header and the GPU protocol header it includes are on the path.
+add_executable(uml_virtio_video_suspend_tests virtio_video_suspend_tests.cpp)
+target_include_directories(uml_virtio_video_suspend_tests PRIVATE
+    ${PROJECT_SOURCE_DIR}/tests/unit/gpu
+    ${PROJECT_SOURCE_DIR}/darwin/device/gpu)
+target_link_libraries(uml_virtio_video_suspend_tests PRIVATE
+    UML::VideoDevice UML::VhostUserTransport)
+uml_add_unit_test(NAME virtio-video-suspend COMMAND uml_virtio_video_suspend_tests LABELS video)
+
 add_executable(uml_video_encoder_capabilities_tests video_encoder_capabilities_tests.cpp)
 target_link_libraries(uml_video_encoder_capabilities_tests PRIVATE UML::VideoDevice UML::VideoEncoder)
 uml_add_unit_test(NAME video-encoder-capabilities COMMAND uml_video_encoder_capabilities_tests LABELS video)

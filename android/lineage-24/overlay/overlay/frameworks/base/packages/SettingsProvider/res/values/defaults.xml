@@ -5,7 +5,10 @@
          The lock screen default is ro.lockscreen.disable.default. -->
     <bool name="def_lockscreen_disabled">true</bool>
     <integer name="def_screen_off_timeout">2147483647</integer>
-    <bool name="def_show_ime_with_hard_keyboard">true</bool>
+    <!-- Off: Android hides its on-screen keyboard while a hardware keyboard is attached, and the host's
+         keyboard is a device that is attached only while it is there. A guest that started with an older
+         release, which kept it on, is moved once (kernarium_keyboard_default.sh). -->
+    <bool name="def_show_ime_with_hard_keyboard">false</bool>
     <bool name="def_stay_on_while_plugged_in">true</bool>
     <integer name="def_power_sounds_enabled">0</integer>
     <integer name="def_lockscreen_sounds_enabled">0</integer>

@@ -10,11 +10,13 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <poll.h>
 #include <pthread.h>
 #include <stdexcept>
@@ -35,8 +37,36 @@
 #include "in_process_service_testing.hpp"
 #endif
 
+#ifndef UML_VHOST_USER_WAIT_TESTING
+#define UML_VHOST_USER_WAIT_TESTING 0
+#endif
+
+#if UML_VHOST_USER_WAIT_TESTING
+#include "vhost_user_server_testing.hpp"
+#endif
+
 namespace uml::gpu {
 namespace {
+
+using WaitClock = std::chrono::steady_clock;
+
+#if UML_VHOST_USER_WAIT_TESTING
+std::atomic<WaitClock::time_point (*)() noexcept> testingWaitClock {nullptr};
+std::atomic<std::int64_t> testingWaitBoundMilliseconds {0};
+std::atomic<int> testingWaitIntervalMilliseconds {0};
+#endif
+
+/* The clock the polls of a backend wait are timed by. It measures one poll at a
+ * time and is never compared with an earlier reading, so it needs no property
+ * but running while the process does. */
+[[nodiscard]] WaitClock::time_point waitNow() noexcept
+{
+#if UML_VHOST_USER_WAIT_TESTING
+    if (const auto clock = testingWaitClock.load(std::memory_order_acquire))
+        return clock();
+#endif
+    return WaitClock::now();
+}
 
 constexpr std::uint32_t maximumGuestMemoryRegions =
     static_cast<std::uint32_t>(maximumVhostUserDescriptors);
@@ -46,6 +76,38 @@ constexpr std::uint32_t maximumGuestMemoryRegions =
 constexpr int socketPollTimeoutMilliseconds =
     UML_GPU_STOP_POLL_TIMEOUT_MILLISECONDS;
 static_assert(socketPollTimeoutMilliseconds > 0);
+
+[[nodiscard]] WaitClock::duration waitBound() noexcept
+{
+#if UML_VHOST_USER_WAIT_TESTING
+    if (const auto bound =
+            testingWaitBoundMilliseconds.load(std::memory_order_acquire);
+        bound > 0) {
+        return std::chrono::milliseconds {bound};
+    }
+#endif
+    return backendAcknowledgementBound;
+}
+
+/* How long one poll of a backend wait asks for. */
+[[nodiscard]] int waitInterval() noexcept
+{
+#if UML_VHOST_USER_WAIT_TESTING
+    if (const auto interval =
+            testingWaitIntervalMilliseconds.load(std::memory_order_acquire);
+        interval > 0) {
+        return interval;
+    }
+#endif
+    return socketPollTimeoutMilliseconds;
+}
+/* The start of the line written when a ring disable resets a device that
+ * holds deferred requests, followed by ` device=<name> ring=<index>
+ * deferred=<count>`. The Android runners match it. */
+constexpr const char* ringDisableResetPrefix =
+    "Vhost-user: device reset at ring disable:";
+/* How many such resets are each reported before only the doublings are. */
+constexpr unsigned reportedDisableResets = 256;
 constexpr std::uint64_t transportFeatures =
     protocol::vhostFeatureProtocol |
     protocol::virtioFeatureVersion1;
@@ -64,8 +126,8 @@ class ConnectionStopped final {};
 class ConnectionClosed final {};
 
 /* What a write goes to. A socket of the connection whose peer has closed it
- * fails a write with EPIPE, or with ECONNRESET when the peer left data
- * unread; either means the front-end closed the connection. */
+ * fails a write in the ways writeFailureMeansPeerClosed() lists, and each
+ * means the front-end closed the connection. */
 enum class WriteTarget : bool {
     descriptor,
     socket,
@@ -76,17 +138,18 @@ enum class WriteTarget : bool {
     const char* operation,
     int error)
 {
-    if (target == WriteTarget::socket &&
-        (error == EPIPE || error == ECONNRESET)) {
+    if (target == WriteTarget::socket && writeFailureMeansPeerClosed(error))
         throw ConnectionClosed {};
-    }
     throw std::runtime_error(
         std::string(operation) + ": " + std::strerror(error));
 }
 
 /* A front-end request whose reply the front-end reads from the main socket
- * without draining the backend channel, and whose handling only reads state,
- * so it can be answered while a backend request is outstanding. */
+ * without draining the backend channel, so it can be answered while a backend
+ * request is outstanding. Most only read state. GET_FEATURES, which ends a
+ * driver, also retires the disabled rings, a flag flip with no I/O; when it
+ * would reset held requests as well it is not answered inside the wait
+ * (awaitBackendAcknowledgement). */
 [[nodiscard]] bool answeredDuringBackendWait(std::uint32_t request) noexcept
 {
     switch (static_cast<protocol::VhostRequest>(request)) {
@@ -94,6 +157,27 @@ enum class WriteTarget : bool {
     case protocol::VhostRequest::getProtocolFeatures:
     case protocol::VhostRequest::getQueueNum:
     case protocol::VhostRequest::getSharedMemoryConfig:
+    case protocol::VhostRequest::getConfig:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* Whether the front-end blocks until the server sends a reply to `request`:
+ * a query always has one, and any other request that asks for one. A kick and
+ * the other requests that ask for none leave the front-end running. */
+[[nodiscard]] bool frontendAwaitsReply(
+    const protocol::VhostHeader& request) noexcept
+{
+    if ((request.flags & protocol::vhostUserNeedReply) != 0)
+        return true;
+    switch (static_cast<protocol::VhostRequest>(request.request)) {
+    case protocol::VhostRequest::getFeatures:
+    case protocol::VhostRequest::getProtocolFeatures:
+    case protocol::VhostRequest::getQueueNum:
+    case protocol::VhostRequest::getSharedMemoryConfig:
+    case protocol::VhostRequest::getVringBase:
     case protocol::VhostRequest::getConfig:
         return true;
     default:
@@ -399,6 +483,27 @@ void requireNoDescriptors(
 
 } // namespace
 
+#if UML_VHOST_USER_WAIT_TESTING
+namespace testing {
+
+void setBackendWaitClock(WaitClock::time_point (*now)() noexcept) noexcept
+{
+    testingWaitClock.store(now, std::memory_order_release);
+}
+
+void setBackendWaitTiming(
+    std::chrono::milliseconds bound,
+    int pollIntervalMilliseconds) noexcept
+{
+    testingWaitBoundMilliseconds.store(
+        bound.count(), std::memory_order_release);
+    testingWaitIntervalMilliseconds.store(
+        pollIntervalMilliseconds, std::memory_order_release);
+}
+
+} // namespace testing
+#endif
+
 VhostUserServer::VhostUserServer(
     std::unique_ptr<uml::virtio::VhostUserDevice> device)
     : device_(std::move(device))
@@ -432,32 +537,111 @@ void VhostUserServer::setRequestGate(std::shared_ptr<RequestGate> gate)
     requestGate_ = std::move(gate);
 }
 
+void VhostUserServer::setStopShutsDownConnection() noexcept
+{
+    stopShutsDownConnection_ = true;
+}
+
+void VhostUserServer::revokeOwnedSharedMemory() noexcept
+{
+    if (sharedMemoryRegions_ && device_ && device_->sharedMemoryRegion())
+        sharedMemoryRegions_->revokeAll();
+}
+
 void VhostUserServer::resetConnection() noexcept
 {
     resetDeviceState();
     slaveRequestDescriptor_.reset();
-    if (sharedMemoryRegions_ && device_ && device_->sharedMemoryRegion())
-        sharedMemoryRegions_->revokeAll();
+    revokeOwnedSharedMemory();
     clearMappings();
     resetQueues();
     negotiatedFeatures_ = 0;
     negotiatedProtocolFeatures_ = 0;
     featuresConfigured_ = false;
+    configChangeWithheld_ = false;
 }
 
 void VhostUserServer::resetDeviceState() noexcept
 {
     device_->prepareReset();
+    // Fail closed if an acknowledgement is missing, late or negative. Closing
+    // the backend-request channel makes the front-end revoke every map, so the
+    // host index drops every range this backend owns with it, not only those
+    // whose unmap was already sent; local teardown must still retire each
+    // renderer owner below.
+    const auto failClosed = [this] {
+        slaveRequestDescriptor_.reset();
+        revokeOwnedSharedMemory();
+    };
     try {
         dispatchSharedMemoryActions();
+    } catch (const VhostUserTimeout& error) {
+        std::fprintf(
+            stderr,
+            "%s vhost-user reset: %s\n",
+            device_->name(),
+            error.what());
+        failClosed();
     } catch (...) {
-        // Fail closed if an acknowledgement is missing or negative. Closing
-        // the backend-request channel makes the front-end revoke every map;
-        // local teardown must still retire each renderer owner below.
-        slaveRequestDescriptor_.reset();
+        failClosed();
     }
     device_->reset();
     pendingRequests_.clear();
+    heldCompletions_.clear();
+}
+
+/* The one reset a guest's suspend can cause without a word, and it loses
+ * what the guest holds: each is said in one line, which the test runners
+ * match by `ringDisableResetPrefix` (see the constant). A guest that did it
+ * more than `reportedDisableResets` times is told of each doubling only, so
+ * a loop cannot flood the log. */
+void VhostUserServer::reportDisableReset(std::uint32_t ring) noexcept
+{
+    const auto count = ++disableResets_;
+    if (count > reportedDisableResets && (count & (count - 1U)) != 0)
+        return;
+    std::fprintf(
+        stderr,
+        "%s device=%s ring=%u deferred=%zu\n",
+        ringDisableResetPrefix,
+        device_->name(),
+        ring,
+        pendingRequests_.size());
+}
+
+bool VhostUserServer::requestsAreHeld() const noexcept
+{
+    if (pendingRequests_.empty() || !device_->keepsDeferredRequestsWhileDisabled())
+        return false;
+    return std::any_of(queues_.begin(), queues_.end(), [](const Queue& queue) {
+        return queue.size != 0 && !queue.enabled;
+    });
+}
+
+void VhostUserServer::retireHeldRequests() noexcept
+{
+    if (requestsAreHeld())
+        resetDeviceState();
+}
+
+/* A ring still disabled when the driver ends is one the guest frees: what it
+ * puts in that memory afterwards is not a ring, so the ring is read no more
+ * until the front-end starts it again with its kick. A ring that is enabled,
+ * and a disabled one whose driver has not ended, stay read and stay refused
+ * when their flags are reserved. */
+void VhostUserServer::retireDisabledRings() noexcept
+{
+    for (auto& queue : queues_) {
+        if (!queue.enabled)
+            queue.started = false;
+    }
+}
+
+bool VhostUserServer::everyConfiguredRingIsEnabled() const noexcept
+{
+    return std::all_of(queues_.begin(), queues_.end(), [](const Queue& queue) {
+        return queue.size == 0 || queue.enabled;
+    });
 }
 
 void VhostUserServer::resetQueues() noexcept
@@ -482,6 +666,9 @@ void VhostUserServer::sendReply(
         .size = static_cast<std::uint32_t>(payload.size()),
     };
     writeFrame(socket, header, payload, connectionStopRequested_);
+    /* The reply the request being handled was owed is on the socket. */
+    if (handling_ != nullptr)
+        handling_->replyOwed = false;
 }
 
 void VhostUserServer::sendIntegerReply(
@@ -804,18 +991,25 @@ void VhostUserServer::signalQueue(std::uint32_t index)
 
 void VhostUserServer::signalPendingConfigChange()
 {
+    configChangeWithheld_ = false;
     if (!device_->configChangePending())
         return;
     constexpr std::uint64_t requiredFeatures =
         protocol::protocolFeatureReplyAck |
         protocol::protocolFeatureSlaveRequest |
         protocol::protocolFeatureConfig;
+    /* Only a message from the front-end changes what this waits for, and
+     * every message ends in another attempt at the top of the loop. */
     if ((negotiatedProtocolFeatures_ & requiredFeatures) != requiredFeatures ||
         slaveRequestDescriptor_.get() < 0) {
         return;
     }
-    if (!device_->claimConfigChange())
+    if (!device_->claimConfigChange()) {
+        /* The device is not ready to announce it, and what it waits for may
+         * end without an event on its descriptor. */
+        configChangeWithheld_ = true;
         return;
+    }
 
     const protocol::VhostHeader header {
         .request = static_cast<std::uint32_t>(
@@ -840,9 +1034,60 @@ void VhostUserServer::signalPendingConfigChange()
 
     awaitBackendAcknowledgement(header, "config-change");
     device_->clearConfigChange();
+    /* A claim may announce one part of the change while the device holds
+     * another back; that part is withheld too. */
+    configChangeWithheld_ = device_->configChangePending();
+}
+
+int VhostUserServer::mainPollTimeout(bool activePolling) const noexcept
+{
+    // A queue in polling mode has no kick to wait for.
+    if (activePolling)
+        return 1;
+    if (stopShutsDownConnection_ && !configChangeWithheld_)
+        return -1;
+    return socketPollTimeoutMilliseconds;
+}
+
+bool VhostUserServer::frontendWaitsForReply() const noexcept
+{
+    /* No main socket: the connection has ended and the server is tearing the
+     * device down, which only the acknowledgements it waits for let it finish. */
+    if (frontendDescriptor_ < 0)
+        return true;
+    for (const auto* message = handling_; message != nullptr;
+         message = message->outer) {
+        if (message->replyOwed)
+            return true;
+    }
+    return std::any_of(
+        deferredFrontendMessages_.begin(),
+        deferredFrontendMessages_.end(),
+        [](const VhostUserMessage& message) {
+            return frontendAwaitsReply(message.header);
+        });
 }
 
 void VhostUserServer::awaitBackendAcknowledgement(
+    const protocol::VhostHeader& request,
+    const char* channel)
+{
+    try {
+        waitForBackendAcknowledgement(request, channel);
+    } catch (const ConnectionStopped&) {
+        // Every later wait and write ends at once for the same stop.
+        throw;
+    } catch (...) {
+        /* The request is unanswered. A reply that came later could not be told
+         * from the answer to the next request, and must not release this one's
+         * work, so the channel goes: the front-end then drops the device, and
+         * the teardown that follows has no unmap left to wait for. */
+        slaveRequestDescriptor_.reset();
+        throw;
+    }
+}
+
+void VhostUserServer::waitForBackendAcknowledgement(
     const protocol::VhostHeader& request,
     const char* channel)
 {
@@ -854,8 +1099,39 @@ void VhostUserServer::awaitBackendAcknowledgement(
      * outstanding. Any other request waits until the reply has arrived: its
      * sender drains the backend channel while it waits for an
      * acknowledgement, and handling it here could start another backend
-     * request inside this one. */
-    bool frontendOpen = frontendDescriptor_ >= 0;
+     * request inside this one.
+     *
+     * A budget is spent only while a reply the front-end waits for depends on
+     * this wait: that front-end drains the channel as it waits, so the
+     * acknowledgement is due at once. It is spent by the polls of the wait, each
+     * charged at most the interval it asked for, not by the clock: a stretch in
+     * which the whole process could not run, such as an application the system
+     * suspended mid-wait, costs one poll. A wait with nothing behind it, such as
+     * a notification the guest has not read because its suspend came first,
+     * takes as long as the guest does; the end of the main socket, the end of
+     * the channel and a stop end it. An acknowledgement that has already
+     * arrived is read, whatever the budget. */
+    const auto bound = waitBound();
+    const int interval = waitInterval();
+    std::optional<WaitBudget> budget;
+    const auto armIfRepliesAreOwed = [&] {
+        if (!budget && frontendWaitsForReply()) {
+            budget.emplace(
+                bound,
+                std::string("vhost-user ") + channel +
+                    " acknowledgement missing for " + describeWaitTime(bound));
+        }
+    };
+    const auto boundFor = [&](int watch) {
+        return FrameBound {
+            .allowance = bound,
+            .now = &waitNow,
+            .pollIntervalMilliseconds = interval,
+            .wait = budget ? &*budget : nullptr,
+            .watch = watch,
+        };
+    };
+    armIfRepliesAreOwed();
     for (;;) {
         std::array<pollfd, 2> descriptors {{
             {
@@ -864,15 +1140,22 @@ void VhostUserServer::awaitBackendAcknowledgement(
                 .revents = 0,
             },
             {
-                .fd = frontendOpen ? frontendDescriptor_ : -1,
+                .fd = frontendDescriptor_,
                 .events = POLLIN,
                 .revents = 0,
             },
         }};
+        /* A poll that finds nothing after the budget is spent is the one
+         * that fails the wait, so whatever had arrived by then was read. */
+        const bool spentBefore = budget && budget->spent();
+        const int asked = budget ? budget->pollTimeout(interval) : interval;
+        const auto started = budget ? waitNow() : WaitClock::time_point {};
         const int ready = ::poll(
             descriptors.data(),
             static_cast<nfds_t>(descriptors.size()),
-            socketPollTimeoutMilliseconds);
+            asked);
+        if (budget)
+            budget->charge(waitNow() - started, asked);
         if (connectionStopRequested_ != nullptr &&
             connectionStopRequested_->load(std::memory_order_acquire)) {
             throw ConnectionStopped {};
@@ -883,23 +1166,81 @@ void VhostUserServer::awaitBackendAcknowledgement(
             throw std::runtime_error(
                 std::string("vhost-user ") + channel + " poll failed");
         }
-        if (ready == 0)
+        if (ready == 0) {
+            if (spentBefore)
+                budget->fail();
             continue;
+        }
         if ((descriptors[0].revents & POLLNVAL) != 0 ||
             (descriptors[1].revents & POLLNVAL) != 0) {
             throw std::runtime_error(
                 std::string("invalid descriptor while waiting on the vhost-user ") +
                 channel + " channel");
         }
+        /* The main socket is read first: once the front-end has let the device
+         * go, the acknowledgement releases nothing to write to. */
+        if (descriptors[1].revents != 0) {
+            VhostUserMessage frontendRequest;
+            const auto frontendBound = boundFor(-1);
+            if (!receiveVhostUserMessage(
+                    frontendDescriptor_,
+                    frontendRequest,
+                    connectionStopRequested_,
+                    &frontendBound)) {
+                if (connectionStopRequested_ != nullptr &&
+                    connectionStopRequested_->load(std::memory_order_acquire)) {
+                    throw ConnectionStopped {};
+                }
+                /* The front-end closed the socket: the operation that waits
+                 * here is over, and the connection ends. */
+                throw ConnectionClosed {};
+            }
+            /* A GET_FEATURES that retires held requests resets the device: it
+             * would send the unmaps of the device's shared memory while this
+             * request's reply is still owed, and clear the requests under the
+             * loop that waits here. The front-end drains the backend channel
+             * while it waits for the reply, so the acknowledgement arrives and
+             * the GET_FEATURES is answered once the wait is over. It also stays
+             * behind every message already queued: those can be the ring
+             * disables that make it retire the requests, sent without a reply
+             * for it to follow, and its own reply tells the driver that the
+             * disables and everything before them have taken effect. */
+            const bool mustFollowQueued =
+                static_cast<protocol::VhostRequest>(
+                    frontendRequest.header.request) ==
+                    protocol::VhostRequest::getFeatures &&
+                (requestsAreHeld() || !deferredFrontendMessages_.empty());
+            if (answeredDuringBackendWait(frontendRequest.header.request) &&
+                !mustFollowQueued) {
+                handleMessage(frontendDescriptor_, frontendRequest);
+            } else {
+                deferredFrontendMessages_.push_back(std::move(frontendRequest));
+                armIfRepliesAreOwed();
+            }
+        }
         if (descriptors[0].revents != 0) {
             VhostUserMessage reply;
-            if (!receiveVhostUserMessage(
+            /* The reception watches the main socket: an acknowledgement that
+             * arrives as the front-end lets the device go releases nothing,
+             * whether it comes in one piece or in several. */
+            const auto backendBound = boundFor(frontendDescriptor_);
+            bool received = false;
+            try {
+                received = receiveVhostUserMessage(
                     slaveRequestDescriptor_.get(),
                     reply,
-                    connectionStopRequested_)) {
+                    connectionStopRequested_,
+                    &backendBound);
+            } catch (const VhostUserWatchedPeerEnded&) {
                 if (connectionStopRequested_ != nullptr &&
-                    connectionStopRequested_->load(
-                        std::memory_order_acquire)) {
+                    connectionStopRequested_->load(std::memory_order_acquire)) {
+                    throw ConnectionStopped {};
+                }
+                throw ConnectionClosed {};
+            }
+            if (!received) {
+                if (connectionStopRequested_ != nullptr &&
+                    connectionStopRequested_->load(std::memory_order_acquire)) {
                     throw ConnectionStopped {};
                 }
                 /* A guest that powers off with a configuration change still
@@ -907,6 +1248,8 @@ void VhostUserServer::awaitBackendAcknowledgement(
                  * closes the main socket. */
                 throw ConnectionClosed {};
             }
+            if (vhostUserPeerHasEnded(frontendDescriptor_))
+                throw ConnectionClosed {};
             constexpr std::uint32_t expectedReplyFlags =
                 protocol::vhostUserVersion | protocol::vhostUserReply;
             if (reply.header.request != request.request ||
@@ -920,19 +1263,8 @@ void VhostUserServer::awaitBackendAcknowledgement(
             }
             return;
         }
-        if (descriptors[1].revents == 0)
-            continue;
-        VhostUserMessage request;
-        if (!receiveVhostUserMessage(
-                frontendDescriptor_, request, connectionStopRequested_)) {
-            // The connection loop sees the closed socket again afterwards.
-            frontendOpen = false;
-            continue;
-        }
-        if (answeredDuringBackendWait(request.header.request))
-            handleMessage(frontendDescriptor_, request);
-        else
-            deferredFrontendMessages_.push_back(std::move(request));
+        if (spentBefore)
+            budget->fail();
     }
 }
 
@@ -1047,6 +1379,16 @@ void VhostUserServer::drainQueueCompletions()
             continue;
         }
         const auto queueIndex = found->second.queueIndex;
+        if (queueIndex < queues_.size() && !queues_[queueIndex].enabled &&
+            device_->keepsDeferredRequestsWhileDisabled()) {
+            /* The guest suspended its ring while the device held this
+             * request. The used ring is not written while the ring is
+             * disabled; the answer waits for the enable. */
+            heldCompletions_.push_back(
+                {completion.requestId, std::move(completion.response)});
+            completion = {};
+            continue;
+        }
         completeRequest(found->second, completion.response);
         pendingRequests_.erase(found);
         completedQueues[queueIndex] = true;
@@ -1056,6 +1398,39 @@ void VhostUserServer::drainQueueCompletions()
         if (completedQueues[index])
             notifyQueue(index);
     }
+}
+
+void VhostUserServer::publishHeldCompletions(std::uint32_t index)
+{
+    bool published = false;
+    for (auto held = heldCompletions_.begin(); held != heldCompletions_.end();) {
+        const auto found = pendingRequests_.find(held->requestId);
+        if (found == pendingRequests_.end()) {
+            held = heldCompletions_.erase(held);
+            continue;
+        }
+        if (found->second.queueIndex != index) {
+            ++held;
+            continue;
+        }
+        completeRequest(found->second, held->response);
+        pendingRequests_.erase(found);
+        held = heldCompletions_.erase(held);
+        published = true;
+    }
+    if (published)
+        notifyQueue(index);
+}
+
+void VhostUserServer::resumeQueues()
+{
+    for (std::uint32_t index = 0; index < queues_.size(); ++index) {
+        if (queues_[index].enabled)
+            publishHeldCompletions(index);
+    }
+    drainQueueCompletions();
+    for (std::uint32_t index = 0; index < queues_.size(); ++index)
+        processQueue(index);
 }
 
 void VhostUserServer::dispatchSharedMemoryActions()
@@ -1323,7 +1698,9 @@ void VhostUserServer::processQueue(std::uint32_t index)
              * a request's response only after the ring is enabled again. */
             if (requestSize == 0 && responseCapacity != 0)
                 break;
-            if (requestSize != 0 && device_->keepsRequestsOnDisabledRing())
+            if (requestSize != 0 &&
+                (device_->keepsRequestsOnDisabledRing() ||
+                 device_->keepsDeferredRequestsWhileDisabled()))
                 break;
             const PendingRequest disabled {
                 .requestId = 0,
@@ -1463,6 +1840,18 @@ void VhostUserServer::handleMessage(
         protocol::vhostUserVersionMask | protocol::vhostUserNeedReply;
     if ((message.header.flags & ~allowedRequestFlags) != 0)
         throw std::runtime_error("invalid vhost-user request flags");
+    /* While this request is handled, a wait for the front-end is a wait the
+     * front-end's reply is behind, until sendReply() has sent it. */
+    HandledMessage handled {
+        .replyOwed = frontendAwaitsReply(message.header),
+        .outer = handling_,
+    };
+    handling_ = &handled;
+    struct HandlingScope final {
+        VhostUserServer& server;
+        HandledMessage& handled;
+        ~HandlingScope() { server.handling_ = handled.outer; }
+    } handlingScope {*this, handled};
     const auto request =
         static_cast<protocol::VhostRequest>(message.header.request);
     const std::uint64_t offeredFeatures =
@@ -1495,16 +1884,38 @@ void VhostUserServer::handleMessage(
             throw;
         }
     };
+    /* The enable of a ring the device held requests across: its held
+     * completions go to the used ring, in order, before the ring runs. */
+    const auto enableAcceptedQueue = [&](std::uint32_t index) {
+        try {
+            if (device_->keepsDeferredRequestsWhileDisabled())
+                publishHeldCompletions(index);
+            processQueue(index);
+            if (device_->keepsDeferredRequestsWhileDisabled() &&
+                everyConfiguredRingIsEnabled()) {
+                resumeQueues();
+            }
+        } catch (...) {
+            acknowledgeAcceptedRequest();
+            throw;
+        }
+    };
     switch (request) {
     case protocol::VhostRequest::getFeatures:
         requirePayloadSize(message, 0, "GET_FEATURES");
         requireNoDescriptors(message, "GET_FEATURES");
+        /* A driver's teardown sends it after disabling its rings, to know
+         * that the disables were handled, and then frees the rings. A
+         * suspend never sends it. */
+        retireHeldRequests();
+        retireDisabledRings();
         sendIntegerReply(socket, message.header, offeredFeatures);
         sentReply = true;
         break;
     case protocol::VhostRequest::setFeatures:
         requirePayloadSize(message, sizeof(std::uint64_t), "SET_FEATURES");
         requireNoDescriptors(message, "SET_FEATURES");
+        retireHeldRequests();
         negotiatedFeatures_ = payloadAs<std::uint64_t>(message.payload);
         if ((negotiatedFeatures_ & ~offeredFeatures) != 0)
             throw std::runtime_error("guest negotiated unknown features");
@@ -1524,6 +1935,7 @@ void VhostUserServer::handleMessage(
         requirePayloadSize(
             message, sizeof(std::uint64_t), "SET_PROTOCOL_FEATURES");
         requireNoDescriptors(message, "SET_PROTOCOL_FEATURES");
+        retireHeldRequests();
         const auto requestedProtocolFeatures =
             payloadAs<std::uint64_t>(message.payload);
         if ((requestedProtocolFeatures & ~offeredProtocolFeatures) != 0) {
@@ -1624,6 +2036,7 @@ void VhostUserServer::handleMessage(
         requireNoDescriptors(message, "SET_VRING_NUM");
         const auto state =
             payloadAs<protocol::VringState>(message.payload);
+        retireHeldRequests();
         if (!pendingRequests_.empty())
             throw std::runtime_error(
                 "SET_VRING_NUM while deferred requests are pending");
@@ -1640,6 +2053,7 @@ void VhostUserServer::handleMessage(
         requireNoDescriptors(message, "SET_VRING_BASE");
         const auto state =
             payloadAs<protocol::VringState>(message.payload);
+        retireHeldRequests();
         if (!pendingRequests_.empty())
             throw std::runtime_error(
                 "SET_VRING_BASE while deferred requests are pending");
@@ -1680,6 +2094,7 @@ void VhostUserServer::handleMessage(
         requireNoDescriptors(message, "SET_VRING_ADDR");
         const auto address =
             payloadAs<protocol::VringAddress>(message.payload);
+        retireHeldRequests();
         if (!pendingRequests_.empty())
             throw std::runtime_error(
                 "SET_VRING_ADDR while deferred requests are pending");
@@ -1705,12 +2120,16 @@ void VhostUserServer::handleMessage(
             throw std::runtime_error("SET_VRING_ENABLE was not negotiated");
         if (state.index >= queues_.size() || state.value > 1)
             throw std::runtime_error("invalid SET_VRING_ENABLE");
-        if (state.value == 0 && !pendingRequests_.empty()) {
+        /* A device that keeps its deferred requests across the disable is
+         * reset only by a message that changes what they refer to. */
+        if (state.value == 0 && !pendingRequests_.empty() &&
+            !device_->keepsDeferredRequestsWhileDisabled()) {
+            reportDisableReset(state.index);
             resetDeviceState();
         }
         queues_[state.index].enabled = state.value != 0;
         if (queues_[state.index].enabled)
-            processAcceptedQueue(state.index);
+            enableAcceptedQueue(state.index);
         break;
     }
     case protocol::VhostRequest::setVringKick:
@@ -1947,7 +2366,7 @@ void VhostUserServer::serveConnection(
             const int peerPoll = ::poll(
                 descriptors.data(),
                 static_cast<nfds_t>(descriptors.size()),
-                activePolling ? 1 : socketPollTimeoutMilliseconds);
+                mainPollTimeout(activePolling));
             if (peerPoll < 0) {
                 if (errno == EINTR)
                     continue;
@@ -2158,6 +2577,9 @@ void InProcessVhostUserService::run() noexcept
             server->setSharedMemoryRegions(sharedMemoryRegions_);
         if (requestGate_)
             server->setRequestGate(requestGate_);
+        // stop() shuts the connection down, which wakes the server wherever
+        // it polls the main socket.
+        server->setStopShutsDownConnection();
         server->runConnected(
             descriptors_[0].release(), stopRequested_, [this] {
                 {

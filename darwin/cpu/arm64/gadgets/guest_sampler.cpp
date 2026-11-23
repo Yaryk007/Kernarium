@@ -22,8 +22,8 @@
 
 /* Zero-size labels around each section the gadget bank (engine.S) emits
  * code into: the bank itself, the sections its gadgets push forwarding
- * variants, cold paths and FEAT_AFP twins into, the SME part and the AArch32
- * part's bank and cold paths. */
+ * variants, cold paths and FEAT_AFP twins into, the SME part, the AArch32
+ * part's bank and cold paths, and the run heads. */
 extern "C" const char uml_arm64_gadget_bank_begin[];
 extern "C" const char uml_arm64_gadget_bank_end[];
 extern "C" const char uml_arm64_gadget_forward_section_begin[];
@@ -40,6 +40,8 @@ extern "C" const char uml_arm64_gadget_a32_bank_section_begin[];
 extern "C" const char uml_arm64_gadget_a32_bank_section_end[];
 extern "C" const char uml_arm64_gadget_a32_cold_section_begin[];
 extern "C" const char uml_arm64_gadget_a32_cold_section_end[];
+extern "C" const char uml_arm64_gadget_runs_section_begin[];
+extern "C" const char uml_arm64_gadget_runs_section_end[];
 
 namespace uml::cpu::arm64::gadgets::diagnostics {
 
@@ -80,6 +82,8 @@ namespace {
 			uml_arm64_gadget_a32_bank_section_end},
 		{uml_arm64_gadget_a32_cold_section_begin,
 			uml_arm64_gadget_a32_cold_section_end},
+		{uml_arm64_gadget_runs_section_begin,
+			uml_arm64_gadget_runs_section_end},
 	};
 	return std::ranges::any_of(sections, [pc](const auto &section) {
 		return pc >= reinterpret_cast<std::uintptr_t>(section.first) &&
@@ -431,11 +435,7 @@ private:
 Sampler *sampler() noexcept
 {
 	static Sampler *const instance = []() -> Sampler * {
-#ifdef UML_APP_STORE_RUNTIME
-		const char *setting = nullptr;
-#else
 		const char *setting = std::getenv("DARWIN_UML_GUEST_SAMPLES");
-#endif
 		if (setting == nullptr || *setting == '\0')
 			return nullptr;
 		std::string path = setting;

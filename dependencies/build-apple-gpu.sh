@@ -101,8 +101,11 @@ arm64|aarch64) ;;
 *) fail "the Apple GPU build requires an arm64 host" ;;
 esac
 
-# Every Apple product, and the build machine's own pass, builds at this floor.
-DEPLOYMENT_TARGET=27.0
+# The macOS product and the build machine's own passes build at the macOS
+# floor; the iOS device and Simulator products build at the iOS floor. Each
+# platform below sets DEPLOYMENT_TARGET to its own.
+MACOS_DEPLOYMENT_TARGET=27.0
+IOS_DEPLOYMENT_TARGET=26.0
 
 # The software variant has no Vulkan driver, no Venus protocol and no render
 # server; the other platforms render on KosmicKrisp.
@@ -110,6 +113,7 @@ SOFTWARE=0
 MESA_SOFTWARE_DRIVERS=
 case "$PLATFORM" in
 macos)
+	DEPLOYMENT_TARGET=$MACOS_DEPLOYMENT_TARGET
 	SDK_NAME=macosx
 	TARGET=arm64-apple-macos$DEPLOYMENT_TARGET
 	EPOXY_SYSTEM=darwin
@@ -119,6 +123,7 @@ macos)
 	PREFIX_PLATFORM=macos-arm64
 	;;
 ios)
+	DEPLOYMENT_TARGET=$IOS_DEPLOYMENT_TARGET
 	SDK_NAME=iphoneos
 	TARGET=arm64-apple-ios$DEPLOYMENT_TARGET
 	EPOXY_SYSTEM=ios
@@ -128,6 +133,7 @@ ios)
 	PREFIX_PLATFORM=ios-device-arm64
 	;;
 ios-simulator)
+	DEPLOYMENT_TARGET=$IOS_DEPLOYMENT_TARGET
 	SDK_NAME=iphonesimulator
 	TARGET=arm64-apple-ios$DEPLOYMENT_TARGET-simulator
 	EPOXY_SYSTEM=ios
@@ -252,7 +258,7 @@ STRIP=$($XCRUN --sdk "$SDK_NAME" --find strip)
 # generator, which run here rather than on the target.
 NATIVE_SDK_ROOT=$($XCRUN --sdk macosx --show-sdk-path)
 [ -d "$NATIVE_SDK_ROOT" ] || fail "xcrun returned an invalid macOS SDK"
-NATIVE_TARGET=arm64-apple-macos$DEPLOYMENT_TARGET
+NATIVE_TARGET=arm64-apple-macos$MACOS_DEPLOYMENT_TARGET
 NATIVE_CC=$($XCRUN --sdk macosx --find clang)
 NATIVE_CXX=$($XCRUN --sdk macosx --find clang++)
 
@@ -458,13 +464,13 @@ if [ "$SOFTWARE" -eq 0 ]; then
 	env -i PATH="$MESA_TOOL_PATH" TMPDIR="$APPLE_GPU_TEMP_DIR" \
 		CC="$NATIVE_CC" SDKROOT="$NATIVE_SDK_ROOT" \
 		CFLAGS="-isysroot $NATIVE_SDK_ROOT -target $NATIVE_TARGET" \
-		MACOSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
+		MACOSX_DEPLOYMENT_TARGET="$MACOS_DEPLOYMENT_TARGET" \
 		PKG_CONFIG_PATH= PKG_CONFIG_LIBDIR="$MESA_PKG_CONFIG" \
 		"$MESON" setup "$VENUS_PROTOCOL_BUILD" "$VENUS_PROTOCOL_SOURCE" \
 			--buildtype debugoptimized -Db_ndebug=false --wrap-mode=nodownload \
 			-Dvulkan-headers-dir="$VULKAN_HEADERS_SOURCE"
 	env -i PATH="$MESA_TOOL_PATH" TMPDIR="$APPLE_GPU_TEMP_DIR" \
-		SDKROOT="$NATIVE_SDK_ROOT" MACOSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
+		SDKROOT="$NATIVE_SDK_ROOT" MACOSX_DEPLOYMENT_TARGET="$MACOS_DEPLOYMENT_TARGET" \
 		"$MESON" compile -C "$VENUS_PROTOCOL_BUILD" -j "$JOBS"
 	env -i PATH="$MESA_TOOL_PATH" TMPDIR="$APPLE_GPU_TEMP_DIR" \
 		"$MESON" test -C "$VENUS_PROTOCOL_BUILD" --print-errorlogs
@@ -485,7 +491,7 @@ if [ "$CROSS_BUILD" -eq 1 ] && [ "$SOFTWARE" -eq 0 ]; then
 	MESA_TOOLS_STAGE="$BUILDS/Mesa-tools-stage"
 	mkdir -p -- "$MESA_TOOLS_STAGE"
 	env -i PATH="$MESA_TOOL_PATH" TMPDIR="$APPLE_GPU_TEMP_DIR" \
-		SDKROOT="$NATIVE_SDK_ROOT" MACOSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
+		SDKROOT="$NATIVE_SDK_ROOT" MACOSX_DEPLOYMENT_TARGET="$MACOS_DEPLOYMENT_TARGET" \
 		CC="$NATIVE_CC" CXX="$NATIVE_CXX" \
 		OBJC="$NATIVE_CC" OBJCXX="$NATIVE_CXX" \
 		PKG_CONFIG_PATH= PKG_CONFIG_LIBDIR="$MESA_PKG_CONFIG" \
@@ -498,10 +504,10 @@ if [ "$CROSS_BUILD" -eq 1 ] && [ "$SOFTWARE" -eq 0 ]; then
 			-Dllvm=disabled -Dspirv-tools=disabled \
 			-Dinstall-mesa-clc=true -Dinstall-precomp-compiler=true
 	env -i PATH="$MESA_TOOL_PATH" TMPDIR="$APPLE_GPU_TEMP_DIR" \
-		SDKROOT="$NATIVE_SDK_ROOT" MACOSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
+		SDKROOT="$NATIVE_SDK_ROOT" MACOSX_DEPLOYMENT_TARGET="$MACOS_DEPLOYMENT_TARGET" \
 		"$MESON" compile -C "$MESA_TOOLS_BUILD" -j "$JOBS"
 	env -i PATH="$MESA_TOOL_PATH" TMPDIR="$APPLE_GPU_TEMP_DIR" \
-		SDKROOT="$NATIVE_SDK_ROOT" MACOSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
+		SDKROOT="$NATIVE_SDK_ROOT" MACOSX_DEPLOYMENT_TARGET="$MACOS_DEPLOYMENT_TARGET" \
 		"$MESON" install --no-rebuild -C "$MESA_TOOLS_BUILD" > /dev/null
 	for tool in vtn_bindgen2 kk_clc; do
 		[ -x "$MESA_TOOLS_STAGE/bin/$tool" ] ||

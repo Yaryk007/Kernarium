@@ -11,6 +11,7 @@ _uml_arm64_gadget_region_sme
 _uml_arm64_gadget_region_a32_bank
 _uml_arm64_gadget_region_a32_cold
 _uml_arm64_gadget_region_a32_veneer
+_uml_arm64_gadget_region_runs
 # The x86-64 gadget region, after the arm64 one in an image that carries both;
 # x86_64/gadgets/engine/region.inc names each part's offset-0 label.
 _uml_x86_64_gadget_region_bank

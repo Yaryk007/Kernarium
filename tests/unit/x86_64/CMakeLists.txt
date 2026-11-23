@@ -95,6 +95,21 @@ uml_add_unit_test(
     COMMAND uml_x86_64_gadget_shared_tests bound
     LABELS cpu;x86-64;tsan)
 
+# The gadget engine over a frame that more than one address maps, on the real
+# static MMU: a store through another address reaches the translation, the
+# write entry's tag follows the frame's holders, and a flush or a failed
+# registration leaves nothing runnable unregistered.
+uml_add_x86_64_test_binary(uml_x86_64_gadget_alias_tests
+    x86_64_gadget_alias_tests.cpp GADGETS
+    LIBRARIES UML::MemoryTestComponent)
+target_include_directories(uml_x86_64_gadget_alias_tests PRIVATE
+    ${PROJECT_SOURCE_DIR}/darwin/memory
+    ${PROJECT_SOURCE_DIR}/darwin/memory/mmu)
+uml_add_unit_test(
+    NAME x86-64-gadget-alias
+    COMMAND uml_x86_64_gadget_alias_tests
+    LABELS cpu;x86-64)
+
 # The cache's handling of destroyed address-space generations alone, cheap
 # enough for the sanitizer trees.
 uml_add_unit_test(
@@ -175,8 +190,18 @@ uml_add_unit_test(
     COMMAND uml_x86_64_fex_asm_runner "${_corpus}"
     LABELS cpu;x86-64
     TIMEOUT 900)
+# The same corpus with every call into the address space leaving garbage in the
+# registers a C++ function does not preserve, which holds each gadget to
+# keeping its values across a translation that misses.
+uml_add_unit_test(
+    NAME x86-64-instruction-corpus-clobbered-calls
+    COMMAND uml_x86_64_fex_asm_runner --clobber-calls "${_corpus}"
+    LABELS cpu;x86-64
+    TIMEOUT 900)
 # The instructions a run retires before each kind of stop, which the JIT
-# runner checks against the same counts.
+# runner checks against the same counts. The rows that name the flags, x87
+# status or MXCSR a faulting store must leave hold the gadget engine to them
+# and pin the JIT's known gap.
 uml_add_unit_test(
     NAME x86-64-retirement
     COMMAND uml_x86_64_fex_asm_runner --retirement
@@ -287,6 +312,33 @@ if(TARGET uml_x86_64_jit)
         COMMAND uml_x86_64_jit_code_change_tests
         LABELS cpu;x86-64
         TIMEOUT 300)
+    # The JIT over a frame that more than one address maps, on the real static
+    # MMU: a store through another address reaches the compiled code, the
+    # running unit leaves before such a store, and a failed registration
+    # reports a fetch fault the kernel resolves.
+    uml_add_x86_64_test_binary(uml_x86_64_jit_alias_tests
+        x86_64_jit_alias_tests.cpp JIT
+        LIBRARIES UML::MemoryTestComponent UML::BridgeAbi)
+    target_include_directories(uml_x86_64_jit_alias_tests PRIVATE
+        ${PROJECT_SOURCE_DIR}/darwin/memory
+        ${PROJECT_SOURCE_DIR}/darwin/memory/mmu)
+    uml_add_unit_test(
+        NAME x86-64-jit-alias
+        COMMAND uml_x86_64_jit_alias_tests
+        LABELS cpu;x86-64
+        TIMEOUT 300)
+    # What a vCPU hands the JIT before each run: the stuck participants are
+    # settled first, before either early return.
+    uml_add_x86_64_test_binary(uml_x86_64_jit_sync_tests
+        x86_64_jit_sync_tests.cpp JIT
+        LIBRARIES UML::MemoryTestComponent UML::BridgeAbi)
+    target_include_directories(uml_x86_64_jit_sync_tests PRIVATE
+        ${PROJECT_SOURCE_DIR}/darwin/memory
+        ${PROJECT_SOURCE_DIR}/darwin/memory/mmu)
+    uml_add_unit_test(
+        NAME x86-64-jit-sync
+        COMMAND uml_x86_64_jit_sync_tests
+        LABELS cpu;x86-64)
     # CPUID through the JIT answers every leaf and subleaf as cpuid.hpp does,
     # AVX-VNNI's included.
     uml_add_x86_64_test_binary(uml_x86_64_jit_cpuid_tests

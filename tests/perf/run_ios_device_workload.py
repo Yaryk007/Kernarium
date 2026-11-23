@@ -26,6 +26,7 @@ REPOSITORY = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPOSITORY / "tests" / "integration" / "support"))
 import guest  # noqa: E402
 import ios_device  # noqa: E402
+import ios_device_reports  # noqa: E402
 import kernarium  # noqa: E402
 
 DEFAULT_ARTIFACT_ROOT = REPOSITORY / ".build" / "ios-device-workload"
@@ -70,6 +71,7 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
                         default=DEFAULT_ARTIFACT_ROOT)
     parser.add_argument("--initramfs-tool", type=Path,
                         default=kernarium.DEFAULT_INITRAMFS_TOOL)
+    ios_device_reports.add_arguments(parser)
     options = parser.parse_args(argv)
     if options.geekbench_workloads is not None and (
         not options.geekbench
@@ -113,6 +115,7 @@ def main(argv: list[str] | None = None) -> int:
         "%Y%m%d-%H%M%S"
     )
     artifact.mkdir(parents=True, exist_ok=False)
+    ios_device_reports.preflight(options, [kernarium.APPLICATION])
     written = build_payload(options).write(
         artifact / "payload.cpio", options.initramfs_tool
     )

@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 19:00:16 +0900
+Subject: [PATCH] um: free an IRQ entry after a grace period
+
+The CPU that dispatches host events reads an irq_entry from the event
+that names it, with preemption off and no lock, until the handlers it
+runs have returned. Another CPU can free that entry in the meantime:
+free_irq_by_fd(), deactivate_fd() and um_free_irq() unlink it and remove
+its registration, which stops new events but not one the dispatcher has
+already taken. The random device does it routinely: its handler
+completes the reader, which frees the entry from process context while
+irq_io_loop() still has to store to it. Only CPU0 used to dispatch on
+Darwin, which made the window narrow; any CPU can dispatch now, so it
+is wider.
+
+Free a registered entry with kfree_rcu(). sigio_handler() disables
+preemption and, when it runs from idle, makes RCU watch the CPU, so a
+grace period that begins after the registration was removed waits for
+every dispatch that began before, and so for any dispatch that holds the
+pointer: a kevent() issued after the removal cannot return the entry. An
+entry that was never registered is still freed directly.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ arch/um/kernel/irq.c | 24 +++++++++++++++++++++---
+ 1 file changed, 21 insertions(+), 3 deletions(-)
+
+diff --git a/arch/um/kernel/irq.c b/arch/um/kernel/irq.c
+index b3ec418a15562010328501b23b534c163b465fc0..089c29b6bd5bc4df1119cfb0bfd96a63754646f7 100644
+--- a/arch/um/kernel/irq.c
++++ b/arch/um/kernel/irq.c
+@@ -13,6 +13,7 @@
+ #include <linux/interrupt.h>
+ #include <linux/kernel_stat.h>
+ #include <linux/module.h>
++#include <linux/rcupdate.h>
+ #include <linux/sched.h>
+ #include <linux/seq_file.h>
+ #include <linux/slab.h>
+@@ -52,6 +53,7 @@ struct irq_reg {
+ 
+ struct irq_entry {
+ 	struct list_head list;
++	struct rcu_head rcu;
+ 	int fd;
+ 	struct irq_reg reg[NUM_IRQ_TYPES];
+ 	bool suspended;
+@@ -274,6 +276,22 @@ void sigio_handler(int sig, struct siginfo *unused_si, struct uml_pt_regs *regs,
+ 		ct_irq_exit();
+ }
+ 
++/*
++ * The CPU that dispatches host events reads an entry from the event that
++ * names it until its handlers return, with preemption off and no lock, while
++ * another CPU can free the entry here: removing the registration stops new
++ * events, not one already returned.  Free it after a grace period, which
++ * waits for every dispatch that began before the registration was removed
++ * (sigio_handler() disables preemption, and makes RCU watch the CPU if it
++ * dispatches from idle), and so for any dispatch that holds the pointer.  An
++ * entry that was never registered is freed directly.
++ */
++static void free_irq_entry(struct irq_entry *entry)
++{
++	if (entry)
++		kfree_rcu(entry, rcu);
++}
++
+ static struct irq_entry *get_irq_entry_by_fd(int fd)
+ {
+ 	struct irq_entry *walk;
+@@ -405,7 +423,7 @@ void free_irq_by_fd(int fd)
+ 	to_free = get_irq_entry_by_fd(fd);
+ 	remove_irq_entry(to_free, true);
+ 	raw_spin_unlock_irqrestore(&irq_lock, flags);
+-	kfree(to_free);
++	free_irq_entry(to_free);
+ }
+ EXPORT_SYMBOL(free_irq_by_fd);
+ 
+@@ -436,7 +454,7 @@ static void free_irq_by_irq_and_dev(unsigned int irq, void *dev)
+ 	}
+ out:
+ 	raw_spin_unlock_irqrestore(&irq_lock, flags);
+-	kfree(to_free);
++	free_irq_entry(to_free);
+ }
+ 
+ void deactivate_fd(int fd, int irqnum)
+@@ -462,7 +480,7 @@ void deactivate_fd(int fd, int irqnum)
+ 	entry = update_or_remove_irq_entry(entry);
+ out:
+ 	raw_spin_unlock_irqrestore(&irq_lock, flags);
+-	kfree(entry);
++	free_irq_entry(entry);
+ 
+ 	ignore_sigio_fd(fd);
+ }

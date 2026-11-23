@@ -615,11 +615,11 @@ scalar_entry \name, \forward, (17 - \load), Lsd\@, Lsn\@, Lsm\@, Lscalar_none, 1
 	.if \base_sp
 	sp_alignment_check x24, \load, \forward, Lscalar_forward_alignment_read\@, Lscalar_forward_alignment_write\@
 	.endif
-	add x25, x24, x21
+	add x23, x24, x21
 	.if \mode >= 2
 	mov x26, x24
 	.else
-	mov x26, x25
+	mov x26, x23
 	.endif
 	.if !\base_sp
 	/* Top-byte ignore: the TLB is keyed by the untagged address. */
@@ -647,7 +647,7 @@ Lscalar_other_immediate_untagged\@:
 	scalar_memory_transfer \load, \forward, 2, \instruction, \host_register
 	.endif
 	.if \mode == 1 || \mode == 2
-	str x25, [_vcpu, x20]
+	str x23, [_vcpu, x20]
 	.endif
 	next_gadget
 	.if \load
@@ -693,7 +693,7 @@ Lscalar_other_immediate_cross\@:
 	transfer_slow 1, x26, \bytes, fault=uml_arm64_gadget_memory_fault_indexed
 	.endif
 	.if \mode == 1 || \mode == 2
-	str x25, [_vcpu, x20]
+	str x23, [_vcpu, x20]
 	.endif
 	next_gadget
 	.endif
@@ -943,11 +943,11 @@ scalar_entry \name, \forward, (17 - \load), Lscalar_none, Lsn\@, Lscalar_none, L
 	.if \base_sp
 	sp_alignment_check x24, \load, \forward, Lscalar_forward_alignment_read\@, Lscalar_forward_alignment_write\@
 	.endif
-	add x25, x24, x21
+	add x23, x24, x21
 	.if \mode == 2
 	mov x26, x24
 	.else
-	mov x26, x25
+	mov x26, x23
 	.endif
 	.if !\base_sp || \mode != 0
 	ldrb w9, [_vcpu, #UML_GADGET_CPU_TBI_ENABLED]
@@ -965,7 +965,7 @@ Lvector_other_immediate_translate\@:
 	\instruction \host_register\()0, [x7]
 	.endif
 	.if \mode == 1 || \mode == 2
-	str x25, [_vcpu, x20]
+	str x23, [_vcpu, x20]
 	.endif
 	next_gadget
 	.if \load
@@ -983,7 +983,7 @@ Lvector_other_immediate_cross\@:
 	transfer_slow 1, x26, \bytes, fault=uml_arm64_gadget_memory_fault_indexed
 	.endif
 	.if \mode == 1 || \mode == 2
-	str x25, [_vcpu, x20]
+	str x23, [_vcpu, x20]
 	.endif
 	next_gadget
 

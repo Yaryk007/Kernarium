@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 19:07:26 +0900
+Subject: [PATCH] Measure caption similarity with a local edit distance
+
+CaptionConsumer took LevenshteinDistance from Apache commons-text, a
+library the Android image's source tree does not carry, for one call. It
+now computes the same unit-cost edit distance itself.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .../controller/CaptionConsumer.java           | 24 ++++++++++++++++---
+ 1 file changed, 21 insertions(+), 3 deletions(-)
+
+diff --git a/braille/brailledisplay/src/phone/java/com/google/android/accessibility/braille/brailledisplay/controller/CaptionConsumer.java b/braille/brailledisplay/src/phone/java/com/google/android/accessibility/braille/brailledisplay/controller/CaptionConsumer.java
+index c3d0c576e300c7999e7860c895104a4498a9796b..6958cc5d4fc1b8d3b827c77a3984478c96a95e8c 100644
+--- a/braille/brailledisplay/src/phone/java/com/google/android/accessibility/braille/brailledisplay/controller/CaptionConsumer.java
++++ b/braille/brailledisplay/src/phone/java/com/google/android/accessibility/braille/brailledisplay/controller/CaptionConsumer.java
+@@ -20,7 +20,6 @@ import com.google.android.accessibility.braille.common.BrailleUserPreferences;
+ import com.google.android.accessibility.utils.AccessibilityEventUtils;
+ import com.google.android.accessibility.utils.AccessibilityNodeInfoUtils;
+ import java.time.Duration;
+-import org.apache.commons.text.similarity.LevenshteinDistance;
+ 
+ /** An event consumer catches captions on the screen. */
+ public class CaptionConsumer implements EventConsumer {
+@@ -94,7 +93,6 @@ public class CaptionConsumer implements EventConsumer {
+    * threshold.
+    */
+   private boolean sameCaption(String oldStr, String newStr) {
+-    LevenshteinDistance levenshteinDistance = new LevenshteinDistance();
+     // If the new string is longer than the old string, we only compare the portion of the new
+     // string that has the same length as the old string, because the new string could be very long.
+     // For example, if the old string is "Hello world" and the new string is "Hello world. This is a
+@@ -103,7 +101,7 @@ public class CaptionConsumer implements EventConsumer {
+     // string. For example, if the old string is "Hello world" and the new string is "Hello word",
+     // the new string is considered the same caption.
+     String prefix = newStr.substring(0, min(newStr.length(), oldStr.length()));
+-    int distance = levenshteinDistance.apply(oldStr, prefix);
++    int distance = levenshteinDistance(oldStr, prefix);
+     BrailleDisplayLog.v(
+         TAG,
+         "oldStr.length: "
+@@ -115,6 +113,26 @@ public class CaptionConsumer implements EventConsumer {
+     return distance <= newStr.length() * SENTENCE_SIMILARITY_THRESHOLD;
+   }
+ 
++  /** Returns the number of single-character edits that turn one string into the other. */
++  private static int levenshteinDistance(String from, String to) {
++    int[] previous = new int[to.length() + 1];
++    int[] current = new int[to.length() + 1];
++    for (int j = 0; j <= to.length(); j++) {
++      previous[j] = j;
++    }
++    for (int i = 1; i <= from.length(); i++) {
++      current[0] = i;
++      for (int j = 1; j <= to.length(); j++) {
++        int substitution = previous[j - 1] + (from.charAt(i - 1) == to.charAt(j - 1) ? 0 : 1);
++        current[j] = min(min(previous[j] + 1, current[j - 1] + 1), substitution);
++      }
++      int[] swap = previous;
++      previous = current;
++      current = swap;
++    }
++    return previous[to.length()];
++  }
++
+   @Override
+   public boolean onMappedInputEvent(BrailleInputEvent event) {
+     return false;

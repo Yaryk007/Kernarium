@@ -1,0 +1,676 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Abdulmajeed Almarzoqi <abdulmjad01@gmail.com>
+Date: Tue, 10 Nov 2026 07:01:09 +0300
+Subject: [PATCH] Leave Google Play services out of the phone build
+
+The phone build linked three closed-source Google libraries: ML Kit text
+recognition (play-services-mlkit-text-recognition), Play Core and, through
+the Wear libraries, Play services Wearable. They are now gone from it:
+
+- The Wear libraries are the watch build's alone; the phone code names no
+  Wear class. Guava, which they brought, is a dependency of its own.
+- OcrController recognises no text: a request finishes at once without
+  text blocks, as one does when ML Kit is not ready. Image descriptions
+  keep the rest of their sources.
+- Play services availability is read from the GMS core package itself, an
+  installed and enabled one of at least the version the client required.
+- TalkBackApplication is a plain Application: the build has no downloaded
+  modules for SplitCompat to load.
+---
+ shared.gradle                                 |  14 +-
+ .../talkback/TalkBackApplication.java         |   8 +-
+ .../utils/GoogleApiAvailabilityManager.java   |  67 ---
+ .../utils/PackageManagerUtils.java            |  21 +-
+ .../utils/ocr/OcrController.java              | 385 ++----------------
+ .../accessibility/utils/ocr/OcrInfo.java      |   2 +-
+ 6 files changed, 55 insertions(+), 442 deletions(-)
+ delete mode 100644 utils/src/main/java/com/google/android/accessibility/utils/GoogleApiAvailabilityManager.java
+
+diff --git a/shared.gradle b/shared.gradle
+index c783e539d04078e89ffdcfa1c22f7d0a5342db45..18f610fddb8c925165a7f62f4ff9bf7b64eaf0c8 100644
+--- a/shared.gradle
++++ b/shared.gradle
+@@ -46,9 +46,7 @@ android {
+ dependencies {
+ 
+     // Google common
+-    implementation 'com.google.android.gms:play-services-mlkit-text-recognition:19.0.1'
+     implementation 'com.google.android.material:material:1.11.0'
+-    implementation 'com.google.android.play:core:1.10.3'
+ 
+     // Support library
+     implementation 'androidx.annotation:annotation:1.2.0'
+@@ -69,10 +67,14 @@ dependencies {
+     annotationProcessor 'com.google.auto.value:auto-value:1.11.0'
+     implementation 'javax.annotation:javax.annotation-api:1.3.2'
+ 
+-    // Wear
+-    implementation 'androidx.wear:wear:1.2.0-rc01'
+-    implementation 'androidx.wear:wear-remote-interactions:1.0.0'
+-    implementation 'com.google.android.support:wearable:2.8.1'
++    // Guava and its nullness annotations, which the Wear libraries brought
++    // before the phone build left them out
++    implementation 'com.google.guava:guava:33.4.0-android'
++
++    // Wear: the watch build's alone, as they bring Google Play services
++    wearImplementation 'androidx.wear:wear:1.2.0-rc01'
++    wearImplementation 'androidx.wear:wear-remote-interactions:1.0.0'
++    wearImplementation 'com.google.android.support:wearable:2.8.1'
+     implementation 'com.google.zxing:core:3.5.1'
+ 
+     // Cloud services
+diff --git a/talkback/src/main/java/com/google/android/accessibility/talkback/TalkBackApplication.java b/talkback/src/main/java/com/google/android/accessibility/talkback/TalkBackApplication.java
+index fff5dee64a2d70ac3394a5c7f1a7918ee3654ca6..3ecb70892f7eb44bfa312e8de0f6a8378e78bcbd 100644
+--- a/talkback/src/main/java/com/google/android/accessibility/talkback/TalkBackApplication.java
++++ b/talkback/src/main/java/com/google/android/accessibility/talkback/TalkBackApplication.java
+@@ -16,6 +16,7 @@
+ 
+ package com.google.android.accessibility.talkback;
+ 
++import android.app.Application;
+ import com.google.android.accessibility.talkback.training.PageConfigMapperImpl;
+ import com.google.android.accessibility.talkback.training.TalkBackDisabledWarmingDialogImpl;
+ import com.google.android.accessibility.talkback.training.TrainingConfigMapperImpl;
+@@ -24,13 +25,12 @@ import com.google.android.accessibility.talkback.training.content.TutorialConten
+ import com.google.android.accessibility.talkback.trainingcommon.TrainingActivityInterfaceInjector;
+ import com.google.android.accessibility.talkback.trainingcommon.content.TutorialContentInterfaceInjector;
+ import com.google.android.accessibility.utils.FormFactorUtils;
+-import com.google.android.play.core.splitcompat.SplitCompatApplication;
+ 
+ /**
+- * A top level Application for TalkBack. It extends SplitCompatApplication to enable SplitCompat,
+- * which allows our app to access code and resources from a downloaded module.
++ * A top level Application for TalkBack. This build has no downloaded modules, so it needs no
++ * SplitCompat and no Play Core.
+  */
+-public class TalkBackApplication extends SplitCompatApplication {
++public class TalkBackApplication extends Application {
+ 
+   @Override
+   public void onCreate() {
+diff --git a/utils/src/main/java/com/google/android/accessibility/utils/GoogleApiAvailabilityManager.java b/utils/src/main/java/com/google/android/accessibility/utils/GoogleApiAvailabilityManager.java
+deleted file mode 100644
+index 59ff66e8a5825a49accdb4b3a42749e78081d41c..0000000000000000000000000000000000000000
+--- a/utils/src/main/java/com/google/android/accessibility/utils/GoogleApiAvailabilityManager.java
++++ /dev/null
+@@ -1,67 +0,0 @@
+-/*
+- * Copyright (C) 2025 Google Inc.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package com.google.android.accessibility.utils;
+-
+-import android.content.Context;
+-import androidx.annotation.VisibleForTesting;
+-import com.google.android.gms.common.GoogleApiAvailability;
+-
+-/**
+- * A singleton class for verifying Google Play services availability by {@link
+- * GoogleApiAvailability}.
+- */
+-public class GoogleApiAvailabilityManager {
+-
+-  @SuppressWarnings("NonFinalStaticField")
+-  private static GoogleApiAvailabilityManager instance;
+-
+-  public static GoogleApiAvailabilityManager getInstance() {
+-    if (instance == null) {
+-      instance = new GoogleApiAvailabilityManager(GoogleApiAvailability.getInstance());
+-    }
+-    return instance;
+-  }
+-
+-  /**
+-   * Sets a fake GoogleApiAvailable {@link
+-   * com.google.android.gms.common.testing.FakeGoogleApiAvailability} for test. This should be
+-   * invoked before the first APIs are created.
+-   */
+-  @VisibleForTesting
+-  public static void initializeForTest(GoogleApiAvailability googleApiAvailability) {
+-    instance = new GoogleApiAvailabilityManager(googleApiAvailability);
+-  }
+-
+-  @VisibleForTesting
+-  public static void stopInstanceForTest() {
+-    instance = null;
+-  }
+-
+-  private final GoogleApiAvailability googleApiAvailability;
+-
+-  private GoogleApiAvailabilityManager(GoogleApiAvailability googleApiAvailability) {
+-    this.googleApiAvailability = googleApiAvailability;
+-  }
+-
+-  /**
+-   * Verifies that Google Play services is installed and enabled on this device.
+-   *
+-   * @param minApkVersion the installed version is not older than the specified version
+-   */
+-  public int isGooglePlayServicesAvailable(Context context, int minApkVersion) {
+-    return googleApiAvailability.isGooglePlayServicesAvailable(context, minApkVersion);
+-  }
+-}
+diff --git a/utils/src/main/java/com/google/android/accessibility/utils/PackageManagerUtils.java b/utils/src/main/java/com/google/android/accessibility/utils/PackageManagerUtils.java
+index edb2b2694eb9f1f20020c9d1e352b89ba99711d7..5c8c8d573bfac6d03f6cc3cea845f35f55fc8288 100644
+--- a/utils/src/main/java/com/google/android/accessibility/utils/PackageManagerUtils.java
++++ b/utils/src/main/java/com/google/android/accessibility/utils/PackageManagerUtils.java
+@@ -22,7 +22,6 @@ import android.content.pm.PackageManager;
+ import android.content.pm.PackageManager.NameNotFoundException;
+ import android.os.Build;
+ import android.text.TextUtils;
+-import com.google.android.gms.common.ConnectionResult;
+ import com.google.android.libraries.accessibility.utils.log.LogUtils;
+ import java.util.Objects;
+ import org.checkerframework.checker.nullness.qual.Nullable;
+@@ -42,6 +41,7 @@ public class PackageManagerUtils {
+       "com.google.android.marvin.talkback.TalkBackService";
+ 
+   private static final int MIN_GMSCORE_VERSION = 9200000; // Version should be at least V4.
++  private static final String GMS_CORE_PACKAGE = "com.google.android.gms";
+ 
+   /** Returns the package version code. */
+   public static long getVersionCode(Context context) {
+@@ -93,11 +93,20 @@ public class PackageManagerUtils {
+ 
+   /** Returns {@code true} if the platform has GMS core package (aka Google Play Service). */
+   public static boolean hasGmsCorePackage(Context context) {
+-    // Checks if the GMS core is available using GoogleApiAvailability instead of relying on package
+-    // name checks.
+-    return GoogleApiAvailabilityManager.getInstance()
+-            .isGooglePlayServicesAvailable(context, MIN_GMSCORE_VERSION)
+-        == ConnectionResult.SUCCESS;
++    // This build carries no Google Play services client, so it reads the package itself: an
++    // installed and enabled GMS core of at least the version the client would require.
++    try {
++      PackageInfo info = context.getPackageManager().getPackageInfo(GMS_CORE_PACKAGE, 0);
++      long version =
++          Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
++              ? info.getLongVersionCode()
++              : info.versionCode;
++      return info.applicationInfo != null
++          && info.applicationInfo.enabled
++          && version >= MIN_GMSCORE_VERSION;
++    } catch (NameNotFoundException e) {
++      return false;
++    }
+   }
+ 
+   /** Returns {@code true} if the package is Talkback package */
+diff --git a/utils/src/main/java/com/google/android/accessibility/utils/ocr/OcrController.java b/utils/src/main/java/com/google/android/accessibility/utils/ocr/OcrController.java
+index 75df4f021feefa6af0c74feaf1c2e46026d27229..17cebcbb487b05cac81155ae41c87144fa2e5bea 100644
+--- a/utils/src/main/java/com/google/android/accessibility/utils/ocr/OcrController.java
++++ b/utils/src/main/java/com/google/android/accessibility/utils/ocr/OcrController.java
+@@ -16,255 +16,82 @@
+ 
+ package com.google.android.accessibility.utils.ocr;
+ 
+-import static java.util.Comparator.comparing;
+-
+ import android.graphics.Bitmap;
+ import android.graphics.Rect;
+-import android.os.Handler;
+-import android.os.Looper;
+-import android.text.TextUtils;
+ import androidx.annotation.Nullable;
+-import androidx.annotation.VisibleForTesting;
+ import androidx.core.view.accessibility.AccessibilityNodeInfoCompat;
+ import com.google.android.accessibility.utils.Filter;
+-import com.google.android.accessibility.utils.RectUtils;
+-import com.google.android.libraries.accessibility.utils.bitmap.BitmapUtils;
+-import com.google.android.libraries.accessibility.utils.log.LogUtils;
+-import com.google.common.collect.ImmutableList;
+-import com.google.mlkit.vision.common.InputImage;
+-import com.google.mlkit.vision.text.Text.Element;
+-import com.google.mlkit.vision.text.Text.Line;
+-import com.google.mlkit.vision.text.Text.TextBlock;
+-import com.google.mlkit.vision.text.TextRecognition;
+-import com.google.mlkit.vision.text.TextRecognizer;
+-import com.google.mlkit.vision.text.latin.TextRecognizerOptions;
+-import java.util.ArrayList;
+-import java.util.Comparator;
+-import java.util.HashSet;
+ import java.util.List;
+-import java.util.Set;
+-import java.util.concurrent.ConcurrentHashMap;
+ 
+ /**
+- * OcrController holds onto an OCR TextRecognizer, and allows consumers to perform OCR based on a
+- * list of {@link AccessibilityNodeInfoCompat}, and a screencapture {@link Bitmap}.
++ * OcrController recognizes no text in this build. TalkBack's recognizer is ML Kit, a Google Play
++ * services library this build leaves out, so every request finishes at once without text, as a
++ * request does when ML Kit is not ready.
+  */
+ public class OcrController {
+ 
+-  // TODO: Consider localizing wordSeparator and paragraphSeparator as a string resource
+-  // (or, retrieve separators based on user's default language from system).
+   public static final String WORD_SEPARATOR = " ";
+   public static final String PARAGRAPH_SEPARATOR = "\n";
+-  private static final long DELAY_PARSER_OCR_RESULT_MS = 50;
+ 
+-  /** Maximal waiting time of OCR results. */
+-  private static final long OCR_RESULT_MAX_WAITING_TIME_MS = 5000;
++  /** A block of recognized text; this build recognizes none. */
++  public static final class TextBlock {
++    private final String text;
++
++    public TextBlock(String text) {
++      this.text = text;
++    }
+ 
+-  public static final Comparator<TextBlock> TEXT_BLOCK_POSITION_COMPARATOR =
+-      comparing(
+-          textBlock -> {
+-            @Nullable Rect boundingBox = textBlock.getBoundingBox();
+-            return boundingBox == null ? new Rect() : boundingBox;
+-          },
+-          RectUtils.RECT_POSITION_COMPARATOR);
+-  private static final String TAG = "OcrController";
++    public String getText() {
++      return text;
++    }
++  }
+ 
+   private final OcrListener ocrListener;
+-  private final boolean needCropScreenshot;
+-  private final Handler handler;
+-  // TextRecognizer (MlKitContext) may not be ready when the device just boots completely, so this
+-  // recognizer can't be initialized in the constructor.
+-  @Nullable private TextRecognizer recognizer;
+ 
+   public OcrController(OcrListener ocrListener, boolean needCropScreenshot) {
+-    this(
+-        new Handler(Looper.getMainLooper()),
+-        ocrListener,
+-        needCropScreenshot,
+-        /* recognizer= */ null);
+-  }
+-
+-  public OcrController(
+-      Handler handler,
+-      OcrListener ocrListener,
+-      boolean needCropScreenshot,
+-      @Nullable TextRecognizer recognizer) {
+     this.ocrListener = ocrListener;
+-    this.handler = handler;
+-    this.recognizer = recognizer;
+-    this.needCropScreenshot = needCropScreenshot;
+   }
+ 
+-  /**
+-   * Closes the detector and releases its resources. Invokes this method when you no longer want to
+-   * use OcrController.
+-   */
+-  public void shutdown() {
+-    if (recognizer != null) {
+-      recognizer.close();
+-      recognizer = null;
+-    }
+-  }
++  /** Releases nothing: no recognizer is held. */
++  public void shutdown() {}
+ 
+   /**
+-   * Recognize text in all the nodes by performing OCR on the cropped screenshots of all the nodes,
+-   * and save the resulting TextBlocks in each node.
++   * Finishes at once: the nodes keep no text blocks.
+    *
+    * @param image The {@link Bitmap} containing the screenshot.
+-   * @param ocrInfos Provides some information of {@link AccessibilityNodeInfoCompat} nodes
+-   *     representing the on-screen {@link android.view.View}s whose screenshots we want to extract
+-   *     text from using OCR.
+-   * @param filter Only the nodes which are accepted by the filter will be recognized.
++   * @param ocrInfos The nodes whose text was asked for.
++   * @param filter Only the nodes which are accepted by the filter would be recognized.
+    */
+   public void recognizeTextForNodes(
+       Bitmap image,
+       List<OcrInfo> ocrInfos,
+       Rect selectionBounds,
+       Filter<AccessibilityNodeInfoCompat> filter) {
+-    if (recognizer == null) {
+-      try {
+-        recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS);
+-      } catch (IllegalStateException e) {
+-        LogUtils.w(TAG, "Fail to get TextRecognizer.");
+-        // MlKitContext is not ready.
+-        ocrListener.onOcrFinished(ocrInfos);
+-        return;
+-      }
+-    }
+-
+-    new Thread(
+-            new OcrRunnable(
+-                handler,
+-                ocrListener,
+-                recognizer,
+-                image,
+-                needCropScreenshot,
+-                ocrInfos,
+-                selectionBounds,
+-                filter))
+-        .start();
++    ocrListener.onOcrFinished(ocrInfos);
+   }
+ 
+-  private static void filterTextBlocks(OcrInfo ocrInfo, Rect selectionBounds) {
+-    Rect nodeBounds = new Rect();
+-    ocrInfo.getBoundsInScreenForOcr(nodeBounds);
+-
+-    List<TextBlock> textBlocks = ocrInfo.getTextBlocks();
+-    if (textBlocks == null) {
+-      return;
+-    }
+-    Set<TextBlock> toBeRemoved = new HashSet<>();
+-    for (int i = textBlocks.size() - 1; i >= 0; i--) {
+-      TextBlock block = textBlocks.get(i);
+-      @Nullable Rect textBlockBox = block.getBoundingBox();
+-      if (textBlockBox == null) {
+-        toBeRemoved.add(block);
+-        continue;
+-      }
+-
+-      textBlockBox.offset(nodeBounds.left, nodeBounds.top);
+-
+-      if (!Rect.intersects(textBlockBox, selectionBounds)) {
+-        toBeRemoved.add(block);
+-      }
+-    }
+-    textBlocks.removeAll(toBeRemoved);
+-  }
+-
+-  // TODO: Consolidate logic from getTextFromBlocks and createWordBoundsMapping. Consider using
+-  // SpannableStringBuilder#setSpan to attach TextLocationSpans (containing Rects) to each element
+-  // from OCR TextBlocks.
+-
+-  /**
+-   * Combine all the text from the textBlocks into one string, concatenating words and lines with
+-   * wordSeparators (likely spaces), and TextBlocks with paragraphSeparators (likely newlines).
+-   *
+-   * @param textBlocks The TextBlocks that contain the resulting text from OCR.
+-   * @return A string containing the combined text from all the TextBlocks.
+-   */
++  /** Joins the blocks' text with {@link #PARAGRAPH_SEPARATOR}; null without any. */
+   @Nullable
+   public static String getTextFromBlocks(@Nullable List<TextBlock> textBlocks) {
+     return getTextFromBlocks(textBlocks, 0f);
+   }
+ 
+-  /**
+-   * Combine all the text from the textBlocks into one string, concatenating words and lines with
+-   * wordSeparators (likely spaces), and TextBlocks with paragraphSeparators (likely newlines).
+-   *
+-   * @param textBlocks The TextBlocks that contain the resulting text from OCR.
+-   * @param threshold The text will be skipped if its confidence level is less than the threshold.
+-   * @return A string containing the combined text from all the TextBlocks.
+-   */
++  /** Joins the blocks' text with {@link #PARAGRAPH_SEPARATOR}; null without any. */
+   @Nullable
+   public static String getTextFromBlocks(@Nullable List<TextBlock> textBlocks, float threshold) {
+-    LogUtils.v(TAG, "getTextFromBlocks=");
+     if (textBlocks == null || textBlocks.isEmpty()) {
+       return null;
+     }
+-
+     StringBuilder text = new StringBuilder();
+-
+-    for (int i = 0; i < textBlocks.size(); i++) {
+-      TextBlock textBlock = textBlocks.get(i);
+-
+-      for (Line line : textBlock.getLines()) {
+-        StringBuilder logLineText = new StringBuilder();
+-        if (line.getConfidence() < threshold) {
+-          for (Element word : line.getElements()) {
+-            logLineText.append(word.getText().trim()).append(WORD_SEPARATOR);
+-          }
+-        } else {
+-          for (Element word : line.getElements()) {
+-            text.append(word.getText().trim()).append(WORD_SEPARATOR);
+-            logLineText.append(word.getText().trim()).append(WORD_SEPARATOR);
+-          }
+-        }
+-        LogUtils.v(TAG, "(confidence=%f) %s", line.getConfidence(), logLineText);
+-      }
+-
+-      if (textBlock.getLines().isEmpty() || TextUtils.isEmpty(text)) {
+-        continue;
+-      }
+-
+-      // If this TextBlock isn't empty (i.e. contains Lines), replace the just-added wordSeparator
+-      // with a paragraphSeparator (if this isn't the last textblock) or remove the just-added
+-      // wordSeparator (if this is the last textblock).
+-      if (i < textBlocks.size() - 1) {
+-        text.replace(text.length() - WORD_SEPARATOR.length(), text.length(), PARAGRAPH_SEPARATOR);
+-      } else {
+-        text.replace(text.length() - WORD_SEPARATOR.length(), text.length(), "");
++    for (TextBlock textBlock : textBlocks) {
++      if (text.length() > 0) {
++        text.append(PARAGRAPH_SEPARATOR);
+       }
++      text.append(textBlock.getText().trim());
+     }
+-
+     return text.toString();
+   }
+ 
+-  /**
+-   * Interprets OCR result into a list of {@link TextBlock} sorted by {@link
+-   * #TEXT_BLOCK_POSITION_COMPARATOR}.
+-   */
+-  @Nullable
+-  @VisibleForTesting
+-  public static List<TextBlock> ocrResultToSortedList(@Nullable List<TextBlock> textBlocks) {
+-    if (textBlocks == null) {
+-      return null;
+-    }
+-    List<TextBlock> result = new ArrayList<>();
+-    for (TextBlock item : textBlocks) {
+-      if (item == null || item.getBoundingBox() == null) {
+-        continue;
+-      }
+-      result.add(item);
+-    }
+-
+-    if (result.isEmpty()) {
+-      return null;
+-    }
+-
+-    result.sort(TEXT_BLOCK_POSITION_COMPARATOR);
+-    return result;
+-  }
+-
+   /**
+    * Listener callback interface for performing OCR.
+    *
+@@ -278,166 +105,8 @@ public class OcrController {
+     /**
+      * Invoked when OCR completes.
+      *
+-     * @param ocrResults The {@link List} of {@link AccessibilityNodeInfoCompat} and their
+-     *     ocrTextBlocks which sets with {@link List}s of {@link TextBlock}s that contain the lines,
+-     *     words, and bounding boxes detected by OCR. For reference, see:
+-     *     https://developers.google.com/android/reference/com/google/mlkit/vision/text/Text.TextBlock
++     * @param ocrResults The nodes and the text blocks recognized in each.
+      */
+     void onOcrFinished(List<OcrInfo> ocrResults);
+   }
+-
+-  /** Performs OCR and gets text blocks from OCR results. */
+-  @VisibleForTesting
+-  static class OcrRunnable implements Runnable {
+-
+-    private final Handler handler;
+-    private final OcrListener ocrListener;
+-    private final TextRecognizer recognizer;
+-    private final Bitmap screenshot;
+-    private final List<OcrInfo> ocrInfos;
+-    @Nullable private final Rect selectionBounds;
+-    private final Filter<AccessibilityNodeInfoCompat> filter;
+-    private final boolean needCropScreenshot;
+-
+-    public OcrRunnable(
+-        Handler handler,
+-        OcrListener ocrListener,
+-        TextRecognizer recognizer,
+-        Bitmap screenshot,
+-        boolean needCropScreenshot,
+-        List<OcrInfo> ocrInfos,
+-        @Nullable Rect selectionBounds,
+-        Filter<AccessibilityNodeInfoCompat> filter) {
+-      this.handler = handler;
+-      this.ocrListener = ocrListener;
+-      this.recognizer = recognizer;
+-      this.screenshot = screenshot;
+-      this.needCropScreenshot = needCropScreenshot;
+-      this.ocrInfos = ocrInfos;
+-      this.selectionBounds = selectionBounds;
+-      this.filter = filter;
+-    }
+-
+-    @Override
+-    public void run() {
+-      // Add recognized text to HashMap instead of mutating the nodes inside the thread.
+-      ConcurrentHashMap<OcrInfo, List<TextBlock>> textBlocksMap = new ConcurrentHashMap<>();
+-      ParserResultRunnable runnable =
+-          new ParserResultRunnable(handler, ocrInfos, textBlocksMap, selectionBounds, ocrListener);
+-
+-      for (OcrInfo ocrInfo : ocrInfos) {
+-        AccessibilityNodeInfoCompat node = ocrInfo.getNode();
+-        if (filter.accept(node)) {
+-          Rect nodeBounds = new Rect();
+-          ocrInfo.getBoundsInScreenForOcr(nodeBounds);
+-
+-          if (screenshot.isRecycled()) {
+-            LogUtils.w(TAG, "Screenshot has been recycled.");
+-            break;
+-          }
+-
+-          Bitmap croppedBitmap;
+-          try {
+-            croppedBitmap =
+-                needCropScreenshot ? BitmapUtils.cropBitmap(screenshot, nodeBounds) : screenshot;
+-          } catch (IllegalArgumentException e) {
+-            LogUtils.w(TAG, e.getMessage() == null ? "Fail to crop screenshot." : e.getMessage());
+-            continue;
+-          }
+-
+-          if (croppedBitmap == null) {
+-            continue;
+-          }
+-
+-          runnable.addRecognitionCount();
+-          recognizer
+-              .process(InputImage.fromBitmap(croppedBitmap, /* rotationDegrees= */ 0))
+-              .addOnSuccessListener(text -> textBlocksMap.put(ocrInfo, text.getTextBlocks()))
+-              .addOnFailureListener(
+-                  exception -> {
+-                    LogUtils.w(TAG, "Fail to recognize text. errMsg=" + exception.getMessage());
+-                    textBlocksMap.put(ocrInfo, ImmutableList.of());
+-                  });
+-        }
+-      }
+-      handler.postDelayed(runnable, DELAY_PARSER_OCR_RESULT_MS);
+-    }
+-  }
+-
+-  /** Parsers OCR results and notifies caller that OCR is finished. */
+-  @VisibleForTesting
+-  static class ParserResultRunnable implements Runnable {
+-
+-    private final Handler handler;
+-    private final List<OcrInfo> ocrInfos;
+-    @Nullable private final Rect selectionBounds;
+-    private final ConcurrentHashMap<OcrInfo, List<TextBlock>> textBlocksMap;
+-    private final OcrListener ocrListener;
+-    private long waitingTimeMs;
+-    private int recognitionNumber = 0;
+-
+-    public ParserResultRunnable(
+-        Handler handler,
+-        List<OcrInfo> ocrInfos,
+-        ConcurrentHashMap<OcrInfo, List<TextBlock>> textBlocksMap,
+-        @Nullable Rect selectionBounds,
+-        OcrListener ocrListener) {
+-      this.handler = handler;
+-      this.ocrInfos = ocrInfos;
+-      this.textBlocksMap = textBlocksMap;
+-      this.selectionBounds = selectionBounds;
+-      this.ocrListener = ocrListener;
+-      this.waitingTimeMs = 0;
+-    }
+-
+-    /** Checks if all OCR tasks for the nodes in ocrInfos are finished. */
+-    public boolean isOcrFinished() {
+-      return textBlocksMap.size() == recognitionNumber;
+-    }
+-
+-    public synchronized void addRecognitionCount() {
+-      recognitionNumber++;
+-    }
+-
+-    @Override
+-    public void run() {
+-      // If there are unfinished recognition tasks, waiting DELAY_PARSER_OCR_RESULT_MS then checking
+-      // again.
+-      if (!isOcrFinished() && waitingTimeMs < OCR_RESULT_MAX_WAITING_TIME_MS) {
+-        waitingTimeMs = waitingTimeMs + DELAY_PARSER_OCR_RESULT_MS;
+-        LogUtils.v(TAG, "waiting for OCR result... timeout=" + waitingTimeMs);
+-        handler.postDelayed(this, DELAY_PARSER_OCR_RESULT_MS);
+-        return;
+-      }
+-
+-      boolean isOcrInAction = false;
+-
+-      // Copies OCR results which are represented by a list of text blocks (a.k.a. paragraphs) into
+-      // nodes that requested OCR.
+-      for (OcrInfo ocrInfo : ocrInfos) {
+-        List<TextBlock> textBlocks = ocrResultToSortedList(textBlocksMap.get(ocrInfo));
+-        ocrInfo.setTextBlocks(textBlocks);
+-
+-        // It's unnecessary to check all OCR results. isOCRInAction will be true as long as
+-        // there is a non-empty OCR result.
+-        if (!isOcrInAction && !TextUtils.isEmpty(getTextFromBlocks(textBlocks))) {
+-          isOcrInAction = true;
+-        }
+-      }
+-
+-      if (isOcrInAction) {
+-        ocrListener.onOcrStarted();
+-      }
+-
+-      // If the user selected only one node, and the node has non-null ocrTextBlocks, then
+-      // filter the textblocks down to only textBlocks that intersect with selectionBounds
+-      if (selectionBounds != null
+-          && ocrInfos.size() == 1
+-          && ocrInfos.get(0).getTextBlocks() != null) {
+-        filterTextBlocks(ocrInfos.get(0), selectionBounds);
+-      }
+-
+-      ocrListener.onOcrFinished(ocrInfos);
+-    }
+-  }
+ }
+diff --git a/utils/src/main/java/com/google/android/accessibility/utils/ocr/OcrInfo.java b/utils/src/main/java/com/google/android/accessibility/utils/ocr/OcrInfo.java
+index bae45ef235f1c45756182c98fac8789f21d68680..e1b693202bdd2435409b9268b331b91e84f10a67 100644
+--- a/utils/src/main/java/com/google/android/accessibility/utils/ocr/OcrInfo.java
++++ b/utils/src/main/java/com/google/android/accessibility/utils/ocr/OcrInfo.java
+@@ -19,7 +19,7 @@ package com.google.android.accessibility.utils.ocr;
+ import android.graphics.Rect;
+ import androidx.annotation.Nullable;
+ import androidx.core.view.accessibility.AccessibilityNodeInfoCompat;
+-import com.google.mlkit.vision.text.Text.TextBlock;
++import com.google.android.accessibility.utils.ocr.OcrController.TextBlock;
+ import java.util.List;
+ 
+ /**

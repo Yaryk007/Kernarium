@@ -11,6 +11,7 @@
 #include <memory>
 #include <optional>
 #include <string_view>
+#include <vector>
 
 #if __APPLE__
 #include <pthread.h>
@@ -65,12 +66,18 @@ std::uint64_t now()
 #if UML_SCALAR_CEILING_GADGETS
 struct Workload final {
 	static constexpr std::uint64_t pc = 0x1000;
-	std::array<std::uintptr_t, 2> terminal{
-		reinterpret_cast<std::uintptr_t>(uml_arm64_gadget_interrupt), pc + 72};
+	static constexpr std::size_t header = g::block_header_bytes / sizeof(std::uintptr_t);
+	// Linked words sit behind the header gadgets/program.hpp describes. A zero
+	// header count suppresses loop retirement/budget replenishment for this
+	// manual ideal control only. The full program is entered once and exits once.
+	std::array<std::uintptr_t, header + 2> terminal{
+		pc + 72, 0, reinterpret_cast<std::uintptr_t>(uml_arm64_gadget_interrupt), pc + 72};
 	g::BlockLink loop{.guest_pc = pc};
-	g::BlockLink end{.stream = terminal.data(), .instruction_count = 0, .guest_pc = pc + 72};
+	g::BlockLink end{.guest_pc = pc + 72, .entry = terminal[header], .stream = terminal.data() + header + 1};
 	std::array<std::optional<g::Program>, 2> variants;
 	std::optional<g::Program> program;
+	// The loop's target: the selected program's words behind a header.
+	std::vector<std::uintptr_t> looped;
 	alignas(128) a::CpuState cpu;
 	uml::memory::Tlb tlb;
 	std::size_t changed_words{};
@@ -97,17 +104,23 @@ struct Workload final {
 			std::string_view{description.name} == "mixed_twochain")
 			require(changed_words == 0, "independent control has a changed stream");
 		program.emplace(*variants[0]);
-		loop.stream = program->words().data();
-		// Suppress loop retirement/budget replenishment for this manual ideal
-		// control only. The full program is entered once and exits once.
-		loop.instruction_count = 0;
+		looped.assign(header + off.size(), 0);
+		looped[0] = pc;
+		select(false);
 	}
 	void select(bool forwarding)
 	{
-		// ProgramWords copy assignment reuses the existing allocation. Only
-		// stream data changes, before timing; CPU, TLB and link addresses match.
+		// ProgramWords copy assignment reuses the existing allocation, as does
+		// the copy into the loop's words. Only stream data changes, before
+		// timing; CPU, TLB and link addresses match.
+		const auto *before = program->words().data();
 		*program = *variants[forwarding];
-		require(program->words().data() == loop.stream, "stream allocation moved");
+		const auto words = program->words();
+		require(words.data() == before && words.size() + header == looped.size(),
+			"stream allocation moved");
+		std::copy(words.begin(), words.end(), looped.begin() + header);
+		loop.entry = looped[header];
+		loop.stream = looped.data() + header + 1;
 	}
 	a::CpuState run(std::uint64_t iterations, const Registers &input)
 	{

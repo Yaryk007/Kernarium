@@ -11,7 +11,7 @@ both gadget engines is [`NOTICE.md`](../../arm64/gadgets/NOTICE.md).
 | Path | Role |
 | --- | --- |
 | `engine.S`, `engine/*.inc` | The gadgets. `engine/region.inc` places every group. |
-| `engine/generate_baked.py` | Writes the register-baked scalar bank (`baked_scalar.inc`) at build time. |
+| `engine/generate_baked.py` | Writes the register-baked scalar bank at build time: `baked_scalar.inc`, and `baked_tail.inc` for the families behind the last group. |
 | `engine/fit_slots.py` | Reports the groups that no longer fit their slot. |
 | `native_builder.cpp`, `native_baked.hpp`, `native_entry.hpp` | Turn decoded instructions into streams. |
 | `executor.cpp`, `program.cpp`, `translation_body.hpp`, `translation_space.*` | The translation cache, its sharing and its budget. |
@@ -53,11 +53,19 @@ rejects.
   128-byte line. Setting those rows' slots moves later groups by whole lines
   and keeps their phase, so the commit says which slots grew and needs no pad
   control ([optimization history](../../../../docs/optimization-history.md)).
-- A phase never changes. A new group takes a new row with phase 0: a new
-  `engine/*.inc` file's at the end of the table, a new baked family's after the
-  last baked one.
+- A phase never changes. A new group takes a new row with phase 0, in the
+  order `engine.S` emits it: a family the generator writes to
+  `baked_scalar.inc` after the last of those; a new `engine/*.inc` file's after
+  the last of those, in front of the tail families, which then move by whole
+  lines and keep their phase; and a family the generator writes to
+  `baked_tail.inc` after the last tail group, `baked_compare_branch` being the
+  first. The tail families end the table, so a new one moves no other bank
+  group; the cold part starts on the first page after the bank's slots and
+  moves by whole pages.
 - A call to a helper outside the engine is a `helper_call`, and a new helper
-  is appended to the island's list in `engine/common.inc`.
+  is appended to the island's list in `engine/common.inc`. The helper may
+  overwrite x0 to x17, so no gadget keeps a value in x2 to x17 across the call
+  (`x86-64-gadget-helper-clobbers`).
 
 ## Gadget banks
 
@@ -83,10 +91,19 @@ tail and resolves the same address.
   instruction from the stream pointer on a fault.
 - A block ends at an unconditional transfer or at the 64-instruction fetch
   window, not at its first conditional branch. A cached link names its target
-  by a stream pointer and an instruction count, one aligned pair that a single
-  paired store replaces; the guest bounds of a stream sit in the two words in
-  front of it, loaded at `[stream, #-16]`. `x86-64-gadget-link-layout` holds the
-  layout.
+  by the target's first entry and its stream past that entry, one aligned pair
+  that a single paired store replaces, so a follow branches on the pair alone.
+  In front of the stream a pair names sit the target's instruction count, its
+  guest bounds and the first entry (`link_header` in `program.hpp`): a body's
+  own, or an unlinked record's, whose entry is `link_exit`.
+  `x86-64-gadget-link-layout` holds the layout.
+- In long64 code with the baked bank on, a register CMP or TEST against an
+  immediate or a register at 32 or 64 bits and the conditional branch right
+  after it are one baked entry when the branch takes its inline form (its
+  fall-through follows it and its target has a link), for every condition but
+  parity and, after TEST, the four that read the carry (B, AE, BE, A). The
+  branch then has no stream word, and a stream built without links keeps the
+  two apart.
 - A dispatch's instruction budget bounds how long it runs, not where a block
   stops: the block that crosses it runs to its end. Only a single step and the
   instruction a POPF or IRET setting TF leaves before its trap ask for an exact
@@ -103,7 +120,11 @@ tail and resolves the same address.
 - The deferred-flag record (`DeferredFlagOperation`, `CpuState::carry_slot`) is
   read by assembly and C++ materializers that must agree. A producer that
   leaves host NZCV lets the next SETcc, CMOVcc or Jcc read it, and the deferred
-  record is always written as well.
+  record is written as well, but for one case: in long64 with the baked bank
+  on, a register-only ADD, SUB, AND, OR or XOR at 32 or 64 bits whose next
+  instruction in the block is a register-only ADD, SUB, AND, OR, XOR, CMP or
+  TEST writes neither, since that instruction writes the whole record before
+  anything can read it.
 
 ## Guest-visible model
 
@@ -121,11 +142,20 @@ tail and resolves the same address.
   not run. In compatibility mode FS and GS accesses check their limit, and a
   task whose ES, SS or DS is not flat writable data steps one instruction at a
   time; long-mode code pays for none of it.
+- An instruction whose store faults has changed no flag, x87 status bit,
+  MXCSR flag, register or stack pointer, apart from the elements a repeated
+  string instruction had stored. A gadget commits its results after the
+  store, and one whose helper raises status first keeps what it would change
+  and puts it back at the fault exit. An exit for the runtime's exact segment
+  check, which runs the instruction again, has changed none of it either. The
+  `--retirement` rows of the corpus runner hold it.
 - The engine runs only on hosts with FEAT_LSE2, which the runtime checks once.
   A locked operand inside one 16-byte granule keeps the exclusive loop; one
   across a granule or a page runs under the process-wide `split_operand_lock`
   (`../split_operand_lock.hpp`), which is atomic only against other operands on
-  that path.
+  that path. A split CMPXCHG whose compare fails writes nothing back, because
+  another vCPU's plain store may have landed since the read; it checks write
+  access to each page instead.
 - Every gadget that touches guest memory leaves through a `dmb ish`, because
   x86 promises total store order and full-fence LOCK and XCHG. `translate`,
   `stack_fast` and the bulk-helper macros mark their gadget
@@ -134,11 +164,33 @@ tail and resolves the same address.
 - A translation may miss and a miss is a call that does not save host vector
   registers, so a gadget may not hold a guest value in one across its own
   translation. This is also why vector result forwarding takes register forms
-  only.
-- The software TLB is direct-mapped. `native_tlb_entry_count` in
-  `../software_tlb.hpp` is the one constant; the three assembly copies of the
-  index (`translate` and `translate_plain` in `engine/common.inc`, and the
-  baked entries in `engine/generate_baked.py`) must change with it.
+  only. The corpus CTest `x86-64-instruction-corpus-clobbered-calls` holds it:
+  every call into the address space leaves garbage in the caller-saved
+  registers.
+- The software TLB is direct-mapped and indexed by the low
+  `UML_X86_64_TLB_INDEX_BITS` bits of the page number
+  (`../layout/assembly_offsets.h`); `native_tlb_index` in
+  `../software_tlb.hpp` and the three assembly copies of the index
+  (`translate` and `translate_plain` in `engine/common.inc`, and the baked
+  entries in `engine/generate_baked.py`) all read that constant. A
+  translation compares the page of its access's last byte, and an index that
+  never puts neighbouring pages in one entry is what makes every access that
+  crosses a page miss and take its crossing path.
+- x22 (`_tlb` in `engine/common.inc`) holds the run's software-TLB base:
+  `uml_x86_64_gadget_enter` loads it from the context, the host frame gives
+  the caller its own back, and no gadget writes it
+  (`x86-64-gadget-tlb-register`).
+- A stack access first re-checks the entry that the run's last stack
+  translation used (`stack_fast`): PUSH, POP, CALL and RET, and the stack twin
+  that the baked tables name in place of every fused [rsp + displacement]
+  entry. A run starts at the entry of RSP's page. A hit needs the entry's exact
+  tag, so it is that page's own entry and retires with it, and a store hits
+  only an entry with no code bit, which a page holding code and a frame held
+  at another address both set, while the run's `write_code` is clear, so it
+  keeps the overlap test and skips the publication test. A twin hits only an
+  access aligned to its size, which cannot cross a page. A crossing or
+  misaligned access or another page takes the ordinary translation, and only
+  the stack instructions' misses move the entry.
 
 ## Floating-point environment
 
@@ -194,12 +246,48 @@ Known deviations from x86 that remain:
 
 - [`../code_page_registry.hpp`](../code_page_registry.hpp) keeps, per
   address-space generation, the set of pages in which any executor holds a
-  translation. A store publishes a code change only when its page is in that
-  set, which keeps publication precise under READ_IMPLIES_EXEC. A participant
-  with another TLB layout, such as the x86-64 JIT, joins with a function that
-  retires its own entry for a page. A page enters the set before any
-  translation built from it is handed out, and every participating executor's
-  write-side TLB entry for it is retired before the registration returns.
+  translation. A store publishes a code change at its own page only when that
+  page is in that set (a store through a writable alias also publishes at the
+  other holders of its frame), which keeps publication precise under
+  READ_IMPLIES_EXEC. A participant with another TLB layout, such as the x86-64
+  JIT, joins with a function that retires its own entry for a page. A page
+  enters the set before any translation built from it is handed out, and every
+  participating executor's write-side TLB entry for it is retired before the
+  registration returns. A registration waits at most one second for a
+  participant that is still inside the engine, and says so once; the page then
+  stays unsettled for as long as that participant stays inside, and the gadget
+  engine builds the translation of an unsettled page again at every dispatch
+  instead of caching it.
+- The memory layer accounts the writer locations and the holders of each frame
+  ([`docs/architecture.md`](../../../../docs/architecture.md#x86-64-frame-accounting)).
+  A translator that registers a frame retires the write translations of the
+  writer locations the registration names.
+- A translation is built and validated only from a frame its generation holds:
+  the executor registers the frame at the page's location before it reads a
+  byte, and caches nothing from a page whose registration did not settle: an
+  unsettled, failed or refused one gives a transient program, one instruction
+  when no holder stands, never cached and rebuilt at the next dispatch (a
+  refused first page, one that is not a code page or whose generation is
+  gone, runs that one instruction and no more). Every body records the generation's
+  flush serial with its page stamps, so a flush of the generation makes a
+  body compare its source and register again though no stamp moved.
+  The executor remembers the last settled registration of a page and skips
+  the address-space call while the generation's mappings are unchanged, its
+  flush serial is the one it was taken at, and the frame's change count has
+  not moved. A holder added to the frame, and its writers becoming unknown,
+  move the count; an unsettled, failed, refused or global registration is
+  never remembered ([`../registration_memo.hpp`](../registration_memo.hpp)).
+- A write fill is tagged when its frame has a holder at another location,
+  whether or not the page it fills is executable, and a store through that
+  entry publishes at every holder: the holders in this generation cool their
+  blocks, those in another generation are published in theirs. A store that
+  writes, through such an alias, into the block that is running leaves the
+  block after the store, as a store at the block's own address does, whatever
+  instruction stored: an ordinary or baked store, PUSH and CALL, a store across
+  a page, a vector, x87 or bulk store, a string store, ENTER, an extended-state
+  save and the segment model's SLDT and STR. A helper that stores and
+  publishes itself records the store's reach in the run, and the instruction's
+  epilogue leaves on it.
 - Every store to a page that holds cached code owes a publication of its own,
   and the program performs it before its next store: another vCPU may
   revalidate the page between two stores, so a program that patches a page
@@ -217,7 +305,10 @@ moves the page stamp, then moves the code-change sequence; a reader observes
 the sequence before it looks. A store still in flight reaches the vCPU at its
 next code-change checkpoint (a system call, CPUID or IRET), which leaves the
 native run so the runtime revalidates what it selects next. A moved mapping
-sequence or a raised execution interrupt abandons a validation.
+sequence or a raised execution interrupt abandons a validation. A code-change
+range of length 0 is the whole address space, and a change the ring cannot
+describe is treated alike: every body's link records are reset, since no stamp
+guards a link.
 
 ### Sharing and budget
 
@@ -235,7 +326,8 @@ sequence or a raised execution interrupt abandons a validation.
   reuses a generation number.
 - Each address space charges an account in the gadget engines' process-wide
   byte budget (`cpu/gadget_cache_budget.hpp`,
-  [`darwin/README.md`](../../../README.md)); an account asked to shed is let go
+  [`darwin/README.md`](../../../README.md)); a run's first block tells the
+  account the address space was entered, and an account asked to shed is let go
   of at the executor's next run.
 
 `UML_GADGET_CACHE_CENSUS=ON` builds record what each cache holds in the arm64

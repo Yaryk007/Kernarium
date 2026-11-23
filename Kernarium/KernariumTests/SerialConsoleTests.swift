@@ -186,7 +186,14 @@ struct SerialConsoleTests {
         // A multi-byte character split across two chunks.
         controller.receive(wide.prefix(2))
         controller.receive(wide.dropFirst(2))
-        let overwrite = Data(("\r" + String(repeating: "=", count: 40)).utf8)
+        // Output that arrives before the view exists is replayed into the
+        // terminal's first grid, which is the device's own (27 columns by 9
+        // rows on an iPhone, 41 by 14 on an iPad) and which the view's layout
+        // resizes a moment later. A line of filler wider than that grid wraps,
+        // so each repeat would scroll the screen and take the first line off
+        // it: the filler is no wider than the first line, which needs 26
+        // columns itself.
+        let overwrite = Data(("\r" + String(repeating: "=", count: 20)).utf8)
         var filler = Data()
         while filler.count <= 3 << 19 {
             filler.append(overwrite)
@@ -196,17 +203,20 @@ struct SerialConsoleTests {
 
         let console = try host(controller)
         defer { console.remove() }
-        controller.receive(Data("\u{1b}[10;5HPOSITIONED\r\n".utf8))
+        // The position is one the first grid has the rows for as well as the
+        // layout's, so where the output lands does not depend on which grid
+        // is there when the terminal handles it.
+        controller.receive(Data("\u{1b}[5;5HPOSITIONED\r\n".utf8))
 
         let lines = try await viewportLines(of: controller, once: "POSITIONED")
-        try #require(lines.count >= 10)
+        try #require(lines.count >= 5)
         #expect(
             lines[0].trimmingCharacters(in: .whitespaces) ==
                 "FIRST red \u{2713} \u{fc}n\u{ef}c\u{f8}d\u{e9} " +
                 "\u{65e5}\u{672c}\u{8a9e}"
         )
         #expect(lines[1].trimmingCharacters(in: .whitespaces) == "BEFORE-ATTACH")
-        #expect(lines[9].hasPrefix("    POSITIONED"))
+        #expect(lines[4].hasPrefix("    POSITIONED"))
     }
 
     @Test(.timeLimit(.minutes(1)))

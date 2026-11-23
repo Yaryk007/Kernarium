@@ -119,10 +119,11 @@ public:
         words_.insert(words_.end(), payload.begin(), payload.end());
     }
 
-    [[nodiscard]] int submit(VirglRenderer& renderer)
+    [[nodiscard]] int submit(
+        VirglRenderer& renderer, std::uint32_t context = contextId)
     {
         const int result = renderer.submit(
-            contextId,
+            context,
             {reinterpret_cast<const std::uint8_t*>(words_.data()),
                 words_.size() * sizeof(std::uint32_t)});
         words_.clear();

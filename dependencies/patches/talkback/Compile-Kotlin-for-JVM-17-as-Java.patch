@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Abdulmajeed Almarzoqi <abdulmjad01@gmail.com>
+Date: Tue, 10 Nov 2026 06:31:41 +0300
+Subject: [PATCH] Compile Kotlin for JVM 17, as Java
+
+Without a target, Kotlin compiles for the JDK that runs Gradle, and the
+Android Gradle plugin refuses a Kotlin target that differs from Java's 17.
+---
+ build.gradle | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/build.gradle b/build.gradle
+index dcd26f0a88e5e431c5918a2d35158b5e30465c42..eccbddeee2aaca43d36c883317c2faf4cc92158c 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -37,6 +37,10 @@ allprojects {
+         mavenCentral()
+         google()
+     }
++    // Java compiles for 17; Kotlin would follow the JDK running Gradle.
++    tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile).configureEach {
++        kotlinOptions { jvmTarget = "17" }
++    }
+ }
+ 
+ android {

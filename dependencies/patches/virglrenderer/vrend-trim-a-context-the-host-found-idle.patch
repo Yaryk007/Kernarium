@@ -101,7 +101,7 @@ index 88372ec8bc0b688810895001081f6d9d20bd5ff4..2b9c5dab5e96c54f71940a69aebe475b
   * mapping is owned by the caller and is its responsibility to unmap
   * the resource by its own means (i.e. overriding the map with
 diff --git a/src/vrend/vrend_decode.c b/src/vrend/vrend_decode.c
-index 75b4a818376aadee69e98a799e1d1d1ba63b0c30..1f7f600bc93226e680184e1217639c7ad01e4153 100644
+index 68ffdc6cbf51ba88da4a9c7410a5c8a85624ec54..4a45f64140cb16c3c1f14a71b98ef56c3a2f5464 100644
 --- a/src/vrend/vrend_decode.c
 +++ b/src/vrend/vrend_decode.c
 @@ -1700,6 +1700,13 @@ static void vrend_decode_ctx_detach_resource(struct virgl_context *ctx,
@@ -118,17 +118,17 @@ index 75b4a818376aadee69e98a799e1d1d1ba63b0c30..1f7f600bc93226e680184e1217639c7a
  static int vrend_decode_ctx_transfer_3d(struct virgl_context *ctx,
                                          struct virgl_resource *res,
                                          const struct vrend_transfer_info *info,
-@@ -2216,4 +2223,5 @@ static void vrend_decode_ctx_init_base(struct vrend_decode_ctx *dctx,
+@@ -2220,4 +2227,5 @@ static void vrend_decode_ctx_init_base(struct vrend_decode_ctx *dctx,
     ctx->get_fencing_fd = vrend_decode_ctx_get_fencing_fd;
     ctx->retire_fences = vrend_decode_ctx_retire_fences;
     ctx->submit_fence = vrend_decode_ctx_submit_fence;
 +   ctx->trim = vrend_decode_ctx_trim;
  }
 diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
-index 3423fe7f586d39713e3b91fde8df1d5672bc2247..20af151e94d97a840bf70cb3e0be0f4148af1031 100644
+index 257f1986718c13bd46bfe08fef0b6fd848d83bb0..981e775cbcd414b85b522624f50bb7da623d8f11 100644
 --- a/src/vrend/vrend_renderer.c
 +++ b/src/vrend/vrend_renderer.c
-@@ -13217,6 +13217,38 @@ bool vrend_hw_switch_context(struct vrend_context *ctx, bool now)
+@@ -13417,6 +13417,38 @@ bool vrend_hw_switch_context(struct vrend_context *ctx, bool now)
     return true;
  }
  
@@ -168,7 +168,7 @@ index 3423fe7f586d39713e3b91fde8df1d5672bc2247..20af151e94d97a840bf70cb3e0be0f41
  {
     if (ctx->ctx_switch_pending == false)
 diff --git a/src/vrend/vrend_renderer.h b/src/vrend/vrend_renderer.h
-index 5589b218a457645d6d341f879ae49f393bd9aabd..b520f319ba1c8062c0b0c3a042e0ae6cd725814e 100644
+index 73c0b43737f92501aa7090f7b6805addbc5bf12a..07d80e63002b023266dbaa358c5076c057313eea 100644
 --- a/src/vrend/vrend_renderer.h
 +++ b/src/vrend/vrend_renderer.h
 @@ -593,6 +593,9 @@ void vrend_renderer_get_rect(struct pipe_resource *pres,

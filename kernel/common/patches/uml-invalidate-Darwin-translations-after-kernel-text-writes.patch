@@ -17,9 +17,10 @@ copy_to_user_page() calls flush_icache_user_page() after the copy, which
 is where arm64 synchronises its instruction cache for the same reason.
 process_vm_writev() had no such hook; it now calls
 flush_icache_remote_user_range(), a no-op on every other architecture.
-On Darwin both ask the host to move the page's code stamp and publish the
-range in the target mm's generation; the host skips pages mapped without
-execute permission, so data transfers publish nothing. This adds
+On Darwin both ask the host to move the page's code stamp and publish
+the range to each process that translated the frame, and to every
+process when the host cannot tell which did; a transfer into memory
+no process translated publishes nothing. This adds
 darwin_uml_vm_invalidate_code() to the bridge, version 11.
 ---
  arch/um/include/asm/cacheflush.h            | 20 ++++++++++++++++++++

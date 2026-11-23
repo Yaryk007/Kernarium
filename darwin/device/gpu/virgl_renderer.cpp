@@ -3,7 +3,9 @@
 #include "virgl_renderer.hpp"
 
 #include "device_memory_pool.hpp"
+#include "freed_memory_watch.hpp"
 #include "host_gl_provider.hpp"
+#include "gpu_cache_reclaim.hpp"
 #include "gpu_memory_figures.hpp"
 #include "host_gpu_memory.hpp"
 #include "protocol.hpp"
@@ -56,11 +58,7 @@ constexpr auto defaultIdleTrim = std::chrono::milliseconds(1000);
 
 [[nodiscard]] std::optional<std::chrono::milliseconds> idleTrimInterval()
 {
-#ifdef UML_APP_STORE_RUNTIME
-    const char* const text = nullptr;
-#else
     const char* const text = std::getenv("UML_GPU_IDLE_TRIM_MS");
-#endif
     if (text == nullptr || *text == '\0')
         return defaultIdleTrim;
     char* end = nullptr;
@@ -90,6 +88,13 @@ std::atomic<void*> memoryRefusalObserverData;
 // Who is told how much device memory each Venus context holds; the same rule.
 std::atomic<VirglRenderer::MemoryAccountObserver> memoryAccountObserver;
 std::atomic<void*> memoryAccountObserverData;
+// Who decides whether a refused Venus allocation waits; the same rule.
+std::atomic<VirglRenderer::MemoryWaitObserver> memoryWaitObserver;
+std::atomic<VirglRenderer::MemoryWaitedObserver> memoryWaitedObserver;
+std::atomic<void*> memoryWaitObserverData;
+// What the guest has freed, for the pool's reclaim hook; the account callback
+// below feeds it.
+FreedMemoryWatch guestFrees;
 // Guards the pool's address for the readers of its figures: a statistics read
 // from any thread must not meet a renderer that is going.
 std::mutex deviceMemoryReadMutex;
@@ -119,9 +124,29 @@ void deviceMemoryRefused(void*) noexcept
     }
 }
 
+bool deviceMemoryWait(void*, std::uint32_t contextId, std::uint64_t size,
+    std::uint32_t attempt) noexcept
+{
+    const auto observer = memoryWaitObserver.load(std::memory_order_acquire);
+    return observer != nullptr &&
+        observer(memoryWaitObserverData.load(std::memory_order_relaxed),
+            contextId, size, attempt);
+}
+
+void deviceMemoryWaited(void*, std::uint32_t, bool admitted) noexcept
+{
+    if (const auto observer =
+            memoryWaitedObserver.load(std::memory_order_acquire)) {
+        observer(
+            memoryWaitObserverData.load(std::memory_order_relaxed), admitted);
+    }
+}
+
 void deviceMemoryAccounted(
     void*, std::uint32_t contextId, std::int64_t delta) noexcept
 {
+    if (delta < 0)
+        guestFrees.noteFreed(static_cast<std::uint64_t>(-delta));
     if (const auto observer =
             memoryAccountObserver.load(std::memory_order_acquire)) {
         observer(
@@ -132,8 +157,7 @@ void deviceMemoryAccounted(
 }
 #endif
 
-/* The capability report is a diagnostic an App Store runtime does not carry. */
-#ifndef UML_APP_STORE_RUNTIME
+/* The capability report is a diagnostic, off unless the variable is 1. */
 [[nodiscard]] bool capabilityReportEnabled() noexcept
 {
     const char* value = std::getenv("UML_GPU_CAPABILITY_REPORT");
@@ -229,7 +253,6 @@ void reportCapset(
         "UML_GPU_CAPSET_END|id=" + std::to_string(identifier) +
         "|chunks=" + std::to_string(chunks) + "\n");
 }
-#endif
 
 void unavailableGlEntryPoint()
 {
@@ -375,6 +398,10 @@ VirglRenderer::VirglRenderer()
                 },
                 deviceMemoryReserveBytes);
             uml::platform::publishGpuMemoryBudget(limit);
+            /* The runtime frees the same caches when the system says it is
+             * short of memory. */
+            uml::platform::publishGpuCacheReclaimer(
+                &VirglRenderer::reclaimCachedMemory);
             /* A Venus guest is shown, and budgets, what the pool admits. */
             const virgl_renderer_device_memory_pool pool {
                 .limit = deviceMemoryPool->ceiling(),
@@ -384,6 +411,8 @@ VirglRenderer::VirglRenderer()
                 .release = &releaseDeviceMemory,
                 .refused = &deviceMemoryRefused,
                 .account = &deviceMemoryAccounted,
+                .wait = &deviceMemoryWait,
+                .waited = &deviceMemoryWaited,
             };
             virgl_renderer_set_device_memory_pool(&pool);
         } else {
@@ -414,14 +443,26 @@ VirglRenderer::VirglRenderer()
         }
         if (deviceMemoryPool) {
             /* A refused reservation first frees what the host GL driver
-             * caches. The hook reaches this renderer's provider, so it is
+             * caches, and has Metal give back the footprint of the heaps that
+             * were freed. The hook reaches this renderer's provider, so it is
              * cleared before the provider goes. */
+            guestFrees.reset();
             deviceMemoryPool->setReclaim(
                 [provider = provider_.get()]() -> std::uint64_t {
-                    return provider->releaseCachedMemory();
+                    const std::uint64_t released =
+                        provider->releaseCachedMemory();
+                    /* The decision that follows reads the footprint at once,
+                     * so when something was freed the retire is given the
+                     * moment it takes; a refusal with nothing to give back
+                     * fails at once. */
+                    const bool freed = guestFrees.freedSinceLastCall(
+                        released, virgl_renderer_get_resident_heap_memory());
+                    uml::platform::retireFreedGpuMemory(
+                        freed ? std::chrono::milliseconds {10}
+                              : std::chrono::milliseconds {});
+                    return released;
                 });
         }
-#ifndef UML_APP_STORE_RUNTIME
         if (capabilityReportEnabled()) {
             // vrend asks for 4.6 first, the core context this provider serves.
             reportContextProbe(provider_->probeContext(4, 6));
@@ -431,14 +472,15 @@ VirglRenderer::VirglRenderer()
             reportCapset(venusCapsetId, capset(venusCapsetId));
 #endif
         }
-#endif
     } catch (...) {
         {
             std::lock_guard lock(deviceMemoryReadMutex);
             deviceMemoryReadable = false;
         }
-        if (deviceMemoryPool)
+        if (deviceMemoryPool) {
             deviceMemoryPool->setReclaim({});
+            uml::platform::publishGpuCacheReclaimer(nullptr);
+        }
         if (initialized)
             virgl_renderer_cleanup(this);
         rendererInstanceActive.store(false, std::memory_order_release);
@@ -464,6 +506,20 @@ void VirglRenderer::setMemoryAccountObserver(
     memoryAccountObserverData.store(data, std::memory_order_relaxed);
     if (observer != nullptr)
         memoryAccountObserver.store(observer, std::memory_order_release);
+}
+
+void VirglRenderer::setMemoryWaitObserver(MemoryWaitObserver wait,
+    MemoryWaitedObserver waited, void* data) noexcept
+{
+    if (wait == nullptr) {
+        memoryWaitObserver.store(nullptr, std::memory_order_release);
+        memoryWaitedObserver.store(nullptr, std::memory_order_release);
+    }
+    memoryWaitObserverData.store(data, std::memory_order_relaxed);
+    if (wait != nullptr) {
+        memoryWaitedObserver.store(waited, std::memory_order_release);
+        memoryWaitObserver.store(wait, std::memory_order_release);
+    }
 }
 
 std::optional<VirglRenderer::DeviceMemory> VirglRenderer::deviceMemory() noexcept
@@ -492,6 +548,7 @@ VirglRenderer::~VirglRenderer()
     // they report is wanted after that.
     setMemoryRefusalObserver(nullptr, nullptr);
     setMemoryAccountObserver(nullptr, nullptr);
+    setMemoryWaitObserver(nullptr, nullptr, nullptr);
     {
         // A reader of the pool's figures that is inside the pool finishes
         // first, and none starts after this.
@@ -504,8 +561,10 @@ VirglRenderer::~VirglRenderer()
     /* The pool is the renderer's: nothing the cleanup left can reach it, and
      * the guest that comes after this one starts with nothing reserved. */
     virgl_renderer_set_device_memory_pool(nullptr);
-    if (deviceMemoryPool)
+    if (deviceMemoryPool) {
+        uml::platform::publishGpuCacheReclaimer(nullptr);
         uml::platform::publishGpuMemoryBudget(0);
+    }
     deviceMemoryPool.reset();
     rendererInstanceActive.store(false, std::memory_order_release);
 }
@@ -594,8 +653,11 @@ void VirglRenderer::destroyContext(std::uint32_t contextId) noexcept
     virgl_renderer_context_destroy(contextId);
     try {
         idleContexts_.remove(contextId);
-        // Destroying a context deletes the textures only it held.
-        idleContexts_.noteRelease(ContextIdleTracker::Clock::now());
+        // Destroying a context deletes the textures only it held, and leaves
+        // the driver caching what they and its batches used.
+        const auto now = ContextIdleTracker::Clock::now();
+        idleContexts_.noteRelease(now);
+        idleContexts_.noteDestroyed(now);
         std::lock_guard lock(mutex_);
         std::erase_if(
             retiredContextFences_,
@@ -1255,12 +1317,20 @@ void VirglRenderer::trimIdleContexts() noexcept
     if (!idleTrimEnabled_)
         return;
     try {
-        for (const auto contextId : idleContexts_.takeIdle(
-                 ContextIdleTracker::Clock::now())) {
+        const auto now = ContextIdleTracker::Clock::now();
+        for (const auto contextId : idleContexts_.takeIdle(now)) {
             virgl_renderer_context_trim(contextId);
             // A missing GL entry point is reported through the next call that
             // checks; trimming has no result to carry it.
             (void)checkGlDispatchResult(0);
+        }
+        // The contexts have released what a destroyed context's resources
+        // held; the driver's caches keep it until they are asked, and no
+        // guest that is not allocating asks. The footprint of the heaps the
+        // release freed stays until Metal is asked to retire it.
+        if (idleContexts_.takeRelease(now)) {
+            (void)provider_->releaseCachedMemory();
+            uml::platform::retireFreedGpuMemory();
         }
     } catch (...) {
         // Never carry a C++ exception through the C renderer API.

@@ -13,8 +13,7 @@ gadget \name\()_\width\()_r
 gadget \name\()_\width\()_m
 	effective_address
 	mov x25, x7
-	page_cross_check (\width / 8), Lx86_divide_read_cross\@
-	translate 0, UML_X86_64_TLB_READ_PAGE, (\width / 8)
+	translate 0, UML_X86_64_TLB_READ_PAGE, (\width / 8), cross=Lx86_divide_read_cross\@
 	\load \host_register\()15, [x7]
 	/* The shared tail belongs to the register form and carries no barrier. */
 	x86_memory_order_boundary
@@ -220,7 +219,7 @@ Lx86_divide_signed_store:
 
 .p2align 4
 Lx86_divide_trap:
-	instruction_rip x22
-	str x22, [_vcpu, #UML_X86_64_CPU_RIP]
+	instruction_rip x8
+	str x8, [_vcpu, #UML_X86_64_CPU_RIP]
 	mov w0, #UML_X86_64_EVENT_FLOATING_POINT_TRAP
 	b uml_x86_64_gadget_leave

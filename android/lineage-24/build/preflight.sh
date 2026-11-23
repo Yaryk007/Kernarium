@@ -7,6 +7,7 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 ROOT_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/../../.." && pwd)
 AOSP_METADATA="$ROOT_DIR/android/lineage-24/metadata/lineage.env"
 MESA_VENUS_VERIFIER="$ROOT_DIR/android/lineage-24/tools/verify-mesa-venus-source.py"
+ACCESSIBILITY_VERIFIER="$ROOT_DIR/android/lineage-24/tools/verify-accessibility-source.py"
 
 AOSP_SOURCE=
 DARWIN_SDK=
@@ -96,6 +97,8 @@ absolute_path "AOSP source" "$AOSP_SOURCE"
 [ -f "$AOSP_METADATA" ] || fail "missing AOSP metadata: $AOSP_METADATA"
 [ -x "$MESA_VENUS_VERIFIER" ] ||
 	fail "missing Mesa Venus source verifier: $MESA_VENUS_VERIFIER"
+[ -x "$ACCESSIBILITY_VERIFIER" ] ||
+	fail "missing accessibility source verifier: $ACCESSIBILITY_VERIFIER"
 # shellcheck disable=SC1090
 . "$AOSP_METADATA"
 
@@ -116,6 +119,8 @@ if [ -n "$dirty_projects" ]; then
 	fail "AOSP Repo workspace has dirty projects: $dirty_projects"
 fi
 "$MESA_VENUS_VERIFIER" --android-root "$ROOT_DIR/android/lineage-24" \
+	--aosp-source "$AOSP_SOURCE"
+"$ACCESSIBILITY_VERIFIER" --android-root "$ROOT_DIR/android/lineage-24" \
 	--aosp-source "$AOSP_SOURCE"
 
 if [ "$SOURCE_ONLY" -eq 1 ]; then

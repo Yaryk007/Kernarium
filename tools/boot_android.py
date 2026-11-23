@@ -19,6 +19,7 @@ __import__("sys").dont_write_bytecode = True
 import argparse
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import signal
@@ -61,6 +62,10 @@ DEFAULT_INSTANCE = INSTANCES_ROOT / "android-17"
 # The signals that ask the emulator to stop, each with its grace period,
 # before it is killed.
 GUEST_STOP_STAGES = ((signal.SIGINT, 10), (signal.SIGTERM, 5))
+# Below this a value cannot be a guest's memory, whatever its unit: it is
+# a number of megabytes or gigabytes given as bytes.
+MINIMUM_GUEST_MEMORY = 64 * 1024 * 1024
+_SIZE_UNIT_SHIFTS = {"k": 10, "m": 20, "g": 30, "t": 40, "p": 50, "e": 60}
 
 
 class LauncherError(RuntimeError):
@@ -73,6 +78,45 @@ class RequestedShutdown(Exception):
         self.signum = signum
 
 
+def kernel_memory_size(text: str) -> tuple[int, bool]:
+    """The size the kernel reads from `mem=<text>`, and whether it had a unit.
+
+    The kernel's memparse() reads digits in the base their prefix names (0x
+    hexadecimal, 0 octal, else decimal), then one K, M, G, T, P or E suffix in
+    either case, and ignores the rest. A number without a suffix is bytes.
+    """
+    mask = (1 << 64) - 1
+    hexadecimal = "0123456789abcdef"
+    base, index = 10, 0
+    if text.startswith("0"):
+        base = 8
+        if len(text) >= 3 and text[1] in "xX" and text[2].lower() in hexadecimal:
+            base, index = 16, 2
+    value = 0
+    while index < len(text) and text[index].lower() in hexadecimal[:base]:
+        value = (value * base + int(text[index], 16)) & mask
+        index += 1
+    shift = _SIZE_UNIT_SHIFTS.get(text[index : index + 1].lower())
+    if shift is None:
+        return value, False
+    return (value << shift) & mask, True
+
+
+def guest_memory_problem(text: str) -> str | None:
+    """Why `text` cannot be a guest's memory, or None if it can."""
+    size, has_unit = kernel_memory_size(text)
+    if size >= MINIMUM_GUEST_MEMORY:
+        return None
+    if not (text[:1].isascii() and text[:1].isdigit()):
+        return "is not a size; give a number with a unit, K, M or G (for example 4G)"
+    if has_unit:
+        return f"is {size} bytes; a guest needs at least 64M"
+    return (
+        f"is {size} bytes, because the kernel reads a number without a unit as "
+        "bytes; give a unit, K, M or G (for example 4096M or 4G)"
+    )
+
+
 def positive_integer(value: str) -> int:
     try:
         parsed = int(value)
@@ -81,6 +125,26 @@ def positive_integer(value: str) -> int:
     if parsed <= 0:
         raise argparse.ArgumentTypeError("must be greater than zero")
     return parsed
+
+
+def serial_number(value: str) -> str:
+    """A serial the guest can have: the platform's own form, and not "unknown"."""
+    if re.fullmatch(r"[0-9A-Za-z]{6,20}", value) is None or value.lower() == "unknown":
+        raise argparse.ArgumentTypeError(
+            "must be 6 to 20 letters and digits, and not 'unknown'"
+        )
+    return value
+
+
+def unicast_mac(value: str) -> str:
+    """A hardware address aa:bb:cc:dd:ee:ff whose group bit is clear and that
+    is not all zero, in the emulator's spelling."""
+    if re.fullmatch(r"[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}", value) is None:
+        raise argparse.ArgumentTypeError("must be aa:bb:cc:dd:ee:ff")
+    octets = [int(part, 16) for part in value.split(":")]
+    if octets[0] & 1 or not any(octets):
+        raise argparse.ArgumentTypeError("must be a unicast address")
+    return value.lower()
 
 
 def port_number(value: str) -> int:
@@ -124,8 +188,29 @@ def parse_arguments(arguments: Sequence[str] | None = None) -> argparse.Namespac
         "--instance",
         type=Path,
         help=(
-            "directory of the guest instance: its data.img, instance.json and "
-            "update snapshot (default: android-17 below .build/android/instances)"
+            "directory of the guest instance: its data.img, instance.json, "
+            "identity.json and update snapshot (default: android-17 below "
+            ".build/android/instances)"
+        ),
+    )
+    parser.add_argument(
+        "--serialno",
+        type=serial_number,
+        help=(
+            "the guest's serial number, 6 to 20 letters and digits, for a run "
+            "that must have a fixed one; the instance's identity file is then "
+            "neither read nor written, and the eth0 address stays the user "
+            "network's default unless --eth-mac gives one"
+        ),
+    )
+    parser.add_argument(
+        "--eth-mac",
+        type=unicast_mac,
+        metavar="AA:BB:CC:DD:EE:FF",
+        help=(
+            "eth0's hardware address, a unicast address, for a run that must "
+            "have a fixed one; like --serialno it excludes the instance's "
+            "identity file"
         ),
     )
     parser.add_argument(
@@ -133,8 +218,9 @@ def parse_arguments(arguments: Sequence[str] | None = None) -> argparse.Namespac
         type=positive_integer,
         help=(
             "capacity of the data disk in GiB: a new disk is created at it, an "
-            "existing one grown to it, and one never shrinks (default: the "
-            "release's default for a new disk, otherwise unchanged)"
+            "existing one grown to it, and a larger one is kept, never shrunk "
+            "(default: the release's default for a new disk, otherwise "
+            "unchanged)"
         ),
     )
     update = parser.add_mutually_exclusive_group()
@@ -157,7 +243,7 @@ def parse_arguments(arguments: Sequence[str] | None = None) -> argparse.Namespac
     update.add_argument(
         "--reset",
         action="store_true",
-        help="delete the instance (data disk, state, snapshots) and create it anew",
+        help="delete the instance (data disk, state, identity, snapshots) and create it anew",
     )
     parser.add_argument(
         "--emulator",
@@ -197,7 +283,14 @@ def parse_arguments(arguments: Sequence[str] | None = None) -> argparse.Namespac
         ),
     )
     parser.add_argument("--cpus", type=positive_integer, default=10)
-    parser.add_argument("--memory", default="8G")
+    parser.add_argument(
+        "--memory",
+        default="8G",
+        help=(
+            "guest memory, the kernel's mem= argument: a number with the unit "
+            "K, M or G; a number without a unit is bytes (default: 8G)"
+        ),
+    )
     parser.add_argument(
         "--width",
         type=positive_integer,
@@ -297,6 +390,14 @@ def parse_arguments(arguments: Sequence[str] | None = None) -> argparse.Namespac
         help="boot the accepted release into recovery once, as a first-boot override",
     )
     parser.add_argument(
+        "--root",
+        action="store_true",
+        help=(
+            "boot the release's Magisk-patched ramdisk in place of its own "
+            "(only a release that carries root/ has one; recovery keeps its own)"
+        ),
+    )
+    parser.add_argument(
         "--build",
         action="store_true",
         help="incrementally rebuild the macos-android17 executable before boot",
@@ -309,6 +410,8 @@ def parse_arguments(arguments: Sequence[str] | None = None) -> argparse.Namespac
     options = parser.parse_args(arguments)
     if not options.memory or any(character.isspace() for character in options.memory):
         parser.error("--memory must be one kernel argument without whitespace")
+    if (problem := guest_memory_problem(options.memory)) is not None:
+        parser.error(f"--memory {options.memory} {problem}")
     if options.display != "offscreen" and (
         options.offscreen_size or options.offscreen_mirror
     ):
@@ -398,6 +501,19 @@ def build_commands(cmake: Path) -> list[list[str]]:
     ]
 
 
+def identity_arguments(options: argparse.Namespace, data_disk: Path) -> list[str]:
+    """What tells this installation from another: the identity file beside its
+    data disk, which the emulator makes when it is absent and when the data disk
+    is new, or the values a run states for itself, which exclude the file."""
+    stated = [
+        *([f"--android-serialno={options.serialno}"] if options.serialno else []),
+        *([f"--net-mac={options.eth_mac}"] if options.eth_mac else []),
+    ]
+    if stated:
+        return stated
+    return [f"--android-identity={data_disk.parent / android_instance.IDENTITY_FILE}"]
+
+
 def emulator_command(
     options: argparse.Namespace,
     release: Path,
@@ -410,7 +526,9 @@ def emulator_command(
         f"--android-release={release}",
         f"--android-data-disk={data_disk}",
         *([f"--android-data-gib={data_gib}"] if data_gib is not None else []),
+        *identity_arguments(options, data_disk),
         f"--android-boot-mode={options.boot_mode}",
+        *(["--android-root"] if getattr(options, "root", False) else []),
         f"--net-forward=tcp:127.0.0.1:{options.adb_port}-{GUEST_ADB_PORT}",
         "--gpu",
         f"--gpu-display={options.display}",

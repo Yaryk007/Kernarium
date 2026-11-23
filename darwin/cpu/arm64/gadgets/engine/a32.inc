@@ -301,7 +301,7 @@ gadget a32_set_itstate
  * from the return link's key, so the stream carries no LR value. */
 gadget a32_bl_linked
 	ldp x8, x11, [_stream]
-	ldr x9, [x11, #16]
+	ldr x9, [x11]
 	a32_return_value w12, x12, x9
 	str w12, [_vcpu, #(UML_GADGET_CPU_X0 + 14 * 8)]
 	push_return_record x9, x11
@@ -354,7 +354,7 @@ gadget a32_blx_cached
 	ldr w10, [_vcpu, x8]
 	a32_key_interworking
 	ldr x14, [_stream]
-	ldr x11, [x14, #16]
+	ldr x11, [x14]
 	a32_return_value w15, x15, x11
 	str w15, [_vcpu, #(UML_GADGET_CPU_X0 + 14 * 8)]
 	push_return_record x11, x14

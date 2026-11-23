@@ -31,7 +31,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
  1 file changed, 1 insertion(+), 2 deletions(-)
 
 diff --git a/src/venus/vkr_device_memory.c b/src/venus/vkr_device_memory.c
-index 918e9b4efb813b6773a407e7b579640b8cb3a2d6..770b47170b9facfc2f623c2579a113422585fe0e 100644
+index fcb391d8c3c893988923c1999cf4a96fe448f417..8929547f4a7e319055ca87edd3b075b9298915eb 100644
 --- a/src/venus/vkr_device_memory.c
 +++ b/src/venus/vkr_device_memory.c
 @@ -279,7 +279,6 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,

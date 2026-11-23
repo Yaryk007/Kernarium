@@ -12,8 +12,27 @@
  * name, the refusals (a non-DNS TCP port is reset, a non-DNS datagram is
  * dropped), guest multicast, and a stop and reopen. The wire rules themselves
  * are the unit test network-dns-rules.
+ *
+ * While the host has no network path the system resolver says "no such
+ * record" at once, and the guest must be told to try again instead. The
+ * probe stands in for the path with the provider's state: a missing name is
+ * answered as before while the path is usable, with SERVFAIL (and counted as
+ * failed) while it is not, over UDP and TCP, a name with records is answered
+ * in both states, an alias whose target has no record is one answer while the
+ * path is usable and SERVFAIL without records while it is not (the aliases
+ * alone are no address), and the state at the moment of the answer decides, not
+ * the state when the query came in. An outage that was reported ends with the
+ * provider's stop. A last part starts the system's monitor and checks that the
+ * provider hears a report of that open, whichever path this host has, and that
+ * one monitor serves the provider's life, across a stop and a reopen. The
+ * system giving no monitor is made here too: the provider then makes another
+ * at its next open, and keeps the one that works. What the state does to an
+ * answer across a stop and a reopen is checked with a monitor that writes
+ * nothing, the state being the probe's own: a monitor that works keeps an
+ * outage across a stop, and one the system did not give does not.
  */
 #include "dns_message.hpp"
+#include "host_network_path_attempt.hpp"
 #include "provider.hpp"
 #include "slirp_tcp_harness.hpp"
 #include "uml_slirp_net.h"
@@ -26,11 +45,13 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <string>
 #include <thread>
@@ -431,6 +452,203 @@ void check_tcp(uml::network::SlirpProvider &provider, Guest &guest)
 		fail("TCP", "the guest's DNS made SLiRP open a host Internet socket");
 }
 
+/* A UDP query to the name server; the reply. */
+std::optional<Reply> ask(Guest &guest, const char *name, std::uint16_t id,
+			 std::uint16_t port)
+{
+	if (!guest.send(udp_frame(name_server, port, 53,
+				  query_message(id, name, 1))))
+		return std::nullopt;
+	std::optional<Reply> reply;
+	(void)guest.receive([&](const std::vector<std::uint8_t> &frame) {
+		reply = udp_reply(frame, name_server, port);
+		return reply.has_value() && reply->id == id;
+	});
+	return reply;
+}
+
+/* "No such record" or "no such name", the answer for a missing name. */
+bool is_negative(const std::optional<Reply> &reply)
+{
+	return reply && reply->answers == 0 &&
+		(reply->rcode == dns::rcode_noerror ||
+		 reply->rcode == dns::rcode_nxdomain);
+}
+
+bool is_servfail(const std::optional<Reply> &reply)
+{
+	return reply && reply->answers == 0 &&
+		reply->rcode == dns::rcode_servfail;
+}
+
+bool has_loopback(const std::optional<Reply> &reply)
+{
+	return reply && reply->rcode == dns::rcode_noerror &&
+		has_loopback_answer(*reply);
+}
+
+/* A CNAME in the system resolver's local-only registry, which stays while the
+ * object lives. Its target has no record, so a query for an address of the
+ * alias gets the alias, then "no such record". The registry takes a record
+ * only in the mDNS domain: a name under .invalid, .test, .example,
+ * .localhost, .home.arpa, .lan, .internal or a real domain is refused as a
+ * bad parameter, which is why the name is the one environment-portability
+ * allowlist entry of this file. */
+class LocalAlias final {
+public:
+	static constexpr const char *name = "uml-dns-probe-alias.local";
+
+	LocalAlias()
+	{
+		const auto target = wire("uml-dns-probe-target.invalid");
+		if (DNSServiceCreateConnection(&connection_) !=
+		    kDNSServiceErr_NoError)
+			return;
+		if (DNSServiceRegisterRecord(
+			    connection_, &record_, kDNSServiceFlagsUnique,
+			    kDNSServiceInterfaceIndexLocalOnly, name,
+			    kDNSServiceType_CNAME, kDNSServiceClass_IN,
+			    static_cast<std::uint16_t>(target.size()),
+			    target.data(), 120, &registered, this) !=
+		    kDNSServiceErr_NoError)
+			return;
+		/* The daemon says so when the record is in. */
+		const int descriptor = DNSServiceRefSockFD(connection_);
+		const auto deadline = Clock::now() + std::chrono::seconds{5};
+		while (!done_ && Clock::now() < deadline) {
+			pollfd waiting{descriptor, POLLIN, 0};
+			if (::poll(&waiting, 1, 100) > 0 &&
+			    DNSServiceProcessResult(connection_) !=
+				    kDNSServiceErr_NoError)
+				break;
+		}
+	}
+	LocalAlias(const LocalAlias &) = delete;
+	LocalAlias &operator=(const LocalAlias &) = delete;
+	~LocalAlias()
+	{
+		if (connection_ != nullptr)
+			DNSServiceRefDeallocate(connection_);
+	}
+	[[nodiscard]] bool ok() const noexcept { return ok_; }
+
+private:
+	static void DNSSD_API registered(DNSServiceRef, DNSRecordRef,
+					 DNSServiceFlags,
+					 DNSServiceErrorType error,
+					 void *context)
+	{
+		auto *self = static_cast<LocalAlias *>(context);
+		self->ok_ = error == kDNSServiceErr_NoError;
+		self->done_ = true;
+	}
+
+	DNSServiceRef connection_{};
+	DNSRecordRef record_{};
+	bool done_{};
+	bool ok_{};
+};
+
+/* Changes the path from the resolver's thread, after the system has
+ * answered and before the guest is. */
+struct PathChange final {
+	uml::platform::HostNetworkPathState *path{};
+	bool usable{};
+};
+
+void change_path(void *context)
+{
+	const auto *change = static_cast<const PathChange *>(context);
+	change->path->report(change->usable);
+}
+
+/* A missing name asks for a retry while the host has no network path, and is
+ * a plain "no such record" while it has one; a name with records is answered
+ * either way; and the state when the answer is made decides. */
+void check_outage(uml::network::SlirpProvider &provider, Guest &guest)
+{
+	auto &path = provider.path_state_for_testing();
+	const char *const missing = "uml-dns-probe-outage.invalid";
+	std::uint16_t port = 42000;
+	const auto before = provider.counters();
+	const int failures_before = failures;
+	if (!path.usable())
+		fail("the path state", "it does not start usable");
+	const LocalAlias alias;
+	if (!alias.ok())
+		fail("the alias record", "the system did not take it");
+
+	const char *label = "a missing name with a path";
+	if (!is_negative(ask(guest, missing, 0x7a01, ++port)))
+		fail(label, "no plain negative answer");
+
+	label = "an alias with no address, with a path";
+	const auto aliased = ask(guest, LocalAlias::name, 0x7a0a, ++port);
+	if (!aliased || aliased->rcode != dns::rcode_noerror ||
+	    aliased->answers != 1)
+		fail(label, "no answer that carries the alias");
+
+	path.report(false);
+	label = "an alias with no address, with no path";
+	if (!is_servfail(ask(guest, LocalAlias::name, 0x7a0b, ++port)))
+		fail(label, "the alias was passed on, or the guest was not told "
+			    "to try again");
+	label = "a missing name with no path";
+	if (!is_servfail(ask(guest, missing, 0x7a02, ++port)))
+		fail(label, "the guest was not told to try again");
+	label = "a name with records and no path";
+	if (!has_loopback(ask(guest, "localhost", 0x7a03, ++port)))
+		fail(label, "localhost has no 127.0.0.1 answer");
+	label = "a missing name over TCP with no path";
+	if (!is_servfail(tcp_exchange(guest, name_server, ++port,
+				      query_message(0x7a04, missing, 1))))
+		fail(label, "the guest was not told to try again");
+	label = "a name with records over TCP and no path";
+	if (!has_loopback(tcp_exchange(guest, name_server, ++port,
+				       query_message(0x7a05, "localhost", 1))))
+		fail(label, "localhost has no 127.0.0.1 answer");
+
+	path.report(true);
+	label = "a missing name once the path is back";
+	if (!is_negative(ask(guest, missing, 0x7a06, ++port)))
+		fail(label, "no plain negative answer");
+	label = "a missing name over TCP once the path is back";
+	if (!is_negative(tcp_exchange(guest, name_server, ++port,
+				      query_message(0x7a07, missing, 1))))
+		fail(label, "no plain negative answer");
+
+	/* The state at the answer decides: the system answers while the path is
+	 * as it was, and the path changes before the guest is told. */
+	PathChange change{&path, false};
+	provider.set_dns_before_answer_for_testing(&change_path, &change);
+	label = "a path lost as the answer is made";
+	if (!is_servfail(ask(guest, missing, 0x7a08, ++port)))
+		fail(label, "the state when the query came in decided");
+	change.usable = true;
+	label = "a path back as the answer is made";
+	if (!is_negative(ask(guest, missing, 0x7a09, ++port)))
+		fail(label, "the state when the query came in decided");
+	provider.set_dns_before_answer_for_testing(nullptr, nullptr);
+	if (!path.usable())
+		fail("the path state", "it was left in an outage");
+
+	/* Each query is one outcome: an answer, or a failure the guest retries.
+	 * Seven were answered (two names with records, an alias with a path, four
+	 * missing names with a path) and four met the outage (an alias and three
+	 * missing names). */
+	const auto counts = provider.counters();
+	const auto answered = counts.dns_answered - before.dns_answered;
+	const auto failed = counts.dns_failed - before.dns_failed;
+	if (answered != 7 || failed != 4 ||
+	    counts.dns_policy_denied != before.dns_policy_denied ||
+	    counts.dns_timed_out != before.dns_timed_out)
+		fail("the counts", "answered " + std::to_string(answered) +
+			", failed " + std::to_string(failed) +
+			" for seven answers and four outages");
+	if (failures == failures_before)
+		std::puts("the guest is told to retry while the host has no path");
+}
+
 /* Without a socket path for DNS over TCP, a connection to port 53 is reset
  * like one to any other port: SLiRP, with its own proxy off, would connect to
  * the literal address on the host's network. */
@@ -476,6 +694,234 @@ bool open_provider(uml::network::SlirpProvider &provider, Guest &guest)
 		return frame.size() >= 14 && get16(frame, 12) == 0x0806;
 	});
 	return true;
+}
+
+/* An outage that was reported is over when the provider stops: a reopen whose
+ * monitor has not reported yet (none runs here) is answered as a host with a
+ * path is. */
+void check_reopen_after_outage(uml::network::SlirpProvider &provider,
+			       Guest &guest)
+{
+	const char *label = "a reopen after an outage";
+	auto &path = provider.path_state_for_testing();
+	path.report(false);
+	provider.stop();
+	if (!open_provider(provider, guest)) {
+		fail(label, "the provider did not reopen");
+		return;
+	}
+	if (!path.usable())
+		fail(label, "the reopened provider starts in the old outage");
+	if (!is_negative(ask(guest, "uml-dns-probe-reopen.invalid", 0x7a0c,
+			     42200)))
+		fail(label, "a missing name was not a plain negative answer");
+}
+
+/* Ends the provider's monitor: an open that no monitor is asked for drops the
+ * one it holds, and the state is the one of a host with a path again. */
+void drop_path_monitor(uml::network::SlirpProvider &provider, Guest &guest)
+{
+	const char *label = "a dropped path monitor";
+	auto &path = provider.path_state_for_testing();
+	/* What the monitor reported last, written here as the system would. */
+	path.report(false);
+	provider.set_path_monitor_for_testing(false);
+	if (!open_provider(provider, guest)) {
+		fail(label, "the provider did not open");
+		return;
+	}
+	if (provider.path_monitor_for_testing() != nullptr)
+		fail(label, "the provider kept a monitor that was no longer asked "
+			    "for");
+	if (!path.usable())
+		fail(label, "the last report of a dropped monitor stayed the state");
+	provider.stop();
+}
+
+/* The provider starts the system's monitor at open() and hears its report of
+ * that open, whichever path this host has, and the one monitor serves its life.
+ * What the report says is the host's own and may move at any moment, so only
+ * that it arrives and how many monitors were made are checked here; what the
+ * state does to an answer is checked with a monitor that writes nothing. */
+void check_path_monitor(uml::network::SlirpProvider &provider, Guest &guest)
+{
+	const char *label = "the system's path monitor";
+	provider.set_path_monitor_for_testing(true);
+	const auto made_before = provider.path_monitors_made_for_testing();
+	/* A report that counts is one of this open: the earlier reports here
+	 * were made by the probe itself. */
+	const auto reports_before = provider.path_state_for_testing().reports();
+	if (!open_provider(provider, guest)) {
+		fail(label, "the provider did not open");
+		provider.set_path_monitor_for_testing(false);
+		return;
+	}
+	auto &path = provider.path_state_for_testing();
+	const auto deadline = Clock::now() + std::chrono::seconds{10};
+	while (path.reports() == reports_before && Clock::now() < deadline)
+		std::this_thread::sleep_for(std::chrono::milliseconds{5});
+	if (path.reports() == reports_before) {
+		fail(label, "the system did not report the path");
+	} else {
+		std::printf("%s: the host's path is %s\n", label,
+			    path.usable() ? "usable" : "down");
+		/* A guest's restart stops and opens the provider again, and the
+		 * monitor lives on. */
+		provider.stop();
+		if (!open_provider(provider, guest))
+			fail(label, "the provider did not reopen");
+		else if (provider.path_monitors_made_for_testing() !=
+			 made_before + 1)
+			fail(label, "the monitor was made again at the reopen");
+	}
+	provider.stop();
+	drop_path_monitor(provider, guest);
+}
+
+/* A monitor that reports nothing, for a check that writes the state itself as
+ * the system would: the only writer is the probe. It says it failed when it was
+ * made to. */
+class ControlledMonitor final : public uml::platform::HostNetworkPathMonitor {
+public:
+	explicit ControlledMonitor(bool failed) : failed_(failed) {}
+	[[nodiscard]] bool failed() const noexcept override { return failed_; }
+
+private:
+	const bool failed_;
+};
+
+/* While a monitor that works lives, a stop does not end an outage it reported
+ * (a guest's restart stops and opens the provider again): a reopen still tells
+ * a guest to retry, until a report says the path is back. A monitor the system
+ * gave no monitor reports nothing, so a stop ends an outage as with no monitor
+ * at all. */
+void check_state_across_a_restart(uml::network::SlirpProvider &provider,
+				  Guest &guest)
+{
+	const char *label = "the state across a restart";
+	auto &path = provider.path_state_for_testing();
+	provider.set_path_monitor_for_testing(true);
+	provider.set_path_monitor_factory_for_testing(
+		[](uml::platform::HostNetworkPathState &) {
+			return std::make_unique<ControlledMonitor>(false);
+		});
+	const auto made_before = provider.path_monitors_made_for_testing();
+	if (!open_provider(provider, guest)) {
+		fail(label, "the provider did not open");
+	} else {
+		path.report(false);
+		if (!is_servfail(ask(guest, "uml-dns-probe-monitor.invalid",
+				     0x7a10, 42100)))
+			fail(label, "a missing name was not told to retry");
+		provider.stop();
+		if (path.usable())
+			fail(label, "the stop ended an outage that a monitor which "
+				    "works keeps");
+		if (!open_provider(provider, guest)) {
+			fail(label, "the provider did not reopen");
+		} else {
+			if (!is_servfail(ask(guest, "uml-dns-probe-monitor.invalid",
+					     0x7a11, 42101)))
+				fail(label, "a reopen during an outage did not tell "
+					    "a guest to retry");
+			path.report(true);
+			if (!is_negative(ask(guest, "uml-dns-probe-monitor.invalid",
+					     0x7a12, 42102)))
+				fail(label, "a path that is back did not end the "
+					    "outage");
+			if (provider.path_monitors_made_for_testing() !=
+			    made_before + 1)
+				fail(label, "the monitor was made again at the "
+					    "reopen");
+		}
+	}
+	provider.stop();
+	drop_path_monitor(provider, guest);
+
+	provider.set_path_monitor_for_testing(true);
+	provider.set_path_monitor_factory_for_testing(
+		[](uml::platform::HostNetworkPathState &) {
+			return std::make_unique<ControlledMonitor>(true);
+		});
+	if (!open_provider(provider, guest)) {
+		fail(label, "the provider did not open with a failed monitor");
+	} else {
+		path.report(false);
+		provider.stop();
+		if (!path.usable())
+			fail(label, "the stop kept an outage that a monitor the "
+				    "system did not give cannot end");
+	}
+	provider.stop();
+	provider.set_path_monitor_factory_for_testing({});
+	drop_path_monitor(provider, guest);
+}
+
+/* The system's creation fails for the first monitor only. */
+std::atomic<int> system_creations;
+
+bool only_the_first_system_creation_fails()
+{
+	return system_creations.fetch_add(1) != 0;
+}
+
+/* The system gives the provider no path monitor at its first open: the monitor
+ * says so (nothing waits for its report), the next open makes another, whose
+ * report arrives, and that one, which works, is kept however often the provider
+ * stops and opens. */
+void check_a_monitor_the_system_did_not_give(
+	uml::network::SlirpProvider &provider, Guest &guest)
+{
+	const char *label = "a path monitor the system did not give";
+	auto &path = provider.path_state_for_testing();
+	system_creations = 0;
+	provider.set_path_monitor_factory_for_testing(
+		[](uml::platform::HostNetworkPathState &state) {
+			return uml::platform::makeAppleHostNetworkPathMonitor(
+				state, only_the_first_system_creation_fails);
+		});
+	provider.set_path_monitor_for_testing(true);
+	const auto made_before = provider.path_monitors_made_for_testing();
+	const auto reports_before = path.reports();
+	if (!open_provider(provider, guest)) {
+		fail(label, "the provider did not open");
+		provider.set_path_monitor_factory_for_testing({});
+		provider.set_path_monitor_for_testing(false);
+		return;
+	}
+	const auto *first = provider.path_monitor_for_testing();
+	const auto deadline = Clock::now() + std::chrono::seconds{10};
+	while (first != nullptr && !first->failed() && Clock::now() < deadline)
+		std::this_thread::sleep_for(std::chrono::milliseconds{5});
+	if (first == nullptr || !first->failed())
+		fail(label, "a monitor the system did not give did not say so");
+	provider.stop();
+	if (!open_provider(provider, guest)) {
+		fail(label, "the provider did not reopen");
+	} else {
+		const auto report_deadline = Clock::now() + std::chrono::seconds{10};
+		while (path.reports() == reports_before &&
+		       Clock::now() < report_deadline)
+			std::this_thread::sleep_for(std::chrono::milliseconds{5});
+		if (path.reports() == reports_before)
+			fail(label, "the reopen did not make another monitor");
+		if (system_creations.load() != 2)
+			fail(label, "the system was not asked a second time");
+		const auto *second = provider.path_monitor_for_testing();
+		if (second == nullptr || second->failed())
+			fail(label, "the reopen did not hold a monitor that works");
+		/* A monitor that works stays, as at every stop and reopen. */
+		provider.stop();
+		if (!open_provider(provider, guest))
+			fail(label, "the provider did not reopen again");
+		else if (provider.path_monitors_made_for_testing() !=
+				 made_before + 2 ||
+			 system_creations.load() != 2)
+			fail(label, "a monitor that works was made again");
+	}
+	provider.stop();
+	provider.set_path_monitor_factory_for_testing({});
+	drop_path_monitor(provider, guest);
 }
 
 /* Where the resolver bound its DNS-over-TCP socket, for the log of a run on a
@@ -618,6 +1064,8 @@ int main()
 			      "default $TMPDIR", provider);
 	check_udp(provider, guest);
 	check_tcp(provider, guest);
+	check_outage(provider, guest);
+	check_reopen_after_outage(provider, guest);
 
 	/* A guest restart: the resolver comes back with the link. */
 	provider.stop();
@@ -627,6 +1075,9 @@ int main()
 	}
 	check_udp(provider, guest);
 	provider.stop();
+	check_path_monitor(provider, guest);
+	check_a_monitor_the_system_did_not_give(provider, guest);
+	check_state_across_a_restart(provider, guest);
 
 	provider.set_dns_streams_unavailable_for_testing(true);
 	if (open_provider(provider, guest)) {

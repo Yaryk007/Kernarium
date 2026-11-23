@@ -1,0 +1,142 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 02:16:59 +0900
+Subject: [PATCH] adbd: refuse a reverse forward that would listen on vsock
+
+`adb reverse <device side> <host side>` reaches adbd as the service
+`reverse:forward:[norebind:]<device side>;<host side>` (reverse_service
+in daemon/services.cpp, which hands it to handle_forward_request). The
+device side is a listener that install_listener in adb_listeners.cpp
+creates through socket_spec_listen. A client that held a vsock port that
+way would receive what the host's own channels to the guest's services
+send there, and could answer it.
+
+install_listener now refuses, on the device only, a device side that
+would listen on vsock. It refuses the spelling "vsock:" and the spelling
+"acceptfd:" before the parser runs: no client knows which descriptors
+adbd holds, so nothing legitimate uses the second, and it names a
+descriptor of adbd's own. It also asks the socket the parser created
+what its family is (getsockname), and refuses AF_VSOCK, or a family it
+cannot read, before the listener is installed or accepts anything; the
+descriptor is closed there. The refusal is the CANNOT_BIND status, whose
+message the client prints. A rebind of an existing device side keeps the
+socket it has, so it is unaffected, as are adbd's own listeners (adbd
+installs those without install_listener), `adb forward`, and every
+other form.
+
+The forms socket_spec_listen accepts: tcp:<port>, tcp:<host>:<port>
+(an empty host, localhost or ::1), vsock:<port> (no CID), acceptfd:<fd>
+(a descriptor that is not close-on-exec), and the local socket types
+local, localreserved, localabstract and localfilesystem.
+---
+ adb_listeners.cpp      | 43 ++++++++++++++++++++++++++++++++++++++++++
+ adb_listeners_test.cpp | 25 ++++++++++++++++++++++++
+ 2 files changed, 68 insertions(+)
+
+diff --git a/adb_listeners.cpp b/adb_listeners.cpp
+index 32aa5352442a35f30fb5b604e1ca2e004bd2d92f..c3e0ffb94e491299210ee2efa0b5954c33a8eab1 100644
+--- a/adb_listeners.cpp
++++ b/adb_listeners.cpp
+@@ -18,6 +18,9 @@
+ 
+ #include <stdio.h>
+ #include <stdlib.h>
++#if !ADB_HOST
++#include <sys/socket.h>
++#endif
+ 
+ #include <algorithm>
+ #include <list>
+@@ -187,6 +190,23 @@ void close_smartsockets() EXCLUDES(listener_list_mutex) {
+ }
+ #endif
+ 
++#if !ADB_HOST
++#ifndef AF_VSOCK
++#define AF_VSOCK 40
++#endif
++
++// Whether |fd| is a vsock socket, judged by the family the kernel reports for the socket and not
++// by the spelling of the request. A socket whose family cannot be read counts as one.
++static bool is_vsock_socket(int fd) {
++    sockaddr_storage address{};
++    socklen_t length = sizeof(address);
++    if (getsockname(fd, reinterpret_cast<sockaddr*>(&address), &length) != 0) {
++        return true;
++    }
++    return address.ss_family == AF_VSOCK;
++}
++#endif
++
+ InstallStatus install_listener(const std::string& local_name, const char* connect_to,
+                                atransport* transport, int flags, int* resolved_tcp_port,
+                                std::string* error) EXCLUDES(listener_list_mutex) {
+@@ -217,12 +237,35 @@ InstallStatus install_listener(const std::string& local_name, const char* connec
+ 
+     auto listener = std::make_unique<alistener>(local_name, connect_to);
+ 
++#if !ADB_HOST
++    // On the device a listener is installed only by `adb reverse`, and a client must not make adbd
++    // listen on a vsock port: the host's channels to the guest's own services (the text message
++    // service's port among them) would then reach that client's computer. A descriptor adbd
++    // already holds, which acceptfd: names, is not the client's to give a listener either.
++    // vsock: never binds; the family check below catches any other spelling of the same socket.
++    if (android::base::StartsWith(local_name, "vsock:") ||
++        android::base::StartsWith(local_name, "acceptfd:")) {
++        *error = "adbd does not listen on vsock or on an inherited descriptor for a reverse forward";
++        return INSTALL_STATUS_CANNOT_BIND;
++    }
++#endif
++
+     int resolved = 0;
+     listener->fd = socket_spec_listen(listener->local_name, error, &resolved);
+     if (listener->fd < 0) {
+         return INSTALL_STATUS_CANNOT_BIND;
+     }
+ 
++#if !ADB_HOST
++    if (is_vsock_socket(listener->fd)) {
++        // Not yet an fdevent's: it is closed here, so the kernel resets what it had queued.
++        adb_close(listener->fd);
++        listener->fd = -1;
++        *error = "adbd does not listen on vsock for a reverse forward";
++        return INSTALL_STATUS_CANNOT_BIND;
++    }
++#endif
++
+     // If the caller requested port 0, update the listener name with the resolved port.
+     if (resolved != 0) {
+         listener->local_name = android::base::StringPrintf("tcp:%d", resolved);
+diff --git a/adb_listeners_test.cpp b/adb_listeners_test.cpp
+index 2b53c3d0c96283a6db1bc1bf9c3163198ce2a05f..08765db41ddad15490dfb67b936573fb23ddf79b 100644
+--- a/adb_listeners_test.cpp
++++ b/adb_listeners_test.cpp
+@@ -164,3 +164,28 @@ TEST_F(AdbListenersTest, test_transport_disconnect) {
+     transport_.RunDisconnects();
+     ASSERT_TRUE(format_listeners().empty());
+ }
++
++#if !ADB_HOST
++// A reverse forward never makes adbd listen on vsock, nor on a descriptor adbd already holds.
++TEST_F(AdbListenersTest, test_install_listener_refuses_vsock) {
++    std::string error;
++
++    ASSERT_EQ(INSTALL_STATUS_CANNOT_BIND,
++              install_listener("vsock:5599", "tcp:9000", &transport_, false, nullptr, &error));
++    ASSERT_FALSE(error.empty());
++    ASSERT_TRUE(format_listeners().empty());
++}
++
++TEST_F(AdbListenersTest, test_install_listener_refuses_acceptfd) {
++    for (int fd = 0; fd < 32; ++fd) {
++        std::string error;
++        std::string name = android::base::StringPrintf("acceptfd:%d", fd);
++
++        ASSERT_EQ(INSTALL_STATUS_CANNOT_BIND,
++                  install_listener(name, "tcp:9000", &transport_, false, nullptr, &error))
++                << name;
++        ASSERT_FALSE(error.empty()) << name;
++    }
++    ASSERT_TRUE(format_listeners().empty());
++}
++#endif

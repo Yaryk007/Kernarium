@@ -20,6 +20,7 @@
 
     <feature name="android.hardware.audio.output" />
     <feature name="android.hardware.microphone" />
+    <feature name="android.hardware.telephony.messaging" />
     <feature name="android.hardware.touchscreen" />
     <feature name="android.hardware.touchscreen.multitouch" />
     <feature name="android.hardware.touchscreen.multitouch.distinct" />

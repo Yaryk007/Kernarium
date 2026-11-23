@@ -1,0 +1,281 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 21:17:03 +0900
+Subject: [PATCH] um: name the frame a kernel write into another process
+ changed
+
+A ptrace, /proc/pid/mem or process_vm_writev() store reaches another
+process's memory through the kernel's own alias of the frame, and the
+host was told only the user address written. The target may map another
+frame at that address before the store lands: process_vm_writev() pins
+the pages and drops the target's mmap lock before it copies from the
+caller's buffer, which can wait on a userfaultfd handler. The host then
+published at the frame mapped by now, and the holders of the frame
+actually written kept their translated code.
+
+The kernel holds the page it writes, so it names it: phys_mapping() of
+the page gives the (fd, offset) with which a mapping of that frame is
+installed. darwin_uml_vm_invalidate_code_frame() takes the generation,
+a user range within one page and that name, and the host publishes at
+the frame's holders whatever the generation maps at the address now. A
+frame Linux cannot name (a negative fd) is told to every generation, as
+a page the host has no entry for is.
+
+__access_remote_vm() holds the page it wrote, and process_vm_writev()
+passes the pages it pinned to a new flush_icache_remote_user_pages()
+hook, one call per page of the batch. An AArch32 cacheflush() writes
+nothing and is still told by address, through
+flush_icache_remote_user_range(), which only a kernel that runs AArch32
+tasks builds, so the x86_64 slice no longer imports that entry. The
+bridge ABI goes to 27, which also declares
+darwin_uml_vm_invalidate_code_frames() for a kernel write into a
+page-cache frame (the x86_64 slice's flush_dcache_folio() calls it).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ arch/um/include/asm/cacheflush.h            | 15 ++++--
+ arch/um/include/shared/os.h                 |  7 +++
+ arch/um/kernel/tlb.c                        | 59 ++++++++++++++++++---
+ arch/um/os-Darwin/uml_darwin_abi_identity.h |  4 +-
+ arch/um/os-Darwin/uml_darwin_memory.h       | 27 ++++++++++
+ include/asm-generic/cacheflush.h            | 20 +++++--
+ mm/process_vm_access.c                      |  3 +-
+ 7 files changed, 120 insertions(+), 15 deletions(-)
+
+diff --git a/arch/um/include/asm/cacheflush.h b/arch/um/include/asm/cacheflush.h
+index 31deab0b5c24a55cd6baf6a253f418fc98db3ed0..a18b3a62e8bc588cfcd054cdc48b04d932431945 100644
+--- a/arch/um/include/asm/cacheflush.h
++++ b/arch/um/include/asm/cacheflush.h
+@@ -14,17 +14,26 @@ struct page;
+ /*
+  * Darwin guests run translated code cached by address. A ptrace,
+  * /proc/pid/mem or process_vm_writev() store reaches another process's
+- * memory through the kernel's view of the frame, so tell the host which of
+- * that process's pages changed.
++ * memory through the kernel's view of the frame, so name that frame to the
++ * host, which publishes the change at the frame's holders whatever the
++ * process maps at the address by now. An AArch32 cacheflush() changes no
++ * frame and is told by address, in a kernel that runs AArch32 tasks.
+  */
+ extern void darwin_flush_icache_user_page(struct vm_area_struct *vma,
+ 					  struct page *page,
+ 					  unsigned long addr, int len);
+-extern void darwin_flush_icache_remote_user_range(struct mm_struct *mm,
++extern void darwin_flush_icache_remote_user_pages(struct mm_struct *mm,
++						  struct page **pages,
+ 						  unsigned long start,
+ 						  unsigned long len);
+ #define flush_icache_user_page darwin_flush_icache_user_page
++#define flush_icache_remote_user_pages darwin_flush_icache_remote_user_pages
++#ifdef CONFIG_UML_ARM64_AARCH32
++extern void darwin_flush_icache_remote_user_range(struct mm_struct *mm,
++						  unsigned long start,
++						  unsigned long len);
+ #define flush_icache_remote_user_range darwin_flush_icache_remote_user_range
++#endif
+ 
+ /*
+  * With 4 KiB pages on a 16 KiB host, a kernel alias whose host page does not
+diff --git a/arch/um/include/shared/os.h b/arch/um/include/shared/os.h
+index baa005982001744d04629b405948124d2e100a95..7950c3f1a95380d0bd9820dfedd28f6c9d20c532 100644
+--- a/arch/um/include/shared/os.h
++++ b/arch/um/include/shared/os.h
+@@ -286,6 +286,13 @@ extern int darwin_uml_vm_flush_generation(unsigned long generation);
+ extern int darwin_uml_vm_invalidate_code(unsigned long generation,
+ 					 unsigned long address,
+ 					 unsigned long length);
++extern int darwin_uml_vm_invalidate_code_frame(unsigned long generation,
++					       unsigned long address,
++					       unsigned long length, int fd,
++					       unsigned long long offset);
++extern int darwin_uml_vm_invalidate_code_frames(int fd,
++						unsigned long long offset,
++						unsigned long long length);
+ extern int darwin_uml_vm_unmap_generation(unsigned long generation,
+ 					  void *address,
+ 					  unsigned long length);
+diff --git a/arch/um/kernel/tlb.c b/arch/um/kernel/tlb.c
+index 7ce5ae0fe9820ab0e84bdfab11d201634b1bd0d5..4b3b6019b6650d789f8f339311f3b874e799383c 100644
+--- a/arch/um/kernel/tlb.c
++++ b/arch/um/kernel/tlb.c
+@@ -1267,28 +1267,75 @@ void darwin_tlb_flush_range(struct mm_struct *mm, unsigned long start,
+ 	darwin_tlb_flush_guest_range(mm, max(start, native_end), end);
+ }
+ 
++#ifdef CONFIG_UML_ARM64_AARCH32
++/*
++ * A flush by address, as an AArch32 cacheflush() makes it: no page is held
++ * and nothing was written, so the host publishes the frames the mm maps in
++ * the range now.  A 32-bit address carries no tag.  Only a kernel that runs
++ * AArch32 tasks has it, and imports the host's entry for it.
++ */
+ void darwin_flush_icache_remote_user_range(struct mm_struct *mm,
+ 					   unsigned long start,
+ 					   unsigned long len)
+ {
+ 	if (mm == &init_mm || len == 0)
+ 		return;
+-	/* process_vm_writev() passes the remote address as the caller gave it,
+-	 * and pinning its pages ignored the tag. */
+-	start = untagged_addr(start);
+ 	if (darwin_uml_vm_invalidate_code(mm->context.id.darwin_generation,
+ 					  start, len) < 0)
+ 		panic("Darwin: unable to invalidate guest mm %lu code %#lx+%#lx",
+ 		      mm->context.id.darwin_generation, start, len);
+ }
++#endif
+ 
++/*
++ * The kernel wrote @len bytes at @addr, in one page of another process's mm,
++ * through its own alias of @page, which it still holds.  The process may map
++ * another frame at @addr by now, so name the frame written, as a mapping
++ * names it when installed, and the host publishes at that frame's holders.
++ * Without a name the host tells every mm.
++ */
++static void darwin_flush_icache_frame(struct mm_struct *mm, struct page *page,
++				      unsigned long addr, unsigned long len)
++{
++	unsigned long long offset = 0;
++	int fd = phys_mapping(page_to_phys(page), &offset);
++
++	if (darwin_uml_vm_invalidate_code_frame(mm->context.id.darwin_generation,
++						addr, len, fd,
++						fd < 0 ? 0 : offset) < 0)
++		panic("Darwin: unable to invalidate guest mm %lu frame code %#lx+%#lx",
++		      mm->context.id.darwin_generation, addr, len);
++}
++
++/* __access_remote_vm() untagged @addr before it looked the page up. */
+ void darwin_flush_icache_user_page(struct vm_area_struct *vma,
+ 				   struct page *page, unsigned long addr,
+ 				   int len)
+ {
+-	(void)page;
+-	if (len > 0)
+-		darwin_flush_icache_remote_user_range(vma->vm_mm, addr, len);
++	if (vma->vm_mm != &init_mm && len > 0)
++		darwin_flush_icache_frame(vma->vm_mm, page, addr, len);
++}
++
++/*
++ * @pages are the pinned pages of the range, the first of them holding
++ * @start.  process_vm_writev() passes the remote address as the caller gave
++ * it, and pinning its pages ignored the tag.
++ */
++void darwin_flush_icache_remote_user_pages(struct mm_struct *mm,
++					   struct page **pages,
++					   unsigned long start,
++					   unsigned long len)
++{
++	if (mm == &init_mm)
++		return;
++	start = untagged_addr(start);
++	while (len) {
++		unsigned long chunk = min(len, PAGE_SIZE - offset_in_page(start));
++
++		darwin_flush_icache_frame(mm, *pages++, start, chunk);
++		start += chunk;
++		len -= chunk;
++	}
+ }
+ #endif
+ 
+diff --git a/arch/um/os-Darwin/uml_darwin_abi_identity.h b/arch/um/os-Darwin/uml_darwin_abi_identity.h
+index f9e50b7ee00cb39e57bae199a6980c02b45c8ad6..a5723f9ae3fbbffa4bd04528184148b66b9f5162 100644
+--- a/arch/um/os-Darwin/uml_darwin_abi_identity.h
++++ b/arch/um/os-Darwin/uml_darwin_abi_identity.h
+@@ -3,7 +3,7 @@
+ #ifndef UML_DARWIN_ABI_IDENTITY_H
+ #define UML_DARWIN_ABI_IDENTITY_H
+ 
+-#define DARWIN_UML_ABI_VERSION 26U
+-#define DARWIN_UML_ABI_FINGERPRINT 0x1d7ce579d497fc37ULL
++#define DARWIN_UML_ABI_VERSION 27U
++#define DARWIN_UML_ABI_FINGERPRINT 0x3d09b8eeee7ea3c2ULL
+ 
+ #endif
+diff --git a/arch/um/os-Darwin/uml_darwin_memory.h b/arch/um/os-Darwin/uml_darwin_memory.h
+index 0a955f3eb4b7ce9f02b7c6f32ad22a54b6f3e46e..24cfef381dfb32736935b7a68345a90b77552f8b 100644
+--- a/arch/um/os-Darwin/uml_darwin_memory.h
++++ b/arch/um/os-Darwin/uml_darwin_memory.h
+@@ -30,8 +30,35 @@ int darwin_uml_vm_walker_lock(unsigned long generation);
+ int darwin_uml_vm_walker_unlock(unsigned long generation);
+ int darwin_uml_vm_destroy(unsigned long generation);
+ int darwin_uml_vm_flush_generation(unsigned long generation);
++/* The generation's own code changed in [address, address + length) by a
++ * flush by address, as an AArch32 cacheflush() makes it: the frames the
++ * generation maps there now are published at their holders, and every
++ * generation hears of a page the generation has no entry for. Returns 0, or
++ * a negative value on failure. */
+ int darwin_uml_vm_invalidate_code(unsigned long generation,
+ 				  unsigned long address, unsigned long length);
++/* Linux wrote length bytes at address in the generation's process, within
++ * one guest page, through its own alias of the frame at fd and offset (the
++ * frame's offset in fd, which Linux still holds): a ptrace, /proc/pid/mem
++ * or process_vm_writev() store. The change is published at every holder of
++ * that frame, whatever the generation maps at address now, and in the
++ * generation when its view of address is that frame and code, or it holds
++ * the frame. A negative fd names no frame, and every generation hears of
++ * the change. Returns 0, or a negative value on failure. */
++int darwin_uml_vm_invalidate_code_frame(unsigned long generation,
++					unsigned long address,
++					unsigned long length, int fd,
++					unsigned long long offset);
++/* Linux wrote the bytes of the whole guest pages [offset, offset + length)
++ * of the frame at fd through its own alias, for no process and at no
++ * user address: a write(2), splice(2) or truncate into a page-cache or
++ * memfd frame some process maps and runs as code. The change is published
++ * at every x86 translation of those pages, whichever address spaces map
++ * them; an arm64 guest follows the architecture's cache maintenance and is
++ * not told. A negative fd names no frame, and every address space hears of
++ * the change. Returns 0, or a negative value on failure. */
++int darwin_uml_vm_invalidate_code_frames(int fd, unsigned long long offset,
++					 unsigned long long length);
+ int darwin_uml_vm_sync_from_backing(unsigned long address);
+ int darwin_uml_vm_sync_from_buffer(unsigned long address,
+ 				   const void *buffer, unsigned long length);
+diff --git a/include/asm-generic/cacheflush.h b/include/asm-generic/cacheflush.h
+index c477760b04bce31ff289297c7d181123bcf1cc30..198e199783d487452ced56b52beea795a7a3baa5 100644
+--- a/include/asm-generic/cacheflush.h
++++ b/include/asm-generic/cacheflush.h
+@@ -104,9 +104,23 @@ static inline void flush_cache_vunmap(unsigned long start, unsigned long end)
+ #endif
+ 
+ /*
+- * process_vm_writev() stored into another mm through the frames it pinned.
+- * Coherent architectures need nothing; one that caches translated code by
+- * user address must forget what it cached for the range.
++ * process_vm_writev() stored into another mm through the frames it pinned,
++ * @pages, the first of them holding @start.  Coherent architectures need
++ * nothing; one that caches translated code by user address must forget what
++ * it cached for the frames written.
++ */
++#ifndef flush_icache_remote_user_pages
++static inline void flush_icache_remote_user_pages(struct mm_struct *mm,
++						  struct page **pages,
++						  unsigned long start,
++						  unsigned long len)
++{
++}
++#endif
++
++/*
++ * The range of an mm needs its translated code forgotten, though no page of
++ * it was written: a flush by address.  Coherent architectures need nothing.
+  */
+ #ifndef flush_icache_remote_user_range
+ static inline void flush_icache_remote_user_range(struct mm_struct *mm,
+diff --git a/mm/process_vm_access.c b/mm/process_vm_access.c
+index ced5b2064ae83c963cb9934c9983c446ea081b98..62e10569d9410fa03f62d540727748678cd3e9c8 100644
+--- a/mm/process_vm_access.c
++++ b/mm/process_vm_access.c
+@@ -119,7 +119,8 @@ static int process_vm_rw_single_vec(unsigned long addr,
+ 					 start_offset, bytes, iter,
+ 					 vm_write);
+ 		if (vm_write)
+-			flush_icache_remote_user_range(mm, pa + start_offset,
++			flush_icache_remote_user_pages(mm, process_pages,
++						       pa + start_offset,
+ 						       bytes);
+ 		len -= bytes;
+ 		start_offset = 0;

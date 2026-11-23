@@ -1,0 +1,130 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 22:02:55 +0900
+Subject: [PATCH] uml: virtio_uml: kick every device but the console without a
+ reply
+
+With in-band notifications every kick was a round trip on the main
+socket: the kicking CPU held sock_lock with its interrupts off until
+the backend acknowledged the kick. A backend that reads the kick only
+after the request it is running, such as a graphics submission that
+runs for hundreds of milliseconds, kept that CPU off its interrupts for
+as long, and every other CPU that kicked the device spun on the lock.
+Under user-mode Linux every device interrupt is taken on CPU 0, so a
+kick from CPU 0 also stalled every other device, sound among them.
+
+A backend that is idle still has to be scheduled to read and answer a
+kick, and when the host is busy that takes long. Measured with a vsock
+stream, a kick from CPU 0 waited 0.3 to 1.5 ms on average and up to
+209 ms, and 541 ms when the host starved the backend's thread; sent
+without waiting it took 5 to 93 us, and bulk stream throughput rose by
+20 to 28 percent.
+
+Send the kick of every device but the console as a message that asks
+for no reply. sock_lock still keeps it whole and out of another
+request's round trip, ordering on the socket still puts it ahead of any
+later request, and a backend that has gone still shows as a failed
+send. The backend must accept a kick that asks for no acknowledgement,
+as the protocol allows.
+
+A console kick still waits for its acknowledgement and serves the
+backend's requests meanwhile. The console driver spins on its output
+queue with interrupts off after a kick, and its backend reads nothing
+more until the guest has answered a configuration change it sent:
+without the wait, a writer spinning on CPU 0 kept the interrupt that
+answers from ever running. Every other driver sleeps, or takes its
+buffers back from the queue's interrupt, while its device works.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ arch/um/drivers/virtio_uml.c | 54 ++++++++++++++++++++++++++++--------
+ 1 file changed, 43 insertions(+), 11 deletions(-)
+
+diff --git a/arch/um/drivers/virtio_uml.c b/arch/um/drivers/virtio_uml.c
+index 61c5ef5b7f2f9b8a2c30a45235331818c74ed613..30390dbaac62913abbebc2f849ff2a279d77c45c 100644
+--- a/arch/um/drivers/virtio_uml.c
++++ b/arch/um/drivers/virtio_uml.c
+@@ -29,6 +29,7 @@
+ #include <linux/string.h>
+ #include <linux/virtio.h>
+ #include <linux/virtio_config.h>
++#include <linux/virtio_ids.h>
+ #include <linux/virtio_ring.h>
+ #include <linux/time-internal.h>
+ #include <linux/virtio-uml.h>
+@@ -347,11 +348,12 @@ static int vhost_user_recv_req(struct virtio_uml_device *vu_dev,
+  *
+  * Only their order pairs a reply with its request, so nothing else may be
+  * sent on the socket between the two: sock_lock covers the whole round trip.
+- * In-band notifications make every kick such a round trip, sent from any CPU
+- * and from atomic context, while another CPU may be reading the device's
+- * configuration. A reply read after sock_lock was dropped could be taken by
+- * that kick, which would then report a healthy backend as gone, and the
+- * reader would take the kick's acknowledgement in its place.
++ * A console kick is such a round trip, and in-band notifications are sent from
++ * any CPU and from atomic context, while another CPU may be reading the
++ * device's configuration. A reply read after sock_lock was dropped could be
++ * taken by that kick, which would then report a healthy backend as gone, and
++ * the reader would take the kick's acknowledgement in its place. A kick that
++ * asks for no reply is kept whole and out of another request's round trip too.
+  */
+ static int vhost_user_round_trip(struct virtio_uml_device *vu_dev,
+ 				 struct vhost_user_msg *msg,
+@@ -1050,6 +1052,36 @@ static int vhost_user_set_vring_state(struct virtio_uml_device *vu_dev,
+ 	return vhost_user_send(vu_dev, &msg, NULL, 0);
+ }
+ 
++/*
++ * Notify the backend in-band that @index has new buffers.
++ *
++ * A kick asks for no acknowledgement. The kicking CPU holds sock_lock with
++ * its interrupts off, so a kick that waited would hold it for as long as the
++ * backend's thread takes to be scheduled and to run the queue, and a CPU 0
++ * held there takes no device interrupt meanwhile. A disconnect still shows
++ * here, as a failed send.
++ *
++ * A console kick alone waits for its acknowledgement, and serves the
++ * backend's requests while it waits (vhost_user_wait_resp()). The console
++ * driver spins on its output queue with interrupts off after a kick, and a
++ * backend may wait for the answer to a request of its own, such as a
++ * configuration change, before it reads the kick: a CPU 0 spinning there would
++ * never take the interrupt that answers. Every other driver sleeps, or takes
++ * its buffers back from the queue's interrupt, while its device works.
++ */
++static int vhost_user_kick_inband(struct virtio_uml_device *vu_dev, u32 index)
++{
++	struct vhost_user_msg msg = {
++		.header.request = VHOST_USER_VRING_KICK,
++		.header.size = sizeof(msg.payload.vring_state),
++		.payload.vring_state.index = index,
++	};
++
++	if (vu_dev->vdev.id.device == VIRTIO_ID_CONSOLE)
++		return vhost_user_send(vu_dev, &msg, NULL, 0);
++	return vhost_user_round_trip(vu_dev, &msg, NULL, 0, NULL, 0);
++}
++
+ static int vhost_user_set_vring_num(struct virtio_uml_device *vu_dev,
+ 				    u32 index, u32 num)
+ {
+@@ -1143,13 +1175,13 @@ static bool vu_notify(struct virtqueue *vq)
+ 
+ 	if (info->kick_fd < 0) {
+ 		/*
+-		 * An in-band notification is a synchronous round trip on the
+-		 * main socket. Its transient failures are already retried or
+-		 * waited out inside that round trip, so anything it reports
+-		 * here is a genuine transport failure.
++		 * An in-band notification is a message on the main socket,
++		 * and a console's alone a synchronous round trip. Its
++		 * transient failures are already retried or waited out inside
++		 * it, so anything it reports here is a genuine transport
++		 * failure.
+ 		 */
+-		rc = vhost_user_set_vring_state(vu_dev, VHOST_USER_VRING_KICK,
+-						vq->index, 0);
++		rc = vhost_user_kick_inband(vu_dev, vq->index);
+ 		if (!rc)
+ 			return true;
+ 	} else {

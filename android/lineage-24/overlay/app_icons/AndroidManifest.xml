@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- The renderer requests no permission and has no activity, receiver or launcher entry. The provider is open only
+     to holders of ACCESS_CONTENT_PROVIDERS_EXTERNALLY (the shell and the system) and checks for the shell user;
+     the service runs in an isolated process and is not exported. Everything is direct-boot aware so that the first
+     call after boot needs no user data. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.kernarium.icons">
+
+    <application
+        android:label="Andarium icons"
+        android:allowBackup="false"
+        android:directBootAware="true"
+        android:usesNonSdkApi="true">
+
+        <provider
+            android:name=".IconProvider"
+            android:authorities="com.kernarium.icons"
+            android:exported="true"
+            android:permission="android.permission.ACCESS_CONTENT_PROVIDERS_EXTERNALLY"
+            android:directBootAware="true" />
+
+        <service
+            android:name=".IconRenderService"
+            android:exported="false"
+            android:isolatedProcess="true"
+            android:directBootAware="true" />
+    </application>
+</manifest>

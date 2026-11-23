@@ -298,6 +298,9 @@ JitExecutor::Implementation::materialize_shared_translation(
 JitExecutor::Implementation::install_shared_translation(
     unsigned long generation, std::uint64_t changes, std::uint64_t pc,
     std::uint8_t mode, std::span<const std::uint32_t> guest_words) {
+  /* A budget too small for a shared tier leaves none to look in. */
+  if (!cache_lease_.shared_translations())
+    return nullptr;
   auto &cache = SharedTranslationCache::instance();
   const auto translation =
       cache.find(shared_codegen_profile(mode), pc, guest_words);
@@ -357,9 +360,11 @@ JitExecutor::Implementation::publish_shared_translation(
     std::uint64_t pc, std::uint8_t mode,
     std::span<const std::uint32_t> validation_words,
     std::size_t guest_word_count, const JitCompiler::Result &compiled) {
-  auto &cache = SharedTranslationCache::instance();
-  if (!compiled.relocatable)
+  /* Nor does one publish to a tier that does not exist; the block keeps its
+   * private validation words. */
+  if (!compiled.relocatable || !cache_lease_.shared_translations())
     return nullptr;
+  auto &cache = SharedTranslationCache::instance();
   const auto profile = shared_codegen_profile(mode);
   const auto preflight = cache.preflight_publication(
       profile, pc, validation_words,

@@ -1,0 +1,150 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 04:07:38 +0900
+Subject: [PATCH] kosmickrisp: give each timestamp of a compute encoder its own
+ sample
+
+A timestamp whose stage has no render stage of its own is sampled by a
+compute encoder, always into entry 0 of the pool's counter heap, and
+read back when the encoder stops. Samples taken by one encoder overwrite
+each other, so every query of the encoder reads the time of the last
+one. When commands lie between the writes, a query then reports a time
+after commands recorded later than it, which vkCmdWriteTimestamp2 does
+not allow: it latches the timer when all previous commands have
+completed the stage. A top-of-pipe write, a copy, a bottom-of-pipe
+write, a second copy and a last top-of-pipe write, all between two
+passes, read one time.
+
+The encoder that runs ahead of the render encoder takes the top stages.
+It now stops before a second sample into a heap it has not resolved yet,
+and the next encoder samples entry 0 again. Outside a started pass that
+opens no command buffer: the encoder runs in order in the main one.
+Inside a started pass the encoder has a command buffer of its own, so
+each further top-stage timestamp into the same pool ends one command
+buffer and opens another. The encoder that runs after the render encoder
+takes the bottom stages inside a pass, and it cannot stop while the
+pass's render encoder is open: its command buffer would be submitted
+ahead of the pass, with the pass's post-render work in it. Each of its
+samples takes the next entry, which a heap has for every query of its
+pool; more samples into one heap than the pool has queries share the
+last entry. Only samples into a heap count: a pipeline-statistics
+publication takes none.
+
+The transform feedback stage is at the end of a pass, like bottom of
+pipe, because a draw's capture is done once the draws before it have
+run. A transform feedback timestamp written after a capture of the same
+pass was sampled by the encoder ahead of the pass, before that capture
+had run, and read the same time as the top-of-pipe write before it; it
+now follows the pass's draws. Writes with no command between them may
+read alike or either way round under Vulkan's rule. The encoders keep
+their recording order all the same, and the test checks that.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/kosmickrisp/vulkan/kk_cmd_buffer.c | 10 +++++++
+ src/kosmickrisp/vulkan/kk_cmd_buffer.h |  1 +
+ src/kosmickrisp/vulkan/kk_query_pool.c | 40 ++++++++++++++++++++++++--
+ 3 files changed, 49 insertions(+), 2 deletions(-)
+
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_buffer.c b/src/kosmickrisp/vulkan/kk_cmd_buffer.c
+index bbe6df540b4edc5ace683dd9b078dd9b06fbf437..8390f70828acc23163e8924530cde655bb20980a 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_buffer.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_buffer.c
+@@ -605,6 +605,16 @@ kk_stop_encoder(struct kk_cmd_buffer *cmd, struct kk_encoder_state *es)
+    es->cmd_buf = NULL;
+ }
+ 
++/* Stops the compute encoder that runs ahead of the render encoder, or in
++ * recording order when none is open, so that it resolves the timestamps it
++ * sampled. The next compute starts another. */
++void
++cs_stop_pre_compute(struct kk_cmd_buffer *cmd)
++{
++   if (cmd->pre_gfx->encoder)
++      kk_stop_encoder(cmd, cmd->pre_gfx);
++}
++
+ void
+ cs_end(struct kk_cmd_buffer *cmd)
+ {
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_buffer.h b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
+index af62d43c89cfbd9ca95503ec6dae7ad435a3b223..65aa82c7d8b0798c393a709f5fa5a1f0485543a4 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_buffer.h
++++ b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
+@@ -481,6 +481,7 @@ void kk_cmd_buffer_set_vertex_amplification(struct kk_cmd_buffer *cmd,
+                                             const uint32_t *layer_ids,
+                                             uint32_t count);
+ mtl_compute_encoder *cs_get_compute(struct kk_cmd_buffer *cmd, bool pre_gfx);
++void cs_stop_pre_compute(struct kk_cmd_buffer *cmd);
+ void cs_end(struct kk_cmd_buffer *cmd);
+ void cs_flush(struct kk_cmd_buffer *cmd);
+ /* Re-emits the graphics state of the draw being recorded into a render
+diff --git a/src/kosmickrisp/vulkan/kk_query_pool.c b/src/kosmickrisp/vulkan/kk_query_pool.c
+index b8abb9fefcbd59ac4e0d183a304f5b798561fe62..6fb8e2b78ae7896e19d4dab89ee88ec17fd8e203 100644
+--- a/src/kosmickrisp/vulkan/kk_query_pool.c
++++ b/src/kosmickrisp/vulkan/kk_query_pool.c
+@@ -349,6 +349,21 @@ kk_pipeline_stages_to_mtl_render_stage(VkPipelineStageFlags2 vk_flags)
+    return 0;
+ }
+ 
++/* The samples the compute encoder `es` has taken into `heap` since it began,
++ * which it has not yet resolved. A pipeline-statistics publication takes no
++ * sample and has no heap. */
++static uint32_t
++kk_encoder_samples_into(const struct kk_encoder_state *es,
++                        const mtl_counter_heap *heap)
++{
++   uint32_t samples = 0;
++   util_dynarray_foreach(&es->ts_resolves, struct kk_ts_resolve, r) {
++      if (r->heap == heap)
++         samples++;
++   }
++   return samples;
++}
++
+ VKAPI_ATTR void VKAPI_CALL
+ kk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
+                       VkPipelineStageFlags2 stage, VkQueryPool queryPool,
+@@ -411,19 +426,40 @@ kk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
+       bool top = true;
+       struct kk_encoder_state *es;
+ 
++      /* Stages with no render stage of their own. Inside a render pass,
++       * those at its end sample after the pass's draws; the others sample
++       * before it. The transform feedback stage is at the end: a draw's
++       * capture is done by the time the draws before it have run. */
+       const VkPipelineStageFlagBits2 bottom_mask =
+-         VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
++         VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT |
++         VK_PIPELINE_STAGE_2_TRANSFORM_FEEDBACK_BIT_EXT;
+       if (cmd->gfx.encoder && ((stage & bottom_mask) != 0)) {
+          top = false;
+       }
+       es = top ? cmd->pre_gfx : cmd->post_gfx;
+ 
++      /* An encoder resolves its samples when it stops, each from the heap
++       * entry it was sampled into. A second sample into an entry would
++       * overwrite the first, and both queries would read the later time. The
++       * pre-render encoder stops before such a sample and a new one takes it.
++       * The post-render encoder cannot stop while the pass's render encoder
++       * is open, because its command buffer would then run ahead of the pass,
++       * so each of its samples takes the next entry; the entries are
++       * adjacent from the first, and a heap has an entry for each query. */
++      uint32_t entry = kk_encoder_samples_into(es, pool->ts.heap);
++      if (entry != 0 && top) {
++         cs_stop_pre_compute(cmd);
++         entry = 0;
++      }
++      entry = MIN2(entry, pool->vk.query_count - 1);
++      resolve.index = entry;
++
+       /* Keep compute work to trigger sampling even for timestamp-only
+        * command buffers, without prematurely publishing availability. */
+       libkk_write_u32(cmd, kk_grid_1d(1), top,
+                       kk_query_available_addr(pool, query), false);
+ 
+-      mtl_compute_write_timestamp(es->encoder, pool->ts.heap, 0);
++      mtl_compute_write_timestamp(es->encoder, pool->ts.heap, entry);
+       mtl_retain(resolve.heap);
+       mtl_retain(resolve.availability);
+       util_dynarray_append(&es->ts_resolves, resolve);

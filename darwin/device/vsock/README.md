@@ -35,9 +35,10 @@ application.
   the device sends no event.
 - **Every guest-initiated request is answered with an RST**, and so is a packet
   for another CID, of another socket type, or for no connection.
-- **The device is appended after every other Virtio device**, in the runtime and
-  in the launcher, so that no other device's index moves: Android's vendor policy
-  names the battery's sysfs path by its position.
+- **The device is appended after the Virtio devices that existed before it**, in
+  the runtime and in the launcher, so that no other device's index moves:
+  Android's vendor policy names the battery's sysfs path by its position. A device
+  added later (GNSS, then the camera) goes after it.
 
 ## Connections
 
@@ -75,7 +76,9 @@ repeatable. Each forward is a loopback TCP listener, and each accepted
 connection is attached to the guest port, so a stock client of a guest service
 reaches it: `adb connect 127.0.0.1:<port>` for adbd on 5555. Only a loopback
 address is accepted. The device exists, appended last, only when a forward is
-given.
+given. The listeners belong to the launch: a guest that restarts in the same
+process keeps every host port, and a connection that arrives before the new
+boot is attached is closed.
 
 ## Tests
 

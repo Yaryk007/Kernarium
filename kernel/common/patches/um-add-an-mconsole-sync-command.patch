@@ -1,0 +1,132 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 22:25:49 +0900
+Subject: [PATCH] um: add an mconsole sync command
+
+The host asks a guest to write its file systems back before it stops
+running the guest, to hold the guest's dirty pages in its own hands.
+Its only request was SysRq 's', which is refused whenever the guest's
+SysRq mask is off and the command line did not set
+sysrq_always_enabled, and which emergency_sync() runs asynchronously:
+the console replies when the writeback has started, so the host slept
+for a fixed time and hoped.
+
+Add a "sync" command that runs ksys_sync(), as sync(2) does, and
+replies "synced in <n> ms" only once it has returned.  It syncs the
+inodes, the file systems and the block devices, whose flush the UBD
+driver carries to the host's descriptor, and needs no SysRq mask.
+Suspend runs the same ksys_sync() but only when sync_on_suspend is set,
+and replies after it, so the command also gives a host that cannot
+suspend the guest the durability that suspend had.
+
+The sync runs on a work item of its own: the console runs its
+process-context requests one at a time, and one that waits, as when the
+host holds a block device while its disk is full, would hold up a trim,
+a suspend and every other request behind it.  The reply is the only
+completion signal, a sync that cannot finish sends none, and the host
+bounds its own wait.  An older kernel answers "Unknown command".
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ arch/um/drivers/mconsole.h      |  1 +
+ arch/um/drivers/mconsole_kern.c | 48 +++++++++++++++++++++++++++++++++
+ arch/um/drivers/mconsole_user.c |  1 +
+ 3 files changed, 50 insertions(+)
+
+diff --git a/arch/um/drivers/mconsole.h b/arch/um/drivers/mconsole.h
+index bbaaffc484eb218acefffdffbc15cd7e5976d807..ae489e643cd377f1d07f0336e2f36bbf8ec17d6b 100644
+--- a/arch/um/drivers/mconsole.h
++++ b/arch/um/drivers/mconsole.h
+@@ -94,6 +94,7 @@ extern void mconsole_proc(struct mc_request *req);
+ extern void mconsole_stack(struct mc_request *req);
+ extern void mconsole_mem(struct mc_request *req);
+ extern void mconsole_trim(struct mc_request *req);
++extern void mconsole_sync(struct mc_request *req);
+ 
+ extern int mconsole_get_request(int fd, struct mc_request *req);
+ extern int mconsole_notify(char *sock_name, int type, const void *data,
+diff --git a/arch/um/drivers/mconsole_kern.c b/arch/um/drivers/mconsole_kern.c
+index 57979cb49b0f642beb61e01f6f5ce4722a8dd036..d9753c60ac429c5b1fdb3a556c38934c89112357 100644
+--- a/arch/um/drivers/mconsole_kern.c
++++ b/arch/um/drivers/mconsole_kern.c
+@@ -9,6 +9,7 @@
+ #include <linux/delay.h>
+ #include <linux/string.h>
+ #include <linux/interrupt.h>
++#include <linux/ktime.h>
+ #include <linux/list.h>
+ #include <linux/mm.h>
+ #include <linux/module.h>
+@@ -229,6 +230,8 @@ void mconsole_proc(struct mc_request *req)
+     mem - returns the memory total=, available= and free=, in bytes\n\
+     trim on|off|once - trim page cache the host already caches:\n\
+ 	periodically, no longer, or all of the cold cache now\n\
++    sync - write every file system back, as sync(2) does, and reply when\n\
++	that has returned\n\
+ "
+ 
+ void mconsole_help(struct mc_request *req)
+@@ -940,6 +943,51 @@ void mconsole_trim(struct mc_request *req)
+ 	}
+ }
+ 
++struct mconsole_sync {
++	struct work_struct work;
++	struct mc_request req;
++};
++
++static void mconsole_sync_work(struct work_struct *work)
++{
++	struct mconsole_sync *sync =
++		container_of(work, struct mconsole_sync, work);
++	ktime_t start = ktime_get();
++	char reply[32];
++
++	ksys_sync();
++	snprintf(reply, sizeof(reply), "synced in %lld ms",
++		 ktime_ms_delta(ktime_get(), start));
++	mconsole_reply(&sync->req, reply, 0, 0);
++	kfree(sync);
++}
++
++/*
++ * Write every file system and block device back, as sync(2) does, and reply
++ * once that has returned.  The host asks before it stops running the guest, to
++ * have the guest's dirty pages in its hands.  SysRq 's' only starts the
++ * writeback and is refused while the SysRq mask is off; this does neither.
++ *
++ * The sync runs on a work item of its own, so one that has to wait, for a
++ * block device the host holds while its disk is full or for a FUSE daemon
++ * that does not answer, delays no other console request.  It sends no reply
++ * until it has returned, and the host bounds its own wait.  The reply says
++ * the pass returned.  sync(2) reports no I/O error, so one that a file
++ * system lost is not reported either.
++ */
++void mconsole_sync(struct mc_request *req)
++{
++	struct mconsole_sync *sync = kmalloc(sizeof(*sync), GFP_KERNEL);
++
++	if (sync == NULL) {
++		mconsole_reply(req, "Out of memory", 1, 0);
++		return;
++	}
++	sync->req = *req;
++	INIT_WORK(&sync->work, mconsole_sync_work);
++	queue_work(system_unbound_wq, &sync->work);
++}
++
+ static int __init mount_proc(void)
+ {
+ 	struct file_system_type *proc_fs_type;
+diff --git a/arch/um/drivers/mconsole_user.c b/arch/um/drivers/mconsole_user.c
+index 6ead5ac46da71436c324b8579e0b853d52964616..d55ae3ac7fde06c643eda8ad1d919ec54dc9628a 100644
+--- a/arch/um/drivers/mconsole_user.c
++++ b/arch/um/drivers/mconsole_user.c
+@@ -36,6 +36,7 @@ static struct mconsole_command commands[] = {
+ 	{ "stack", mconsole_stack, MCONSOLE_INTR },
+ 	{ "mem", mconsole_mem, MCONSOLE_INTR },
+ 	{ "trim", mconsole_trim, MCONSOLE_PROC },
++	{ "sync", mconsole_sync, MCONSOLE_PROC },
+ };
+ 
+ /* Initialized in mconsole_init, which is an initcall */

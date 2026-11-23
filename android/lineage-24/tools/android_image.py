@@ -338,13 +338,35 @@ def parse_boot_image(
     )
 
 
+# A partition layout is a few kilobytes; nothing near this size is one.
+MAX_LAYOUT = 1 << 20
+
+
 def partition_range(
-    layout_path: Path, disk_path: Path, name: str, error: Error
+    layout: Path | bytes, disk_path: Path, name: str, error: Error
 ) -> tuple[int, int]:
-    """Return a system disk partition's byte offset and size from the checked layout."""
+    """Return a system disk partition's byte offset and size from the checked layout.
+    `layout` is the layout file, read with a bound, or its bytes already read. The
+    disk's size is taken by its path: a caller that opens the disk takes the size
+    from what it opened and uses partition_range_in."""
+    return partition_range_in(layout, disk_path.stat().st_size, name, error)
+
+
+def partition_range_in(
+    layout: Path | bytes, disk_bytes: int, name: str, error: Error
+) -> tuple[int, int]:
+    """partition_range for a disk of `disk_bytes` bytes, the size of the descriptor
+    the caller opened."""
     try:
-        document = json.loads(layout_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as failure:
+        if isinstance(layout, bytes):
+            text = layout
+        else:
+            with layout.open("rb") as handle:
+                text = handle.read(MAX_LAYOUT + 1)
+        if len(text) > MAX_LAYOUT:
+            raise ValueError(f"larger than {MAX_LAYOUT} bytes")
+        document = json.loads(text.decode("utf-8"))
+    except (OSError, ValueError) as failure:
         raise error(f"cannot read partition layout: {failure}") from failure
     if not isinstance(document, dict) or document.get("schema_version") != 2:
         raise error("partition layout schema is invalid")
@@ -371,7 +393,7 @@ def partition_range(
         or start + size > disk_size
     ):
         raise error(f"partition range is invalid: {name}")
-    if disk_path.stat().st_size != disk_size:
+    if disk_bytes != disk_size:
         raise error("disk size differs from the checked partition layout")
     return start, size
 

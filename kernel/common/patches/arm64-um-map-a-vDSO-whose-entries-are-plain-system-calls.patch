@@ -1,0 +1,550 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 04:04:09 +0900
+Subject: [PATCH] arm64: um: map a vDSO whose entries are plain system calls
+
+An arm64 guest task had no vDSO: no [vdso] mapping and no
+AT_SYSINFO_EHDR. A C library that reaches clock_gettime only through
+the vDSO, as the glibc 2.39 inside a guest application's own root file
+system does, then failed every clock with -1 and errno 0, and time()
+returned stack garbage.
+
+Build the vDSO as arm64 Linux's and the x86 UML port's are built, an ELF
+shared object linked at address 0 with one read-only segment, and embed
+it in the kernel. It carries the LINUX_2.6.39 version node, both hash
+tables (glibc and bionic read the GNU one, musl the SysV one), the Linux
+note, and an unwind table, and it needs no relocation. Its entries are
+__kernel_clock_gettime, __kernel_gettimeofday and __kernel_clock_getres.
+Each loads the call number, executes svc and returns the call's result
+unchanged, a negative errno included, as the native vDSO's fallback
+does. None reads a counter: the guest has none a task may read, and a
+fast path is a topic of its own. __kernel_rt_sigreturn is not exported;
+a handler without SA_RESTORER keeps returning through the [sigpage].
+
+exec maps the image as a special mapping where the address space has
+room, in addition to the [sigpage], and records a move by mremap().
+ARCH_DLINFO puts its address in AT_SYSINFO_EHDR; it is now defined in
+every configuration and holds AT_MINSIGSTKSZ only with SME. An AArch32
+task keeps its kuser helpers and compat sigpage and gets neither a vDSO
+nor the entry, as on native arm64.
+
+UML_ARM64_VDSO selects it. The x86-64 userspace slice clears it, since
+its tasks run x86 code. The comments of the time-data headers that said
+the guest has no vDSO now describe this one.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ arch/arm64/um/Kconfig                 |   6 ++
+ arch/arm64/um/Makefile                |   1 +
+ arch/arm64/um/asm/elf.h               |  38 ++++++++--
+ arch/arm64/um/asm/vdso/clocksource.h  |   7 +-
+ arch/arm64/um/asm/vdso/gettimeofday.h |   6 +-
+ arch/arm64/um/signal.c                |   8 +-
+ arch/arm64/um/vdso/Makefile           |  44 +++++++++++
+ arch/arm64/um/vdso/note.S             |  16 ++++
+ arch/arm64/um/vdso/syscalls.S         |  33 +++++++++
+ arch/arm64/um/vdso/vdso.S             |  13 ++++
+ arch/arm64/um/vdso/vdso.lds.S         |  84 +++++++++++++++++++++
+ arch/arm64/um/vdso/vma.c              | 102 ++++++++++++++++++++++++++
+ arch/um/include/asm/mmu.h             |   4 +
+ 13 files changed, 350 insertions(+), 12 deletions(-)
+ create mode 100644 arch/arm64/um/vdso/Makefile
+ create mode 100644 arch/arm64/um/vdso/note.S
+ create mode 100644 arch/arm64/um/vdso/syscalls.S
+ create mode 100644 arch/arm64/um/vdso/vdso.S
+ create mode 100644 arch/arm64/um/vdso/vdso.lds.S
+ create mode 100644 arch/arm64/um/vdso/vma.c
+
+diff --git a/arch/arm64/um/Kconfig b/arch/arm64/um/Kconfig
+index b0bdc892ebff790cc6bdd8002886b56566f08794..1f8ca002428d50244d6501cdb626447b08556dea 100644
+--- a/arch/arm64/um/Kconfig
++++ b/arch/arm64/um/Kconfig
+@@ -87,3 +87,9 @@ config GENERIC_HWEIGHT
+ 
+ config GENERIC_CSUM
+ 	def_bool y
++
++# Every arm64 task maps the vDSO of arch/arm64/um/vdso at exec, whose entries
++# are plain system calls.  An AArch32 task has none, and the x86-64 slice's
++# tasks run x86 code.
++config UML_ARM64_VDSO
++	def_bool y
+diff --git a/arch/arm64/um/Makefile b/arch/arm64/um/Makefile
+index c9712aae23d0a57eb3cb47e39e2f718b67cbf40e..ca874d4168ca7dc7bcf426ffe7c868a094c21211 100644
+--- a/arch/arm64/um/Makefile
++++ b/arch/arm64/um/Makefile
+@@ -4,6 +4,7 @@ obj-y := bugs.o delay.o fault.o mem.o mmap.o ptrace.o registers.o setjmp.o \
+ 	signal.o subarch.o syscall_table.o syscalls.o sysrq.o tls.o
+ obj-$(CONFIG_UML_ARM64_SME) += sme.o sme_signal.o
+ obj-$(CONFIG_UML_ARM64_TAGGED_ADDR_ABI) += tagged_addr.o
++obj-$(CONFIG_UML_ARM64_VDSO) += vdso/
+ obj-$(CONFIG_UML_ARM64_AARCH32) += aarch32.o aarch32_pages.o \
+ 	armv8_deprecated.o ptrace32.o signal32.o sys32.o sys_compat.o
+ 
+diff --git a/arch/arm64/um/asm/elf.h b/arch/arm64/um/asm/elf.h
+index 2dc1b1be43dca961e4ce25ff7b2407caa3ccf894..9936ea160c79d86052dd800fdbb15574681d7472 100644
+--- a/arch/arm64/um/asm/elf.h
++++ b/arch/arm64/um/asm/elf.h
+@@ -142,24 +142,52 @@ extern int aarch32_setup_additional_pages(struct linux_binprm *bprm,
+ 					  int uses_interp);
+ #endif
+ 
+-#ifdef CONFIG_UML_ARM64_SME
+ /*
+- * With SME, AT_MINSIGSTKSZ gives the stack the largest signal frame needs,
+- * as on native arm64; without it the vector stays as it was.
++ * What every configuration puts in the auxiliary vector beside the standard
++ * entries: AT_SYSINFO_EHDR, the vDSO's address, where the task has one; and,
++ * with SME, AT_MINSIGSTKSZ, which gives the stack the largest signal frame
++ * needs, as on native arm64.  Without SME the vector stays as it was.
+  */
++#ifdef CONFIG_UML_ARM64_VDSO
++#define UML_ARM64_VDSO_DLINFO do { \
++	if (current->mm->context.vdso) \
++		NEW_AUX_ENT(AT_SYSINFO_EHDR, current->mm->context.vdso); \
++} while (0)
++#else
++#define UML_ARM64_VDSO_DLINFO do { } while (0)
++#endif
++
++#ifdef CONFIG_UML_ARM64_SME
+ extern unsigned long uml_arm64_minsigstksz;
+-#define ARCH_DLINFO do { \
++#define UML_ARM64_SME_DLINFO do { \
+ 	if (uml_arm64_minsigstksz) \
+ 		NEW_AUX_ENT(AT_MINSIGSTKSZ, uml_arm64_minsigstksz); \
+ } while (0)
++#else
++#define UML_ARM64_SME_DLINFO do { } while (0)
+ #endif
+ 
++#define ARCH_DLINFO do { \
++	UML_ARM64_VDSO_DLINFO; \
++	UML_ARM64_SME_DLINFO; \
++} while (0)
++
+ #ifdef UML_HOST_DARWIN
+-/* Maps the page that holds the sigreturn trampoline (signal.c). */
++/* Maps the page that holds the sigreturn trampoline (signal.c) and the vDSO. */
+ #define ARCH_HAS_SETUP_ADDITIONAL_PAGES 1
+ struct linux_binprm;
+ extern int arch_setup_additional_pages(struct linux_binprm *bprm,
+ 				       int uses_interp);
+ #endif
+ 
++#ifdef CONFIG_UML_ARM64_VDSO
++/*
++ * Maps the vDSO into the task being executed, which holds mm's mmap lock for
++ * writing, and records its address in mm->context.vdso.  Leaves the task
++ * with no vDSO if the kernel could not build the image.
++ */
++struct mm_struct;
++extern int uml_arm64_vdso_map(struct mm_struct *mm);
++#endif
++
+ #endif
+diff --git a/arch/arm64/um/asm/vdso/clocksource.h b/arch/arm64/um/asm/vdso/clocksource.h
+index 366bc01cc3dd7f9153ff0e5314e1677890ca37dc..c82105b623edd03a1c05baaaa58bca14dd38932f 100644
+--- a/arch/arm64/um/asm/vdso/clocksource.h
++++ b/arch/arm64/um/asm/vdso/clocksource.h
+@@ -2,9 +2,10 @@
+ #ifndef __UM_ARM64_ASM_VDSO_CLOCKSOURCE_H
+ #define __UM_ARM64_ASM_VDSO_CLOCKSOURCE_H
+ 
+-/* UML exposes time through Linux syscalls rather than a native guest vDSO.
+- * Keep a private enum value so the generic time namespace data layout can be
+- * built while every UML clocksource continues to publish VDSO_CLOCKMODE_NONE.
++/* The guest's vDSO (arch/arm64/um/vdso) reads no clock itself: each of its
++ * entries is the system call.  Keep a private enum value so the generic time
++ * namespace data layout can be built while every UML clocksource continues to
++ * publish VDSO_CLOCKMODE_NONE.
+  */
+ #define VDSO_ARCH_CLOCKMODES VDSO_CLOCKMODE_UML
+ 
+diff --git a/arch/arm64/um/asm/vdso/gettimeofday.h b/arch/arm64/um/asm/vdso/gettimeofday.h
+index d78e4d728206ee0416628b0145362965b29e0f1f..bbe5b7f2d09bd4d7af2db4173d5435f748ed21a8 100644
+--- a/arch/arm64/um/asm/vdso/gettimeofday.h
++++ b/arch/arm64/um/asm/vdso/gettimeofday.h
+@@ -4,9 +4,9 @@
+ 
+ #include <uapi/linux/time.h>
+ 
+-/* arm64 UML does not install executable guest vDSO code.  These fallbacks
+- * satisfy the generic time-data contract used by time namespaces; any future
+- * guest vDSO must replace them with the normal translated syscall gateway.
++/* The guest's vDSO (arch/arm64/um/vdso) builds none of lib/vdso: each of its
++ * entries is the system call.  These definitions satisfy the generic time-data
++ * contract used by time namespaces and never run in the guest.
+  */
+ static __always_inline u64 __arch_get_hw_counter(
+ 	s32 clock_mode, const struct vdso_time_data *vd)
+diff --git a/arch/arm64/um/signal.c b/arch/arm64/um/signal.c
+index dd560d7da81a046f943d8a318b50737cf2f053eb..446a558b37797739112838c80c93b3928f8c700f 100644
+--- a/arch/arm64/um/signal.c
++++ b/arch/arm64/um/signal.c
+@@ -66,6 +66,7 @@ int arch_setup_additional_pages(struct linux_binprm *bprm, int uses_interp)
+ 	};
+ 	struct mm_struct *mm = current->mm;
+ 	struct vm_area_struct *vma;
++	int ret;
+ 
+ 	if (!uml_darwin_sigpage)
+ 		return -ENOMEM;
+@@ -78,8 +79,13 @@ int arch_setup_additional_pages(struct linux_binprm *bprm, int uses_interp)
+ 		UML_DARWIN_SIGRETURN_TRAMPOLINE & PAGE_MASK, PAGE_SIZE,
+ 		VM_READ | VM_EXEC | VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC |
+ 		VM_SEALED_SYSMAP, &sigpage);
++	ret = PTR_ERR_OR_ZERO(vma);
++#ifdef CONFIG_UML_ARM64_VDSO
++	if (!ret)
++		ret = uml_arm64_vdso_map(mm);
++#endif
+ 	mmap_write_unlock(mm);
+-	return PTR_ERR_OR_ZERO(vma);
++	return ret;
+ }
+ #endif
+ 
+diff --git a/arch/arm64/um/vdso/Makefile b/arch/arm64/um/vdso/Makefile
+new file mode 100644
+index 0000000000000000000000000000000000000000..9e5ee72bb482029bfe563577d91e4040421cdb40
+--- /dev/null
++++ b/arch/arm64/um/vdso/Makefile
+@@ -0,0 +1,44 @@
++# SPDX-License-Identifier: GPL-2.0
++#
++# The vDSO of an arm64 UML guest: an ELF shared object whose entries are plain
++# system calls, built here and embedded in the kernel image.
++#
++
++# Include the generic Makefile to check the built vdso.
++include $(srctree)/lib/vdso/Makefile.include
++
++# Files linked into the vDSO, and files linked into the kernel.
++vobjs-y := note.o syscalls.o
++obj-y += vdso.o vma.o
++
++vobjs := $(addprefix $(obj)/, $(vobjs-y))
++
++targets += $(vobjs-y) vdso.lds vdso.so vdso.so.dbg
++
++$(obj)/vdso.o: $(obj)/vdso.so
++
++# Both hash tables: glibc and bionic look a symbol up in the GNU one, and
++# musl's vDSO lookup reads the SysV one.  No relocation is needed, so the
++# image does not depend on where it is mapped.
++ldflags-y := -shared -soname=linux-vdso.so.1 --hash-style=both \
++	     -Bsymbolic --build-id=sha1 --eh-frame-hdr -z noexecstack -n
++
++ifdef CONFIG_LD_ORPHAN_WARN
++  ldflags-y += --orphan-handling=$(CONFIG_LD_ORPHAN_WARN_LEVEL)
++endif
++
++ldflags-y += -T
++
++CPPFLAGS_vdso.lds += -P -C -U$(ARCH)
++
++# The .lds file has to come first on the link line.
++$(obj)/vdso.so.dbg: $(obj)/vdso.lds $(vobjs) FORCE
++	$(call if_changed,vdsold_and_vdso_check)
++
++# Strip the image that the kernel embeds.
++$(obj)/%.so: OBJCOPYFLAGS := -S
++$(obj)/%.so: $(obj)/%.so.dbg FORCE
++	$(call if_changed,objcopy)
++
++quiet_cmd_vdsold_and_vdso_check = LD      $@
++      cmd_vdsold_and_vdso_check = $(cmd_ld); $(cmd_vdso_check)
+diff --git a/arch/arm64/um/vdso/note.S b/arch/arm64/um/vdso/note.S
+new file mode 100644
+index 0000000000000000000000000000000000000000..6ce2101d916f32f4754c0038ce8cb7d73450f2d2
+--- /dev/null
++++ b/arch/arm64/um/vdso/note.S
+@@ -0,0 +1,16 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * The .note sections of the vDSO, in its PT_NOTE: the kernel version, as
++ * arm64 Linux's vDSO states it, which glibc reads as the kernel's ABI level.
++ */
++
++#include <linux/uts.h>
++#include <linux/version.h>
++#include <linux/elfnote.h>
++#include <linux/build-salt.h>
++
++ELFNOTE_START(Linux, 0, "a")
++	.long LINUX_VERSION_CODE
++ELFNOTE_END
++
++BUILD_SALT
+diff --git a/arch/arm64/um/vdso/syscalls.S b/arch/arm64/um/vdso/syscalls.S
+new file mode 100644
+index 0000000000000000000000000000000000000000..e52dd2453e274e80af1ea2986c021d7b6e32f030
+--- /dev/null
++++ b/arch/arm64/um/vdso/syscalls.S
+@@ -0,0 +1,33 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * The entries of an arm64 UML guest's vDSO.  Each is the plain system call
++ * and returns its result as the call does, a negative errno included, which
++ * is how arm64 Linux's own vDSO returns the call's failure to glibc and
++ * bionic.  The guest has no counter a user program may read, so none reads
++ * the time itself.
++ *
++ * Each entry carries call frame information, so an unwinder that stops in it
++ * (a signal handler's backtrace, a profiler's sample, a debugger) finds the
++ * caller's frame through the link register.
++ */
++
++#include <asm/unistd.h>
++
++	.text
++
++	.macro	vdso_entry name, nr
++	.globl	\name
++	.type	\name, %function
++	.p2align 2
++\name:
++	.cfi_startproc
++	mov	x8, #\nr
++	svc	#0
++	ret
++	.cfi_endproc
++	.size	\name, . - \name
++	.endm
++
++	vdso_entry __kernel_clock_gettime, __NR_clock_gettime
++	vdso_entry __kernel_gettimeofday, __NR_gettimeofday
++	vdso_entry __kernel_clock_getres, __NR_clock_getres
+diff --git a/arch/arm64/um/vdso/vdso.S b/arch/arm64/um/vdso/vdso.S
+new file mode 100644
+index 0000000000000000000000000000000000000000..a6a04b33351070d4bf37dc319da1e4678dca5a1d
+--- /dev/null
++++ b/arch/arm64/um/vdso/vdso.S
+@@ -0,0 +1,13 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#include <linux/init.h>
++
++	__INITDATA
++
++	.globl	uml_arm64_vdso_start
++	.globl	uml_arm64_vdso_end
++	.balign	8
++uml_arm64_vdso_start:
++	.incbin "arch/arm64/um/vdso/vdso.so"
++uml_arm64_vdso_end:
++
++	__FINIT
+diff --git a/arch/arm64/um/vdso/vdso.lds.S b/arch/arm64/um/vdso/vdso.lds.S
+new file mode 100644
+index 0000000000000000000000000000000000000000..5400d694337a4a06a1d20f9d046d46fd9ba4d975
+--- /dev/null
++++ b/arch/arm64/um/vdso/vdso.lds.S
+@@ -0,0 +1,84 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * GNU linker script for the vDSO of an arm64 UML guest: one read-only,
++ * executable segment at address 0, as arm64 Linux's vDSO has, with the
++ * unwind tables of its entries.
++ */
++
++#include <linux/const.h>
++
++OUTPUT_FORMAT("elf64-littleaarch64", "elf64-bigaarch64", "elf64-littleaarch64")
++OUTPUT_ARCH(aarch64)
++
++SECTIONS
++{
++	. = SIZEOF_HEADERS;
++
++	.hash		: { *(.hash) }			:text
++	.gnu.hash	: { *(.gnu.hash) }
++	.dynsym		: { *(.dynsym) }
++	.dynstr		: { *(.dynstr) }
++	.gnu.version	: { *(.gnu.version) }
++	.gnu.version_d	: { *(.gnu.version_d) }
++	.gnu.version_r	: { *(.gnu.version_r) }
++
++	/*
++	 * Discard .note.gnu.property sections, which are unused and have a
++	 * different alignment requirement from the vDSO's note sections.
++	 */
++	/DISCARD/	: {
++		*(.note.GNU-stack .note.gnu.property)
++		*(.ARM.attributes)
++	}
++	.note		: { *(.note.*) }		:text	:note
++
++	.eh_frame_hdr	: { *(.eh_frame_hdr) }		:text	:eh_frame_hdr
++	.eh_frame	: { KEEP (*(.eh_frame)) }	:text
++
++	. = ALIGN(16);
++
++	.text		: { *(.text*) }			:text	=0xd503201f
++	PROVIDE (__etext = .);
++	PROVIDE (_etext = .);
++	PROVIDE (etext = .);
++
++	.dynamic	: { *(.dynamic) }		:text	:dynamic
++
++	.rodata		: { *(.rodata*) }		:text
++
++	_end = .;
++	PROVIDE(end = .);
++
++	/DISCARD/	: {
++		*(.data .data.* .gnu.linkonce.d.* .sdata*)
++		*(.bss .sbss .dynbss .dynsbss)
++	}
++}
++
++/*
++ * We must supply the ELF program headers explicitly to get just one
++ * PT_LOAD segment, and set the flags explicitly to make segments read-only.
++ */
++#define PT_GNU_EH_FRAME	0x6474e550
++
++PHDRS
++{
++	text		PT_LOAD		FLAGS(5) FILEHDR PHDRS; /* PF_R|PF_X */
++	dynamic		PT_DYNAMIC	FLAGS(4);		/* PF_R */
++	note		PT_NOTE		FLAGS(4);		/* PF_R */
++	eh_frame_hdr	PT_GNU_EH_FRAME;
++}
++
++/*
++ * This controls what symbols we export from the DSO.
++ */
++VERSION
++{
++	LINUX_2.6.39 {
++	global:
++		__kernel_gettimeofday;
++		__kernel_clock_gettime;
++		__kernel_clock_getres;
++	local: *;
++	};
++}
+diff --git a/arch/arm64/um/vdso/vma.c b/arch/arm64/um/vdso/vma.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..73748a9010eef978f9d6accddd748158015d2023
+--- /dev/null
++++ b/arch/arm64/um/vdso/vma.c
+@@ -0,0 +1,102 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Map the vDSO into an arm64 UML guest task.
++ *
++ * The image is the ELF object that this directory builds: the system calls
++ * that tell the time, each a plain system call.  Every task gets the same
++ * read-only pages, mapped where the task's address space has room, as native
++ * arm64 does, and finds them through AT_SYSINFO_EHDR.
++ */
++
++#include <linux/binfmts.h>
++#include <linux/elf.h>
++#include <linux/init.h>
++#include <linux/mm.h>
++#include <linux/printk.h>
++#include <linux/sched.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++#include <asm/elf.h>
++
++extern char uml_arm64_vdso_start[], uml_arm64_vdso_end[];
++
++static unsigned long vdso_pages __ro_after_init;
++
++static int vdso_mremap(const struct vm_special_mapping *sm,
++		       struct vm_area_struct *new_vma)
++{
++	current->mm->context.vdso = new_vma->vm_start;
++	return 0;
++}
++
++static struct vm_special_mapping vdso_mapping __ro_after_init = {
++	.name	= "[vdso]",
++	.mremap	= vdso_mremap,
++};
++
++static int __init vdso_init(void)
++{
++	size_t size = uml_arm64_vdso_end - uml_arm64_vdso_start;
++	struct page **pagelist;
++	unsigned long i;
++
++	if (memcmp(uml_arm64_vdso_start, ELFMAG, SELFMAG)) {
++		pr_err("vDSO is not a valid ELF object\n");
++		return -EINVAL;
++	}
++
++	vdso_pages = DIV_ROUND_UP(size, PAGE_SIZE);
++	/* The special mapping's page list ends with a null entry. */
++	pagelist = kcalloc(vdso_pages + 1, sizeof(*pagelist), GFP_KERNEL);
++	if (!pagelist)
++		goto oom;
++
++	for (i = 0; i < vdso_pages; i++) {
++		size_t chunk = min_t(size_t, size - i * PAGE_SIZE, PAGE_SIZE);
++
++		pagelist[i] = alloc_page(GFP_KERNEL | __GFP_ZERO);
++		if (!pagelist[i])
++			goto oom_pages;
++		memcpy(page_address(pagelist[i]),
++		       uml_arm64_vdso_start + i * PAGE_SIZE, chunk);
++	}
++	vdso_mapping.pages = pagelist;
++	return 0;
++
++oom_pages:
++	while (i--)
++		__free_page(pagelist[i]);
++	kfree(pagelist);
++oom:
++	pr_err("cannot allocate the vDSO; tasks start without one\n");
++	return -ENOMEM;
++}
++subsys_initcall(vdso_init);
++
++int uml_arm64_vdso_map(struct mm_struct *mm)
++{
++	unsigned long len = vdso_pages << PAGE_SHIFT;
++	struct vm_area_struct *vma;
++	unsigned long base;
++
++	if (!vdso_mapping.pages)
++		return 0;
++
++	base = get_unmapped_area(NULL, 0, len, 0, 0);
++	if (IS_ERR_VALUE(base))
++		return base;
++
++	/*
++	 * As native arm64 maps its vDSO: sealed where system mappings are, and
++	 * writable only by a debugger's copy-on-write.
++	 */
++	vma = _install_special_mapping(mm, base, len,
++				       VM_READ | VM_EXEC | VM_MAYREAD |
++				       VM_MAYWRITE | VM_MAYEXEC |
++				       VM_SEALED_SYSMAP, &vdso_mapping);
++	if (IS_ERR(vma))
++		return PTR_ERR(vma);
++
++	mm->context.vdso = base;
++	return 0;
++}
+diff --git a/arch/um/include/asm/mmu.h b/arch/um/include/asm/mmu.h
+index fdc3e28675372640fbebb31155b25a035b021209..4dd32155d3f216cd86b2d5943048e6d3bd06e898 100644
+--- a/arch/um/include/asm/mmu.h
++++ b/arch/um/include/asm/mmu.h
+@@ -30,6 +30,10 @@ typedef struct mm_context {
+ #ifdef CONFIG_COMPAT
+ 	/* Where the signal-return trampolines of a 32-bit task are mapped. */
+ 	unsigned long compat_sigpage;
++#endif
++#ifdef CONFIG_UML_ARM64_VDSO
++	/* Where the task's vDSO is mapped, or 0 if it has none. */
++	unsigned long vdso;
+ #endif
+ 	struct mutex turnstile;
+ 

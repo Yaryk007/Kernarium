@@ -1,0 +1,112 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 05:44:17 +0900
+Subject: [PATCH] venus: offer guest memory fds next to hardware buffers on
+ Android
+
+The Android build offered only the hardware buffer handle type, as
+upstream Venus does. The guest series kept that shape when it taught
+the host-allocation renderer to share a blob, so the renderer that
+exports a blob as an opaque fd or a dma-buf on Linux hid both on
+Android, with VK_KHR_external_memory_fd and
+VK_EXT_external_memory_dma_buf. An application that enables
+VK_KHR_external_memory_fd on every device it creates, to share memory
+between processes, could not create a device at all
+(VK_ERROR_EXTENSION_NOT_PRESENT). Nothing in this project's tests or in
+Android's extension list for a release depends on the exclusion: the
+fd extensions are older than every release the product is tested with.
+
+Offer the two fd handle types in both renderer branches, and the two
+extensions beside the hardware buffer ones. Export, import and mapping
+are the paths the Linux driver already serves: vkGetMemoryFdKHR
+exports the virtio-gpu resource behind a memory object, an import
+wraps one again, and a host-visible allocation asks the renderer for
+the shareable blob. The hardware buffer paths are unchanged. Queries for
+that type are still answered by the Android helpers, and the compatible
+and re-exportable types of an fd query leave it out, so that no
+allocation is described as both a blob and a gralloc buffer.
+
+It reaches users only through the next accepted Android image, so it is
+an input of the next Android release.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/virtio/vulkan/vn_physical_device.c | 31 +++++++++++++++++---------
+ 1 file changed, 20 insertions(+), 11 deletions(-)
+
+diff --git a/src/virtio/vulkan/vn_physical_device.c b/src/virtio/vulkan/vn_physical_device.c
+index cd6af3bc66004bde1e2338be8c08dfb8c74cd49a..4037e52e183a92a5d4adb0ff5d79675acb42997c 100644
+--- a/src/virtio/vulkan/vn_physical_device.c
++++ b/src/virtio/vulkan/vn_physical_device.c
+@@ -1073,13 +1073,12 @@ vn_physical_device_init_external_memory(
+       physical_dev->external_memory.renderer_handle_type =
+          VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+ 
+-#ifdef VK_USE_PLATFORM_ANDROID_KHR
+-      physical_dev->external_memory.supported_handle_types |=
+-         VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
+-#else
+       physical_dev->external_memory.supported_handle_types =
+          VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
+          VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
++#ifdef VK_USE_PLATFORM_ANDROID_KHR
++      physical_dev->external_memory.supported_handle_types |=
++         VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
+ #endif
+    } else if (physical_dev->external_memory.renderer_supports_host_allocation &&
+               physical_dev->instance->renderer->info.has_dma_buf_import) {
+@@ -1090,13 +1089,12 @@ vn_physical_device_init_external_memory(
+        */
+       physical_dev->external_memory.renderer_handle_type =
+          VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+-#ifdef VK_USE_PLATFORM_ANDROID_KHR
+-      physical_dev->external_memory.supported_handle_types |=
+-         VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
+-#else
+       physical_dev->external_memory.supported_handle_types =
+          VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
+          VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
++#ifdef VK_USE_PLATFORM_ANDROID_KHR
++      physical_dev->external_memory.supported_handle_types |=
++         VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
+ #endif
+       if (physical_dev->external_memory.renderer_supports_metal_heap) {
+          physical_dev->external_memory.renderer_optimal_image_handle_type =
+@@ -1179,14 +1177,19 @@ vn_physical_device_get_native_extensions(
+       exts->ANDROID_external_memory_android_hardware_buffer = true;
+       exts->ANDROID_native_buffer = true;
+    }
+-#else  /* VK_USE_PLATFORM_ANDROID_KHR */
++#endif /* VK_USE_PLATFORM_ANDROID_KHR */
++
++   /* The guest fd types name the virtio-gpu resource behind a memory object,
++    * which is the same resource on Android.  They are offered next to the
++    * hardware buffer, not instead of it: an application that shares memory
++    * between processes asks for the fd extension by name.
++    */
+    if (physical_dev->external_memory.renderer_handle_type) {
+ #if !DETECT_OS_WINDOWS
+       exts->KHR_external_memory_fd = true;
+       exts->EXT_external_memory_dma_buf = true;
+ #endif /* !DETECT_OS_WINDOWS */
+    }
+-#endif /* VK_USE_PLATFORM_ANDROID_KHR */
+ 
+ #ifdef VN_USE_WSI_PLATFORM
+    exts->KHR_incremental_present = true;
+@@ -2672,8 +2675,14 @@ vn_sanitize_external_memory_properties(
+    VkExternalMemoryHandleTypeFlagBits renderer_handle_type,
+    VkExternalMemoryProperties *props)
+ {
++   /* What a blob is shared as are the fd types.  A query for the Android
++    * hardware buffer is answered by the Android helpers alone and never
++    * reaches here, so it is not a type a blob can be re-exported as.
++    */
+    const VkExternalMemoryHandleTypeFlags supported_handle_types =
+-      physical_dev->external_memory.supported_handle_types;
++      physical_dev->external_memory.supported_handle_types &
++      (VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
++       VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
+ 
+    /* Export support is provided by virtio-gpu, while import requires the
+     * renderer to consume the resource attached to its context.

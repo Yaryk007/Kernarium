@@ -2,11 +2,12 @@
 /* The process's gadget-cache budget bounds what the address spaces' caches
  * keep, whatever their slots would hold. A workload of large blocks, each
  * translated once, runs under a budget a fraction of what it needs: the
- * largest address space is asked to shed, every executor holding it lets go
- * of it at its next entry and translates afresh in a new one, the open spaces
- * stay within the budget, the guest computes what it would have, and the
- * address spaces that go refund what they held. Under the default budget the
- * same workload is never asked to shed. */
+ * address space is asked to shed, every executor holding it lets go of it at
+ * its next entry and translates afresh in a new one, the open spaces stay
+ * within the budget, the guest computes what it would have, and the address
+ * spaces that go refund what they held. Under the default budget the same
+ * workload is never asked to shed. One that no executor has entered for a
+ * while sheds before one that was, which keeps its translations. */
 #include "arm64_gadget_runtime_test_support.hpp"
 #include "jit_test_support.hpp"
 #include "runtime_test_route.hpp"
@@ -17,6 +18,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -46,6 +48,9 @@ constexpr std::size_t one_store = 128 * kib;
 /* A quarter of what the workload keeps under the default budget, which the
  * control measures first. */
 std::size_t small_budget = mib;
+/* What the control's translations cost per block, which sizes the chains of
+ * the tests after it against the small budget. */
+std::size_t bytes_per_block = kib;
 
 [[nodiscard]] gadgets::BuildOptions options(bool sharing)
 {
@@ -167,6 +172,7 @@ void the_default_budget_never_sheds_it(unsigned long generation)
 		/* Every block keeps at least its 63 gadgets. */
 		require(peak >= chain.blocks * (width - 1) * sizeof(void *));
 		small_budget = std::max(peak / 4, 4 * one_store);
+		bytes_per_block = peak / chain.blocks;
 		std::printf("gadget budget: the control held %zu KiB; the "
 			    "small budget is %zu KiB\n", peak / kib,
 			small_budget / kib);
@@ -174,28 +180,99 @@ void the_default_budget_never_sheds_it(unsigned long generation)
 	require(cache::ledger_state().total == before.total);
 }
 
-/* The largest address space sheds first: a small one that fits beside the
- * budget keeps its translations while a large one is shed around it. */
-void the_largest_sheds_first(unsigned long small_generation,
-	unsigned long large_generation)
+/* An address space no executor has entered for a while sheds before one that
+ * was entered since, though it is the younger: the stores of a third pass the
+ * budget, the idle one goes, and the other two keep every translation they
+ * have made while the idle one is translated afresh. */
+void an_idle_space_sheds_before_one_entered_since(unsigned long entered,
+	unsigned long idle, unsigned long storing)
 {
 	cache::set_budget(small_budget);
 	{
-		const Chain small{small_generation, 50};
-		const Chain large{large_generation, 4000};
+		/* Together 1.1 times the budget, the idle one the largest, and
+		 * the other two within it when it goes. */
+		const Chain entered_chain{entered,
+			small_budget * 30 / 100 / bytes_per_block};
+		const Chain idle_chain{idle,
+			small_budget * 50 / 100 / bytes_per_block};
+		const Chain storing_chain{storing,
+			small_budget * 30 / 100 / bytes_per_block};
 		const auto vcpu = std::make_unique<Vcpu>(options(false));
-		(void)run_chain(*vcpu, small_generation, small);
+		(void)run_chain(*vcpu, entered, entered_chain);
+		(void)run_chain(*vcpu, idle, idle_chain);
+		const auto reliefs = cache::ledger_state().reliefs;
+		/* More than the window the budget asks about, 64 epochs, about
+		 * 175 ms: both are idle now, the first the longer. */
+		std::this_thread::sleep_for(std::chrono::milliseconds{400});
+		/* An entry stamps the address space it enters, so the first is
+		 * not idle any more and the second is. */
+		(void)run_chain(*vcpu, entered, entered_chain);
+		require(cache::ledger_state().reliefs == reliefs);
+		(void)run_chain(*vcpu, storing, storing_chain);
+		require(cache::ledger_state().reliefs > reliefs);
 		const auto translated =
 			vcpu->executor.cache_diagnostics().translations;
-		const auto reliefs = cache::ledger_state().reliefs;
-		(void)run_chain(*vcpu, large_generation, large);
-		require(cache::ledger_state().reliefs > reliefs);
-		const auto large_done =
-			vcpu->executor.cache_diagnostics().translations;
-		(void)run_chain(*vcpu, small_generation, small);
+		(void)run_chain(*vcpu, entered, entered_chain);
+		(void)run_chain(*vcpu, storing, storing_chain);
 		require(vcpu->executor.cache_diagnostics().translations ==
-			large_done);
-		require(large_done > translated + large.blocks);
+			translated);
+		(void)run_chain(*vcpu, idle, idle_chain);
+		require(vcpu->executor.cache_diagnostics().translations >=
+			translated + idle_chain.blocks);
+	}
+	cache::set_budget(cache::fallback_budget);
+}
+
+/* An address space an executor keeps running is not idle, though no executor
+ * ever switches to it again: every entry into translated code stamps it. One
+ * vCPU runs a chain for longer than the window while another runs an idle
+ * chain once and then stores past the budget; the idle chain, the younger, is
+ * asked to shed and the chain that runs keeps every translation. */
+void an_address_space_entered_again_and_again_is_not_idle(
+	unsigned long running, unsigned long idle, unsigned long storing)
+{
+	cache::set_budget(small_budget);
+	{
+		const Chain running_chain{running,
+			small_budget * 30 / 100 / bytes_per_block};
+		const Chain idle_chain{idle,
+			small_budget * 50 / 100 / bytes_per_block};
+		const Chain storing_chain{storing,
+			small_budget * 30 / 100 / bytes_per_block};
+		std::atomic<bool> stop{};
+		std::atomic<std::size_t> passes{};
+		std::atomic<std::uint64_t> first_pass_translations{};
+		std::atomic<std::uint64_t> translations{};
+		std::thread runner{[&] {
+			const auto vcpu = std::make_unique<Vcpu>(options(false));
+			while (!stop.load()) {
+				(void)run_chain(*vcpu, running, running_chain);
+				if (passes.fetch_add(1) == 0)
+					first_pass_translations.store(
+						vcpu->executor.cache_diagnostics()
+							.translations);
+			}
+			translations.store(
+				vcpu->executor.cache_diagnostics().translations);
+		}};
+		while (passes.load() == 0)
+			std::this_thread::yield();
+		const auto vcpu = std::make_unique<Vcpu>(options(false));
+		(void)run_chain(*vcpu, idle, idle_chain);
+		const auto reliefs = cache::ledger_state().reliefs;
+		std::this_thread::sleep_for(std::chrono::milliseconds{400});
+		require(cache::ledger_state().reliefs == reliefs);
+		(void)run_chain(*vcpu, storing, storing_chain);
+		const auto relieved = cache::ledger_state().reliefs > reliefs;
+		stop.store(true);
+		runner.join();
+		require(relieved);
+		require(translations.load() == first_pass_translations.load());
+		const auto translated =
+			vcpu->executor.cache_diagnostics().translations;
+		(void)run_chain(*vcpu, idle, idle_chain);
+		require(vcpu->executor.cache_diagnostics().translations >=
+			translated + idle_chain.blocks);
 	}
 	cache::set_budget(cache::fallback_budget);
 }
@@ -248,7 +325,8 @@ int main()
 	the_default_budget_never_sheds_it(1300);
 	the_budget_bounds_one_address_space(1301, false);
 	the_budget_bounds_one_address_space(1302, true);
-	the_largest_sheds_first(1303, 1304);
+	an_idle_space_sheds_before_one_entered_since(1303, 1304, 1306);
+	an_address_space_entered_again_and_again_is_not_idle(1307, 1308, 1309);
 	vcpus_sharing_a_shed_space(1305);
 	return 0;
 }

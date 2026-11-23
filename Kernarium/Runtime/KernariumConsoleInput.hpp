@@ -90,10 +90,8 @@ public:
         }
     }
 
-#ifndef UML_APP_STORE_RUNTIME
     /* Writes all of `buffer`. Returns 0, or ECANCELED once the input is
-     * stopped, ENOTCONN once the end is closed, or the socket's error. An App
-     * Store runtime has no console input. */
+     * stopped, ENOTCONN once the end is closed, or the socket's error. */
     [[nodiscard]] int send(const void* buffer, std::size_t length) noexcept
     {
         if (length == 0U)
@@ -129,7 +127,6 @@ public:
         }
         return 0;
     }
-#endif
 
     /* Ends a write that waits for room, and refuses every later one. The stop
      * pipe is never drained, so it stays readable for every later wait. */
@@ -160,7 +157,6 @@ private:
     std::atomic<bool> stopped_ {};
 };
 
-#ifndef UML_APP_STORE_RUNTIME
 /*
  * The console input the application reaches through the runtime API while a
  * guest runs. A caller that finds an end published writes to it without
@@ -211,6 +207,5 @@ private:
     HostEnd* active_ {};
     std::size_t writers_ {};
 };
-#endif
 
 } // namespace kernarium::console

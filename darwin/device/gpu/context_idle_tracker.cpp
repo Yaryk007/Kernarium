@@ -51,6 +51,22 @@ void ContextIdleTracker::reset()
 {
     std::lock_guard lock(mutex_);
     contexts_.clear();
+    releaseDue_.reset();
+}
+
+void ContextIdleTracker::noteDestroyed(Clock::time_point now)
+{
+    std::lock_guard lock(mutex_);
+    releaseDue_ = now + reportsPerIdlePeriod * idleInterval_;
+}
+
+bool ContextIdleTracker::takeRelease(Clock::time_point now)
+{
+    std::lock_guard lock(mutex_);
+    if (!releaseDue_ || now < *releaseDue_)
+        return false;
+    releaseDue_.reset();
+    return true;
 }
 
 void ContextIdleTracker::activity(
@@ -142,6 +158,8 @@ ContextIdleTracker::nextDelay(Clock::time_point now) const
 {
     std::optional<Clock::duration> delay;
     std::lock_guard lock(mutex_);
+    if (releaseDue_)
+        delay = std::max(*releaseDue_ - now, Clock::duration::zero());
     for (const auto& entry : contexts_) {
         const auto due = entry.second.nextReport(idleInterval_);
         if (!due)

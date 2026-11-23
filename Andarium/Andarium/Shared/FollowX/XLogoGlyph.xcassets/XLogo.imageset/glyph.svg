@@ -1,0 +1,7 @@
+<!-- SPDX-License-Identifier: GPL-2.0-or-later -->
+<!-- A plain square on the logo's proportions: what the tests and the Debug
+     arrangement draw in place of the logo, which the build takes from the
+     ignored Config/Local directory. -->
+<svg width="1200" height="1227" viewBox="0 0 1200 1227" fill="none" xmlns="http://www.w3.org/2000/svg">
+<path d="M100 100H1100V1127H100Z" fill="white"/>
+</svg>

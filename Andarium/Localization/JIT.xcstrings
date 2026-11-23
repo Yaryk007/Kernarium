@@ -1,0 +1,213 @@
+{
+  "sourceLanguage" : "en",
+  "strings" : {
+    "Not used while JIT is on." : {
+      "comment" : "Under the AOT switch on Home while JIT is on and ready for the next start. AOT and JIT are names and stay as they are.",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "JITがオンの間は使用されません。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "JIT开启期间不使用。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "JIT開啟期間不使用。"
+          }
+        }
+      }
+    },
+    "Preparing JIT" : {
+      "comment" : "The detail of the system step on the boot screen while StikDebug prepares JIT. JIT is a name and stays as it is.",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "JITを準備中"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "正在准备JIT"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "正在準備JIT"
+          }
+        }
+      }
+    },
+    "Ready. Applies to the next start." : {
+      "comment" : "Under the JIT switch on Home: JIT is prepared and the next start uses it. JIT is a name and stays as it is.",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "準備完了。次回の起動時に適用されます。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已就绪。将在下次启动时生效。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已就緒。將於下次啟動時生效。"
+          }
+        }
+      }
+    },
+    "Started without JIT: StikDebug could not prepare it." : {
+      "comment" : "Shown after a start that asked for JIT and ran without it. JIT and StikDebug are names and stay as they are.",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "JITなしで起動しました。StikDebugがJITを準備できませんでした。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "未使用JIT启动：StikDebug无法完成准备。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "未使用JIT啟動：StikDebug無法完成準備。"
+          }
+        }
+      }
+    },
+    "Started without JIT: StikDebug is not connected." : {
+      "comment" : "Shown after a start that asked for JIT and ran without it. JIT and StikDebug are names and stay as they are.",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "JITなしで起動しました。StikDebugが接続されていません。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "未使用JIT启动：StikDebug未连接。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "未使用JIT啟動：StikDebug尚未連線。"
+          }
+        }
+      }
+    },
+    "Started without JIT: the CPU or memory changed after StikDebug prepared it. Open Andarium from StikDebug again." : {
+      "comment" : "Shown after a start that asked for JIT and ran without it because the virtual machine's CPU or memory was changed after StikDebug prepared the memory. JIT and StikDebug are names and stay as they are.",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "JITなしで起動しました。StikDebugが準備したあとにCPUまたはメモリが変更されました。もう一度StikDebugからAndariumを開いてください。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "未使用JIT启动：StikDebug完成准备后，CPU或内存已更改。请再次从StikDebug打开Andarium。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "未使用JIT啟動：StikDebug完成準備後，CPU或記憶體已更改。請再次從StikDebug打開Andarium。"
+          }
+        }
+      }
+    },
+    "Started without JIT: this copy of Andarium cannot use it." : {
+      "comment" : "Shown after a start that asked for JIT and ran without it. JIT is a name and stays as it is.",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "JITなしで起動しました。このAndariumではJITを使用できません。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "未使用JIT启动：此版本的Andarium无法使用JIT。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "未使用JIT啟動：此版本的Andarium無法使用JIT。"
+          }
+        }
+      }
+    },
+    "The CPU or memory changed after JIT was prepared. Open Andarium from StikDebug again to use it." : {
+      "comment" : "Under the JIT switch on Home: the virtual machine's CPU or memory no longer matches what StikDebug prepared. JIT and StikDebug are names and stay as they are.",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "JITの準備後にCPUまたはメモリが変更されました。JITを使用するには、もう一度StikDebugからAndariumを開いてください。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "JIT准备完成后，CPU或内存已更改。要使用JIT，请再次从StikDebug打开Andarium。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "JIT準備完成後，CPU或記憶體已更改。要使用JIT，請再次從StikDebug打開Andarium。"
+          }
+        }
+      }
+    },
+    "To use JIT, open Andarium from StikDebug." : {
+      "comment" : "Under the JIT switch on Home: no debugger is attached. JIT and StikDebug are names and stay as they are.",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "StikDebugからAndariumを開くとJITを使えます。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "要使用JIT，请从StikDebug打开Andarium。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "要使用JIT，請從StikDebug打開Andarium。"
+          }
+        }
+      }
+    }
+  },
+  "version" : "1.0"
+}

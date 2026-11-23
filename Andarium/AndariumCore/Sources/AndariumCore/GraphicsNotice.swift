@@ -25,9 +25,10 @@ public struct GraphicsNotice: Equatable, Sendable {
     public static let visibleFor = Duration.seconds(30)
 
     /// The words of the notice.
-    public static let title = "Android ran out of graphics memory"
-    public static let detail = "If an app looks broken, swipe it away in Recents and open it again."
-    public static let dismissLabel = "Dismiss"
+    public static let title = String(localized: "Android ran out of graphics memory", bundle: .module)
+    public static let detail = String(
+        localized: "If an app looks broken, swipe it away in Recents and open it again.", bundle: .module)
+    public static let dismissLabel = String(localized: "Dismiss", bundle: .module)
 
     /// A notice is up.
     public private(set) var isShowing = false

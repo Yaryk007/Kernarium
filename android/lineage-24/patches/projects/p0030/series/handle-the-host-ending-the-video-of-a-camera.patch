@@ -1,0 +1,506 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 16:19:18 +0900
+Subject: [PATCH] handle the host ending the video of a camera
+
+When the application leaves the foreground the host ends the video of a
+camera that has a video stream open: it fails the camera's video buffers
+under a black, interrupted record and keeps doing so until the guest
+closes the camera's last video stream. The HAL passed those buffers on
+as failed buffers, and the camera stayed dark for as long as the
+application stayed away. What the HAL does about it depends on the
+streams of the session.
+
+A session with a stream whose usage carries the video encoder bit
+(GRALLOC_USAGE_HW_VIDEO_ENCODER) is over:
+
+- A video buffer that fails while the camera's newest record is black
+  and interrupted marks the source as lost (camera_lost, the rule the
+  host's wire contract states).
+- The sensor latches the loss in the health of the opened session, fails
+  the request as a whole with every output buffer returned as an error,
+  and tells the framework ERROR_REQUEST for it, and ERROR_DEVICE besides,
+  once per session. The framework returns the buffers of a request only
+  when it was told that the request failed: a request that ERROR_DEVICE
+  alone named would keep its buffers, and the references to their
+  streams, until the camera service ends, and the application could not
+  open the camera again.
+- Each request the session still holds drains in order as ERROR_REQUEST
+  with error buffers, and the frame source is not asked again.
+- processCaptureRequest, flush and configureStreams answer INTERNAL_ERROR
+  from then on (a flush ends what the session holds as failed requests
+  first), a close succeeds, and a session opened afterwards is a new
+  one. The state belongs to the opened session, not to a frame source or
+  a sensor that a reconfiguration replaces.
+
+Any other session is told nothing:
+
+- The frame source closes the camera's video streams at the start of the
+  next request, which ends the host's loss, and opens them again with
+  the requests after it. The requests that met the loss fail as they do
+  for any interruption.
+- A loss again right after waits for the next due time (250 ms); nothing
+  waits for it.
+
+A failed buffer without that record keeps its old meaning.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .../EmulatedCameraDeviceSessionHWLImpl.cpp    | 49 +++++++++++-
+ .../hwl/EmulatedCameraDeviceSessionHWLImpl.h  |  5 ++
+ devices/EmulatedCamera/hwl/EmulatedSensor.cpp |  5 ++
+ devices/EmulatedCamera/hwl/EmulatedSensor.h   | 10 +++
+ .../EmulatedCamera/hwl/EmulatedSensorHost.cpp | 78 +++++++++++++++----
+ devices/EmulatedCamera/hwl/IFrameSource.h     | 17 ++++
+ .../EmulatedCamera/hwl/V4l2FrameSource.cpp    | 53 +++++++++++++
+ devices/EmulatedCamera/hwl/V4l2FrameSource.h  | 15 ++++
+ 8 files changed, 214 insertions(+), 18 deletions(-)
+
+diff --git a/devices/EmulatedCamera/hwl/EmulatedCameraDeviceSessionHWLImpl.cpp b/devices/EmulatedCamera/hwl/EmulatedCameraDeviceSessionHWLImpl.cpp
+index 337677a5ad2544e1220f538a062609ffd7613c8a..bbc7c6449c1fbc1c8bf3b4854f2ee4728ca88538 100644
+--- a/devices/EmulatedCamera/hwl/EmulatedCameraDeviceSessionHWLImpl.cpp
++++ b/devices/EmulatedCamera/hwl/EmulatedCameraDeviceSessionHWLImpl.cpp
+@@ -34,6 +34,23 @@
+ 
+ namespace android {
+ 
++namespace {
++
++static_assert(GRALLOC_USAGE_HW_VIDEO_ENCODER == andarium::camera::usage_video_encoder,
++              "the overlay's rule names the gralloc encoder usage");
++
++// Whether a stream of the configuration has a video encoder as its consumer (camera_session.hpp).
++bool HasEncoderStream(const google_camera_hal::StreamConfiguration& config) {
++  std::vector<andarium::camera::StreamUse> uses;
++  uses.reserve(config.streams.size());
++  for (const auto& stream : config.streams) {
++    uses.push_back({stream.stream_type == google_camera_hal::StreamType::kInput, stream.usage});
++  }
++  return andarium::camera::has_encoder_stream(uses.data(), uses.size());
++}
++
++}  // namespace
++
+ using google_camera_hal::utils::GetSensorActiveArraySize;
+ using google_camera_hal::utils::HasCapability;
+ 
+@@ -212,6 +229,7 @@ status_t EmulatedCameraDeviceSessionHwlImpl::Initialize(
+ 
+ status_t EmulatedCameraDeviceSessionHwlImpl::InitializeRequestProcessor() {
+   sp<EmulatedSensor> emulated_sensor = new EmulatedSensor();
++  emulated_sensor->SetSessionHealth(health_);
+   auto logical_chars = std::make_unique<LogicalCharacteristics>(logical_chars_);
+   auto ret = emulated_sensor->StartUp(camera_id_, std::move(logical_chars),
+                                       source_config_);
+@@ -248,7 +266,7 @@ status_t EmulatedCameraDeviceSessionHwlImpl::ConstructDefaultRequestSettings(
+ status_t EmulatedCameraDeviceSessionHwlImpl::ConfigurePipeline(
+     uint32_t physical_camera_id, HwlPipelineCallback hwl_pipeline_callback,
+     const StreamConfiguration& request_config,
+-    const StreamConfiguration& /*overall_config*/, uint32_t* pipeline_id) {
++    const StreamConfiguration& overall_config, uint32_t* pipeline_id) {
+   ATRACE_CALL();
+   std::lock_guard<std::mutex> lock(api_mutex_);
+   if (pipeline_id == nullptr) {
+@@ -256,6 +274,12 @@ status_t EmulatedCameraDeviceSessionHwlImpl::ConfigurePipeline(
+     return BAD_VALUE;
+   }
+ 
++  // A session whose device is gone configures nothing: that would make a new source and restart production.
++  if (health_->lost()) {
++    ALOGE("%s: the session's device is gone", __FUNCTION__);
++    return UNKNOWN_ERROR;
++  }
++
+   if (pipelines_built_) {
+     ALOGE("%s Cannot configure pipelines after calling BuildPipelines()",
+           __FUNCTION__);
+@@ -344,6 +368,11 @@ status_t EmulatedCameraDeviceSessionHwlImpl::ConfigurePipeline(
+ 
+   pipelines_.push_back(emulated_pipeline);
+ 
++  // What the host ending a camera's video means for this session depends on its streams: one whose consumer is a
++  // video encoder makes it an encoder session, whatever else it has (camera_session.hpp).
++  health_->set_encoder_stream(HasEncoderStream(request_config) ||
++                              HasEncoderStream(overall_config));
++
+   return OK;
+ }
+ 
+@@ -378,6 +407,10 @@ status_t EmulatedCameraDeviceSessionHwlImpl::GetConfiguredHalStream(
+ status_t EmulatedCameraDeviceSessionHwlImpl::BuildPipelines() {
+   ATRACE_CALL();
+   std::lock_guard<std::mutex> lock(api_mutex_);
++  if (health_->lost()) {
++    ALOGE("%s: the session's device is gone", __FUNCTION__);
++    return UNKNOWN_ERROR;
++  }
+   if (pipelines_built_) {
+     ALOGE("%s Pipelines have already been built!", __FUNCTION__);
+     return ALREADY_EXISTS;
+@@ -452,6 +485,13 @@ status_t EmulatedCameraDeviceSessionHwlImpl::CheckOutputFormatsForInput(
+ 
+ status_t EmulatedCameraDeviceSessionHwlImpl::SubmitRequestLocked(
+     HwlPipelineRequest request) {
++  // The requests accepted before the device was lost drain as failed requests (the sensor); no other is accepted.
++  if (health_->lost()) {
++    ALOGE("%s: the session's device is gone and cannot process further requests",
++          __FUNCTION__);
++    return UNKNOWN_ERROR;
++  }
++
+   // Check whether reprocess request has valid/supported outputs.
+   if (!request.input_buffers.empty()) {
+     for (const auto& input_buffer : request.input_buffers) {
+@@ -504,6 +544,13 @@ status_t EmulatedCameraDeviceSessionHwlImpl::SubmitBatchRequest(
+ status_t EmulatedCameraDeviceSessionHwlImpl::Flush() {
+   ATRACE_CALL();
+   std::lock_guard<std::mutex> lock(api_mutex_);
++  if (health_->lost()) {
++    // What the session still holds ends as failed requests; the flush itself answers that the device is gone.
++    if (request_processor_ != nullptr) {
++      request_processor_->Flush();
++    }
++    return UNKNOWN_ERROR;
++  }
+   return request_processor_->Flush();
+ }
+ 
+diff --git a/devices/EmulatedCamera/hwl/EmulatedCameraDeviceSessionHWLImpl.h b/devices/EmulatedCamera/hwl/EmulatedCameraDeviceSessionHWLImpl.h
+index 030e570a29a2fa34e2eb726b2f5813fa38bca7d6..1508ed73aadb15b8224be2f55998710c22cd0c65 100644
+--- a/devices/EmulatedCamera/hwl/EmulatedCameraDeviceSessionHWLImpl.h
++++ b/devices/EmulatedCamera/hwl/EmulatedCameraDeviceSessionHWLImpl.h
+@@ -26,6 +26,7 @@
+ #include "EmulatedCameraDeviceHWLImpl.h"
+ #include "EmulatedRequestProcessor.h"
+ #include "EmulatedTorchState.h"
++#include "camera_session.hpp"
+ #include "multicam_coordinator_hwl.h"
+ #include "utils/StreamConfigurationMap.h"
+ 
+@@ -214,6 +215,10 @@ class EmulatedCameraDeviceSessionHwlImpl : public CameraDeviceSessionHwl {
+   mutable std::mutex api_mutex_;
+   uint32_t camera_id_ = 0;
+   bool error_state_ = false;
++  // The health of this opened session: whether its device is gone, and the kind of its configuration. It outlives the
++  // processors and sensors a reconfiguration makes (camera_session.hpp).
++  std::shared_ptr<andarium::camera::SessionHealth> health_ =
++      std::make_shared<andarium::camera::SessionHealth>();
+   bool pipelines_built_ = false;
+   bool has_raw_stream_ = false;
+   bool supports_session_hal_buf_manager_ = false;
+diff --git a/devices/EmulatedCamera/hwl/EmulatedSensor.cpp b/devices/EmulatedCamera/hwl/EmulatedSensor.cpp
+index 8ab54a26637656a9e9639734b7b8937a9decb426..5ef04945daccb7a23dd09297f2d7ee0215239360 100644
+--- a/devices/EmulatedCamera/hwl/EmulatedSensor.cpp
++++ b/devices/EmulatedCamera/hwl/EmulatedSensor.cpp
+@@ -609,6 +609,11 @@ status_t EmulatedSensor::StartUp(
+         std::make_unique<EmulatedFrameSource>(*chars_, logical_camera_id);
+   }
+ 
++  if (session_health_ == nullptr) {
++    session_health_ = std::make_shared<andarium::camera::SessionHealth>();
++  }
++  frame_source_->SetSessionHealth(session_health_);
++
+   jpeg_compressor_ = std::make_unique<JpegCompressor>();
+ 
+   auto res = run(LOG_TAG, ANDROID_PRIORITY_URGENT_DISPLAY);
+diff --git a/devices/EmulatedCamera/hwl/EmulatedSensor.h b/devices/EmulatedCamera/hwl/EmulatedSensor.h
+index b7f8e622257551764d1b850a42176f3b75a71f30..0c82bc55efc071c8b4b347d93699d3f47464eff0 100644
+--- a/devices/EmulatedCamera/hwl/EmulatedSensor.h
++++ b/devices/EmulatedCamera/hwl/EmulatedSensor.h
+@@ -80,11 +80,13 @@
+ 
+ #include <algorithm>
+ #include <functional>
++#include <memory>
+ 
+ #include "Base.h"
+ #include "IFrameSource.h"
+ #include "JpegCompressor.h"
+ #include "SensorCharacteristics.h"
++#include "camera_session.hpp"
+ #include "utils/Mutex.h"
+ #include "utils/StreamConfigurationMap.h"
+ #include "utils/Thread.h"
+@@ -177,6 +179,13 @@ class EmulatedSensor : private Thread, public virtual RefBase {
+    * Power control
+    */
+ 
++  // The health of the opened device session this sensor serves (camera_session.hpp). The session
++  // owns it and gives the same one to every sensor a reconfiguration makes, so the state of a
++  // session that is over outlives them. Set before StartUp; a sensor made without one gets its own.
++  void SetSessionHealth(std::shared_ptr<andarium::camera::SessionHealth> health) {
++    session_health_ = std::move(health);
++  }
++
+   status_t StartUp(uint32_t logical_camera_id,
+                    std::unique_ptr<LogicalCharacteristics> logical_chars,
+                    const FrameSourceConfig& source_config);
+@@ -265,6 +274,7 @@ class EmulatedSensor : private Thread, public virtual RefBase {
+   nsecs_t next_readout_time_;
+ 
+   std::unique_ptr<IFrameSource> frame_source_;
++  std::shared_ptr<andarium::camera::SessionHealth> session_health_;
+   std::map<uint32_t, SensorBinningFactorInfo> sensor_binning_factor_info_;
+ 
+   bool WaitForVSyncLocked(nsecs_t reltime);
+diff --git a/devices/EmulatedCamera/hwl/EmulatedSensorHost.cpp b/devices/EmulatedCamera/hwl/EmulatedSensorHost.cpp
+index d2105c09f0f31cfa7a0c73f1c423c0756df17431..b2b464dcf1871ed233559de105d2854c1fc45945 100644
+--- a/devices/EmulatedCamera/hwl/EmulatedSensorHost.cpp
++++ b/devices/EmulatedCamera/hwl/EmulatedSensorHost.cpp
+@@ -55,6 +55,52 @@ void EmulatedSensor::CaptureFromHost(
+     exposure_time = settings.begin()->second.exposure_time;
+   }
+ 
++  // Returns the request as failed, as a whole: every output buffer goes back with an error
++  // status, whatever it did before (one output may have completed when another met the loss),
++  // the buffers are marked so that none of them sends a buffer error of its own, and the
++  // framework is told by one error for the request, with no shutter and no results. The request
++  // that also tells the framework that the device is gone (the first of a lost session) is
++  // reported as a failed request all the same, after the device error: the framework returns the
++  // buffers of a request only when it was told that the request failed, so a request that only
++  // the device error named would keep its buffers, and the references to their streams, until
++  // the camera service itself ends, and the application's own reopening would fail.
++  auto fail_request = [&](bool device_error) {
++    for (auto& buffer : *buffers) {
++      if (!buffer->is_input) {
++        buffer->stream_buffer.status = BufferStatus::kError;
++      }
++      buffer->is_failed_request = true;
++    }
++    next_capture_time_ = getSystemTimeWithSource(timestamp_source);
++    next_readout_time_ = next_capture_time_ + exposure_time;
++    if (callback.notify != nullptr) {
++      if (device_error) {
++        NotifyMessage device = ErrorMessage{.frame_number = frame_number,
++                                            .error_stream_id = -1,
++                                            .error_code = ErrorCode::kErrorDevice};
++        callback.notify(pipeline_id, device);
++      }
++      NotifyMessage request = ErrorMessage{.frame_number = frame_number,
++                                           .error_stream_id = -1,
++                                           .error_code = ErrorCode::kErrorRequest};
++      callback.notify(pipeline_id, request);
++    }
++    if (result != nullptr) {
++      result->result_metadata.reset();
++    }
++    buffers->clear();
++  };
++
++  // A session whose device is gone (the host ended the camera's video in a session with an
++  // encoder stream) never restarts production, whatever configuration it is in: each request
++  // it still holds drains here, in order, as a failed request, without a word to the frame
++  // source. The one that tells the framework that the device is gone is the first of them.
++  if (session_health_->lost()) {
++    ALOGW("%s: frame %u failed: the session's device is gone", __FUNCTION__, frame_number);
++    fail_request(session_health_->claim_device_error());
++    return;
++  }
++
+   // The request processor hands every buffer over marked as failed, and the
+   // stock sensor flips the mark as it produces the buffer. Here the source's
+   // BeginRequest marks only the buffers it could not queue, so the others start
+@@ -134,24 +180,22 @@ void EmulatedSensor::CaptureFromHost(
+       ++failed;
+     }
+   }
+-  if (frame_source_->FailsRequest(outputs, failed)) {
+-    ALOGW("%s: frame %u failed: none of its %zu outputs was produced",
+-          __FUNCTION__, frame_number, outputs);
+-    for (auto& buffer : *buffers) {
+-      buffer->is_failed_request = true;
+-    }
+-    next_capture_time_ = getSystemTimeWithSource(timestamp_source);
+-    next_readout_time_ = next_capture_time_ + exposure_time;
+-    if (callback.notify != nullptr) {
+-      NotifyMessage msg = ErrorMessage{.frame_number = frame_number,
+-                                       .error_stream_id = -1,
+-                                       .error_code = ErrorCode::kErrorRequest};
+-      callback.notify(pipeline_id, msg);
+-    }
+-    if (result != nullptr) {
+-      result->result_metadata.reset();
++  // A camera whose video the host ended in a session with an encoder stream fails the request
++  // whatever else was produced, and the session is over: the loss is latched at the session's
++  // scope, and the framework is told that the device is gone (ERROR_DEVICE), once, besides the
++  // failed request.
++  if (frame_source_->DeviceLost()) {
++    session_health_->latch_lost();
++  }
++  const bool device_lost = session_health_->lost();
++  if (device_lost || frame_source_->FailsRequest(outputs, failed)) {
++    if (device_lost) {
++      ALOGW("%s: frame %u failed: the host ended the camera", __FUNCTION__, frame_number);
++    } else {
++      ALOGW("%s: frame %u failed: none of its %zu outputs was produced",
++            __FUNCTION__, frame_number, outputs);
+     }
+-    buffers->clear();
++    fail_request(device_lost && session_health_->claim_device_error());
+     return;
+   }
+ 
+diff --git a/devices/EmulatedCamera/hwl/IFrameSource.h b/devices/EmulatedCamera/hwl/IFrameSource.h
+index cea72f2711ef850a568d7fc8830a4414dc430326..9627a5c5d186c88327be7bf600c5cb4d6d8dbd97 100644
+--- a/devices/EmulatedCamera/hwl/IFrameSource.h
++++ b/devices/EmulatedCamera/hwl/IFrameSource.h
+@@ -22,9 +22,11 @@
+ #include <utils/Timers.h>
+ 
+ #include <cstddef>
++#include <memory>
+ 
+ #include "Base.h"
+ #include "SensorCharacteristics.h"
++#include "camera_session.hpp"
+ 
+ namespace android {
+ namespace framesource {
+@@ -80,6 +82,21 @@ class IFrameSource {
+     return false;
+   }
+ 
++  // The health of the opened device session the source serves, shared with the sensor and the
++  // session (camera_session.hpp). The sensor gives it to the source once, before the first request.
++  // A source that can learn that the host ended its camera's video decides by it what to do about
++  // the loss: end the session (DeviceLost) or close its own streams and open them again.
++  virtual void SetSessionHealth(std::shared_ptr<andarium::camera::SessionHealth> /*health*/) {
++  }
++
++  // Whether the source has seen the host end the camera's video in a session that has an encoder
++  // stream. The sensor then fails the request as a whole (ERROR_REQUEST), latches the loss in the
++  // session's health and tells the framework ERROR_DEVICE besides, once per session; every later
++  // request of the session fails as ERROR_REQUEST alone.
++  virtual bool DeviceLost() const {
++    return false;
++  }
++
+   // Collects a JPEG into `buffer`: the picture, its Exif data built from the
+   // result's metadata, and the trailing blob header.
+   virtual status_t ProduceBlob(uint32_t /*camera_id*/,
+diff --git a/devices/EmulatedCamera/hwl/V4l2FrameSource.cpp b/devices/EmulatedCamera/hwl/V4l2FrameSource.cpp
+index a8abb58cc4209beb6a2539b77019f402046b4831..c11ceb9d79875e807dad3af387e1d23ec5902bf0 100644
+--- a/devices/EmulatedCamera/hwl/V4l2FrameSource.cpp
++++ b/devices/EmulatedCamera/hwl/V4l2FrameSource.cpp
+@@ -426,6 +426,15 @@ status_t V4l2FrameSource::BeginRequest(const LogicalCameraSettings& settings, Bu
+     }
+     pending_.clear();
+   }
++  // The host ended a camera's video and the session goes on (NoteFailedBuffer): close that camera's video streams now, between
++  // requests, so that this request and the ones after it open them again. A loss again right after is acted on at the next due
++  // time (andarium::camera::reopen_interval_ns); the requests in between fail as they do in any gap.
++  const nsecs_t reopen_now = systemTime(SYSTEM_TIME_MONOTONIC);
++  for (auto& entry : cameras_) {
++    if (entry.second.reopen.take(reopen_now)) {
++      CloseVideoStreams(&entry.second);
++    }
++  }
+   // The stills the device takes in this request are one capture. A JPEG made
+   // here from a video frame is not one of them. The whole request has one
+   // deadline.
+@@ -565,6 +574,49 @@ bool V4l2FrameSource::MetaOf(Camera* camera, uint64_t sequence, abi::Meta* meta)
+   return camera->meta->Latest(meta);
+ }
+ 
++// A video buffer that failed under a black, interrupted record is the host's end of the camera's video (the host fails the
++// buffers of a video it ended, and records them so); any other failed buffer is a failed buffer. What follows depends on the
++// session (camera_session.hpp): one with an encoder stream is over (the sensor tells the framework), any other goes on: the
++// camera's video streams are closed at the start of the next request, which ends the host's loss, and the requests after it
++// open them again.
++void V4l2FrameSource::NoteFailedBuffer(Camera* camera, const V4l2Stream& stream) {
++  abi::Meta latest{};
++  const bool has_record = camera->meta != nullptr && camera->meta->Latest(&latest);
++  if (!andarium::camera::camera_lost(stream.params().kind == V4l2Stream::Kind::kVideo, true,
++                                     has_record, has_record ? latest.flags : 0)) {
++    return;
++  }
++  if (health_ == nullptr || health_->response() == andarium::camera::LossResponse::device_error) {
++    if (!device_lost_.exchange(true)) {
++      ALOGW("%s: the host ended the camera: its video buffers fail under an interrupted record (flags %x)",
++            __FUNCTION__, static_cast<unsigned>(latest.flags));
++    }
++    return;
++  }
++  if (!camera->reopen.pending()) {
++    ALOGW("%s: the host ended the camera's video: its video streams are closed and opened again (flags %x)",
++          __FUNCTION__, static_cast<unsigned>(latest.flags));
++  }
++  camera->reopen.note_loss();
++}
++
++// Closes the camera's video streams: the host's loss ends with the last of them, and the next request that needs one opens
++// it again. Between requests only, when no buffer is in flight. A close is a stop of the stream and a close of the node; the
++// source waits for nothing.
++void V4l2FrameSource::CloseVideoStreams(Camera* camera) {
++  size_t closed = 0;
++  for (auto it = camera->streams.begin(); it != camera->streams.end();) {
++    if (it->first.kind == V4l2Stream::Kind::kVideo) {
++      camera->stream_last_request.erase(it->first);
++      it = camera->streams.erase(it);
++      ++closed;
++    } else {
++      ++it;
++    }
++  }
++  ALOGI("%s: closed %zu video streams of the camera the host ended", __FUNCTION__, closed);
++}
++
+ bool V4l2FrameSource::WaitFor(const SensorBuffer* buffer, V4l2Stream::Completion* completion,
+                               const uint8_t** mapped, Pending* pending) {
+   auto found = pending_.find(buffer);
+@@ -604,6 +656,7 @@ status_t V4l2FrameSource::ProduceFrame(uint32_t camera_id, nsecs_t /*timestamp*/
+     return BAD_VALUE;
+   }
+   if (completion.error) {
++    NoteFailedBuffer(camera, *pending.stream);
+     return UNKNOWN_ERROR;
+   }
+   if (camera->request_timestamp == 0) {
+diff --git a/devices/EmulatedCamera/hwl/V4l2FrameSource.h b/devices/EmulatedCamera/hwl/V4l2FrameSource.h
+index 715b9241d8e7a547a69ee3abf3e07391c448e75e..1459745d8fb304e55855718b1a0e4b4830762682 100644
+--- a/devices/EmulatedCamera/hwl/V4l2FrameSource.h
++++ b/devices/EmulatedCamera/hwl/V4l2FrameSource.h
+@@ -64,6 +64,12 @@ class V4l2FrameSource : public IFrameSource {
+   }
+   status_t BeginRequest(const LogicalCameraSettings& settings, Buffers* buffers) override;
+   bool FailsRequest(size_t outputs, size_t failed) const override;
++  bool DeviceLost() const override {
++    return device_lost_;
++  }
++  void SetSessionHealth(std::shared_ptr<andarium::camera::SessionHealth> health) override {
++    health_ = std::move(health);
++  }
+   status_t ProduceBlob(uint32_t camera_id, const SensorSettings& settings,
+                        SensorBuffer* buffer, HalCameraMetadata* result_metadata,
+                        const SensorCharacteristics& chars) override;
+@@ -133,6 +139,8 @@ class V4l2FrameSource : public IFrameSource {
+     bool use_dmabuf = true;
+     // The sizes the camera serves, with how each is made.
+     andarium::camera::StreamSizes sizes;
++    // The host ended the camera's video and the session goes on: its video streams are to be closed.
++    andarium::camera::ReopenGate reopen;
+   };
+ 
+   struct Pending {
+@@ -158,6 +166,8 @@ class V4l2FrameSource : public IFrameSource {
+                          SensorBuffer* buffer, HalCameraMetadata* result_metadata,
+                          const SensorCharacteristics& chars);
+   bool MetaOf(Camera* camera, uint64_t sequence, andarium::camera::abi::Meta* meta);
++  void NoteFailedBuffer(Camera* camera, const v4l2cam::V4l2Stream& stream);
++  void CloseVideoStreams(Camera* camera);
+   static andarium::camera::Request RequestOf(const SensorSettings& settings);
+ 
+   std::map<uint32_t, Camera> cameras_;
+@@ -169,6 +179,11 @@ class V4l2FrameSource : public IFrameSource {
+   uint64_t still_free_requests_begun_ = 0;
+   // A flush or a close is under way (Interrupt); the sensor clears it as it takes the next request.
+   std::atomic<bool> interrupted_{false};
++  // The host ended a camera's video in a session with an encoder stream (NoteFailedBuffer): its video buffers fail
++  // under an interrupted record. The sensor latches it in the session's health.
++  std::atomic<bool> device_lost_{false};
++  // The opened session's health; null for a source made outside a session.
++  std::shared_ptr<andarium::camera::SessionHealth> health_;
+   // When the request being collected has to be complete, whatever its buffers
+   // wait for: one deadline for the whole request.
+   andarium::camera::RequestClock request_clock_;

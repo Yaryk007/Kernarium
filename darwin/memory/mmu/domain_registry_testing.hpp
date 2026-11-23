@@ -17,5 +17,12 @@ using SoftwareAddressSpaceAcquiredHook = void (*)() noexcept;
 void set_software_address_space_acquired_hook(
 	SoftwareAddressSpaceAcquiredHook hook) noexcept;
 
+/* Recounts, for every software domain, the executable guest-code words of
+ * every live generation per physical-page record and compares each record's
+ * count with the recount. Returns the number of records that disagree (a
+ * record that can no longer count is not compared). For a test that has
+ * stopped changing mappings. */
+[[nodiscard]] std::size_t audit_executable_counts() noexcept;
+
 } // namespace uml::memory::testing
 #endif

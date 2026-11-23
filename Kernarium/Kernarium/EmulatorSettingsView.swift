@@ -114,17 +114,21 @@ struct EmulatorSettingsView: View {
                         configuration.vCPUCountChanged(from: oldCount)
                     }
 
-                    Stepper(
-                        "Guest RAM: \(configuration.guestMemoryMiB) MiB",
-                        value: $configuration.guestMemoryMiB,
-                        in: EmulatorConfiguration.guestMemoryRangeMiB
-                            .lowerBound...maximumGuestMemoryMiB,
-                        step: EmulatorConfiguration.guestMemoryStepMiB
-                    )
-                    .accessibilityIdentifier("guestMemoryStepper")
+                    // Where no size fits (the bound is zero) the stepper has no
+                    // size to offer, so it is left out.
+                    if maximumGuestMemoryMiB > 0 {
+                        Stepper(
+                            "Guest RAM: \(configuration.guestMemoryMiB) MiB",
+                            value: $configuration.guestMemoryMiB,
+                            in: EmulatorConfiguration.guestMemoryRangeMiB
+                                .lowerBound...maximumGuestMemoryMiB,
+                            step: EmulatorConfiguration.guestMemoryStepMiB
+                        )
+                        .accessibilityIdentifier("guestMemoryStepper")
+                    }
 
-                    if maximumGuestMemoryMiB <
-                        EmulatorConfiguration.guestMemoryRangeMiB.upperBound {
+                    if maximumGuestMemoryMiB > 0, maximumGuestMemoryMiB <
+                        EmulatorConfiguration.guestMemoryCeilingMiB {
                         Text(
                             "With \(configuration.vCPUCount) \(configuration.vCPUCount == 1 ? "vCPU" : "vCPUs") the " +
                                 "system leaves room for at most " +

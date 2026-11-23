@@ -535,6 +535,26 @@ bool set_translation_cache_budget(std::size_t total_bytes,
 		total_bytes, executors, per_executor_bytes);
 }
 
+bool select_aot(AotSelection selection, const AotRelease *release) noexcept
+{
+	return ::uml::cpu::select_aot(selection, release);
+}
+
+void end_aot_session() noexcept
+{
+	::uml::cpu::end_aot_session();
+}
+
+int aot_choice() noexcept
+{
+	return ::uml::cpu::aot_choice();
+}
+
+void restore_aot_choice(int choice) noexcept
+{
+	::uml::cpu::restore_aot_choice(choice);
+}
+
 bool acquire_translation_cache_run_session() noexcept
 {
 	return ::uml::cpu::acquire_translation_cache_run_session();
@@ -554,6 +574,35 @@ std::size_t gadget_cache_budget_for(std::size_t guest_memory_bytes,
 		static_cast<std::size_t>(
 			::uml::platform::process_memory_limit_bytes()),
 		executors);
+}
+
+std::size_t jit_cache_budget_for(std::size_t guest_memory_bytes,
+	unsigned executors) noexcept
+{
+	return gadget_cache_budget_for(guest_memory_bytes, 0, executors);
+}
+
+JitMemoryStatus prepare_jit_memory(std::size_t guest_memory_bytes,
+	unsigned executors, std::size_t per_executor_bytes) noexcept
+{
+	return ::uml::cpu::prepare_jit_memory(
+		jit_cache_budget_for(guest_memory_bytes, executors), executors,
+		per_executor_bytes);
+}
+
+bool jit_debugger_attached() noexcept
+{
+	return ::uml::cpu::jit_debugger_attached();
+}
+
+void release_jit_debugger() noexcept
+{
+	::uml::cpu::release_jit_debugger();
+}
+
+std::size_t prepared_jit_region_bytes() noexcept
+{
+	return ::uml::cpu::prepared_jit_region_bytes();
 }
 
 std::size_t set_gadget_cache_budget(std::size_t guest_memory_bytes,

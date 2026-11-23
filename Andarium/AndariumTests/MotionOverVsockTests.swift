@@ -10,7 +10,7 @@ import Testing
 /// foreground probe APK is copied to Library/Caches/andarium-motion-probe.apk before launch.
 ///
 /// The probe reads both sensors through Android's public SensorManager API.
-/// The automated mode checks sustained delivery and off/on/off; the separate
+/// The automated mode checks sustained delivery; the separate
 /// `ANDARIUM_MOTION_INTERACTIVE=1` mode checks physical tilt and rotation
 /// (`tests/integration/android/motion/README.md` has the probe and the
 /// invocation). Physical sensor delivery requires a sensor-capable iOS device
@@ -21,25 +21,18 @@ import Testing
 struct MotionOverVsockTests {
     @Test(.enabled(if: ProcessInfo.processInfo.environment["ANDARIUM_MOTION_TESTS"] == "1"
         && ProcessInfo.processInfo.environment["ANDARIUM_MOTION_INTERACTIVE"] != "1"), .timeLimit(.minutes(20)))
-    func sustainedSensorDeliveryAndTheSwitch() async throws {
+    func sustainedSensorDelivery() async throws {
         try await withProbe { model, operations in
             try await RotationOverVsockTests().checkPreferences(model: model, operations: operations)
-            try await check("silence", seconds: 3, operations: operations)
-            model.setMotionSensors(true)
             try await check("events", seconds: 5, operations: operations)
             try await check("events", seconds: 75, operations: operations)
-            try #require(model.motionSensorsProblem == nil, "\(model.motionSensorsProblem ?? "")")
-            model.setMotionSensors(false)
-            try await Task.sleep(for: .seconds(1))
-            try await check("silence", seconds: 3, operations: operations)
-            print("MOTION: sustained accelerometer, gyroscope, opt-out and rotation preference checks passed")
+            print("MOTION: sustained accelerometer, gyroscope and rotation preference checks passed")
         }
     }
 
     @Test(.enabled(if: ProcessInfo.processInfo.environment["ANDARIUM_MOTION_INTERACTIVE"] == "1"), .timeLimit(.minutes(30)))
     func physicalMotionAndSceneTransitions() async throws {
         try await withProbe { model, operations in
-            model.setMotionSensors(true)
             try await check("events", seconds: 3, operations: operations)
             print("MOTION: ready for physical movement; tilt and rotate the iPad (up to ten minutes)")
             let deadline = ContinuousClock.now + .seconds(600)
@@ -61,7 +54,7 @@ struct MotionOverVsockTests {
             try #require(moved, "No physical tilt and rotation was observed within ten minutes")
             print("MOTION: real accelerometer and gyroscope movement passed")
             if ProcessInfo.processInfo.environment["ANDARIUM_ROTATION_VISUAL"] == "1" {
-                try await RotationOverVsockTests().checkSceneTransitions(model: model, operations: operations)
+                try await RotationOverVsockTests().checkInterfaceTurns(model: model, operations: operations)
             }
         }
     }
@@ -73,8 +66,8 @@ struct MotionOverVsockTests {
         try #require(probe.prefix(4) == Data([0x50, 0x4b, 0x03, 0x04]))
         defer { try? FileManager.default.removeItem(at: probeURL) }
         try await withAndroidGuest(cleanupCommand: "pm uninstall org.example.andarium.motionprobe >/dev/null 2>&1") { model, operations in
-            try #require(model.motionSensorsAvailable)
-            try await operations.installApk(at: probeURL, sizeBytes: probe.count, update: { _ in })
+            try #require(MotionSensors().available, "This device has no accelerometer or gyroscope")
+            try await operations.installApk(at: probeURL, update: { _ in })
             try await body(model, operations)
         }
     }
@@ -103,15 +96,11 @@ struct MotionOverVsockTests {
     private func check(_ mode: String, seconds: Int, operations: AdbGuestOperations) async throws {
         let value = try await capture(mode, seconds: seconds, operations: operations)
         try #require(value.valid && value.passed)
-        if mode == "silence" {
-            #expect(value.accelerometer.count == 0 && value.gyroscope.count == 0)
-        } else {
-            #expect(value.accelerometer.count >= 75 && value.gyroscope.count >= 75)
-            if mode == "events", seconds >= 60 {
-                let minimumSpan = Int64(seconds - 1) * 1_000_000_000
-                try #require(value.accelerometer.last_ns - value.accelerometer.first_ns >= minimumSpan)
-                try #require(value.gyroscope.last_ns - value.gyroscope.first_ns >= minimumSpan)
-            }
+        #expect(value.accelerometer.count >= 75 && value.gyroscope.count >= 75)
+        if mode == "events", seconds >= 60 {
+            let minimumSpan = Int64(seconds - 1) * 1_000_000_000
+            try #require(value.accelerometer.last_ns - value.accelerometer.first_ns >= minimumSpan)
+            try #require(value.gyroscope.last_ns - value.gyroscope.first_ns >= minimumSpan)
         }
     }
 

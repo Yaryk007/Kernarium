@@ -46,6 +46,9 @@ import subprocess
 import sys
 
 SCRIPTS = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPTS.parents[1] / "tests" / "integration" / "support"))
+import ios_device_reports  # noqa: E402
+
 PROJECT = SCRIPTS.parent / "AudioInterrupter" / "AudioInterrupter.xcodeproj"
 KERNARIUM_PROJECT = SCRIPTS.parent / "Kernarium.xcodeproj" / "project.pbxproj"
 SIGNING = SCRIPTS.parents[1] / "GuestHost" / "Config" / "Signing.local.xcconfig"
@@ -54,6 +57,8 @@ DEFAULT_OUTPUT = SCRIPTS.parents[1] / ".build" / "audio-interrupter"
 SUFFIX = "AudioInterrupter"
 MODES = ("direct", "switch")
 ENDS = ("quiet", "notify", "stay")
+# The processes whose diagnostic reports a run needs free slots for.
+PROCESSES = (SUFFIX, "Kernarium")
 
 
 def signing_team(environment: dict[str, str] | None = None, signing: pathlib.Path = SIGNING) -> str:
@@ -139,6 +144,16 @@ def require_device(args: argparse.Namespace) -> None:
         raise SystemExit(f"audio-interrupter.py {args.command}: --device is required")
 
 
+def check_report_slots(args: argparse.Namespace) -> None:
+    """Free the device's diagnostic-report slots before touching the device."""
+    if args.dry_run:
+        return
+    try:
+        ios_device_reports.preflight(args, [], extra_processes=PROCESSES)
+    except ios_device_reports.DeviceError as error:
+        raise SystemExit(f"audio-interrupter.py {args.command}: {error}")
+
+
 def bundle_version(app: pathlib.Path) -> str:
     done = subprocess.run(
         ["/usr/libexec/PlistBuddy", "-c", "Print :CFBundleVersion", str(app / "Info.plist")],
@@ -172,6 +187,7 @@ def do_install(args: argparse.Namespace) -> int:
     app = args.app or output_app(args)
     if not args.dry_run and not app.is_dir():
         raise SystemExit(f"{app}: not built; run `build` first")
+    check_report_slots(args)
     code = run(["codesign", "--verify", "--deep", "--strict", str(app)], args.dry_run)
     if code != 0:
         return code
@@ -181,6 +197,7 @@ def do_install(args: argparse.Namespace) -> int:
 
 def do_launch(args: argparse.Namespace) -> int:
     require_device(args)
+    check_report_slots(args)
     command, environment = launch_command(args)
     return run(command, args.dry_run, environment)
 
@@ -195,6 +212,7 @@ def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     root.add_argument("--device", help="device identifier, UDID or name")
     root.add_argument("--dry-run", action="store_true", help="print the commands without running them")
+    ios_device_reports.add_arguments(root)
     commands = root.add_subparsers(dest="command", required=True)
 
     build = commands.add_parser("build", help="build and sign the application")

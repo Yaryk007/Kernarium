@@ -117,6 +117,18 @@ if(UML_BUILD_TOOLING_TESTS)
     uml_finalize_suite_binary_target(tooling tooling-test-binaries)
     add_dependencies(tooling-test-binaries uml_arm64_instruction_corpus
         uml_arm64_aarch32_corpus)
+    if(TARGET uml_arm64_aot_runtime)
+        add_dependencies(tooling-test-binaries uml_arm64_aot_runtime)
+    endif()
+    # memory-product-carries-no-count-audit reads this target's objects.
+    if(TARGET uml_static_mmu)
+        add_dependencies(tooling-test-binaries uml_static_mmu)
+    endif()
+    # memory-audit-compilation-fails-packaging and
+    # memory-audit-symbols-are-refused audit this target's objects.
+    if(TARGET uml_static_mmu_audit_probe)
+        add_dependencies(tooling-test-binaries uml_static_mmu_audit_probe)
+    endif()
 endif()
 if(UML_BUILD_INTEGRATION_TESTS)
     uml_finalize_suite_binary_target(integration integration-test-binaries)

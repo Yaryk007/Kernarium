@@ -327,7 +327,7 @@ index a8c185c6807c5ffc8be7b01b9d23a5b58ea4dc39..fcf875c2c3fcc242342034a04ad1ab1b
  VKR_DEFINE_OBJECT_CAST(device, VK_OBJECT_TYPE_DEVICE, VkDevice)
  
 diff --git a/src/venus/vkr_device_memory.c b/src/venus/vkr_device_memory.c
-index 82acbc43a7c0a465a1f6050dc46869889cfa883a..f01e1020296faed1bce5c5fce17a63534c3820d9 100644
+index 74088a8d857b0df0e83137f4a814bc25cde1a341..f6acce4536cc5c8955610cc1db69ccb09cbba012 100644
 --- a/src/venus/vkr_device_memory.c
 +++ b/src/venus/vkr_device_memory.c
 @@ -7,6 +7,7 @@
@@ -615,7 +615,7 @@ index 82acbc43a7c0a465a1f6050dc46869889cfa883a..f01e1020296faed1bce5c5fce17a6353
     if (mem->gbm_bo)
        vkr_gbm_bo_destroy(mem->gbm_bo);
     if (mem->udmabuf_fd >= 0)
-@@ -609,6 +736,45 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
+@@ -621,6 +748,45 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
        return true;
     }
  

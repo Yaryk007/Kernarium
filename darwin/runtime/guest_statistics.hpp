@@ -43,6 +43,10 @@ struct GuestRamUsage final {
 	/* The part of it the host holds now: everything the guest has committed
 	 * and not released, and the kernel image, which is never released. */
 	std::uint64_t held_bytes{};
+	/* The failed wiring operations on the guest's RAM (a commit or a
+	 * readmission of a range of pages), since the guest began
+	 * (memory/guest_ram_commitment.hpp). */
+	std::uint64_t wire_failures{};
 };
 
 /* The guest's RAM and the part of it the host holds, or nothing before the
@@ -84,6 +88,63 @@ struct MemoryTerms final {
 	std::uint64_t internal{};
 	std::uint64_t compressed{};
 };
+
+/*
+ * What the session record's checkpoint writes besides the memory terms, for a
+ * report that must say why a guest's frames dropped: how many frames the guest
+ * flushed and the longest gap between two, the host's thermal state and
+ * memory pressure, what the gadget cache did, and how much CPU the process and
+ * the vCPU carriers used and how it ran. Each counter is a total, so that the
+ * record differences two readings; the others are states at the moment of the
+ * reading. A source that has nothing to say leaves its bit out of `sources`,
+ * and its fields are zero.
+ */
+struct RunFigures final {
+	/* The sources that answered. */
+	static constexpr std::uint32_t frames = 1U << 0;
+	static constexpr std::uint32_t host = 1U << 1;
+	static constexpr std::uint32_t cache = 1U << 2;
+	static constexpr std::uint32_t largest = 1U << 3;
+	static constexpr std::uint32_t cpu = 1U << 4;
+	static constexpr std::uint32_t carriers = 1U << 5;
+	static constexpr std::uint32_t usage = 1U << 6;
+	static constexpr std::uint32_t cycle_count = 1U << 7;
+	std::uint32_t sources{};
+
+	/* Scanout flushes since the process began (platform/frame_figures.hpp),
+	 * and the longest gap between two since the previous reading. */
+	std::uint64_t flushes{};
+	std::uint64_t longest_gap_ns{};
+	/* The stall watch's last observation (platform/host_state_figures.hpp):
+	 * the thermal state, 0 nominal to 3 critical, and the memory pressure
+	 * level, 0 normal to 2 critical. */
+	std::uint8_t thermal{};
+	std::uint8_t pressure{};
+	/* The gadget cache ledger's relief counters since the process began, and
+	 * the bytes of its largest open account (cpu/gadget_cache_budget.hpp). */
+	std::uint64_t reliefs{};
+	std::uint64_t shed_accounts{};
+	std::uint64_t renewals{};
+	std::uint64_t largest_open{};
+	/* The process's user and system time, and the carriers' (guest_cpu_time),
+	 * in nanoseconds. */
+	std::uint64_t cpu_ns{};
+	std::uint64_t carrier_ns{};
+	/* From the system's power information of the task (task_info,
+	 * TASK_POWER_INFO_V2, on every platform): the part of the process's CPU
+	 * time spent on performance cores, and its energy in nanojoules. */
+	std::uint64_t performance_ns{};
+	std::uint64_t energy_nj{};
+	/* The CPU cycles the process has run, from proc_pid_rusage where
+	 * <libproc.h> exists (macOS); iOS has no such source. */
+	std::uint64_t cycles{};
+};
+
+/* The figures now; any thread, and it never waits on the guest. `session_begins`
+ * starts the frame gaps afresh for a guest that is about to run. It costs the
+ * reading of the carriers' times (guest_cpu_time) and a system call each for
+ * the process's usage and, on macOS, its cycles, and holds no lock. */
+[[nodiscard]] RunFigures run_figures(bool session_begins) noexcept;
 
 /* The terms now; any thread, and it never waits on the guest. With
  * `read_malloc`, also the malloc zones' statistics: a walk of the zones that

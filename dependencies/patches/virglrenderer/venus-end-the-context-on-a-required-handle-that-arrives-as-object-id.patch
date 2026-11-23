@@ -1,0 +1,446 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 06:50:57 +0900
+Subject: [PATCH] venus: end the context on a required handle that arrives as
+ object id 0
+
+The codec yields NULL for a non-dispatchable handle that the guest sends as
+object id 0, and refuses only an id that names no object of the type, plus
+id 0 for the first argument of a command.  A handle the specification does
+not allow to be VK_NULL_HANDLE therefore reaches its handler as a null
+pointer, which the renderer reads or the driver dereferences, and in the
+product the renderer runs in the app's own process.
+
+Add vkr_context_refuse_null_handle(), which logs the command and the slot
+and ends the context as an id that names no object does, and ask it in the
+handlers this project wrote or changed and in the few upstream ones that
+read the handle themselves: the memory requirements and binds of buffers
+and images (a bind with no memory is refused outright, since the swapchain
+binding that allows one is not in the protocol), vkCreateImageView's
+conversion, vkCmdCopyMemoryToImageKHR, vkCmdCopyImageToMemoryKHR and
+vkCmdCopyQueryPoolResultsToMemoryKHR, vkFreeCommandBuffers and
+vkFreeDescriptorSets, vkImportSemaphoreResourceMESA, vkCreateFramebuffer's
+render pass, the physical devices of a device group, and the libraries a
+pipeline create info chains, and a create info that chains pipeline
+binaries.  The renderer serves no VK_KHR_pipeline_binary, so no object
+names a binary, and a guest can enable the extension on a device by name.
+The bind commands also refuse an array the codec left null.
+
+vkCmdCopyMemoryToImageKHR and vkCmdCopyImageToMemoryKHR may send no info at
+all, which the driver ignores, so the image of the info is read only when the
+info is there.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/venus/vkr_buffer.c         | 22 +++++++++++--
+ src/venus/vkr_command_buffer.c | 22 +++++++++++--
+ src/venus/vkr_context.h        | 25 +++++++++++++++
+ src/venus/vkr_descriptor_set.c |  3 ++
+ src/venus/vkr_device.c         | 13 ++++++++
+ src/venus/vkr_image.c          | 30 ++++++++++++++++--
+ src/venus/vkr_pipeline.c       | 57 ++++++++++++++++++++++++++++++++++
+ src/venus/vkr_queue.c          |  3 ++
+ src/venus/vkr_render_pass.c    |  3 ++
+ 9 files changed, 171 insertions(+), 7 deletions(-)
+
+diff --git a/src/venus/vkr_buffer.c b/src/venus/vkr_buffer.c
+index 86b98b426ba315425f10d559681e7c77782795bf..7c457c8de8ec77a3267ab069ee38b9cd73f3beef 100644
+--- a/src/venus/vkr_buffer.c
++++ b/src/venus/vkr_buffer.c
+@@ -49,12 +49,15 @@ vkr_dispatch_vkDestroyBuffer(struct vn_dispatch_context *dispatch,
+ 
+ static void
+ vkr_dispatch_vkGetBufferMemoryRequirements(
+-   UNUSED struct vn_dispatch_context *dispatch,
++   struct vn_dispatch_context *dispatch,
+    struct vn_command_vkGetBufferMemoryRequirements *args)
+ {
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
++   if (VKR_REFUSE_NULL_HANDLE(dispatch->data, args->buffer))
++      return;
++
+    vn_replace_vkGetBufferMemoryRequirements_args_handle(args);
+    vk->GetBufferMemoryRequirements(args->device, args->buffer, args->pMemoryRequirements);
+    args->pMemoryRequirements->memoryTypeBits =
+@@ -64,12 +67,15 @@ vkr_dispatch_vkGetBufferMemoryRequirements(
+ 
+ static void
+ vkr_dispatch_vkGetBufferMemoryRequirements2(
+-   UNUSED struct vn_dispatch_context *dispatch,
++   struct vn_dispatch_context *dispatch,
+    struct vn_command_vkGetBufferMemoryRequirements2 *args)
+ {
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
++   if (VKR_REFUSE_NULL_HANDLE(dispatch->data, args->pInfo->buffer))
++      return;
++
+    vn_replace_vkGetBufferMemoryRequirements2_args_handle(args);
+    vk->GetBufferMemoryRequirements2(args->device, args->pInfo, args->pMemoryRequirements);
+    args->pMemoryRequirements->memoryRequirements.memoryTypeBits =
+@@ -96,6 +102,10 @@ vkr_dispatch_vkBindBufferMemory(struct vn_dispatch_context *dispatch,
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
++   if (VKR_REFUSE_NULL_HANDLE(dispatch->data, args->buffer) ||
++       VKR_REFUSE_NULL_HANDLE(dispatch->data, args->memory))
++      return;
++
+    vn_replace_vkBindBufferMemory_args_handle(args);
+    args->ret =
+       vk->BindBufferMemory(args->device, args->buffer, args->memory, args->memoryOffset);
+@@ -110,6 +120,14 @@ vkr_dispatch_vkBindBufferMemory2(struct vn_dispatch_context *dispatch,
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
++   if (args->bindInfoCount && VKR_REFUSE_NULL_HANDLE(dispatch->data, args->pBindInfos))
++      return;
++   for (uint32_t i = 0; i < args->bindInfoCount; i++) {
++      if (VKR_REFUSE_NULL_HANDLE(dispatch->data, args->pBindInfos[i].buffer) ||
++          VKR_REFUSE_NULL_HANDLE(dispatch->data, args->pBindInfos[i].memory))
++         return;
++   }
++
+    vn_replace_vkBindBufferMemory2_args_handle(args);
+    args->ret = vk->BindBufferMemory2(args->device, args->bindInfoCount, args->pBindInfos);
+    if (args->ret != VK_SUCCESS)
+diff --git a/src/venus/vkr_command_buffer.c b/src/venus/vkr_command_buffer.c
+index a64a178845c9d83055ed419254909d912b8fe48a..c4f5786cdd7968204359f5d1250fae0452e03d7a 100644
+--- a/src/venus/vkr_command_buffer.c
++++ b/src/venus/vkr_command_buffer.c
+@@ -97,6 +97,9 @@ vkr_dispatch_vkFreeCommandBuffers(struct vn_dispatch_context *dispatch,
+    struct vkr_context *ctx = dispatch->data;
+    struct list_head free_list;
+ 
++   if (VKR_REFUSE_NULL_HANDLE(ctx, args->commandPool))
++      return;
++
+    /* args->pCommandBuffers is marked noautovalidity="true" */
+    if (args->commandBufferCount && !args->pCommandBuffers) {
+       vkr_context_set_fatal(ctx);
+@@ -1349,17 +1352,27 @@ vkr_dispatch_vkCmdCopyMemoryKHR(
+ 
+ static void
+ vkr_dispatch_vkCmdCopyMemoryToImageKHR(
+-   UNUSED struct vn_dispatch_context *dispatch,
++   struct vn_dispatch_context *dispatch,
+    struct vn_command_vkCmdCopyMemoryToImageKHR *args)
+ {
++   /* The info is optional and the driver ignores a null one. */
++   if (args->pCopyMemoryInfo &&
++       VKR_REFUSE_NULL_HANDLE(dispatch->data, args->pCopyMemoryInfo->image))
++      return;
++
+    VKR_CMD_CALL(CmdCopyMemoryToImageKHR, args, args->pCopyMemoryInfo);
+ }
+ 
+ static void
+ vkr_dispatch_vkCmdCopyImageToMemoryKHR(
+-   UNUSED struct vn_dispatch_context *dispatch,
++   struct vn_dispatch_context *dispatch,
+    struct vn_command_vkCmdCopyImageToMemoryKHR *args)
+ {
++   /* The info is optional and the driver ignores a null one. */
++   if (args->pCopyMemoryInfo &&
++       VKR_REFUSE_NULL_HANDLE(dispatch->data, args->pCopyMemoryInfo->image))
++      return;
++
+    VKR_CMD_CALL(CmdCopyImageToMemoryKHR, args, args->pCopyMemoryInfo);
+ }
+ 
+@@ -1382,9 +1395,12 @@ vkr_dispatch_vkCmdFillMemoryKHR(
+ 
+ static void
+ vkr_dispatch_vkCmdCopyQueryPoolResultsToMemoryKHR(
+-   UNUSED struct vn_dispatch_context *dispatch,
++   struct vn_dispatch_context *dispatch,
+    struct vn_command_vkCmdCopyQueryPoolResultsToMemoryKHR *args)
+ {
++   if (VKR_REFUSE_NULL_HANDLE(dispatch->data, args->queryPool))
++      return;
++
+    VKR_CMD_CALL(CmdCopyQueryPoolResultsToMemoryKHR, args, args->queryPool,
+                 args->firstQuery, args->queryCount, args->pDstRange, args->dstFlags,
+                 args->queryResultFlags);
+diff --git a/src/venus/vkr_context.h b/src/venus/vkr_context.h
+index 432ebbda29d271ddbca70208b25caa783b62ead1..becea074ecf6d2c9f5a7ef62f515bbc28f3abc51 100644
+--- a/src/venus/vkr_context.h
++++ b/src/venus/vkr_context.h
+@@ -197,6 +197,31 @@ vkr_context_get_fatal(struct vkr_context *ctx)
+    return ctx->cs_fatal_error;
+ }
+ 
++/* The codec yields NULL for a non-dispatchable handle that the guest sends as
++ * object id 0, and refuses only an id that names no object of the type (and,
++ * for the first argument of a command, id 0 as well).  A handle the
++ * specification does not allow to be VK_NULL_HANDLE therefore reaches its
++ * handler as a null pointer, which the renderer reads or the driver
++ * dereferences.  A handler that needs such a handle asks here: a null one ends
++ * the context, as an id that names no object does.  `slot` says which handle
++ * of the command it was. */
++static inline bool
++vkr_context_refuse_null_handle(struct vkr_context *ctx,
++                               const void *handle,
++                               const char *command,
++                               const char *slot)
++{
++   if (handle)
++      return false;
++
++   vkr_log("%s: %s is the null handle", command, slot);
++   vkr_context_set_fatal(ctx);
++   return true;
++}
++
++#define VKR_REFUSE_NULL_HANDLE(ctx, handle)                                              \
++   vkr_context_refuse_null_handle((ctx), (handle), __func__, #handle)
++
+ /* Names the context whose commands the calling thread dispatches, or NULL
+  * when it dispatches none. */
+ void
+diff --git a/src/venus/vkr_descriptor_set.c b/src/venus/vkr_descriptor_set.c
+index 5ec209f4a96e7de1d5a9cb0b3c16da115d44003c..402ba590c2c8f408924737b820a228a7256d59ad 100644
+--- a/src/venus/vkr_descriptor_set.c
++++ b/src/venus/vkr_descriptor_set.c
+@@ -120,6 +120,9 @@ vkr_dispatch_vkFreeDescriptorSets(struct vn_dispatch_context *dispatch,
+    struct vkr_context *ctx = dispatch->data;
+    struct list_head free_list;
+ 
++   if (VKR_REFUSE_NULL_HANDLE(ctx, args->descriptorPool))
++      return;
++
+    /* args->pDescriptorSets is marked noautovalidity="true" */
+    if (args->descriptorSetCount && !args->pDescriptorSets) {
+       vkr_context_set_fatal(ctx);
+diff --git a/src/venus/vkr_device.c b/src/venus/vkr_device.c
+index ce6ec377df146d76909c8ed5c136c16be1d890cb..6b552876b488caf8cc9271c63dc17d67fcece15b 100644
+--- a/src/venus/vkr_device.c
++++ b/src/venus/vkr_device.c
+@@ -129,6 +129,19 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
+       vkr_physical_device_from_handle(args->physicalDevice);
+    struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
+ 
++   /* The physical devices of a group are not optional, and the codec yields
++    * NULL for object id 0 as it does for any dispatchable handle that is not
++    * the first argument. */
++   const VkDeviceGroupDeviceCreateInfo *group = vkr_find_struct(
++      args->pCreateInfo->pNext, VK_STRUCTURE_TYPE_DEVICE_GROUP_DEVICE_CREATE_INFO);
++   if (group && group->physicalDeviceCount &&
++       VKR_REFUSE_NULL_HANDLE(ctx, group->pPhysicalDevices))
++      return;
++   for (uint32_t i = 0; group && i < group->physicalDeviceCount; i++) {
++      if (VKR_REFUSE_NULL_HANDLE(ctx, group->pPhysicalDevices[i]))
++         return;
++   }
++
+    /* there can be at most two members sharing a queueFamilyIndex (one
+     * protected-capable, one not), in which case their summed queueCount must
+     * be <= the family's VkQueueFamilyProperties::queueCount.
+diff --git a/src/venus/vkr_image.c b/src/venus/vkr_image.c
+index e3238a338cbedef8579c9147c62f2dd488a39df2..490e97e45fdc8a5087ac0a6866add59728a669ff 100644
+--- a/src/venus/vkr_image.c
++++ b/src/venus/vkr_image.c
+@@ -174,13 +174,16 @@ vkr_dispatch_vkDestroyImage(struct vn_dispatch_context *dispatch,
+ 
+ static void
+ vkr_dispatch_vkGetImageMemoryRequirements(
+-   UNUSED struct vn_dispatch_context *dispatch,
++   struct vn_dispatch_context *dispatch,
+    struct vn_command_vkGetImageMemoryRequirements *args)
+ {
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+    struct vkr_image *image = vkr_image_from_handle(args->image);
+ 
++   if (VKR_REFUSE_NULL_HANDLE(dispatch->data, image))
++      return;
++
+    vn_replace_vkGetImageMemoryRequirements_args_handle(args);
+    vk->GetImageMemoryRequirements(args->device, args->image, args->pMemoryRequirements);
+    args->pMemoryRequirements->memoryTypeBits =
+@@ -191,13 +194,16 @@ vkr_dispatch_vkGetImageMemoryRequirements(
+ 
+ static void
+ vkr_dispatch_vkGetImageMemoryRequirements2(
+-   UNUSED struct vn_dispatch_context *dispatch,
++   struct vn_dispatch_context *dispatch,
+    struct vn_command_vkGetImageMemoryRequirements2 *args)
+ {
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+    struct vkr_image *image = vkr_image_from_handle(args->pInfo->image);
+ 
++   if (VKR_REFUSE_NULL_HANDLE(dispatch->data, image))
++      return;
++
+    vn_replace_vkGetImageMemoryRequirements2_args_handle(args);
+    vk->GetImageMemoryRequirements2(args->device, args->pInfo, args->pMemoryRequirements);
+    args->pMemoryRequirements->memoryRequirements.memoryTypeBits =
+@@ -258,6 +264,10 @@ vkr_dispatch_vkBindImageMemory(struct vn_dispatch_context *dispatch,
+       vkr_device_memory_from_handle(args->memory);
+    const VkDeviceSize memory_offset = args->memoryOffset;
+ 
++   if (VKR_REFUSE_NULL_HANDLE(dispatch->data, image) ||
++       VKR_REFUSE_NULL_HANDLE(dispatch->data, mem))
++      return;
++
+    vn_replace_vkBindImageMemory_args_handle(args);
+    args->ret =
+       vk->BindImageMemory(args->device, args->image, args->memory, args->memoryOffset);
+@@ -281,6 +291,9 @@ vkr_dispatch_vkBindImageMemory2(struct vn_dispatch_context *dispatch,
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
++   if (args->bindInfoCount && VKR_REFUSE_NULL_HANDLE(dispatch->data, args->pBindInfos))
++      return;
++
+    STACK_ARRAY(struct vkr_metal_image_binding, bindings,
+                args->bindInfoCount);
+    if (!bindings) {
+@@ -295,6 +308,13 @@ vkr_dispatch_vkBindImageMemory2(struct vn_dispatch_context *dispatch,
+             vkr_device_memory_from_handle(args->pBindInfos[i].memory),
+          .memory_offset = args->pBindInfos[i].memoryOffset,
+       };
++      /* The registry lets the memory be null for an image bound to a
++       * swapchain image, a structure the protocol does not carry. */
++      if (VKR_REFUSE_NULL_HANDLE(dispatch->data, bindings[i].image) ||
++          VKR_REFUSE_NULL_HANDLE(dispatch->data, bindings[i].memory)) {
++         STACK_ARRAY_FINISH(bindings);
++         return;
++      }
+    }
+ 
+    vn_replace_vkBindImageMemory2_args_handle(args);
+@@ -383,6 +403,12 @@ vkr_dispatch_vkCreateImageView(struct vn_dispatch_context *dispatch,
+       return;
+    }
+ 
++   /* A conversion the view chains is not optional. */
++   const VkSamplerYcbcrConversionInfo *ycbcr = vkr_find_struct(
++      args->pCreateInfo->pNext, VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO);
++   if (ycbcr && VKR_REFUSE_NULL_HANDLE(ctx, ycbcr->conversion))
++      return;
++
+    struct vkr_image_view *view = vkr_image_view_create_and_add(ctx, args);
+    if (view) {
+       view->image_id = image->base.id;
+diff --git a/src/venus/vkr_pipeline.c b/src/venus/vkr_pipeline.c
+index d0d6f8364bf6c109bc31e5d01940853ce42669cc..16289f8d4d6dbbd1ef3ffe44322ce98bb195d8e2 100644
+--- a/src/venus/vkr_pipeline.c
++++ b/src/venus/vkr_pipeline.c
+@@ -105,6 +105,42 @@ vkr_dispatch_vkMergePipelineCaches(UNUSED struct vn_dispatch_context *dispatch,
+                                        args->pSrcCaches);
+ }
+ 
++/* A pipeline made of pipeline libraries chains a VkPipelineLibraryCreateInfoKHR,
++ * and the driver reads every library.  The codec looks each handle up and
++ * yields NULL for object id 0, which no pipeline has, leaving the refusal to
++ * the handler (an id the context never made is refused by the lookup itself).
++ * A null one is therefore a null pointer the driver would dereference.  The
++ * handles still hold the objects here; they are replaced by the driver's
++ * handles only when the call is forwarded.
++ *
++ * The renderer serves no VK_KHR_pipeline_binary, so no object names a binary,
++ * and a chain that carries binaries is refused whatever it names: a guest can
++ * enable the extension on a device by name, and the driver would read them. */
++static bool
++vkr_pipeline_chain_holds_handles(const void *pnext)
++{
++   for (const VkBaseInStructure *chain = pnext; chain; chain = chain->pNext) {
++      if (chain->sType == VK_STRUCTURE_TYPE_PIPELINE_BINARY_INFO_KHR) {
++         if (((const VkPipelineBinaryInfoKHR *)chain)->binaryCount) {
++            vkr_log("a pipeline create info names pipeline binaries");
++            return false;
++         }
++      } else if (chain->sType == VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR) {
++         const VkPipelineLibraryCreateInfoKHR *info =
++            (const VkPipelineLibraryCreateInfoKHR *)chain;
++         if (info->libraryCount && !info->pLibraries)
++            return false;
++         for (uint32_t i = 0; i < info->libraryCount; i++) {
++            if (!info->pLibraries[i]) {
++               vkr_log("a pipeline library is the null handle");
++               return false;
++            }
++         }
++      }
++   }
++   return true;
++}
++
+ static void
+ vkr_dispatch_vkCreateGraphicsPipelines(struct vn_dispatch_context *dispatch,
+                                        struct vn_command_vkCreateGraphicsPipelines *args)
+@@ -114,6 +150,13 @@ vkr_dispatch_vkCreateGraphicsPipelines(struct vn_dispatch_context *dispatch,
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct object_array arr;
+ 
++   for (uint32_t i = 0; i < args->createInfoCount; i++) {
++      if (!vkr_pipeline_chain_holds_handles(args->pCreateInfos[i].pNext)) {
++         vkr_context_set_fatal(ctx);
++         return;
++      }
++   }
++
+    if (!vkr_graphics_pipeline_create_array(ctx, args, &arr))
+       return;
+ 
+@@ -129,6 +172,13 @@ vkr_dispatch_vkCreateComputePipelines(struct vn_dispatch_context *dispatch,
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct object_array arr;
+ 
++   for (uint32_t i = 0; i < args->createInfoCount; i++) {
++      if (!vkr_pipeline_chain_holds_handles(args->pCreateInfos[i].pNext)) {
++         vkr_context_set_fatal(ctx);
++         return;
++      }
++   }
++
+    if (!vkr_compute_pipeline_create_array(ctx, args, &arr))
+       return;
+ 
+@@ -152,6 +202,13 @@ vkr_dispatch_vkCreateRayTracingPipelinesKHR(
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct object_array arr;
+ 
++   for (uint32_t i = 0; i < args->createInfoCount; i++) {
++      if (!vkr_pipeline_chain_holds_handles(args->pCreateInfos[i].pNext)) {
++         vkr_context_set_fatal(ctx);
++         return;
++      }
++   }
++
+    if (!vkr_ray_tracing_pipeline_create_array(ctx, args, &arr))
+       return;
+ 
+diff --git a/src/venus/vkr_queue.c b/src/venus/vkr_queue.c
+index 36c39e7052a61308987e17c3077673e5bfb4fab8..de1cba0c605262c8b2e22b1300dae5fb10e28937 100644
+--- a/src/venus/vkr_queue.c
++++ b/src/venus/vkr_queue.c
+@@ -585,6 +585,9 @@ vkr_dispatch_vkImportSemaphoreResourceMESA(
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
++   if (VKR_REFUSE_NULL_HANDLE(ctx, args->pImportSemaphoreResourceInfo->semaphore))
++      return;
++
+    vn_replace_vkImportSemaphoreResourceMESA_args_handle(args);
+ 
+    const VkImportSemaphoreResourceInfoMESA *res_info = args->pImportSemaphoreResourceInfo;
+diff --git a/src/venus/vkr_render_pass.c b/src/venus/vkr_render_pass.c
+index 874de8d48c5ee5b954c73fd5f08ee2da3777e5bb..d40ea2829396dfb8ef63e692f065868a22bd0ba9 100644
+--- a/src/venus/vkr_render_pass.c
++++ b/src/venus/vkr_render_pass.c
+@@ -86,6 +86,9 @@ vkr_dispatch_vkCreateFramebuffer(struct vn_dispatch_context *dispatch,
+    const bool imageless = info->flags & VK_FRAMEBUFFER_CREATE_IMAGELESS_BIT;
+    const uint32_t count = imageless || !info->pAttachments ? 0 : info->attachmentCount;
+ 
++   if (VKR_REFUSE_NULL_HANDLE(ctx, info->renderPass))
++      return;
++
+    struct vkr_framebuffer *fb = vkr_context_alloc_object(
+       ctx, sizeof(*fb) + sizeof(fb->attachments[0]) * count, VK_OBJECT_TYPE_FRAMEBUFFER,
+       args->pFramebuffer);

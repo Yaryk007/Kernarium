@@ -1,0 +1,606 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 23:56:34 +0900
+Subject: [PATCH] kosmickrisp: start a load-only pass's encoder after its
+ draw's compute
+
+Zink ends its render pass for every barrier and begins another, and a
+GPU particle simulation, which steps its particles by transform feedback
+with the rasterizer discarded, has a pass for every step. A transform
+feedback draw runs compute (the vertex stage, the counter kernel) and
+then a render draw that makes the capture. The compute was recorded once
+the pass's render encoder had started, so it took a command buffer of
+its own that had to run before the render encoder, and the pass was
+split to put it there: each step opened a main command buffer, with the
+first render encoder of a command buffer taking about 2.5 MiB of
+allocator storage, and a compute command buffer. Sling Shot's first
+frames record as many as 523 such passes in one recording, 1.3 GiB of
+command storage.
+
+A pass whose attachments are all loaded (a load and a store of an
+attachment nothing was drawn into leave it as it was; no clear, resolve,
+layer, view mask, fragment shading rate attachment, secondary command
+buffer contents or flag other than local read access control) now starts
+its render encoder at its first draw, whether or not the draw
+rasterizes, or at its first clear or render-stage timestamp. A transform
+feedback draw in such a pass flushes its state to no encoder, records
+its compute in the main command buffer in order, then starts the encoder
+and flushes the state again before the render draw, as it would have
+been drawn. The counter copies around a capture stop the encoder of such
+a pass and run in the main command buffer too, and the pass's next draw
+starts another that loads what the first stored. A pass that ends
+without an encoder leaves its compute encoder open, so the barrier
+between two passes is the intra-encoder barrier it already is. The
+passes of a recording then share one main command buffer.
+
+Command storage is still linear in the passes. An encoder costs storage
+whichever command buffer holds it: a chain of 129 passes takes 3 command
+buffers, 131 render and 133 compute encoders and 84 MiB at the end of
+the recording, about 0.65 MiB a pass, where the canonical driver takes
+518 command buffers and 656 MiB. What goes is the first-encoder cost of
+every command buffer and the compute command buffers of the splits, not
+the growth.
+
+A draw that reserves from the geometry heap before its pass's encoder
+starts (an unroll, an indirect capture's setup) pins the heap with no
+encoder open, so its reset is recorded ahead of its reservations, and
+starting the encoder begins a new segment: nothing would reset what the
+draw reserved, and the next draw to reserve counted its demand from zero
+on a heap that was not empty and could be refused, dropping its
+geometry. The draw's segment now carries across the start: the heap is
+pinned again with the encoder open, which queues the reset after the
+pass, and the demand is kept. That leaves a post-render command buffer
+open, so the pass cannot pause its encoder again, and a chain of such
+passes does not share a main command buffer: 25 passes of indexed or
+indirect captures take 53 command buffers and 69 MiB, where the
+canonical driver takes 102 and 130 MiB. A direct capture writes its
+records to the pool and no longer pins the heap, which queued a reset
+after every pass of that kind, deferred or not.
+
+A split of the pass carries the segment too. Compute that must precede
+the encoder, when other work already lies in the main command buffer,
+closes the pass there and resumes it in a new main command buffer, and
+starting that encoder began a new segment while the reset of the one it
+left waits in the post-render command buffer, after both parts of the
+pass. The next draw to reserve counted its demand from zero on a heap
+that still held the earlier reservations, was refused, and lost its
+output; a pass that follows direct-capture passes is split by its first
+draw that reserves. The split saves the segment and restores it after
+the start, so the draws of both parts are counted together and the heap
+grows for them.
+
+The setup kernel of a geometry shader draw takes its invalid branch
+now and then with correct inputs, on an Apple7 GPU under macOS 27.0.1,
+and refuses every geometry draw of the command buffer it is in; a pass
+that starts its encoder late shows it (KK_WORKAROUND_22). The compiled
+code of the kernel's overflow test is at fault, not its inputs: it
+multiplies with the library's checked multiply, which divides, and a
+form that tests the high word of each product instead computes the
+same and did not fail. The kernel uses that form, and the prebuilt
+libkk.spv is regenerated for it.
+
+Nothing rendered or captured changes. A pass that clears, resolves, has
+layers, secondary command buffer contents or no attachments starts its
+encoder when it begins, as before. The sample count an encoder started
+late has comes from the pass's attachments. A failed recording that has
+no encoder behaves as it does.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ docs/drivers/kosmickrisp/workarounds.rst |  56 +++++++++
+ src/kosmickrisp/libkk/kk_geometry.cl     |  21 +++-
+ src/kosmickrisp/vulkan/kk_cmd_buffer.c   |  64 +++++++++-
+ src/kosmickrisp/vulkan/kk_cmd_buffer.h   |  23 +++-
+ src/kosmickrisp/vulkan/kk_cmd_draw.c     | 154 +++++++++++++++++++++--
+ src/kosmickrisp/vulkan/kk_query_pool.c   |   6 +
+ 6 files changed, 305 insertions(+), 19 deletions(-)
+
+diff --git a/docs/drivers/kosmickrisp/workarounds.rst b/docs/drivers/kosmickrisp/workarounds.rst
+index de77d672211eafd60665deccd1f9c8bbab741420..8c666a683e79b2ee19053b5bb1dc3256d955064e 100644
+--- a/docs/drivers/kosmickrisp/workarounds.rst
++++ b/docs/drivers/kosmickrisp/workarounds.rst
+@@ -49,6 +49,62 @@ info on what was updated.
+ Workarounds
+ ===========
+ 
++KK_WORKAROUND_22
++----------------
++| macOS version: 27.0.1 (build 26A434)
++| Metal ticket: Not reported
++| Metal ticket status:
++| CTS test failure: none known; ``gpu-kosmickrisp-raster-state`` (gs and
++  tes-gs stages, host project test)
++| Comments:
++
++The setup kernel of a geometry shader draw, ``libkk_gs_setup_indirect``,
++first checks that the draw's sizes do not overflow, with the library's
++``poly_u32_checked_mul``: ``b != 0 && a > UINT_MAX / b``. Now and then the
++compiled kernel takes the invalid branch with correct inputs, and the draw's
++geometry is lost. On an Apple7 GPU (M1 Ultra) under macOS 27.0.1, with the
++encoder of a render pass started late, about one iteration in a hundred of
++the test's gs and tes-gs stages fails. The draw count, the instance count,
++the vertex output mask and the geometry shader's output vertex count and
++stride are correct in the GPU's view on both sides of the dispatch, and a copy
++of the kernel dispatched before and after it computes valid from them, while
++the kernel itself zeroes the grids and returns. It is all or nothing per
++recording: every geometry setup of the failing command buffer is refused,
++while the same command buffer passed every one in the recording before. The
++same compiled kernel dispatched alone, millions of times, never fails, and an
++edit that does not change what the kernel computes but changes the code the
++compiler generates for the validity test makes the failure disappear. The
++validity test runs in the constant program (the preamble) of the Apple GPU
++binary, whose size differs between the variants that fail and those that do
++not.
++
++The workaround tests the overflow of the multiplications of that block with
++``mul_hi``, whose result is zero exactly when the product fits in 32 bits
++(a zero factor included), and so does without the divisions the five checks
++compile to: five checks, four distinct divisors, so four 32-bit divisions.
++Two programs were measured, in the same load windows as the intact kernel.
++A hand-patched build of the kernel with these multiplications failed in none
++of 559 iterations, against 5 of 696 for the intact kernel; its Apple binary
++is not the shipped one (its constant program is 3648 bytes, the shipped one's
++3712). The shipped kernel failed in none of 680 iterations, against 3 of 680
++for the intact kernel as the control. The mechanism inside the compiler is
++inferred, not shown, and an unrelated edit may move the defect to another
++kernel.
++
++To qualify removing the workaround, first show that the harness reproduces
++the failure in its load window: run the raster-state test's gs and tes-gs
++stages with the late encoder start on against the intact kernel (the
++multiplications as ``poly_u32_checked_mul``) on macOS 27.0.1 and an Apple7
++GPU, where 3 to 5 iterations in 700 fail. Then run the intact kernel on the OS
++and GPU under test. A remaining defect fails at least once in 600 iterations
++with about 93 percent probability at that rate, so 600 clean iterations
++qualify the removal for that combination and one failure keeps the
++workaround.
++
++| Log:
++| 2026-11-12: Workaround implemented, with the figures of the shipped kernel
++  and the condition for removing it
++
+ KK_WORKAROUND_19
+ ----------------
+ | macOS version: 27.0
+diff --git a/src/kosmickrisp/libkk/kk_geometry.cl b/src/kosmickrisp/libkk/kk_geometry.cl
+index bc56afd6293d53a6e3add7fea93f19063d03c7dd..81c8ffcf2fea11c4f31c5778049bb15ccdb08b60 100644
+--- a/src/kosmickrisp/libkk/kk_geometry.cl
++++ b/src/kosmickrisp/libkk/kk_geometry.cl
+@@ -179,6 +179,14 @@ libkk_line_output_sizes(uint32_t count, uint32_t instance_count,
+           poly_heap_size_can_align(allocation);
+ }
+ 
++/* KK_WORKAROUND_22 */
++static inline bool
++libkk_u32_mul_fits(uint32_t a, uint32_t b, uint32_t *result)
++{
++   *result = a * b;
++   return mul_hi(a, b) == 0u;
++}
++
+ KERNEL(1)
+ libkk_gs_setup_indirect(
+    uint64_t index_buffer, constant uint32_t *draw,
+@@ -200,18 +208,19 @@ libkk_gs_setup_indirect(
+    uint32_t output_size = 0;
+    uint32_t vs_records, vs_slots, vs_size;
+    bool valid =
+-      poly_u32_checked_mul(draw[0], draw[1], &vs_records) &&
+-      poly_u32_checked_mul(vs_records, popcount(vertex_outputs), &vs_slots) &&
++      libkk_u32_mul_fits(draw[0], draw[1], &vs_records) &&
++      libkk_u32_mul_fits(vs_records, popcount(vertex_outputs), &vs_slots) &&
+       poly_u32_checked_mul(vs_slots, 16, &vs_size) &&
+       poly_heap_size_can_align(vs_size);
+    if (p->output_vertex_stride) {
+       uint32_t primitive_count =
+          poly_decomposed_prims_for_vertices_u32(prim, draw[0]);
+-      uint32_t total_primitives;
++      uint32_t total_primitives, records;
+       valid = valid &&
+-         poly_u32_checked_mul(primitive_count, draw[1], &total_primitives) &&
+-         poly_gs_output_buffer_size(total_primitives, p->output_vertices,
+-                                     p->output_vertex_stride, &output_size);
++         libkk_u32_mul_fits(primitive_count, draw[1], &total_primitives) &&
++         libkk_u32_mul_fits(total_primitives, p->output_vertices, &records) &&
++         libkk_u32_mul_fits(records, p->output_vertex_stride, &output_size) &&
++         poly_heap_size_can_align(output_size);
+    }
+    /* The setup below sets the grids before it reserves the buffers they
+     * write, so a refused reservation has to clear them again. */
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_buffer.c b/src/kosmickrisp/vulkan/kk_cmd_buffer.c
+index 8390f70828acc23163e8924530cde655bb20980a..5c0582bdc8242b3c03c85e74e444c05306bba5c3 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_buffer.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_buffer.c
+@@ -457,10 +457,18 @@ cs_get_render(struct kk_cmd_buffer *cmd)
+ {
+    struct kk_graphics_state *gfx = &cmd->state.gfx;
+ 
+-   if (gfx->need_to_start_render_pass) {
+-      gfx->render.samples = gfx->pipeline_sample_count;
+-      mtl_render_pass_descriptor_set_default_raster_sample_count(
+-         cmd->state.gfx.render_pass_descriptor, gfx->render.samples);
++   /* A draw that launches compute first leaves the pass unstarted until the
++    * compute is recorded, and its state goes to no encoder; see kk_draw. */
++   if (gfx->need_to_start_render_pass && !gfx->launch_before_encoder) {
++      /* A pass with attachments gives its descriptor the sample count they
++       * have, which holds for every encoder it starts. A pipeline's count
++       * stands for a pass that has no attachment to say. */
++      if (!gfx->render.load_only) {
++         gfx->render.samples = gfx->pipeline_sample_count;
++         mtl_render_pass_descriptor_set_default_raster_sample_count(
++            cmd->state.gfx.render_pass_descriptor, gfx->render.samples);
++      }
++      gfx->render.deferred_start = false;
+       gfx->need_to_start_render_pass = false;
+       cs_start_render(cmd);
+    }
+@@ -493,9 +501,18 @@ kk_start_compute_encoder(struct kk_cmd_buffer *cmd,
+ static void
+ cs_split_render(struct kk_cmd_buffer *cmd)
+ {
++   /* The heap segment goes on across the split. The reset it queued waits in
++    * the post-render encoder, which runs after both parts of the pass, so the
++    * next draw to reserve from the heap counts its demand beside what the
++    * segment has reserved, not from zero on a heap that is not empty. */
++   const bool heap_in_segment = cmd->heap_in_segment;
++   const uint64_t heap_demand_B = cmd->heap_demand_B;
++
+    kk_stop_encoder(cmd, &cmd->gfx);
+    cs_end_main(cmd);
+    cs_start_render(cmd);
++   cmd->heap_in_segment = heap_in_segment;
++   cmd->heap_demand_B = heap_demand_B;
+    /* A draw being recorded flushed its state into the closed encoder and
+     * needs it in this one. Outside a draw the state need not be complete
+     * yet, a dynamic vertex input for one, and starting the encoder has
+@@ -644,6 +661,45 @@ cs_end(struct kk_cmd_buffer *cmd)
+    }
+ }
+ 
++/* Ends a render pass's encoders. A pass that has no render encoder at its end
++ * ends without closing the compute encoder it recorded into the main command
++ * buffer, so that the passes of a transform feedback chain, which Zink ends
++ * for every barrier between them, share one main command buffer and one
++ * compute encoder between render encoders: a barrier there is an
++ * intra-encoder barrier, and the next render encoder to start closes it.
++ * Resolves and publications the encoder owes close with it, as at the end of
++ * any pass. */
++void
++cs_end_render_pass(struct kk_cmd_buffer *cmd)
++{
++   if (cmd->state.gfx.render.deferred_start && cmd->gfx.encoder == NULL &&
++       cmd->post_gfx->encoder == NULL &&
++       util_dynarray_num_elements(&cmd->pre_gfx->ts_resolves,
++                                  struct kk_ts_resolve) == 0)
++      return;
++
++   cs_end(cmd);
++}
++
++/* Stops the render encoder of a pass that only loads its attachments, so that
++ * the compute recorded next runs in order in the main command buffer rather
++ * than in a command buffer of its own that precedes the encoder and splits
++ * the pass. The pass's next draw starts an encoder that loads what this one
++ * stored. */
++void
++cs_pause_render(struct kk_cmd_buffer *cmd)
++{
++   struct kk_graphics_state *gfx = &cmd->state.gfx;
++
++   if (!gfx->render.load_only || cmd->gfx.encoder == NULL ||
++       cmd->pre_gfx->encoder != NULL || cmd->post_gfx->encoder != NULL)
++      return;
++
++   kk_stop_encoder(cmd, &cmd->gfx);
++   gfx->render.deferred_start = true;
++   gfx->need_to_start_render_pass = true;
++}
++
+ /* Closes every encoder and command buffer, in submission order. */
+ void
+ cs_flush(struct kk_cmd_buffer *cmd)
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_buffer.h b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
+index 65aa82c7d8b0798c393a709f5fa5a1f0485543a4..051ab13d7a5c4654e3927d3f9bd8651f17340d26 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_buffer.h
++++ b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
+@@ -186,6 +186,16 @@ struct kk_rendering_state {
+    struct kk_attachment stencil_att;
+    struct kk_attachment fsr_att;
+ 
++   /* The pass has attachments and began with every one of them loaded and
++    * nothing else to do (see kk_rendering_defers_encoder), so its Metal
++    * render encoder can start late and stop early: nothing is lost when it
++    * does not exist, and the next one picks the pass up where it was. */
++   bool load_only;
++   /* A load-only pass has no render encoder now. Its next draw, whether or
++    * not it rasterizes, its next clear and its next render-stage timestamp
++    * start one. */
++   bool deferred_start;
++
+    uint32_t bresenham_samples;
+    bool sample_locations_enable;
+    uint32_t sample_locations_count;
+@@ -214,6 +224,11 @@ struct kk_graphics_state {
+    bool is_cull_front_and_back;
+    bool need_to_start_render_pass;
+ 
++   /* The draw being recorded runs compute before its render draw and its
++    * pass has no render encoder yet: the encoder starts after that compute,
++    * so flushing the draw's state until then must not start one. */
++   bool launch_before_encoder;
++
+    /* Set while a draw records the work that follows flushing its state into
+     * the render encoder. A render pass split then flushes that state into
+     * the encoder that resumes the pass. */
+@@ -483,6 +498,8 @@ void kk_cmd_buffer_set_vertex_amplification(struct kk_cmd_buffer *cmd,
+ mtl_compute_encoder *cs_get_compute(struct kk_cmd_buffer *cmd, bool pre_gfx);
+ void cs_stop_pre_compute(struct kk_cmd_buffer *cmd);
+ void cs_end(struct kk_cmd_buffer *cmd);
++void cs_end_render_pass(struct kk_cmd_buffer *cmd);
++void cs_pause_render(struct kk_cmd_buffer *cmd);
+ void cs_flush(struct kk_cmd_buffer *cmd);
+ /* Re-emits the graphics state of the draw being recorded into a render
+  * encoder that restarted after the draw flushed it. */
+@@ -500,7 +517,11 @@ kk_cmd_buffer_dirty_all_gfx(struct kk_cmd_buffer *cmd)
+    cmd->state.gfx.descriptors.root_dirty = true;
+ 
+    /* The segment's heap reset is queued. A draw that needs the heap again
+-    * pins it for the new segment and queues another. */
++    * pins it for the new segment and queues another. Two starts carry the
++    * segment on instead, because what it reserved is still in the heap and
++    * its reset has not run: a draw that reserved before its pass's encoder
++    * started (kk_start_render_after_launch), and a split of the pass
++    * (cs_split_render). */
+    cmd->heap_in_segment = false;
+    cmd->heap_demand_B = 0;
+ }
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_draw.c b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+index 5dfe1450cc5e11991466b90770f2582c7eb7f658..d0f8a163cb2d04f70138fce089373f6b33f139ef 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -347,6 +347,61 @@ kk_pipeline_attachment_mask(const struct kk_shader *vs)
+    return mask;
+ }
+ 
++/* Whether an attachment is left as it is: nothing in it is cleared, and
++ * nothing is resolved out of it. */
++static bool
++kk_attachment_is_loaded_only(const VkRenderingAttachmentInfo *info)
++{
++   return info == NULL || info->imageView == VK_NULL_HANDLE ||
++          (info->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD &&
++           info->resolveMode == VK_RESOLVE_MODE_NONE);
++}
++
++/* Whether a pass may start its Metal render encoder at its first draw instead
++ * of when it begins, and stop it for compute that follows a draw.
++ *
++ * A pass that only loads its attachments does nothing to them until a draw
++ * is recorded: the load and the store of an attachment that nothing was
++ * drawn into leave it as it was, so an encoder that holds no draw is not
++ * needed, and one that stops loads again what it stored when the next
++ * starts. Zink ends the pass of every transform feedback draw for its
++ * barriers and begins another, and a draw of that kind runs compute before
++ * its render draw. The compute is recorded in the main command buffer, in
++ * order, only while the pass has no encoder; once one has started, compute
++ * takes a command buffer of its own (see cs_get_compute), and a render
++ * encoder that starts a command buffer costs it megabytes of allocator
++ * storage (see cs_start_render).
++ *
++ * Every other pass starts its encoder at once. A clear, a resolve, layers, a
++ * view mask or a flag that suspends, resumes or resolves in a custom way
++ * acts on the attachments or on how the encoder begins, and a fragment
++ * shading rate attachment is bound to it. The only flag a plain pass may
++ * carry is local read access control, which only restricts the order of a
++ * draw's accesses. */
++static bool
++kk_rendering_defers_encoder(const VkRenderingInfo *info)
++{
++   if ((info->flags &
++        ~(VkRenderingFlags)
++           VK_RENDERING_LOCAL_READ_CONCURRENT_ACCESS_CONTROL_BIT_KHR) != 0u ||
++       info->viewMask != 0u || info->layerCount != 1u)
++      return false;
++
++   const VkRenderingFragmentShadingRateAttachmentInfoKHR *fsr =
++      vk_find_struct_const(info->pNext,
++                           RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_INFO_KHR);
++   if (fsr != NULL && fsr->imageView != VK_NULL_HANDLE)
++      return false;
++
++   for (uint32_t i = 0; i < info->colorAttachmentCount; i++) {
++      if (!kk_attachment_is_loaded_only(&info->pColorAttachments[i]))
++         return false;
++   }
++
++   return kk_attachment_is_loaded_only(info->pDepthAttachment) &&
++          kk_attachment_is_loaded_only(info->pStencilAttachment);
++}
++
+ VKAPI_ATTR void VKAPI_CALL
+ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
+                      const VkRenderingInfo *pRenderingInfo)
+@@ -499,9 +554,14 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
+    // it
+ 
+    /* Rendering with no attachments requires pushing the start of the render
+-    * pass to first pipeline binding to know sample count. */
++    * pass to first pipeline binding to know sample count. A pass that only
++    * loads its attachments starts at its first draw, clear or render-stage
++    * timestamp, whether or not the draw rasterizes; its descriptor, which
++    * loads every attachment, is complete now. */
++   const bool deferred =
++      !no_framebuffer && kk_rendering_defers_encoder(pRenderingInfo);
+    cmd->state.gfx.render_pass_descriptor = pass_descriptor;
+-   if (!no_framebuffer)
++   if (!no_framebuffer && !deferred)
+       cs_start_render(cmd);
+ 
+    /* Metal consumes the initial load actions when the encoder starts. Keep a
+@@ -510,7 +570,9 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
+                             render->bound_attachments, true);
+    kk_set_depth_stencil_attachments(pass_descriptor, render,
+                                     render->bound_attachments, true);
+-   cmd->state.gfx.need_to_start_render_pass = no_framebuffer;
++   cmd->state.gfx.need_to_start_render_pass = no_framebuffer || deferred;
++   render->load_only = deferred;
++   render->deferred_start = deferred;
+ 
+    kk_cmd_buffer_dirty_all_gfx(cmd);
+ 
+@@ -649,7 +711,7 @@ kk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
+    };
+ 
+    /* Clean up previous encoder */
+-   cs_end(cmd);
++   cs_end_render_pass(cmd);
+    mtl_release(cmd->state.gfx.render_pass_descriptor);
+    cmd->state.gfx.render_pass_descriptor = NULL;
+ 
+@@ -3844,6 +3906,31 @@ kk_tess_heap_bound(struct kk_cmd_buffer *cmd, const struct kk_draw_data *draw)
+           align64(patches * points * 8u, 16);
+ }
+ 
++/* Starts the encoder of a pass whose draw has recorded its compute. The
++ * start begins a new heap segment, but a draw that reserved from the heap
++ * (an unroll, an indirect setup) did so before it, and the render draw that
++ * follows reads what it reserved. The draw's segment therefore carries on
++ * into the encoder: it is pinned again with the encoder open, so that its
++ * reset is queued after the render segment, and the next draw to reserve
++ * counts its demand beside the draw's own. The reset the draw's pin queued
++ * ahead of its reservations stays, and frees what the segment before left. */
++static void
++kk_start_render_after_launch(struct kk_cmd_buffer *cmd)
++{
++   const bool heap_in_segment = cmd->heap_in_segment;
++   const uint64_t heap_demand_B = cmd->heap_demand_B;
++
++   cs_get_render(cmd);
++
++   if (!heap_in_segment)
++      return;
++
++   cmd->heap_in_segment = true;
++   cmd->heap_demand_B = heap_demand_B;
++   libkk_heap_reset(cmd, kk_grid_1d(1), !cmd->gfx.encoder,
++                    cmd->heap->bo->gpu);
++}
++
+ static void
+ kk_draw_flushed(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+ {
+@@ -3906,10 +3993,13 @@ kk_draw_flushed(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+       fprintf(stderr,
+               "KK_UNROLL unrolled=%u provoking_rewrite=%u provoking_last=%u\n",
+               requires_unroll, rewrite_direct_provoking, provoking_last);
+-   /* Every stage the driver emulates, and every unroll, allocates from the
+-    * device heap. */
++   /* Every unroll and every stage the driver emulates, other than transform
++    * feedback, allocates from the device heap. A direct draw that captures
++    * transform feedback writes its records to the pool, and an indirect one
++    * pins the heap where its setup reserves, as does an unroll above; pinning
++    * it here for the rest queued a heap reset, in a command buffer of its own
++    * after the pass, for every pass. */
+    const bool needs_heap = requires_unroll || tess || emulate_geometry ||
+-                           emulate_transform_feedback ||
+                            emulate_line_raster || emulate_polygon_points ||
+                            materialize_line_raster;
+    if (requires_unroll) {
+@@ -4013,10 +4103,48 @@ kk_draw_flushed(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+           is_polygon_primitive(raster_prim))
+          draw_data.primitive_type = MTL_PRIMITIVE_TYPE_POINT;
+ 
++      /* The compute is recorded: the pass's encoder starts after it, and
++       * receives the draw's state flushed again. */
++      if (cmd->state.gfx.launch_before_encoder) {
++         cmd->state.gfx.launch_before_encoder = false;
++         kk_start_render_after_launch(cmd);
++         kk_flush_gfx_state(cmd);
++      }
++
+       kk_dispatch_draw(cmd, draw_data);
+    }
+ }
+ 
++/* Whether the draw about to be recorded runs compute before its render draw,
++ * and its pass has no render encoder.
++ *
++ * A draw whose vertex stage the driver runs as compute to capture transform
++ * feedback records its capture in the render draw that follows, and the
++ * compute is recorded in the main command buffer, in order, when no render
++ * encoder is open. The pass's encoder therefore starts after the compute, so
++ * that the passes of a recording share one main command buffer instead of
++ * each ending one for the compute that followed its encoder's start.
++ *
++ * The emulated stages that follow vertex capture are left out: tessellation,
++ * the geometry shader, and the line and polygon-point rasterizers each
++ * produce compute of their own around the render draw. */
++static bool
++kk_draw_launches_before_encoder(struct kk_cmd_buffer *cmd)
++{
++   const struct kk_graphics_state *gfx = &cmd->state.gfx;
++   const struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
++
++   if (!gfx->render.deferred_start || !gfx->need_to_start_render_pass ||
++       cmd->gfx.encoder != NULL)
++      return false;
++
++   return vs != NULL && vs->info.vs.transform_feedback_emulation &&
++          !vs->info.vs.geometry_shader_emulation &&
++          !vs->info.vs.line_raster_emulation &&
++          !vs->info.vs.polygon_point_emulation &&
++          cmd->state.shaders[MESA_SHADER_TESS_EVAL] == NULL;
++}
++
+ static void
+ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+ {
+@@ -4030,11 +4158,17 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+ 
+    kk_cmd_select_line_raster_variant(cmd);
+    data->upload_mask = build_per_draw_upload_mask(cmd);
++
++   /* The state of such a draw is flushed to no encoder for the compute to
++    * read: the encoder that starts after it marks all of it dirty and
++    * receives it again before the render draw. */
++   cmd->state.gfx.launch_before_encoder = kk_draw_launches_before_encoder(cmd);
+    kk_flush_gfx_state(cmd);
+ 
+    cmd->state.gfx.draw_state_flushed = true;
+    kk_draw_flushed(cmd, data);
+    cmd->state.gfx.draw_state_flushed = false;
++   cmd->state.gfx.launch_before_encoder = false;
+ }
+ 
+ VKAPI_ATTR void VKAPI_CALL
+@@ -4398,8 +4532,12 @@ kk_begin_end_transform_feedback(
+    gfx->xfb.enabled = begin;
+    if (copies) {
+       struct kk_ptr copy_gpu = kk_pool_upload(cmd, &copy, sizeof(copy), 8);
+-      if (copy_gpu.gpu)
++      if (copy_gpu.gpu) {
++         /* The copy reads what compute before the draw counted, so it may run
++          * between the pass's encoders, in order. */
++         cs_pause_render(cmd);
+          libkk_copy_xfb_counters(cmd, kk_grid_1d(copies), true, copy_gpu.gpu);
++      }
+    }
+ }
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_query_pool.c b/src/kosmickrisp/vulkan/kk_query_pool.c
+index 6fb8e2b78ae7896e19d4dab89ee88ec17fd8e203..f230edd85d6bde1e2cf29e5dd1e5f566dd7d3707 100644
+--- a/src/kosmickrisp/vulkan/kk_query_pool.c
++++ b/src/kosmickrisp/vulkan/kk_query_pool.c
+@@ -390,6 +390,12 @@ kk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
+       .availability_count = count,
+    };
+ 
++   /* The sample of a render stage belongs to the pass's render encoder. A
++    * pass that has not started one starts it for the sample, as the encoder
++    * it would have begun with. */
++   if (mtl_stage && cmd->state.gfx.render.deferred_start)
++      cs_get_render(cmd);
++
+    /* non-gfx or not found*/
+    if (cmd->gfx.encoder && mtl_stage) {
+       /* Metal permits a single timestamp sample for each render stage in an

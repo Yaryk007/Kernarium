@@ -25,12 +25,12 @@ Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
  3 files changed, 48 insertions(+), 5 deletions(-)
 
 diff --git a/src/vrend/vrend_decode.c b/src/vrend/vrend_decode.c
-index 1f7f600bc93226e680184e1217639c7ad01e4153..e54ae0b8ec4bce5e305e12edbf238ae044cdb265 100644
+index 4a45f64140cb16c3c1f14a71b98ef56c3a2f5464..85c3b8c2d898c085c8093acafb5cfe5b05b6a4e2 100644
 --- a/src/vrend/vrend_decode.c
 +++ b/src/vrend/vrend_decode.c
-@@ -1735,11 +1735,13 @@ static int vrend_decode_ctx_get_blob(struct virgl_context *ctx,
-    TRACE_FUNC();
-    struct vrend_decode_ctx *dctx = (struct vrend_decode_ctx *)ctx;
+@@ -1739,11 +1739,13 @@ static int vrend_decode_ctx_get_blob(struct virgl_context *ctx,
+    if (!vrend_blob_pipe_covers(dctx->grctx, blob_id, blob_size))
+       return -EINVAL;
  
 +   int error = EINVAL;
 +
@@ -45,7 +45,7 @@ index 1f7f600bc93226e680184e1217639c7ad01e4153..e54ae0b8ec4bce5e305e12edbf238ae0
     blob->map_info = vrend_renderer_resource_get_map_info(blob->u.pipe_resource);
     return 0;
 diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
-index 99f48550e72fca7e63fd20d891dbfa1a814b33b5..192cb0495564b3b722fa38f0fa6b413e5f40301b 100644
+index 061892d99fae54dd1ec01e1d46b625c3e2749fa1..365ce8b83b3d032ba04284dee3d236620de8c8e7 100644
 --- a/src/vrend/vrend_renderer.c
 +++ b/src/vrend/vrend_renderer.c
 @@ -899,6 +899,8 @@ struct vrend_untyped_resource {
@@ -73,7 +73,7 @@ index 99f48550e72fca7e63fd20d891dbfa1a814b33b5..192cb0495564b3b722fa38f0fa6b413e
     struct vrend_shader_cfg shader_cfg;
  
     unsigned debug_flags;
-@@ -15257,15 +15268,25 @@ int vrend_renderer_pipe_resource_create(struct vrend_context *ctx, uint32_t blob
+@@ -15457,8 +15468,17 @@ int vrend_renderer_pipe_resource_create(struct vrend_context *ctx, uint32_t blob
     struct vrend_resource *res;
     int error;
     res = (struct vrend_resource *)vrend_renderer_resource_create(args, NULL, &error);
@@ -92,7 +92,8 @@ index 99f48550e72fca7e63fd20d891dbfa1a814b33b5..192cb0495564b3b722fa38f0fa6b413e
  
     res->blob_id = blob_id;
     list_addtail(&res->head, &ctx->vrend_resources);
-    return 0;
+@@ -15489,7 +15509,8 @@ bool vrend_blob_pipe_covers(struct vrend_context *ctx, uint64_t blob_id,
+    return true;
  }
  
 -struct pipe_resource *vrend_get_blob_pipe(struct vrend_context *ctx, uint64_t blob_id)
@@ -101,7 +102,7 @@ index 99f48550e72fca7e63fd20d891dbfa1a814b33b5..192cb0495564b3b722fa38f0fa6b413e
  {
     uint32_t id = (uint32_t)blob_id;
  
-@@ -15279,6 +15300,22 @@ struct pipe_resource *vrend_get_blob_pipe(struct vrend_context *ctx, uint64_t bl
+@@ -15503,6 +15524,22 @@ struct pipe_resource *vrend_get_blob_pipe(struct vrend_context *ctx, uint64_t bl
        return &res->base;
     }
  
@@ -125,12 +126,12 @@ index 99f48550e72fca7e63fd20d891dbfa1a814b33b5..192cb0495564b3b722fa38f0fa6b413e
  }
  
 diff --git a/src/vrend/vrend_renderer.h b/src/vrend/vrend_renderer.h
-index 133569a3b0c733d625226afc6f803c89a5a4daa5..81ffe90bea4519848ac979aa2e9faa2e546b9639 100644
+index b10bb514297b1b86fc4fc471649837e759794e15..8b0e723e9f723fa44f7f99ac7a7a550c82380ab5 100644
 --- a/src/vrend/vrend_renderer.h
 +++ b/src/vrend/vrend_renderer.h
-@@ -708,7 +708,11 @@ int
- vrend_renderer_pipe_resource_create(struct vrend_context *ctx, uint32_t blob_id,
-                                     const struct vrend_renderer_resource_create_args *args);
+@@ -715,7 +715,11 @@ vrend_renderer_pipe_resource_create(struct vrend_context *ctx, uint32_t blob_id,
+ bool vrend_blob_pipe_covers(struct vrend_context *ctx, uint64_t blob_id,
+                             uint64_t blob_size);
  
 -struct pipe_resource *vrend_get_blob_pipe(struct vrend_context *ctx, uint64_t blob_id);
 +/* Takes the pipe resource the guest created with PIPE_RESOURCE_CREATE for the

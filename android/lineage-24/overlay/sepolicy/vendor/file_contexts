@@ -23,3 +23,20 @@
 # The Codec2 store that serves the host's hardware video encoders runs in the
 # mediacodec domain like the stock Codec2 service.
 /(vendor|system/vendor)/bin/hw/android\.hardware\.media\.c2-service-v4l2  u:object_r:mediacodec_exec:s0
+
+# The vibrator HAL of a device with haptics runs in the platform's vibrator HAL
+# domain, which the AOSP file contexts assign to its own example binary only.
+/(vendor|system/vendor)/bin/hw/android\.hardware\.vibrator-service\.andarium  u:object_r:hal_vibrator_default_exec:s0
+
+# The GNSS HAL reads the host's receiver and runs in the platform's GNSS HAL
+# domain, which the AOSP file contexts assign to its own example binary only.
+/(vendor|system/vendor)/bin/hw/android\.hardware\.gnss-service\.andarium  u:object_r:hal_gnss_default_exec:s0
+
+# The thermal HAL reports the host's thermal state and runs in the platform's
+# thermal HAL domain, which the AOSP file contexts assign to its own example
+# binary only.
+/(vendor|system/vendor)/bin/hw/android\.hardware\.thermal-service\.andarium  u:object_r:hal_thermal_default_exec:s0
+
+# The gamepad relay turns the host's game controllers into HID devices and runs
+# in a domain of its own: it is a daemon, not a HAL.
+/vendor/bin/kernarium_gamepad  u:object_r:kernarium_gamepad_exec:s0

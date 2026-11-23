@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 22:44:17 +0900
+Subject: [PATCH] virt_wifi: give the device its own lockdep classes
+
+A virt_wifi device sends through its lower device, often a macvlan on an
+Ethernet device. Its transmit queue locks have the class that every
+Ethernet device gets by type, so a packet that goes down the stack takes
+two locks of one class, one inside the other. With lockdep on, the first
+IPv6 neighbour solicitation after boot reports possible recursive
+locking in _xmit_ETHER and lockdep switches itself off for the rest of
+the run.
+
+Call netdev_lockdep_set_classes() when the device is initialised, as
+macvlan, veth and vlan do. The device then has transmit, address list
+and instance lock classes of its own, and its transmit lock sits before
+its lower device's, which is the order the stack takes them in.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ drivers/net/wireless/virtual/virt_wifi.c | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/drivers/net/wireless/virtual/virt_wifi.c b/drivers/net/wireless/virtual/virt_wifi.c
+index ff578d507527ef778a63d476593cdb1d16a1994f..03bab2641e579df48e4f80a07246b3b1e951aa1c 100644
+--- a/drivers/net/wireless/virtual/virt_wifi.c
++++ b/drivers/net/wireless/virtual/virt_wifi.c
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <net/cfg80211.h>
++#include <net/netdev_lock.h>
+ #include <net/rtnetlink.h>
+ #include <linux/etherdevice.h>
+ #include <linux/math64.h>
+@@ -820,7 +821,19 @@ static void virt_wifi_change_rx_flags(struct net_device *dev, int change)
+ 				    dev->flags & IFF_PROMISC ? 1 : -1);
+ }
+ 
++/* A virt_wifi device transmits through its lower device, so the two take
++ * their transmit locks one inside the other. Give this device classes of
++ * its own, as macvlan does, so that lockdep does not take that for the
++ * same lock twice.
++ */
++static int virt_wifi_net_device_init(struct net_device *dev)
++{
++	netdev_lockdep_set_classes(dev);
++	return 0;
++}
++
+ static const struct net_device_ops virt_wifi_ops = {
++	.ndo_init	= virt_wifi_net_device_init,
+ 	.ndo_start_xmit = virt_wifi_start_xmit,
+ 	.ndo_open	= virt_wifi_net_device_open,
+ 	.ndo_stop	= virt_wifi_net_device_stop,

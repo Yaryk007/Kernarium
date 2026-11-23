@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 09:21:42 +0900
+Subject: [PATCH] zink: release what a failed map holds
+
+create_transfer() references the resource a map is for, and a map may
+make a staging resource. The failure paths of zink_buffer_map() and
+zink_image_map() freed the transfer without dropping either reference,
+so every map the driver refused memory for kept the resource, and the
+staging buffer it had made, alive for good: a texture deleted after a
+refused upload kept its storage. They release both now.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/gallium/drivers/zink/zink_resource.c | 15 +++++++++++++--
+ 1 file changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/src/gallium/drivers/zink/zink_resource.c b/src/gallium/drivers/zink/zink_resource.c
+index 49fc93bf604ae9ca16c62f68f141dd0b08c2ad76..059cda7fcb91cfe6894b0e979db8561775d28d2e 100644
+--- a/src/gallium/drivers/zink/zink_resource.c
++++ b/src/gallium/drivers/zink/zink_resource.c
+@@ -2739,6 +2739,17 @@ destroy_transfer(struct zink_context *ctx, struct zink_transfer *trans)
+    }
+ }
+ 
++/* A transfer whose map failed still holds what the map had taken: the
++ * resource it names, and the staging resource it had made.
++ */
++static void
++fail_transfer(struct zink_context *ctx, struct zink_transfer *trans)
++{
++   pipe_resource_reference(&trans->staging_res, NULL);
++   pipe_resource_reference(&trans->base.b.resource, NULL);
++   destroy_transfer(ctx, trans);
++}
++
+ static void *
+ zink_buffer_map(struct pipe_context *pctx,
+                     struct pipe_resource *pres,
+@@ -2948,7 +2959,7 @@ success:
+ fail:
+    if (ctx == screen->copy_context)
+       zink_screen_unlock_context(screen);
+-   destroy_transfer(ctx, trans);
++   fail_transfer(ctx, trans);
+    return NULL;
+ }
+ 
+@@ -3081,7 +3092,7 @@ zink_image_map(struct pipe_context *pctx,
+    return ptr;
+ 
+ fail:
+-   destroy_transfer(ctx, trans);
++   fail_transfer(ctx, trans);
+    return NULL;
+ }
+ 

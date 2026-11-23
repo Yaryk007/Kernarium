@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 09:21:42 +0900
+Subject: [PATCH] zink: give a fence wait one deadline
+
+fence_wait() waits for the submission of a batch with the timeout it is
+given, and then waits for the GPU with the whole timeout again: a wait
+of 100 ms could take nearly 200 ms when the submission used most of the
+first. The wait for the GPU now gets what is left.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/gallium/drivers/zink/zink_fence.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/src/gallium/drivers/zink/zink_fence.c b/src/gallium/drivers/zink/zink_fence.c
+index 6aac14608888f91cd87e32dbc147a8ae7b32e71e..1bf974f15080ed50fea4af01d0ff2a10729c945e 100644
+--- a/src/gallium/drivers/zink/zink_fence.c
++++ b/src/gallium/drivers/zink/zink_fence.c
+@@ -139,6 +139,13 @@ fence_wait(struct zink_screen *screen, struct zink_fence *fence, uint64_t timeou
+       int64_t abs_timeout = os_time_get_absolute_timeout(timeout_ns);
+       if (!util_queue_fence_wait_timeout(&bs->flush_completed, abs_timeout))
+          return false;
++      /* the wait for the GPU gets what is left of the time, not all of it
++       * again after the submission took part of it
++       */
++      if (timeout_ns && abs_timeout != OS_TIMEOUT_INFINITE) {
++         int64_t time_ns = os_time_get_nano();
++         timeout_ns = abs_timeout > time_ns ? abs_timeout - time_ns : 0;
++      }
+    }
+ 
+    assert(fence->batch_id);

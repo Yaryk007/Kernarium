@@ -26,3 +26,7 @@ allowxperm kernarium_net_setup self:udp_socket ioctl SIOCGIFHWADDR;
 
 # The tool logs to the kernel log: logd is not a given this early in boot.
 allow kernarium_net_setup kmsg_device:chr_file w_file_perms;
+
+# disable_ipv6 of eth0 and of the macvlan: a link-local address built from the MAC would
+# show the installation's MACs to every application that lists its interface addresses.
+allow kernarium_net_setup proc_net:file { open write };

@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The resources code reads qemu.sf.lcd_density in a static initialiser and falls
+# back to ro.sf.lcd_density, so kernarium_apps, which runs as the shell user,
+# draws this denial on every list and icons call. The shell gets no permission.
+dontaudit shell qemu_sf_lcd_density_prop:file read;

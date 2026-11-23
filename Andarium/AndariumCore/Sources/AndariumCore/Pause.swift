@@ -61,7 +61,10 @@ public struct PauseMarker: Sendable {
 public protocol PauseEffects: SpacePauseEffects {
     /// Holds every guest GPU request: iOS revokes the host GPU a few seconds
     /// after the application leaves the foreground, and a request that
-    /// reaches it then makes the guest's Vulkan device lost for good.
+    /// reaches it then makes the guest's Vulkan device lost for good. A camera
+    /// video the guest runs ends first, and the call waits (bounded) until the
+    /// guest has stopped it, so what it takes counts against the edge's
+    /// budget.
     func holdGuestGPU()
     func releaseGuestGPU()
     /// Writes the guest's storage back and leaves it running. Waits for the
@@ -74,7 +77,8 @@ public protocol PauseEffects: SpacePauseEffects {
 /// Decides what happens to the guest at each lifecycle edge: Andarium has no
 /// background mode, so a guest runs in the foreground only. The edge holds
 /// the GPU first and releases it only once the guest is running again, which
-/// keeps the GPU safe.
+/// keeps the GPU safe. The edge's budget starts with the edge: the hold is
+/// part of it, and the write-back gets what the hold leaves.
 ///
 /// A guest can also be paused in the foreground, for want of space on the
 /// device (`RunSpace`). It stays paused until the person resumes it: a
@@ -90,10 +94,14 @@ public final class PauseController {
 
     /// What an edge's own work may take: the watchdog answers to the edge
     /// handler as a whole.
-    public static let edgeBudget = DispatchTimeInterval.seconds(4)
+    public nonisolated static let edgeBudget = DispatchTimeInterval.seconds(4)
 
     public private(set) var phase = Phase.foreground
     public var isPausedForSpace: Bool { space.isPaused }
+    /// The guest can be asked something: the application is in the
+    /// foreground and no resume is still under way. Opening a connection to a
+    /// guest that is being resumed races a frozen kernel.
+    public var guestIsAwake: Bool { phase == .foreground && resumesInFlight == 0 && !guestPaused }
     private let effects: any PauseEffects
     private let marker: PauseMarker
     /// Stops while the guest is paused, so timers on the guest's running time
@@ -148,13 +156,14 @@ public final class PauseController {
     public func didEnterBackground() {
         inForeground = false
         guard guestRunning, phase == .foreground else { return }
+        let deadline = DispatchTime.now() + Self.edgeBudget
         effects.holdGuestGPU()
         gpuHeld = true
         // A guest already paused for space has written everything back and
         // is suspended, and stays resident, because the image a hibernation
         // would write is what the device is short of: only the application's
         // own state needs saying.
-        if !space.isPaused { suspendForBackground(until: DispatchTime.now() + Self.edgeBudget) }
+        if !space.isPaused { suspendForBackground(until: deadline) }
         phase = .paused
         marker.arm()
     }

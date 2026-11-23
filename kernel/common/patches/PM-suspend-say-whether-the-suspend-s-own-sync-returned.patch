@@ -1,0 +1,101 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 04:52:35 +0900
+Subject: [PATCH] PM: suspend: say whether the suspend's own sync returned
+
+enter_state() syncs file systems before it freezes tasks, but only
+while sync_on_suspend is set, and nothing tells the platform whether
+it did.  A platform that replies when it has entered the sleep state,
+as the user-mode port's management console does, cannot say whether
+the file systems were written back on the way.  Reading
+sync_on_suspend instead would be a guess, since it can change while
+the sync runs.
+
+Record, for the suspend under way, that ksys_sync_helper() returned,
+and clear it when a suspend begins and again before the transition
+mutex is released, so a reader that does not come through
+enter_state() cannot find an earlier suspend's answer.
+pm_suspend_synced() reads it from the platform's enter callback, which
+runs in the task that called enter_state() with the mutex held.  Tasks
+are frozen after the sync, so one that wrote in between leaves dirty
+pages the flag does not cover.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ include/linux/suspend.h |  2 ++
+ kernel/power/suspend.c  | 21 +++++++++++++++++++++
+ 2 files changed, 23 insertions(+)
+
+diff --git a/include/linux/suspend.h b/include/linux/suspend.h
+index b02876f1ae38acbb59fa04359f0feb603deb12d4..f0fea3f48e5635236c1c9b21a2f20e0dde4e90fc 100644
+--- a/include/linux/suspend.h
++++ b/include/linux/suspend.h
+@@ -276,6 +276,7 @@ extern void arch_suspend_enable_irqs(void);
+ 
+ extern int pm_suspend(suspend_state_t state);
+ extern bool sync_on_suspend_enabled;
++extern bool pm_suspend_synced(void);
+ #else /* !CONFIG_SUSPEND */
+ #define suspend_valid_only_mem	NULL
+ 
+@@ -291,6 +292,7 @@ static inline bool pm_suspend_default_s2idle(void) { return false; }
+ 
+ static inline void suspend_set_ops(const struct platform_suspend_ops *ops) {}
+ static inline int pm_suspend(suspend_state_t state) { return -ENOSYS; }
++static inline bool pm_suspend_synced(void) { return false; }
+ static inline bool sync_on_suspend_enabled(void) { return true; }
+ static inline bool idle_should_enter_s2idle(void) { return false; }
+ static inline void __init pm_states_init(void) {}
+diff --git a/kernel/power/suspend.c b/kernel/power/suspend.c
+index 9040fa0eae3df663e7da6c9d10a623efd3203781..3c4a8631be6ba23f237bf214ff261cffffc28366 100644
+--- a/kernel/power/suspend.c
++++ b/kernel/power/suspend.c
+@@ -558,6 +558,24 @@ static void suspend_finish(void)
+ 	pm_restore_console();
+ }
+ 
++static bool suspend_synced;
++
++/**
++ * pm_suspend_synced - Whether the suspend under way has synced file systems.
++ *
++ * True once enter_state() has run ksys_sync_helper() to its return for the
++ * suspend that is under way: not when sync_on_suspend is off, and not for an
++ * earlier suspend, since it is cleared when a suspend begins and again before
++ * the transition mutex is released.  Tasks are frozen only after that sync,
++ * so one that wrote in between leaves dirty pages it does not cover.  Meant
++ * for the platform's enter callback, which runs in the task that called
++ * enter_state() and so holds the mutex.
++ */
++bool pm_suspend_synced(void)
++{
++	return READ_ONCE(suspend_synced);
++}
++
+ /**
+  * enter_state - Do common work needed to enter system sleep state.
+  * @state: System sleep state to enter.
+@@ -591,6 +609,7 @@ static int enter_state(suspend_state_t state)
+ 	 * the suspend keeps it.
+ 	 */
+ 	pm_wakeup_clear(0);
++	WRITE_ONCE(suspend_synced, false);
+ 
+ 	if (state == PM_SUSPEND_TO_IDLE)
+ 		s2idle_begin();
+@@ -599,6 +618,7 @@ static int enter_state(suspend_state_t state)
+ 		trace_suspend_resume(TPS("sync_filesystems"), 0, true);
+ 		ksys_sync_helper();
+ 		trace_suspend_resume(TPS("sync_filesystems"), 0, false);
++		WRITE_ONCE(suspend_synced, true);
+ 	}
+ 
+ 	/* A wakeup signaled while file systems were synced ends the suspend. */
+@@ -625,6 +645,7 @@ static int enter_state(suspend_state_t state)
+ 	pm_pr_dbg("Finishing wakeup.\n");
+ 	suspend_finish();
+  Unlock:
++	WRITE_ONCE(suspend_synced, false);
+ 	mutex_unlock(&system_transition_mutex);
+ 	return error;
+ }

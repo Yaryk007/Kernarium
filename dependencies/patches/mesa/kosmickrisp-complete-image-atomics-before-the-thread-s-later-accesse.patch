@@ -57,12 +57,12 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  create mode 100644 src/kosmickrisp/vulkan/tests/test_msl_image_atomic_order.c
 
 diff --git a/docs/drivers/kosmickrisp/workarounds.rst b/docs/drivers/kosmickrisp/workarounds.rst
-index de77d672211eafd60665deccd1f9c8bbab741420..192eb59af49ec2b87c2e1b13f49a3ba9d9732cf5 100644
+index 8c666a683e79b2ee19053b5bb1dc3256d955064e..cc4f5776954bdce7c1d5b94127a1ac07047bb41a 100644
 --- a/docs/drivers/kosmickrisp/workarounds.rst
 +++ b/docs/drivers/kosmickrisp/workarounds.rst
-@@ -49,6 +49,52 @@ info on what was updated.
- Workarounds
- ===========
+@@ -105,6 +105,52 @@ workaround.
+ | 2026-11-12: Workaround implemented, with the figures of the shipped kernel
+   and the condition for removing it
  
 +KK_WORKAROUND_20
 +----------------

@@ -2812,6 +2812,38 @@ class ArtifactGuestWaitTests(unittest.TestCase):
             cts.console_progressed(self.log, 0, len(blanks)), (len(blanks), False)
         )
 
+    def test_kernel_lines_with_a_caller_field_classify_the_same(self) -> None:
+        # CONFIG_PRINTK_CALLER puts "[    C1]" or "[  T588]" after the time on
+        # every line, so a matcher anchored after the time alone sees none of
+        # the stall patterns and counts every report as progress.
+        callers = ("[    C1]", "[    C0]", "[  T588]", "[   T12]")
+        stall = "".join(
+            line.replace("] ", "]" + callers[index % len(callers)] + " ", 1)
+            for index, line in enumerate(self.STALL_REPORT.splitlines(keepends=True))
+        ).encode()
+        self.assertIn(b"][    C1] rcu: INFO", stall)
+        self.log.write_bytes(stall)
+        self.assertEqual(
+            cts.console_progressed(self.log, 0, len(stall)), (len(stall), False)
+        )
+
+        guest = stall + b"[ 1096.000000][  T588] uml-vk-gl-cts[588]:   Pass (Pass)\n"
+        self.log.write_bytes(guest)
+        self.assertEqual(
+            cts.console_progressed(self.log, len(stall), len(guest)),
+            (len(guest), True),
+        )
+
+    def test_kernel_stall_reports_with_a_caller_field_hold_off_nothing(self) -> None:
+        report = "".join(
+            line.replace("] ", "][    C1] ", 1)
+            for line in self.STALL_REPORT.splitlines(keepends=True)
+        )
+        self.transport.service.side_effect = self.appending(10, report)
+        with self.assertRaisesRegex(TimeoutError, "no progress for 60 seconds"):
+            self.wait(timeout=300, stall_timeout=60)
+        self.assertLess(self.clock, 300)
+
     def test_unclassifiable_console_is_treated_as_progress(self) -> None:
         # The bound must never cut a guest on a reading failure or on a flood
         # too large to classify: that volume is itself evidence of activity.

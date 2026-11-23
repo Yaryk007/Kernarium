@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 import AndariumCore
+import AndariumCoreTestSupport
 import Foundation
+import SwiftUI
 import Testing
+import UIKit
 @testable import Andarium
 
 /// iOS's microphone permission as a test plays it: the access the system
@@ -35,8 +38,7 @@ final class GuestMicrophone {
 
 /// Microphone asks iOS when it is turned on, shows itself off and unusable
 /// when iOS refuses or the person takes the access away, and gives the guest
-/// no input then. Gyroscope asks for nothing: raw accelerometer and gyroscope
-/// updates need no permission on iOS.
+/// no input then.
 @MainActor
 struct CapabilitiesFlowTests {
     private let host = HostDevice(
@@ -223,7 +225,24 @@ struct CapabilitiesFlowTests {
         #expect(setup(.notAsked).model.microphoneState == .notAsked)
     }
 
-    // MARK: The preview and Gyroscope
+    // MARK: The order of the rows
+
+    /// Location sits above Microphone, Camera follows Microphone and Haptics
+    /// comes last; the section draws its rows in this order, which VoiceOver
+    /// reads.
+    @Test func capabilitiesAreListedLocationMicrophoneCameraHaptics() {
+        #expect(CapabilitiesSection.Row.allCases == [.location, .microphone, .camera, .haptics])
+        #expect(CapabilitiesSection.rows(hapticsAvailable: true) == [.location, .microphone, .camera, .haptics])
+    }
+
+    /// An iPad, a Mac and the Simulator have no Taptic Engine: nothing to
+    /// switch, so no row (and no disabled one).
+    @Test func hapticsHasNoRowWithoutADeviceThatHasThem() {
+        #expect(CapabilitiesSection.rows(hapticsAvailable: false) == [.location, .microphone, .camera])
+        #expect(!setup().model.hapticsAvailable)
+    }
+
+    // MARK: The preview
 
     @Test func thePreviewWithoutAControllerTakesAccessAsGiven() {
         let s = setup(controller: false)
@@ -232,29 +251,97 @@ struct CapabilitiesFlowTests {
         #expect(s.model.microphoneShownOn)
     }
 
-    @Test func gyroscopeIsOnByDefaultAndAsksForNothing() {
+    @Test func hapticsAreOnByDefaultAndAskForNothing() {
         let s = setup()
-        #expect(s.model.guest?.motionChoice == nil)
-        #expect(s.model.motionSensorsOn)
+        s.model.hapticsAvailable = true
+        #expect(s.model.guest?.haptics == true)
+        #expect(s.model.hapticsOn)
         #expect(s.model.permissionPrompt == nil)
-        #expect(s.model.microphoneState == .notAsked)
         #expect(s.system.asked == 0)
-        s.model.setMotionSensors(false)
-        #expect(s.model.guest?.motionChoice == false)
-        #expect(!s.model.motionSensorsOn)
-        #expect(!s.driver.motionSensors)
-        s.model.setMotionSensors(true)
-        #expect(s.model.guest?.motionChoice == true)
-        #expect(s.driver.motionSensors)
+        s.model.setHaptics(false)
+        #expect(s.model.guest?.haptics == false)
+        #expect(!s.model.hapticsOn)
+        // Kept as chosen, and the driver is told at once.
+        #expect(s.driver.savedGuest?.haptics == false)
+        #expect(!s.driver.haptics)
+        s.model.setHaptics(true)
+        #expect(s.model.hapticsOn)
+        #expect(s.driver.savedGuest?.haptics == true)
+        #expect(s.driver.haptics)
         #expect(s.system.asked == 0)
+        // The other switches were never touched.
+        #expect(s.model.guest?.location == false && s.model.guest?.microphone == false)
     }
 
-    @Test func gyroscopeShowsOffOnADeviceWithNoSensors() {
+    /// A harness launch that silences haptics runs as if the switch were off:
+    /// the device plays nothing, and the person's choice, as shown and as
+    /// stored, is not touched, whether the switch is turned meanwhile or not.
+    @Test func aLaunchThatSilencesHapticsPlaysNoneAndKeepsTheChoice() {
         let s = setup()
-        s.model.motionSensorsAvailable = false
-        #expect(!s.model.motionSensorsOn)
-        s.model.setMotionSensors(true)
-        #expect(s.model.guest?.motionChoice == nil)
-        #expect(!s.driver.motionSensors)
+        s.model.hapticsAvailable = true
+        #expect(s.model.hapticsPlays)
+        s.model.hapticsSilencedByLaunch = true
+        #expect(!s.model.hapticsPlays)
+        #expect(s.model.hapticsOn)
+        #expect(s.model.guest?.haptics == true)
+        // Turning the switch on changes nothing for this launch ...
+        s.model.setHaptics(true)
+        #expect(!s.model.hapticsPlays)
+        #expect(s.driver.savedGuest?.haptics == true)
+        // ... and off is kept as the person chose it.
+        s.model.setHaptics(false)
+        #expect(!s.model.hapticsOn && !s.model.hapticsPlays)
+        #expect(s.driver.savedGuest?.haptics == false)
+        // The guest still has its vibrator: the boot request is the device's.
+        #expect(LiveRuntime.hostFeatures(hapticsAvailable: true) == UInt32(KERNARIUM_RUNTIME_ANDROID_HOST_HAPTICS))
+        s.model.hapticsSilencedByLaunch = false
+        s.model.setHaptics(true)
+        #expect(s.model.hapticsPlays)
+    }
+
+    /// The application's own touch feedback (the side keys' click, the rulers'
+    /// tick) is not the guest's vibrator's, so the Haptics switch does not
+    /// govern it; a launch that silences haptics does, because the taps and
+    /// drags of an automated run reach it.
+    @Test func aLaunchThatSilencesHapticsSilencesTheInterfaceFeedbackToo() {
+        let s = setup()
+        #expect(s.model.interfaceFeedbackPlays)
+        #expect(InterfaceFeedback.playing(.selection, in: s.model) == .selection)
+        s.model.setHaptics(false)
+        #expect(!s.model.hapticsOn)
+        #expect(s.model.interfaceFeedbackPlays)
+        #expect(InterfaceFeedback.playing(.impact(weight: .light), in: s.model) == .impact(weight: .light))
+        s.model.hapticsSilencedByLaunch = true
+        #expect(!s.model.interfaceFeedbackPlays)
+        #expect(InterfaceFeedback.playing(.selection, in: s.model) == nil)
+        #expect(InterfaceFeedback.playing(.impact(weight: .light), in: s.model) == nil)
+        // The person's choice is still the person's.
+        s.model.setHaptics(true)
+        #expect(s.model.hapticsOn && s.driver.savedGuest?.haptics == true)
+        // A view with no model (a preview) plays as it always did.
+        #expect(InterfaceFeedback.playing(.selection, in: nil) == .selection)
+    }
+
+    @Test func aGuestStoredBeforeTheSwitchReadsAsOn() throws {
+        let old = Data(#"{"cores":2,"memoryMiB":1024,"capacityGiB":8,"microphone":false,"includeInBackups":false}"#.utf8)
+        let guest = try JSONDecoder().decode(Guest.self, from: old)
+        let model = AppModel(
+            guest: guest, host: host,
+            system: SystemInfo(version: "17", release: "r2", kernel: "Linux 6.18", architecture: "arm64, 4 KiB pages", appVersion: "1"),
+            capabilities: .device, createRequirementBytes: 1)
+        #expect(model.hapticsOn)
+    }
+
+    @Test func theHapticsSwitchNeedsNoDeviceToBeKept() {
+        // The model keeps the choice whatever the device has; the row is what is absent there.
+        let s = setup()
+        #expect(!s.model.hapticsAvailable)
+        s.model.setHaptics(false)
+        #expect(s.model.guest?.haptics == false)
+        #expect(s.driver.savedGuest?.haptics == false)
+    }
+
+    @Test func hapticsSymbolExistsOnTheOSFloor() {
+        #expect(UIImage(systemName: HapticsRow.symbol) != nil)
     }
 }

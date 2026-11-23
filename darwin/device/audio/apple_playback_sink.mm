@@ -5,6 +5,7 @@
 #include "audio_session.hpp"
 #include "playback_mute_clock.hpp"
 #include "playback_output_cycle.hpp"
+#include "playback_output_recovery.hpp"
 #include "protocol.hpp"
 
 #import <AVFAudio/AVFAudio.h>
@@ -29,6 +30,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace uml::audio {
 namespace {
@@ -45,13 +47,56 @@ struct NotificationFlags final {
         wake->notify();
     }
 
+    /* The number of the engine that signals: an engine's notifications count
+     * only while it is the current one, so that an engine just dropped, or one
+     * not yet adopted, never speaks for its successor. A new number is taken
+     * before the engine it names is made. */
+    [[nodiscard]] std::uint64_t nextEngine() noexcept
+    {
+        return engineNumber.fetch_add(1, std::memory_order_acq_rel) + 1U;
+    }
+
     std::shared_ptr<const Waker> wake;
+    // The engine or the route changed: set by the engine's own notification,
+    // and on iOS by the session's route change too.
     std::atomic_bool configurationChanged {};
+    // The engine's own notification arrived, as opposed to a route change.
+    std::atomic_bool engineChanged {};
+    std::atomic<std::uint64_t> engineNumber {};
 #if TARGET_OS_IPHONE
-    std::atomic_bool interruptionBegan {};
-    std::atomic_bool interruptionEnded {};
-    // A recommendation since the last look said to resume.
-    std::atomic_bool resumeRecommended {};
+    /* What the system reported about an interruption: its beginning, or its
+     * end with the system's advice on resuming, which belongs to that end. The
+     * events are kept in the order they came, because the device thread acts on
+     * them later and an end followed by a new beginning is not a beginning
+     * followed by an end: the first leaves the sink interrupted, and the second
+     * would resume it on the advice of an interruption that is over. */
+    struct InterruptionEvent final {
+        bool began {};
+        bool resumeRecommended {};
+    };
+
+    void report(InterruptionEvent event)
+    {
+        {
+            const std::lock_guard guard(eventsLock);
+            // A device thread that never looks cannot be answered, and only
+            // the latest events can matter.
+            if (events.size() == maximumEvents)
+                events.erase(events.begin());
+            events.push_back(event);
+        }
+        wake->notify();
+    }
+
+    [[nodiscard]] std::vector<InterruptionEvent> takeInterruptionEvents()
+    {
+        const std::lock_guard guard(eventsLock);
+        return std::exchange(events, {});
+    }
+
+    static constexpr std::size_t maximumEvents = 32;
+    std::mutex eventsLock;
+    std::vector<InterruptionEvent> events;
 #endif
 };
 
@@ -159,16 +204,187 @@ public:
     // What a period the output consumed reports, set whenever the output
     // starts (measureOutputLatency).
     std::atomic<std::uint32_t> outputLatencyBytes {};
-#if TARGET_OS_IPHONE
-    // Bumped when a mute takes over the queued periods: the completion
-    // handlers of buffers scheduled before it then stand down.
+    // Bumped when a mute or a new engine takes over the queued periods: the
+    // completion handlers of buffers scheduled before it then stand down.
     std::atomic<std::uint64_t> epoch {};
-#endif
     std::size_t slotCount {};
     std::uint32_t periodBytes {};
     std::uint64_t nextTicket {1};
     std::size_t nextSlot {};
 };
+
+/* The engine and the player node on it, which are made and replaced
+ * together. */
+struct Output final {
+    AVAudioEngine* __strong engine {};
+    AVAudioPlayerNode* __strong player {};
+    // The player is connected and the engine prepared: false for an engine
+    // made when its output had no route (see makeOutput).
+    bool connected {};
+    // Listens for the engine's configuration changes.
+    id __strong observer {};
+};
+
+// Listens for the configuration changes of `engine` while it is engine
+// `number`, the current one (NotificationFlags::nextEngine).
+[[nodiscard]] id observeEngine(AVAudioEngine* engine, std::uint64_t number,
+    const std::shared_ptr<NotificationFlags>& notifications)
+{
+    const std::weak_ptr<NotificationFlags> weakNotifications = notifications;
+    return [[NSNotificationCenter defaultCenter]
+        addObserverForName:AVAudioEngineConfigurationChangeNotification
+                    object:engine
+                     queue:nil
+                usingBlock:^(NSNotification*) {
+                  const auto flags = weakNotifications.lock();
+                  if (!flags || flags->engineNumber.load(
+                                    std::memory_order_acquire) != number)
+                      return;
+                  flags->engineChanged.store(true, std::memory_order_release);
+                  flags->signal(flags->configurationChanged);
+                }];
+}
+
+// Whether the engine's output node reports a route: a rate and channels.
+[[nodiscard]] bool outputRouteUp(AVAudioEngine* engine) noexcept
+{
+    @try {
+        AVAudioFormat* const format = [engine.outputNode outputFormatForBus:0];
+        return format != nil && format.sampleRate > 0.0 &&
+            format.channelCount > 0;
+    } @catch (NSException*) {
+        return false;
+    }
+}
+
+/* The engine calls that report an error exist from iOS 27: `connect:to:format:
+ * error:` and `playAndReturnError:`. Below it the calls without a report are
+ * the only ones, and a failure there raises an exception, which every caller
+ * already catches. iOS 27 deprecates the old calls, which a host from iOS 27
+ * on (macOS included) never reaches. */
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+[[nodiscard]] bool connectPlayer(AVAudioEngine* engine,
+    AVAudioPlayerNode* player, AVAudioFormat* format, NSError** error)
+{
+    if (@available(iOS 27.0, *)) {
+        return [engine connect:player
+                            to:engine.mainMixerNode
+                        format:format
+                         error:error];
+    }
+    [engine connect:player to:engine.mainMixerNode format:format];
+    return true;
+}
+
+[[nodiscard]] bool startPlayer(AVAudioPlayerNode* player, NSError** error)
+{
+    if (@available(iOS 27.0, *))
+        return [player playAndReturnError:error];
+    // `play` reports nothing, and it returns with the player stopped when its
+    // engine stopped between the engine's start and this call, as a change of
+    // the format or the route does. What counts is that the player plays.
+    [player play];
+    return player.isPlaying;
+}
+#pragma clang diagnostic pop
+
+/* An engine with a player node, connected for `format` and prepared. It takes
+ * the output route as it is when it is made, so it is made only once the
+ * session is active (see EngineHealth), and with no other engine alive: an
+ * engine made while another that lost the route still exists gets none either.
+ * An engine whose output has no route is left unconnected, because connecting
+ * it would build the graph on a format that does not exist, and it is replaced
+ * before it is started anyway. */
+[[nodiscard]] Output makeOutput(AVAudioFormat* format,
+    const std::shared_ptr<NotificationFlags>& notifications)
+{
+    Output output;
+    // What the engine just dropped says from now on is not for this one, and
+    // what this one says is heard from the moment it exists, before it starts.
+    const auto number = notifications->nextEngine();
+    notifications->engineChanged.store(false, std::memory_order_release);
+    output.engine = [[AVAudioEngine alloc] init];
+    output.observer = observeEngine(output.engine, number, notifications);
+    output.player = [[AVAudioPlayerNode alloc] init];
+    @try {
+        [output.engine attachNode:output.player];
+        if (format != nil && outputRouteUp(output.engine)) {
+            NSError* error = nil;
+            if (connectPlayer(output.engine, output.player, format, &error)) {
+                [output.engine prepare];
+                output.connected = true;
+            }
+        }
+    } @catch (NSException*) {
+        // Before iOS 27 a connection that fails raises. The pair is returned
+        // as it is, unconnected, with its observer: an exception that left
+        // here would drop the observer's token, and the registration would
+        // outlive every owner that could remove it.
+        output.connected = false;
+    }
+    return output;
+}
+
+enum class EngineStart : std::uint8_t {
+    running,
+    // The output node reports no route: nothing was started.
+    noRoute,
+    failed,
+};
+
+/* Starts the engine of `output` with the session active. An engine that is to
+ * be replaced (`stale`, or its output node has no route) is stopped and
+ * dropped, and one made now takes its place; so is one that will not start
+ * though it had a route, once. `output` must hold the only references to the
+ * old pair, or the old engine outlives its replacement. `replaced` is set when
+ * `output` holds a fresh pair for the caller to adopt, and `epoch` is bumped
+ * before the old player goes, so that the completion handlers of the buffers
+ * it holds stand down. An engine whose output has no route is never started:
+ * starting it fails and teaches nothing. It runs on the device thread and on
+ * the thread that takes the session back, and touches nothing of the sink. */
+[[nodiscard]] EngineStart startEngine(Output& output, AVAudioFormat* format,
+    bool stale, std::atomic<std::uint64_t>& epoch, bool& replaced,
+    const std::shared_ptr<NotificationFlags>& notifications) noexcept
+{
+    @try {
+        NSError* error = nil;
+        for (;;) {
+            if (mustReplaceEngine(stale, outputRouteUp(output.engine))) {
+                epoch.fetch_add(1, std::memory_order_acq_rel);
+                if (output.observer != nil) {
+                    [[NSNotificationCenter defaultCenter]
+                        removeObserver:output.observer];
+                }
+                @try {
+                    [output.player stop];
+                    [output.engine stop];
+                } @catch (NSException*) {
+                }
+                output = {};
+                output = makeOutput(format, notifications);
+                replaced = true;
+                stale = false;
+                if (!outputRouteUp(output.engine))
+                    return EngineStart::noRoute;
+                if (!output.connected)
+                    return EngineStart::failed;
+            }
+            if (!outputRouteUp(output.engine))
+                return EngineStart::noRoute;
+            if (output.engine.isRunning ||
+                [output.engine startAndReturnError:&error])
+                return EngineStart::running;
+            if (!outputRouteUp(output.engine))
+                return EngineStart::noRoute;
+            if (replaced)
+                return EngineStart::failed;
+            stale = true;
+        }
+    } @catch (NSException*) {
+        return EngineStart::failed;
+    }
+}
 
 class ApplePlaybackSink final : public PlaybackSink {
 public:
@@ -180,17 +396,11 @@ public:
         , player_([[AVAudioPlayerNode alloc] init])
     {
         [engine_ attachNode:player_];
+        configurationObserver_ =
+            observeEngine(engine_, notifications_->nextEngine(), notifications_);
+#if TARGET_OS_IPHONE
         const std::weak_ptr<NotificationFlags> weakNotifications =
             notifications_;
-        configurationObserver_ = [[NSNotificationCenter defaultCenter]
-            addObserverForName:AVAudioEngineConfigurationChangeNotification
-                        object:engine_
-                         queue:nil
-                    usingBlock:^(NSNotification*) {
-                      if (const auto flags = weakNotifications.lock())
-                          flags->signal(flags->configurationChanged);
-                    }];
-#if TARGET_OS_IPHONE
         routeObserver_ = [[NSNotificationCenter defaultCenter]
             addObserverForName:AVAudioSessionRouteChangeNotification
                         object:[AVAudioSession sharedInstance]
@@ -199,62 +409,98 @@ public:
                       if (const auto flags = weakNotifications.lock())
                           flags->signal(flags->configurationChanged);
                     }];
-        /* iOS 27 replaces the interruption notification with two: the session
-         * becoming inactive, which also reports the app's own deactivations,
-         * and the system's resumption recommendation. An interruption is a
-         * deactivation that carries an interruption context. Every
-         * recommendation ends the interruption; whether the sink takes the
-         * session back at once depends on its advice (see endInterruption). */
-        deactivationObserver_ = [[NSNotificationCenter defaultCenter]
-            addObserverForName:AVAudioSessionDidBecomeInactiveNotification
-                        object:[AVAudioSession sharedInstance]
-                         queue:nil
-                    usingBlock:^(NSNotification* notification) {
-                      const auto flags = weakNotifications.lock();
-                      if (!flags)
-                          return;
-                      const AVAudioSessionDeactivationContext* context =
-                          notification.userInfo[
-                              AVAudioSessionDeactivationContextKey];
-                      if (context.interruptionContext != nil)
-                          flags->signal(flags->interruptionBegan);
-                    }];
-        resumptionObserver_ = [[NSNotificationCenter defaultCenter]
-            addObserverForName:AVAudioSessionResumptionRecommendationNotification
-                        object:[AVAudioSession sharedInstance]
-                         queue:nil
-                    usingBlock:^(NSNotification* notification) {
-                      const auto flags = weakNotifications.lock();
-                      if (!flags)
-                          return;
-                      const AVAudioSessionResumptionContext* context =
-                          notification.userInfo[
-                              AVAudioSessionResumptionContextKey];
-                      if (context.recommendation ==
-                          AVAudioSessionResumptionRecommendationShouldResume) {
-                          flags->resumeRecommended.store(
-                              true, std::memory_order_release);
-                      }
-                      flags->signal(flags->interruptionEnded);
-                    }];
+        if (@available(iOS 27.0, *)) {
+            /* iOS 27 replaces the interruption notification with two: the
+             * session becoming inactive, which also reports the app's own
+             * deactivations, and the system's resumption recommendation. An
+             * interruption is a deactivation that carries an interruption
+             * context. Every recommendation ends the interruption; whether the
+             * sink takes the session back at once depends on its advice (see
+             * endInterruption). */
+            deactivationObserver_ = [[NSNotificationCenter defaultCenter]
+                addObserverForName:AVAudioSessionDidBecomeInactiveNotification
+                            object:[AVAudioSession sharedInstance]
+                             queue:nil
+                        usingBlock:^(NSNotification* notification) {
+                          const auto flags = weakNotifications.lock();
+                          if (!flags)
+                              return;
+                          const AVAudioSessionDeactivationContext* context =
+                              notification.userInfo[
+                                  AVAudioSessionDeactivationContextKey];
+                          if (context.interruptionContext != nil)
+                              flags->report({.began = true});
+                        }];
+            resumptionObserver_ = [[NSNotificationCenter defaultCenter]
+                addObserverForName:
+                    AVAudioSessionResumptionRecommendationNotification
+                            object:[AVAudioSession sharedInstance]
+                             queue:nil
+                        usingBlock:^(NSNotification* notification) {
+                          const auto flags = weakNotifications.lock();
+                          if (!flags)
+                              return;
+                          const AVAudioSessionResumptionContext* context =
+                              notification.userInfo[
+                                  AVAudioSessionResumptionContextKey];
+                          flags->report({.resumeRecommended =
+                                  context.recommendation ==
+                                  AVAudioSessionResumptionRecommendationShouldResume});
+                        }];
+        } else {
+            /* Before iOS 27 the system posts one notification, for an
+             * interruption's beginning and its end. The sink resumes on every
+             * end it reports, and takes the session back at once only on the
+             * system's advice, which the end's options carry. iOS 27
+             * deprecates the notification, which a system from iOS 27 on
+             * never reaches here. */
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            interruptionObserver_ = [[NSNotificationCenter defaultCenter]
+                addObserverForName:AVAudioSessionInterruptionNotification
+                            object:[AVAudioSession sharedInstance]
+                             queue:nil
+                        usingBlock:^(NSNotification* notification) {
+                          const auto flags = weakNotifications.lock();
+                          if (!flags)
+                              return;
+                          const NSNumber* type = notification.userInfo[
+                              AVAudioSessionInterruptionTypeKey];
+                          if (type.unsignedIntegerValue ==
+                              AVAudioSessionInterruptionTypeBegan) {
+                              flags->report({.began = true});
+                              return;
+                          }
+                          const NSNumber* options = notification.userInfo[
+                              AVAudioSessionInterruptionOptionKey];
+                          flags->report({.resumeRecommended =
+                                  (options.unsignedIntegerValue &
+                                      AVAudioSessionInterruptionOptionShouldResume) != 0});
+                        }];
+#pragma clang diagnostic pop
+        }
 #endif
     }
 
     ~ApplePlaybackSink() override
     {
+        // A resumption in flight holds the engine and its observer until reset
+        // has waited for it.
+        reset();
         @try {
             [[NSNotificationCenter defaultCenter]
                 removeObserver:configurationObserver_];
 #if TARGET_OS_IPHONE
             [[NSNotificationCenter defaultCenter] removeObserver:routeObserver_];
-            [[NSNotificationCenter defaultCenter]
-                removeObserver:deactivationObserver_];
-            [[NSNotificationCenter defaultCenter]
-                removeObserver:resumptionObserver_];
+            for (id observer : {deactivationObserver_, resumptionObserver_,
+                                    interruptionObserver_}) {
+                if (observer != nil)
+                    [[NSNotificationCenter defaultCenter]
+                        removeObserver:observer];
+            }
 #endif
         } @catch (NSException*) {
         }
-        reset();
         @try {
             [engine_ detachNode:player_];
         } @catch (NSException*) {
@@ -314,21 +560,22 @@ public:
                 if (state->slots[index].buffer == nil)
                     return false;
             }
-            [engine_ disconnectNodeOutput:player_];
-            NSError* connectError = nil;
-            if (![engine_ connect:player_
-                               to:engine_.mainMixerNode
-                           format:format_
-                            error:&connectError]) {
-                configured_ = false;
-                prepared_ = false;
-                running_ = false;
-                fault("the engine would not connect");
-                return false;
-            }
+            // An engine that is to be replaced is connected when its
+            // replacement is made, with the session active.
+            if (!health_.mustReplace(outputRouteUp(engine_))) {
+                [engine_ disconnectNodeOutput:player_];
+                NSError* connectError = nil;
+                if (!connectPlayer(engine_, player_, format_, &connectError)) {
+                    configured_ = false;
+                    prepared_ = false;
+                    running_ = false;
+                    fault("the engine would not connect");
+                    return false;
+                }
 #if !TARGET_OS_IPHONE
-            applyOutputCycle();
+                applyOutputCycle();
 #endif
+            }
             configured_ = true;
             prepared_ = false;
             running_ = false;
@@ -351,7 +598,8 @@ public:
         if (!configured_ || state_->pending.load(std::memory_order_acquire) != 0)
             return false;
         @try {
-            [engine_ prepare];
+            if (!health_.mustReplace(outputRouteUp(engine_)))
+                [engine_ prepare];
             prepared_ = true;
             faulted_ = false;
             return true;
@@ -387,6 +635,10 @@ public:
             sessionReady = true;
         }
         if (!sessionReady && !activateSession()) {
+            // The system would not activate the session, as when the guest
+            // resumes before the app is active: play muted and ask again.
+            if (waitForOutput(WaitCause::session))
+                return true;
 #else
         running_ = true;
         if (!activateSession()) {
@@ -394,25 +646,21 @@ public:
             failToStart();
             return true;
         }
-        @try {
-            NSError* error = nil;
-            const bool engineRuns =
-                engine_.isRunning || [engine_ startAndReturnError:&error];
-            // Before the player plays, so that its first completion has it.
-            if (engineRuns)
-                measureOutputLatency();
-            if (!engineRuns || ![player_ playAndReturnError:&error]) {
-                deactivateSession();
-                failToStart();
-                return true;
-            }
+        sessionHeld_ = true;
+        switch (bringUpOutput()) {
+        case OutputStart::running:
             faulted_ = false;
             return true;
-        } @catch (NSException*) {
-            deactivateSession();
-            failToStart();
-            return true;
+        case OutputStart::noRoute:
+            if (waitForOutput(WaitCause::route))
+                return true;
+            break;
+        case OutputStart::failed:
+            break;
         }
+        deactivateSession();
+        failToStart();
+        return true;
     }
 
     void stop() noexcept override
@@ -427,6 +675,13 @@ public:
         running_ = false;
 #if TARGET_OS_IPHONE
         cancelMuteTimer();
+        // A stopped stream waits for no route: its periods go back to the
+        // player, which holds them, and start() asks again.
+        if (routeWait_.waiting()) {
+            routeWait_.end();
+            if (!interrupted_)
+                leaveMute();
+        }
 #endif
     }
 
@@ -554,49 +809,63 @@ public:
 #if TARGET_OS_IPHONE
             // A resumption in flight owns the engine: a configuration change
             // it provokes is acted on once it has ended.
-            const bool configurationChanged = resumption_ == nullptr &&
-                notifications_->configurationChanged.exchange(
-                    false, std::memory_order_acq_rel);
+            const bool settled = resumption_ == nullptr;
 #else
-            const bool configurationChanged =
+            const bool settled = true;
+#endif
+            const bool configurationChanged = settled &&
                 notifications_->configurationChanged.exchange(
                     false, std::memory_order_acq_rel);
-#endif
+            const bool engineChanged = configurationChanged &&
+                notifications_->engineChanged.exchange(
+                    false, std::memory_order_acq_rel);
             if (configurationChanged && configured_) {
                 [player_ stop];
                 [engine_ stop];
-#if TARGET_OS_IPHONE
                 // A muted sink's periods belong to the mute clock.
-                if (!muted_)
-#endif
+                if (!mutedNow())
                     abortPending();
 #if !TARGET_OS_IPHONE
                 // The output may be another device now.
                 applyOutputCycle();
 #endif
-                [engine_ prepare];
-                faulted_ = false;
-            }
-#if TARGET_OS_IPHONE
-            if (configurationChanged && running_ && !muted_)
-#else
-            if (configurationChanged && running_)
-#endif
-            {
-                NSError* error = nil;
-                const bool engineRuns = activateSession() &&
-                    (engine_.isRunning || [engine_ startAndReturnError:&error]);
-                if (engineRuns)
-                    measureOutputLatency();
-                if (engineRuns && [player_ playAndReturnError:&error]) {
+                // An engine the change caught without a session or a route is
+                // replaced when the output starts, not prepared again.
+                health_.configurationChanged(
+                    engineChanged, sessionHeld_, outputRouteUp(engine_));
+                if (!health_.stale())
+                    [engine_ prepare];
+                // A stream that stopped for good after a failure stays
+                // failed, so that no period is held for a player that does
+                // not run; a start tries again.
+                if (running_)
                     faulted_ = false;
+            }
+            if (configurationChanged && running_ && !mutedNow()) {
+                auto result = OutputStart::failed;
+                bool refused = false;
+                if (activateSession()) {
+                    sessionHeld_ = true;
+                    result = bringUpOutput();
                 } else {
+                    refused = true;
+                }
+                if (result == OutputStart::running) {
+                    faulted_ = false;
+                } else if (refused && waitForOutput(WaitCause::session)) {
+                    // Asked again by the mute's poll.
+                } else if (result != OutputStart::noRoute ||
+                    !waitForOutput(WaitCause::route)) {
                     abortPending();
-                    running_ = false;
+                    // A missing route is asked for again with the next change.
+                    running_ = result == OutputStart::noRoute;
                     fault("the output did not restart after a change");
                 }
             }
 #if TARGET_OS_IPHONE
+            // The route that was missing may be back: ask for it at once.
+            if (configurationChanged && routeWait_.waiting())
+                nextHintPoll_ = Clock::now();
             serviceMute();
 #endif
         } @catch (NSException*) {
@@ -622,17 +891,13 @@ private:
         std::uint64_t ticket,
         std::uint64_t requestId)
     {
-#if TARGET_OS_IPHONE
         const auto epoch = state->epoch.load(std::memory_order_acquire);
-#endif
         [player_
             scheduleBuffer:state->slots[index].buffer
             completionCallbackType:AVAudioPlayerNodeCompletionDataConsumed
             completionHandler:^(AVAudioPlayerNodeCompletionCallbackType) {
-#if TARGET_OS_IPHONE
               if (state->epoch.load(std::memory_order_acquire) != epoch)
                   return;
-#endif
               auto& slot = state->slots[index];
               auto expected = ticket;
               if (slot.ticket.compare_exchange_strong(
@@ -644,12 +909,34 @@ private:
             }];
     }
 
+    // Hands the periods the sink holds to the player, oldest first.
+    void scheduleQueued()
+    {
+        const auto state = state_;
+        std::array<std::pair<std::uint64_t, std::size_t>,
+            protocol::maximumPeriods> queued;
+        std::size_t count = 0;
+        for (std::size_t index = 0; index < state->slotCount; ++index) {
+            const auto ticket =
+                state->slots[index].ticket.load(std::memory_order_acquire);
+            if (ticket != 0)
+                queued[count++] = {ticket, index};
+        }
+        std::sort(queued.begin(), queued.begin() + count);
+        for (std::size_t position = 0; position < count; ++position) {
+            const auto [ticket, index] = queued[position];
+            schedule(state, index, ticket, state->slots[index].requestId);
+        }
+    }
+
 #if TARGET_OS_IPHONE
     using Clock = MuteClock::Clock;
 
     // How often a muted sink asks whether the app that took the session is
     // still playing.
-    static constexpr auto hintPollInterval = std::chrono::seconds(1);
+    // The poll that asks whether another app let go of the session is also
+    // the retry of a start that found no route or no session.
+    static constexpr auto hintPollInterval = routeRetryInterval;
     // A mute that starts within this long of a recovery is not logged.
     static constexpr auto flapInterval = std::chrono::seconds(10);
 
@@ -667,22 +954,36 @@ private:
     // request that follows them sees the interruption they report.
     void applyInterruptionEvents()
     {
-        if (notifications_->interruptionBegan.exchange(
-                false, std::memory_order_acq_rel)) {
+        const auto events = notifications_->takeInterruptionEvents();
+        for (std::size_t index = 0; index < events.size(); ++index) {
+            const auto& event = events[index];
+            if (!event.began) {
+                // An end that a later beginning has overtaken is not acted
+                // on: taking the session back now would take it from the app
+                // that has it again.
+                const bool overtaken = std::any_of(
+                    events.begin() + static_cast<std::ptrdiff_t>(index) + 1,
+                    events.end(), [](const auto& later) { return later.began; });
+                if (!overtaken)
+                    endInterruption(event.resumeRecommended);
+                continue;
+            }
             interrupted_ = true;
+            ++interruptions_;
+            // The interruption owns the mute now and has its own way back. A
+            // wait for the route is over: it begins again, with a full limit,
+            // if the output has no route when the interruption ends.
+            routeWait_.end();
             if (running_ && !muted_)
                 enterMute();
         }
-        if (notifications_->interruptionEnded.exchange(
-                false, std::memory_order_acq_rel)) {
-            endInterruption(notifications_->resumeRecommended.exchange(
-                false, std::memory_order_acq_rel));
-        }
     }
 
-    // The system took the session while the stream runs: mute, or restart a
-    // mute the stream was stopped in.
-    void enterMute()
+    // The system took the session while the stream runs, or the output has no
+    // route: mute, or restart a mute the stream was stopped in. `line` is
+    // what a mute that is not a flap says.
+    void enterMute(const char* line =
+                       "Audio muted: another app holds the audio session\n")
     {
         const auto now = Clock::now();
         if (!muted_) {
@@ -700,11 +1001,8 @@ private:
                 [engine_ pause];
             } @catch (NSException*) {
             }
-            if (muteLogged_) {
-                std::fputs(
-                    "Audio muted: another app holds the audio session\n",
-                    stderr);
-            }
+            if (muteLogged_)
+                std::fputs(line, stderr);
         }
         muteClock_.restart(now);
         nextHintPoll_ = now + hintPollInterval;
@@ -715,23 +1013,8 @@ private:
     // first, and ends the mute without touching the session.
     void leaveMute()
     {
-        if (muted_) {
-            const auto state = state_;
-            std::array<std::pair<std::uint64_t, std::size_t>,
-                protocol::maximumPeriods> queued;
-            std::size_t count = 0;
-            for (std::size_t index = 0; index < state->slotCount; ++index) {
-                const auto ticket = state->slots[index].ticket.load(
-                    std::memory_order_acquire);
-                if (ticket != 0)
-                    queued[count++] = {ticket, index};
-            }
-            std::sort(queued.begin(), queued.begin() + count);
-            for (std::size_t position = 0; position < count; ++position) {
-                const auto [ticket, index] = queued[position];
-                schedule(state, index, ticket, state->slots[index].requestId);
-            }
-        }
+        if (muted_)
+            scheduleQueued();
         endMute();
     }
 
@@ -744,6 +1027,7 @@ private:
     void endStreamMute() noexcept
     {
         muted_ = false;
+        routeWait_.end();
         cancelMuteTimer();
     }
 
@@ -788,12 +1072,20 @@ private:
      * thread finishes the resumption when the other thread reports; see
      * completeResume. */
     struct Resumption final {
-        enum class Outcome { sessionRefused, engineFailed, ready };
+        using Outcome = ResumeResult;
 
         std::mutex mutex;
         std::condition_variable ended;
         bool finished {};
         Outcome outcome {Outcome::sessionRefused};
+        // The engine and player the thread works on. The sink hands its own
+        // over (it has none while the thread runs, and the muted stream
+        // needs none) and takes back what the thread leaves, which is a
+        // fresh pair if the sink's was not fit to start.
+        Output output;
+        bool replaced {};
+        // Interruptions that had begun when the thread was started.
+        std::uint64_t interruptions {};
     };
 
     // Starts taking the session back, unless that is already under way.
@@ -804,8 +1096,16 @@ private:
         const auto resumption = std::make_shared<Resumption>();
         resumption_ = resumption;
         nextHintPoll_ = Clock::now() + hintPollInterval;
-        AVAudioEngine* const engine = engine_;
-        AVAudioPlayerNode* const player = player_;
+        resumption->output =
+            Output {engine_, player_, true, configurationObserver_};
+        resumption->interruptions = interruptions_;
+        engine_ = nil;
+        player_ = nil;
+        configurationObserver_ = nil;
+        AVAudioFormat* const format = format_;
+        const bool stale = health_.stale();
+        const auto state = state_;
+        const auto notifications = notifications_;
         // A few milliseconds of silence, played once the engine runs: see
         // the worker below.
         AVAudioPCMBuffer* const probe = [[AVAudioPCMBuffer alloc]
@@ -823,18 +1123,26 @@ private:
         dispatch_async(
             dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
               auto outcome = Resumption::Outcome::sessionRefused;
+              Output& output = resumption->output;
+              bool replaced = false;
               @try {
                   if (activateSession()) {
                       NSError* error = nil;
-                      const bool running = engine.isRunning ||
-                          [engine startAndReturnError:&error];
+                      // An engine made before the route went, or while it was
+                      // away, is replaced by one made with the session taken.
+                      const auto started = startEngine(output, format, stale,
+                          state->epoch, replaced, notifications);
+                      const bool running = started == EngineStart::running;
                       outcome = running ? Resumption::Outcome::ready
-                                        : Resumption::Outcome::engineFailed;
+                          : started == EngineStart::noRoute
+                          ? Resumption::Outcome::noRoute
+                          : Resumption::Outcome::engineFailed;
                       // The player starts here, with nothing scheduled, so
                       // the periods handed to it later start at once instead
                       // of after the player's own start-up.
                       if (running) {
-                          (void)[player playAndReturnError:&error];
+                          AVAudioPlayerNode* const player = output.player;
+                          (void)startPlayer(player, &error);
                           // The engine reports that it runs well before the
                           // audio hardware delivers its first cycle: a fifth
                           // of a second has been measured on the iPad mini
@@ -866,6 +1174,7 @@ private:
               {
                   const std::lock_guard lock(resumption->mutex);
                   resumption->outcome = outcome;
+                  resumption->replaced = replaced;
                   resumption->finished = true;
               }
               resumption->ended.notify_all();
@@ -886,7 +1195,15 @@ private:
             resumption_->ended.wait(
                 lock, [this] { return resumption_->finished; });
         }
+        collectResumption();
+    }
+
+    // Takes back the engine and player a finished resumption worked on.
+    void collectResumption() noexcept
+    {
+        const auto resumption = resumption_;
         resumption_.reset();
+        adoptOutput(std::move(resumption->output), resumption->replaced);
     }
 
     /* Plays again with the session taken and the engine running: hands the
@@ -897,11 +1214,19 @@ private:
         bool playing = false;
         @try {
             NSError* error = nil;
-            if (engine_.isRunning || [engine_ startAndReturnError:&error]) {
-                measureOutputLatency();
-                leaveMute();
-                playing = [player_ playAndReturnError:&error];
+            if (!engine_.isRunning) {
+                // The engine stopped between the hand-back and now, as it does
+                // when the route goes: a start of this engine would fail for
+                // good. Ask again, with a fresh one and the wait's deadline.
+                interrupted_ = false;
+                (void)waitForOutput(WaitCause::route);
+                nextHintPoll_ = Clock::now();
+                armMute();
+                return;
             }
+            measureOutputLatency();
+            leaveMute();
+            playing = startPlayer(player_, &error);
         } @catch (NSException*) {
         }
         if (playing) {
@@ -924,7 +1249,7 @@ private:
 
     // Completes the periods that are due, finishes a resumption that has
     // ended and asks whether to take the session back; runs on the device
-    // thread, on every pass and timer tick.
+    // thread, on every device event.
     void serviceMute()
     {
         if (!muted_ || !running_)
@@ -935,6 +1260,21 @@ private:
                muteClock_.take(now)) {
             completeOldest(*state);
         }
+        // An interruption ends a wait (applyInterruptionEvents), so a wait
+        // that expires never reports an interruption as a failure.
+        if (resumption_ == nullptr && !interrupted_ && routeWait_.expired(now)) {
+            // The output did not start in time: it has failed. Another change
+            // of the route, or a new start, asks again. The session it took
+            // stays with nobody.
+            const bool route = routeWait_.cause() == WaitCause::route;
+            abortPending();
+            if (sessionHeld_)
+                deactivateSession();
+            fault(route ? "the output route did not come back"
+                        : "the audio session would not activate");
+            endMute();
+            return;
+        }
         if (resumption_ != nullptr) {
             auto outcome = Resumption::Outcome::sessionRefused;
             bool finished = false;
@@ -944,21 +1284,48 @@ private:
                 outcome = resumption_->outcome;
             }
             if (finished) {
-                resumption_.reset();
-                if (outcome == Resumption::Outcome::ready) {
+                const bool interruptedSince =
+                    interruptions_ != resumption_->interruptions;
+                // A change of the engine or the route that came while the
+                // thread started the engine concerns that engine.
+                const bool changedSince =
+                    notifications_->configurationChanged.load(
+                        std::memory_order_acquire);
+                collectResumption();
+                if (outcome != Resumption::Outcome::sessionRefused)
+                    sessionHeld_ = true;
+                switch (handback(outcome, interruptedSince, changedSince)) {
+                case HandbackAction::play:
                     completeResume();
                     return;
-                }
-                if (outcome == Resumption::Outcome::engineFailed) {
+                case HandbackAction::fail:
                     abortPending();
                     running_ = false;
                     fault("the engine did not start after the session came back");
                     endMute();
                     return;
+                case HandbackAction::waitForRoute:
+                    // The session is ours again, so the interruption is over;
+                    // the output has no route, and the wait for it is bounded.
+                    interrupted_ = false;
+                    (void)waitForOutput(WaitCause::route);
+                    nextHintPoll_ = now + hintPollInterval;
+                    break;
+                case HandbackAction::askAgain:
+                    // The engine is gone with the route; ask again at once,
+                    // with the wait's deadline so that a route that keeps
+                    // changing cannot keep the sink asking for good.
+                    interrupted_ = false;
+                    (void)waitForOutput(WaitCause::route);
+                    nextHintPoll_ = now;
+                    break;
+                case HandbackAction::stayMuted:
+                    // Another app still holds the session, or an interruption
+                    // began meanwhile: stay muted and ask again after the next
+                    // poll interval.
+                    nextHintPoll_ = now + hintPollInterval;
+                    break;
                 }
-                // Another app still holds the session: stay muted and ask
-                // again after the next poll interval.
-                nextHintPoll_ = now + hintPollInterval;
             } else {
                 nextHintPoll_ = now + hintPollInterval;
             }
@@ -1210,6 +1577,132 @@ private:
     }
 #endif
 
+    enum class OutputStart : std::uint8_t {
+        running,
+        // The output has no route, so it was not started.
+        noRoute,
+        failed,
+    };
+
+    /* Starts the engine and the player with the session active, and measures
+     * the output's latency in between, before the player plays, so that its
+     * first completion has it. An engine that is not fit to start is replaced
+     * first (startEngine). */
+    [[nodiscard]] OutputStart bringUpOutput() noexcept
+    {
+        // The pair is the call's alone until it is adopted again, so that an
+        // engine that is replaced is gone before its replacement is made.
+        Output output {engine_, player_, true, configurationObserver_};
+        engine_ = nil;
+        player_ = nil;
+        configurationObserver_ = nil;
+        bool replaced = false;
+        const auto started = startEngine(output, format_, health_.stale(),
+            state_->epoch, replaced, notifications_);
+        adoptOutput(std::move(output), replaced);
+        if (started != EngineStart::running) {
+            return started == EngineStart::noRoute ? OutputStart::noRoute
+                                                   : OutputStart::failed;
+        }
+        @try {
+            NSError* error = nil;
+            measureOutputLatency();
+            if (startPlayer(player_, &error))
+                return OutputStart::running;
+        } @catch (NSException*) {
+        }
+        return OutputStart::failed;
+    }
+
+    /* Takes the engine and player back from a call or a thread that had them
+     * to itself. A fresh pair (`replaced`) also takes over the periods queued
+     * on the old player, unless a mute holds them. */
+    void adoptOutput(Output output, bool replaced) noexcept
+    {
+        if (output.engine == nil || output.player == nil) {
+            // Nothing could be made: an unconnected pair stands in, so that
+            // the sink always has one, and the next start tries again.
+            if (output.observer != nil) {
+                [[NSNotificationCenter defaultCenter]
+                    removeObserver:output.observer];
+            }
+            output = {};
+            const auto number = notifications_->nextEngine();
+            output.engine = [[AVAudioEngine alloc] init];
+            output.observer = observeEngine(output.engine, number, notifications_);
+            output.player = [[AVAudioPlayerNode alloc] init];
+            @try {
+                [output.engine attachNode:output.player];
+            } @catch (NSException*) {
+            }
+            replaced = true;
+        }
+        engine_ = output.engine;
+        player_ = output.player;
+        configurationObserver_ = output.observer;
+        if (!replaced)
+            return;
+        // What the new engine and the route signalled while it was made and
+        // started stays signalled: the device thread acts on it. What the old
+        // engine signalled is not heard (see observeEngine).
+        // An engine made with no route is not fit to start whatever its
+        // output reports later.
+        if (output.connected)
+            health_.replaced();
+        else
+            health_.invalidate();
+#if !TARGET_OS_IPHONE
+        applyOutputCycle();
+#endif
+        if (output.connected && !mutedNow()) {
+            @try {
+                scheduleQueued();
+            } @catch (NSException*) {
+                abortPending();
+                fault("a period could not be queued");
+            }
+        }
+    }
+
+    [[nodiscard]] bool mutedNow() const noexcept
+    {
+#if TARGET_OS_IPHONE
+        return muted_;
+#else
+        return false;
+#endif
+    }
+
+    /* The output cannot start yet, for want of a route or of a session the
+     * system would activate: the stream plays muted, and the mute's poll
+     * starts the output again with a fresh engine (RouteWait). The wait says
+     * once what it awaits, so that a log tells the two apart. macOS has no
+     * mute to wait in, and a route that returns there announces itself as a
+     * change of the engine's configuration; false says to report the
+     * failure. */
+    [[nodiscard]] bool waitForOutput(WaitCause cause)
+    {
+#if TARGET_OS_IPHONE
+        const bool said = routeWait_.waiting() && routeWait_.cause() == cause;
+        routeWait_.begin(Clock::now(), cause);
+        faulted_ = false;
+        const char* const line = cause == WaitCause::route
+            ? "Audio muted: the output route is not available\n"
+            : "Audio muted: the audio session would not activate\n";
+        if (!muted_) {
+            enterMute(line);
+        } else if (!said && muteLogged_) {
+            // Already muted, by an interruption that has just ended or by the
+            // other cause.
+            std::fputs(line, stderr);
+        }
+        return true;
+#else
+        (void)cause;
+        return false;
+#endif
+    }
+
     void failToStart() noexcept
     {
         // Periods queued before the start will never play.
@@ -1258,6 +1751,7 @@ private:
 
     void deactivateSession() noexcept
     {
+        sessionHeld_ = false;
         session::release(session::Client::playback);
     }
 
@@ -1270,13 +1764,20 @@ private:
     id __strong configurationObserver_;
 #if TARGET_OS_IPHONE
     id __strong routeObserver_;
+    // iOS 27 posts two notifications for an interruption (the first two
+    // observers) and earlier systems one (the third).
     id __strong deactivationObserver_;
     id __strong resumptionObserver_;
+    id __strong interruptionObserver_;
     // The system has the session, and no end has come yet.
     bool interrupted_ {};
+    // How many interruptions have begun.
+    std::uint64_t interruptions_ {};
     // The stream runs but plays nothing: the mute clock completes its periods.
     bool muted_ {};
     MuteClock muteClock_;
+    // The output has no route and the stream plays muted until it returns.
+    RouteWait routeWait_;
     // The session and engine being taken back on another thread, if any.
     std::shared_ptr<Resumption> resumption_;
     Clock::time_point muteStarted_ {};
@@ -1285,6 +1786,9 @@ private:
     bool muteLogged_ {};
     dispatch_source_t __strong muteTimer_ {};
 #endif
+    EngineHealth health_;
+    // The sink has asked for the session and not given it back.
+    bool sessionHeld_ {};
     bool configured_ {};
     bool prepared_ {};
     bool running_ {};

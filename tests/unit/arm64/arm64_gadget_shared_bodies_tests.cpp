@@ -115,7 +115,10 @@ void retiring_in_one_executor_keeps_the_other()
 	require(second.cache_diagnostics().adoptions == 1);
 
 	/* Nine other address spaces retire this one from the first executor,
-	 * which held the successor alone: its link goes with it. */
+	 * which held the successor alone: its link goes with it. Neither
+	 * executor has entered it for a while, so its window takes it for an
+	 * address space nobody is running. */
+	let_activity_lapse();
 	std::vector<std::unique_ptr<JitBacking>> others;
 	std::vector<std::unique_ptr<JitMapping>> mappings;
 	for (unsigned long other = 0;
@@ -141,6 +144,70 @@ void retiring_in_one_executor_keeps_the_other()
 	require(cpu.registers[0] == 8 && cpu.registers[1] == 9);
 	require(first.cache_diagnostics().translations == before.translations);
 	require(first.cache_diagnostics().adoptions == before.adoptions + 1);
+}
+
+/* An executor whose window is full does not retire an address space another
+ * executor is running, which would free, as the last holder, the code that
+ * executor is in: the oldest address space nobody entered lately goes
+ * instead. The second executor reaches the first's bodies through the links
+ * the first armed, and holds only the entry block. A new address space looks
+ * entered until its history is its own, so the first fills its window with
+ * the spaces to go before the activity lapses, and only the second's entries
+ * after that keep the shared one in use. */
+void a_window_keeps_the_address_space_another_executor_runs()
+{
+	constexpr unsigned long generation = 944;
+	constexpr unsigned long places = UML_GADGET_RESIDENT_GENERATIONS;
+	JitBacking backing{1};
+	put_program(backing, 6, 7);
+	JitMapping mapping{generation, code_base, backing, 1};
+	StaticGuestMemory first_memory;
+	StaticGuestMemory second_memory;
+	gadgets::GadgetExecutor first{sharing_options()};
+	gadgets::GadgetExecutor second{sharing_options()};
+	arm64::CpuState cpu{};
+	require(run_to_system_call(first, first_memory, generation, cpu,
+		code_base) == 4);
+	require(run_to_system_call(second, second_memory, generation, cpu,
+		code_base) == 4);
+	require(second.cache_diagnostics().translations == 0);
+	require(second.cache_diagnostics().adoptions == 1);
+
+	/* The first executor's window is full: this space and the ones to go. */
+	OtherSpaces old;
+	for (unsigned long other = 1; other < places; ++other) {
+		old.add(970 + other);
+		require(run_to_system_call(first, first_memory, 970 + other,
+			cpu, code_base) == 4);
+	}
+	let_activity_lapse();
+
+	/* A new space is admitted on each turn, and the window goes past this
+	 * one, to the oldest left that nobody entered, every time. */
+	OtherSpaces fresh;
+	auto stamp = activity_stamp();
+	require(run_to_system_call(second, second_memory, generation, cpu,
+		code_base) == 4);
+	for (unsigned long other = 1; other < places; ++other) {
+		fresh.add(990 + other);
+		require(run_to_system_call(first, first_memory, 990 + other,
+			cpu, code_base) == 4);
+		require_activity_held(stamp);
+		/* The second executor runs it throughout. */
+		stamp = activity_stamp();
+		require(run_to_system_call(second, second_memory, generation,
+			cpu, code_base) == 4);
+	}
+
+	/* Neither executor lost its bodies: the second translates nothing and
+	 * the first finds its own, with no adoption. */
+	require(second.cache_diagnostics().translations == 0);
+	const auto before = first.cache_diagnostics();
+	require(run_to_system_call(first, first_memory, generation, cpu,
+		code_base) == 4);
+	require(cpu.registers[0] == 6 && cpu.registers[1] == 7);
+	require(first.cache_diagnostics().translations == before.translations);
+	require(first.cache_diagnostics().adoptions == before.adoptions);
 }
 
 /* Executors built with other options make other streams, so they never
@@ -243,6 +310,66 @@ void concurrent_executors_follow_code_changes()
 	require(adoptions.load() != 0);
 }
 
+/* A window that spares an address space another executor is running takes in
+ * its place one nobody wants, not one that only this cache holds and entered
+ * lately: that one would be translated again at once. The first executor's
+ * window holds the shared space (the second runs it) and the private spaces
+ * the first entered since; with none idle, it takes the place it names the
+ * fewest slots of, the oldest of equals, which here is the spared one, and
+ * the private spaces are kept. */
+void a_window_does_not_take_a_busy_private_space_for_the_one_it_spares()
+{
+	constexpr unsigned long shared = 1010;
+	constexpr unsigned long places = UML_GADGET_RESIDENT_GENERATIONS;
+	std::vector<std::unique_ptr<JitBacking>> backings;
+	std::vector<std::unique_ptr<JitMapping>> mappings;
+	for (unsigned long space = 0; space <= places; ++space) {
+		backings.push_back(std::make_unique<JitBacking>(1));
+		put_program(*backings.back(), 6, 7);
+		mappings.push_back(std::make_unique<JitMapping>(
+			shared + space, code_base, *backings.back(), 1));
+	}
+	StaticGuestMemory first_memory;
+	StaticGuestMemory second_memory;
+	gadgets::GadgetExecutor first{sharing_options()};
+	gadgets::GadgetExecutor second{sharing_options()};
+	arm64::CpuState cpu{};
+	require(run_to_system_call(first, first_memory, shared, cpu,
+		code_base) == 4);
+	require(run_to_system_call(second, second_memory, shared, cpu,
+		code_base) == 4);
+	for (unsigned long space = 1; space < places; ++space)
+		require(run_to_system_call(first, first_memory, shared + space,
+			cpu, code_base) == 4);
+
+	/* The first executor then enters each private space again, which
+	 * leaves the shared one the oldest place; the second enters the shared
+	 * one, which is then running elsewhere. */
+	let_activity_lapse();
+	const auto stamp = activity_stamp();
+	for (unsigned long space = 1; space < places; ++space)
+		require(run_to_system_call(first, first_memory, shared + space,
+			cpu, code_base) == 4);
+	require(run_to_system_call(second, second_memory, shared, cpu,
+		code_base) == 4);
+	/* One address space more than the window holds. */
+	require(run_to_system_call(first, first_memory, shared + places, cpu,
+		code_base) == 4);
+	require_activity_held(stamp);
+
+	/* The oldest private space was kept, with its bodies; the shared one,
+	 * the oldest of the places with the fewest slots, went, and the first
+	 * adopts the entry block the second still holds. */
+	const auto before = first.cache_diagnostics();
+	require(run_to_system_call(first, first_memory, shared + 1, cpu,
+		code_base) == 4);
+	require(first.cache_diagnostics().translations == before.translations);
+	require(first.cache_diagnostics().adoptions == before.adoptions);
+	require(run_to_system_call(first, first_memory, shared, cpu,
+		code_base) == 4);
+	require(first.cache_diagnostics().adoptions == before.adoptions + 1);
+}
+
 } // namespace
 
 int main()
@@ -252,6 +379,8 @@ int main()
 	a_second_executor_adopts_instead_of_translating();
 	a_code_change_reaches_every_executor();
 	retiring_in_one_executor_keeps_the_other();
+	a_window_keeps_the_address_space_another_executor_runs();
+	a_window_does_not_take_a_busy_private_space_for_the_one_it_spares();
 	different_options_do_not_share();
 	a_shared_space_is_never_swept();
 	concurrent_executors_follow_code_changes();

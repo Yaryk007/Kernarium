@@ -6,7 +6,8 @@ Boots the integration rootfs with several vCPUs on one engine and runs the
 freestanding guest_code_change.cpp probe, which changes the code of functions
 the engine has translated -- by a store from outside a function or from inside
 the block that runs it, by mprotect round trips, by writing a page a fork
-write-protected, by MAP_FIXED, munmap and mremap, from other vCPUs that keep
+write-protected, by MAP_FIXED, munmap and mremap, by another process that
+rewrites and synchronizes a page both map shared, from other vCPUs that keep
 running it, and through a flood of code changes -- and requires every call
 after a change to run the new instructions.
 """

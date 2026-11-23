@@ -153,6 +153,9 @@ struct VideoEncodeSettings {
     bool separateParameterSets {};
     bool parameterSetsWithEveryKeyFrame {true};
     std::uint32_t jpegQuality {};  // JPEG: 1..100
+    // JPEG: the largest image the encoder returns, in bytes. A larger one is an error frame and its bytes are not
+    // copied out of the encoder's buffer. Zero: no bound.
+    std::uint64_t maximumJpegBytes {};
 };
 
 // Values that may change while a session encodes. An unset field keeps its

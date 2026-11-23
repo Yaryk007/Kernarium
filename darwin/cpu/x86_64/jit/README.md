@@ -85,9 +85,23 @@ lists the one record a handover changes. The x86 guest runners take
 - The engine joins the code-page registry with a function that retires its own
   TLB entry for a page, and counts a page in before the decoder reads its
   bytes. Only a store to a page the registry holds publishes a code change,
-  and each such store publishes once it has landed. A publishing store into the
-  code of the unit running it stops that unit before it stores. The engine
-  learns of the address space's changes as two histories, mapping and code
+  and each such store publishes once it has landed. When a registration finds
+  a participant stuck inside the engine for longer than its bound, the engine
+  drops the code of the page at every hand-over until that participant has
+  moved or left. A publishing store into the code of the unit running it
+  stops that unit before it stores.
+- The engine registers the frame a page maps before the decoder reads the
+  page, at every query that names it (FEXCore asks again only after the
+  page's code is dropped), also when the address space has no registry, so a
+  store through another address of the frame publishes at this address
+  space. A store publishes when the frame has a holder at another
+  address, whether or not its own page is executable: the store is not
+  filled into the TLB, lands, and publishes at every holder, and a unit that
+  holds such an address stops before it stores. A registration that fails or
+  is refused answers the query with the fetch fault the kernel resolves, and
+  64 in a row end the space as a space that could not be made.
+- The engine learns of the address space's changes as two histories, mapping
+  and code
   (see [`uml_darwin_static_mmu.h`](../../../include/uml_darwin_static_mmu.h)); a
   reader further behind than the history reaches drops every translation of the
   space.
@@ -113,7 +127,13 @@ found it, because the guest resolves the fault, a copy-on-write store among
 them, and runs the instruction again; register allocation therefore never
 commits a value to a guest register before a later access of the same
 instruction that can fault. The exceptions probe's fault-state mode holds both
-engines to that.
+engines to that, except the flags after a read-modify-write whose store
+faults, which the JIT can report other than as the instruction found them, and
+the x87 status bits of a store of ST(0) and the MXCSR flags of VCVTPS2PH to
+memory, which the faulting instruction has already changed;
+`x86-64-jit-retirement` pins that gap. It pins one more: a split CMPXCHG
+whose compare fails writes its operand back from the copy it read, which
+loses a store another vCPU made since.
 
 A dispatch reports as retired only the instructions that completed, as the
 gadget engine does, and retires exactly one instruction, or one element of a

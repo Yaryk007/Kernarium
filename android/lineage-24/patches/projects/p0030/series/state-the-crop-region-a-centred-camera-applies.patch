@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 16:33:36 +0900
+Subject: [PATCH] state the crop region a centred camera applies
+
+The camera service splits an application's zoom into CONTROL_ZOOM_RATIO and
+a residual SCALER_CROP_REGION, sends both to the HAL, and joins them again
+in the result: it unscales the result's crop region by the result's ratio.
+The result stated the whole active array instead of the residual, so above
+about 57x on a 4032 x 3024 array the region an application got back was
+a pixel or three off (CTS testDigitalZoom on the front camera, which
+checks the region within 5%).
+
+The camera crops about the centre of the array only (CENTER_ONLY), so the
+result now states the region it applies (camera_crop.hpp, the overlay's
+rule): the requested size, centred in the active array of the sensor
+mode in use, clamped to the array and to the smallest size the maximum
+digital zoom allows. The session layer (ZoomRatioMapper) has already
+divided the request's region by the zoom ratio when the camera sees it and
+multiplies the result's region by the ratio afterwards, so in the camera's
+space the zoom the service reports is the array over the region, and the
+smallest region is the array over the maximum zoom, whatever the ratio. The
+origin of the request is not used. A request with no region or an empty
+one gets the array, as before. The host scales a frame to the stream's
+size and applies the zoom ratio; the result's region is not a residual
+crop of the picture.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .../hwl/EmulatedRequestState.cpp              | 20 +++++++++++++++++--
+ 1 file changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/devices/EmulatedCamera/hwl/EmulatedRequestState.cpp b/devices/EmulatedCamera/hwl/EmulatedRequestState.cpp
+index 3884d28cd14f819fe8dafee44dd6424f1fbc4661..d214e7f5077a99d1fc1ddbc07b1cbac40b6bae0f 100644
+--- a/devices/EmulatedCamera/hwl/EmulatedRequestState.cpp
++++ b/devices/EmulatedCamera/hwl/EmulatedRequestState.cpp
+@@ -24,6 +24,7 @@
+ #include <utils/HWLUtils.h>
+ 
+ #include "EmulatedRequestProcessor.h"
++#include "camera_crop.hpp"
+ 
+ namespace android {
+ 
+@@ -1200,8 +1201,23 @@ std::unique_ptr<HwlPipelineResult> EmulatedRequestState::InitializeResult(
+     if (info.sensor_pixel_mode_ == ANDROID_SENSOR_PIXEL_MODE_MAXIMUM_RESOLUTION) {
+       chosen_crop_region = info.scaler_crop_region_max_resolution_;
+     }
+-    result->result_metadata->Set(ANDROID_SCALER_CROP_REGION, chosen_crop_region,
+-                                 ARRAY_SIZE(info.scaler_crop_region_default_));
++    // The camera service splits an application's zoom into the ratio and a residual crop
++    // region, and unscales this result's region by this result's ratio to join them again:
++    // the result states the region this centred camera applies, the requested size centred
++    // in the array (camera_crop.hpp), not the whole array and not the request's origin. The
++    // session layer (ZoomRatioMapper) has divided the request's region by the ratio before
++    // this state sees it and multiplies the result's back, so the ratio is not used here.
++    camera_metadata_ro_entry_t asked;
++    const bool has_asked =
++        request_settings_->Get(ANDROID_SCALER_CROP_REGION, &asked) == OK;
++    const andarium::camera::CropRegion crop = andarium::camera::result_crop_region(
++        has_asked ? asked.data.i32 : nullptr, has_asked ? asked.count : 0,
++        {chosen_crop_region[0], chosen_crop_region[1], chosen_crop_region[2],
++         chosen_crop_region[3]},
++        info.max_zoom_);
++    const int32_t crop_region[4] = {crop.left, crop.top, crop.width, crop.height};
++    result->result_metadata->Set(ANDROID_SCALER_CROP_REGION, crop_region,
++                                 ARRAY_SIZE(crop_region));
+     if (info.report_active_sensor_crop_) {
+       int32_t active_crop_region[4];
+       // width

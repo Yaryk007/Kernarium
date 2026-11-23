@@ -1,0 +1,52 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The holder of the text message service's vsock port (overlay/sms/listener). It keeps port 5560 from boot, so
+# that the host's connections queue and no other guest domain can take the port, and it never reads it: it
+# does not accept, read, write, shut down or connect a vsock socket, and the check of the peer's CID and every
+# byte of the host's requests stay in the service (kernarium_sms.te), which runs only while messages are in
+# flight. When a connection waits, the holder sets the control property that starts the waker
+# (kernarium_sms_wake.te); the service connects to the holder's unix socket and the holder passes it the
+# listening socket. The holder is a plain daemon of the core domains. It has no rule of its own for binder, a
+# service lookup, a file or another socket, so that nothing that owns the port can also reach the framework. The
+# platform's grants to every domain still reach it: the binder device nodes, one binder call permission to
+# system_server and one lookup (binder_stats_consumer_service). It cannot use them: a binder client needs the call
+# permission to the service manager, which no domain-wide rule gives, to obtain a handle. The target-files verifier
+# pins that set and fails the image for any other binder or lookup right the holder holds in effect.
+type kernarium_sms_listener, domain;
+typeattribute kernarium_sms_listener coredomain;
+type kernarium_sms_listener_exec, exec_type, system_file_type, file_type;
+
+init_daemon_domain(kernarium_sms_listener)
+
+# The handoff socket that init makes for it (the rc's socket line, /dev/socket/kernarium_sms): init creates and
+# binds it with the holder's label and does not listen on a stream socket, so its rule has no `listen`, and the
+# holder listens and accepts on it, reads its peer's credentials and context, and writes the one byte that carries
+# the descriptor. A socket that is only bound polls as hung up. The platform's `allow domain self` already grants
+# every domain these rights on its own unix sockets; the rule names what the holder needs, and the target-files
+# verifier requires it of the holder whoever grants it.
+type kernarium_sms_socket, file_type, coredomain_socket;
+allow init kernarium_sms_listener:unix_stream_socket { create bind };
+allow kernarium_sms_listener self:unix_stream_socket { accept getattr getopt listen read write };
+
+# The vsock socket of port 5560: the holder makes it, binds it and listens on it, and holds no other right on
+# it. The platform requires the explicit classification for direct vsock access.
+typeattribute kernarium_sms_listener unconstrained_vsock_violators;
+allow kernarium_sms_listener self:vsock_socket { create bind listen };
+
+# Setting the control property that starts the waker is the one thing it asks of init.
+system_internal_prop(ctl_kernarium_sms_wake_prop)
+set_prop(kernarium_sms_listener, ctl_kernarium_sms_wake_prop)
+
+# init authorises a control request (start, stop, restart, ...) of a service through two properties and accepts the
+# first that the requester may set: ctl.<service> (which falls to ctl_default_prop, set by system_app and others) and
+# ctl.<action>$<service>. property_contexts label ctl.<service> and the actions the platform leaves to the default
+# of both services with this type, which only init may set, so that the qualified key decides: the holder starts the
+# waker and nothing else controls either service.
+system_internal_prop(ctl_kernarium_sms_locked_prop)
+
+# init checks the legacy key first and audits its denial, because the platform silences only the legacy control types
+# of its own services: the holder's start of the waker through ctl.start$kernarium_sms_wake is denied on
+# ctl.kernarium_sms_wake (the locked type, which no one but init may set) and then allowed on the qualified key. Every
+# wake would otherwise log an avc denial that nothing needs to act on. The target-files verifier requires the rule, and
+# that init alone may set the locked type: the rule hides only a denial that is meant.
+dontaudit kernarium_sms_listener ctl_kernarium_sms_locked_prop:property_service set;

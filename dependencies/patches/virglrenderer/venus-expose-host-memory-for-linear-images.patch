@@ -9,7 +9,7 @@ Subject: [PATCH] venus: expose host memory for linear images
  2 files changed, 12 insertions(+), 3 deletions(-)
 
 diff --git a/src/venus/vkr_image.c b/src/venus/vkr_image.c
-index 9148f317ff15817e8250883c23278c719a25698e..bb0e867cbc7b4ffd1a262555a4c4d3b1ad9b7f5a 100644
+index 8f27a367cd308e8bda6d112dc337e72b8b3cefcb..6e94ecb87f383b3ef2f3b8483821e551f9f6a558 100644
 --- a/src/venus/vkr_image.c
 +++ b/src/venus/vkr_image.c
 @@ -12,6 +12,7 @@ static void
@@ -20,15 +20,15 @@ index 9148f317ff15817e8250883c23278c719a25698e..bb0e867cbc7b4ffd1a262555a4c4d3b1
     /* XXX If VkExternalMemoryImageCreateInfo is chained by the app, all is
      * good.  If it is not chained, we might still bind an external memory to
      * the image, because vkr_dispatch_vkAllocateMemory makes any HOST_VISIBLE
-@@ -37,6 +38,7 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
-    if (image) {
+@@ -39,6 +40,7 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
        image->format = format;
+       image->mip_levels = mip_levels;
        image->array_layers = array_layers;
 +      image->tiling = tiling;
     }
  }
  
-@@ -54,12 +56,14 @@ vkr_dispatch_vkGetImageMemoryRequirements(
+@@ -56,12 +58,14 @@ vkr_dispatch_vkGetImageMemoryRequirements(
  {
     struct vkr_device *dev = vkr_device_from_handle(args->device);
     struct vn_device_proc_table *vk = &dev->proc_table;
@@ -44,7 +44,7 @@ index 9148f317ff15817e8250883c23278c719a25698e..bb0e867cbc7b4ffd1a262555a4c4d3b1
  }
  
  static void
-@@ -69,13 +73,15 @@ vkr_dispatch_vkGetImageMemoryRequirements2(
+@@ -71,13 +75,15 @@ vkr_dispatch_vkGetImageMemoryRequirements2(
  {
     struct vkr_device *dev = vkr_device_from_handle(args->device);
     struct vn_device_proc_table *vk = &dev->proc_table;
@@ -61,7 +61,7 @@ index 9148f317ff15817e8250883c23278c719a25698e..bb0e867cbc7b4ffd1a262555a4c4d3b1
  }
  
  static void
-@@ -238,6 +244,8 @@ vkr_dispatch_vkGetDeviceImageMemoryRequirements(
+@@ -240,6 +246,8 @@ vkr_dispatch_vkGetDeviceImageMemoryRequirements(
  {
     struct vkr_device *dev = vkr_device_from_handle(args->device);
     struct vn_device_proc_table *vk = &dev->proc_table;
@@ -70,7 +70,7 @@ index 9148f317ff15817e8250883c23278c719a25698e..bb0e867cbc7b4ffd1a262555a4c4d3b1
  
     vn_replace_vkGetDeviceImageMemoryRequirements_args_handle(args);
     vk->GetDeviceImageMemoryRequirements(args->device, args->pInfo,
-@@ -245,7 +253,7 @@ vkr_dispatch_vkGetDeviceImageMemoryRequirements(
+@@ -247,7 +255,7 @@ vkr_dispatch_vkGetDeviceImageMemoryRequirements(
     args->pMemoryRequirements->memoryRequirements.memoryTypeBits =
        vkr_physical_device_get_guest_memory_type_bits(
           dev->physical_device,
@@ -80,12 +80,12 @@ index 9148f317ff15817e8250883c23278c719a25698e..bb0e867cbc7b4ffd1a262555a4c4d3b1
  
  static void
 diff --git a/src/venus/vkr_image.h b/src/venus/vkr_image.h
-index 34af4248b8ff51ad6f6b32f0a512fd135f81217e..f098dc3ccbf5093c370d3d843f0fcd880745bbd9 100644
+index ef1d33b8870c49ba40b273b999ce3ee05d9c00f2..fd1185b340364db79aa7433a55358a20c85885eb 100644
 --- a/src/venus/vkr_image.h
 +++ b/src/venus/vkr_image.h
-@@ -13,6 +13,7 @@ struct vkr_image {
-    /* What a host image copy needs to know how far its region reaches. */
+@@ -14,6 +14,7 @@ struct vkr_image {
     VkFormat format;
+    uint32_t mip_levels;
     uint32_t array_layers;
 +   VkImageTiling tiling;
  };

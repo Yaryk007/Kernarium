@@ -17,22 +17,23 @@ struct alignas(32) NativeTlbEntry final {
 	std::uintptr_t write_data_minus_address{};
 };
 
-/* The table is direct-mapped. The index below is also written out in the
- * gadget engine's assembly (`translate` and `translate_plain` in
- * gadgets/engine/common.inc, and the baked entries in
- * gadgets/engine/generate_baked.py), so a change to this count or to the fold
- * changes all three. */
-inline constexpr std::size_t native_tlb_entry_count = 1U << 15U;
+/* The table is direct-mapped and indexed by the low bits of the page number,
+ * as the gadget engine's assembly indexes it (`translate` and
+ * `translate_plain` in gadgets/engine/common.inc, and the baked entries in
+ * gadgets/engine/generate_baked.py), all from UML_X86_64_TLB_INDEX_BITS. */
+inline constexpr std::size_t native_tlb_entry_count =
+	std::size_t{1} << UML_X86_64_TLB_INDEX_BITS;
 
 /* The executor retires a write translation when a page gains cached code, so
- * it needs the same index the miss handler fills.
+ * it needs the same index the miss handler fills. The index never puts two
+ * neighbouring pages in one entry: a translation keyed by its last byte
+ * relies on that to miss whenever it crosses a page.
  */
 [[nodiscard]] inline constexpr std::size_t native_tlb_index(
 	std::uint64_t address) noexcept
 {
-	const auto page = address >> 12U;
 	return static_cast<std::size_t>(
-		(page ^ (page >> 15U)) & (native_tlb_entry_count - 1U));
+		(address >> 12U) & (native_tlb_entry_count - 1U));
 }
 
 static_assert(sizeof(NativeTlbEntry) == 32);

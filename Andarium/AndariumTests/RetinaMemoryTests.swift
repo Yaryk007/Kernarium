@@ -8,7 +8,8 @@ import UIKit
 @testable import Andarium
 
 /// Opt-in physical-device comparison of app surfaces and retained allocations:
-/// repeated system-app launches at Retina and point resolution, at the guest
+/// repeated system-app launches at native and point resolution (or another
+/// scale `ANDARIUM_RETINA_PROFILE` states), at the guest
 /// memory and vCPU count the launch states, which every snapshot records. The
 /// optional full-resolution WebGL Aquarium workload records the actual
 /// renderer, frames and FPS alongside process, guest and GPU memory
@@ -22,15 +23,22 @@ struct RetinaMemoryTests {
             || environment["ANDARIUM_PROFILE_EXISTING_GUEST"] == "1")
         let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         let model = try #require((scene.delegate as? AndariumSceneDelegate)?.model)
-        let original = model.retina
-        defer { model.retina = original }
-        model.retina = environment["ANDARIUM_RETINA_PROFILE"] == "1"
+        let original = model.launchScale
+        defer { model.launchScale = original }
+        // "1" is native and "0" is one guest pixel to a point, as the earlier
+        // launch setting had it; any other text is a scale ("1.5").
+        switch environment["ANDARIUM_RETINA_PROFILE"] {
+        case "1"?: model.launchScale = .native
+        case let text?: model.launchScale = GuestDisplayScale(text: text) ?? .points
+        case nil: model.launchScale = .points
+        }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("RetinaMemory")
         if FileManager.default.fileExists(atPath: directory.path) {
             try FileManager.default.removeItem(at: directory)
         }
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let output = directory.appendingPathComponent(model.retina ? "retina.jsonl" : "points.jsonl")
+        let output = directory.appendingPathComponent(
+            model.resolution == .native ? "retina.jsonl" : "scale-\(model.resolution.text).jsonl")
         try Data().write(to: output)
         let file = try FileHandle(forWritingTo: output)
         defer { try? file.close() }
@@ -44,7 +52,7 @@ struct RetinaMemoryTests {
             try #require((values["task_info_result"] as? NSNumber)?.intValue == 0)
             values["label"] = label
             values["time"] = Date().timeIntervalSince1970
-            values["retina"] = model.retina
+            values["resolution"] = model.resolution.text
             // The configuration the numbers belong to, whatever the device.
             values["guest_memory_mib"] = model.guest?.memoryMiB ?? 0
             values["guest_cores"] = model.guest?.cores ?? 0
@@ -79,8 +87,7 @@ struct RetinaMemoryTests {
             try installed.stdout.write(to: directory.appendingPathComponent("installed-apps.txt"))
             print("RETINA_MEMORY: installed apps \(installed.text)")
             if webGL {
-                let bytes = try apk.resourceValues(forKeys: [.fileSizeKey]).fileSize!
-                try await operations.installApk(at: apk, sizeBytes: bytes, update: { _ in })
+                try await operations.installApk(at: apk, update: { _ in })
             }
             try await Task.sleep(for: .seconds(10))
             try snapshot("booted")

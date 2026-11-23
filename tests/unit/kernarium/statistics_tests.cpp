@@ -12,9 +12,21 @@
 
 #include <array>
 #include <cerrno>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string_view>
+
+/* The statistics structure is append-only: a field that an earlier runtime API
+ * had keeps its offset, and what a later API adds comes after the last one
+ * (the 120 Hz rate, API 44, is at the end). */
+static_assert(offsetof(kernarium_runtime_statistics, timestamp_ns) == 16U);
+static_assert(offsetof(kernarium_runtime_statistics, processor_time_ns) == 24U);
+static_assert(offsetof(kernarium_runtime_statistics, presented_frames) == 32U);
+static_assert(offsetof(kernarium_runtime_statistics, offered_frames) == 40U);
+static_assert(offsetof(kernarium_runtime_statistics, gpu_memory_used_bytes) == 80U);
+static_assert(offsetof(kernarium_runtime_statistics, display_refresh_hz) == 88U);
+static_assert(sizeof(kernarium_runtime_statistics) == 96U);
 
 namespace {
 
@@ -45,7 +57,9 @@ void aReadingCarriesEveryFigureOfItsSources()
 {
     const auto statistics = reading(
         guestFigures(),
-        DisplayFigures {.presentedFrames = 900U, .offeredFrames = 880U},
+        DisplayFigures {
+            .presentedFrames = 900U, .offeredFrames = 880U,
+            .refreshRate = 120U},
         true,
         2U,
         987654321ULL,
@@ -60,6 +74,8 @@ void aReadingCarriesEveryFigureOfItsSources()
     require(statistics.processor_time_ns == 123456789012ULL);
     require(statistics.presented_frames == 900U);
     require(statistics.offered_frames == 880U);
+    require(statistics.display_refresh_hz == 120U,
+        "the display's granted rate is the application's to read");
     require(statistics.memory_bytes == 2147483648ULL);
     require(statistics.memory_held_bytes == 1610612736ULL);
     require(statistics.gpu_memory_refusals == 7U);
@@ -76,6 +92,7 @@ void noDisplayReadsAsNoFramesAndAnUnknownScreen()
     require(statistics.display_active == -1);
     require(statistics.presented_frames == 0U &&
         statistics.offered_frames == 0U);
+    require(statistics.display_refresh_hz == 0U, "no display has no rate");
     require(statistics.processor_time_ns == 123456789012ULL &&
         statistics.processor_count == 4U);
     require(statistics.gpu_memory_refusals == 0U,

@@ -5,7 +5,7 @@
 # phase of an application target that also builds for the iOS Simulator calls
 # it in place of an Embed Frameworks entry.
 #
-# usage: embed-device-framework.sh XCFRAMEWORK
+# usage: embed-device-framework.sh [--optional] XCFRAMEWORK
 #
 # KosmicKrisp is the Vulkan driver of the device's GPU stack and requires
 # Metal 4, which the Simulator does not have, so its XCFramework has a device
@@ -25,6 +25,16 @@
 # intermediates records the framework, and the signing, it embedded and what
 # the embedded framework held afterwards; an embedded framework that matches
 # is left as it is.
+#
+# --optional embeds a framework that may not be packaged at all, for the
+# device and the Simulator alike (UmlArm64Aot: the packaging step makes it
+# only when the Android runtime links it). An XCFramework that is not there,
+# or has no slice for the SDK being built, embeds nothing and removes a copy
+# an earlier build left, so an application never carries a framework its
+# runtime does not load. It also fails when an embedded framework's load
+# commands name the missing one: dyld refuses to launch an application without
+# a framework its runtime links, so the build stops where the slice is missing
+# rather than at the first launch.
 set -eu
 
 fail()
@@ -33,25 +43,65 @@ fail()
 	exit 1
 }
 
-[ "$#" -eq 1 ] || fail "usage: embed-device-framework.sh XCFRAMEWORK"
+OPTIONAL=0
+if [ "${1:-}" = --optional ]; then
+	OPTIONAL=1
+	shift
+fi
+[ "$#" -eq 1 ] || fail "usage: embed-device-framework.sh [--optional] XCFRAMEWORK"
 XCFRAMEWORK=$1
 NAME=$(basename -- "$XCFRAMEWORK" .xcframework)
 
 case "${PLATFORM_NAME:-}" in
-iphoneos) ;;
+iphoneos) SLICE_NAME=ios-arm64 ;;
+iphonesimulator)
+	if [ "$OPTIONAL" -eq 0 ]; then
+		printf '%s\n' "$NAME is a device-only framework: not embedded for $PLATFORM_NAME"
+		exit 0
+	fi
+	SLICE_NAME=ios-arm64-simulator
+	;;
 *)
 	printf '%s\n' "$NAME is a device-only framework: not embedded for ${PLATFORM_NAME:-an unknown SDK}"
 	exit 0
 	;;
 esac
 
-SLICE="$XCFRAMEWORK/ios-arm64/$NAME.framework"
-[ -d "$SLICE" ] || fail "$XCFRAMEWORK has no device slice; package it with Kernarium/scripts/package-ios-frameworks.sh"
 [ -n "${TARGET_BUILD_DIR:-}" ] && [ -n "${FRAMEWORKS_FOLDER_PATH:-}" ] &&
 	[ -n "${TARGET_TEMP_DIR:-}" ] || fail "run it from an Xcode build phase"
 
 DESTINATION="$TARGET_BUILD_DIR/$FRAMEWORKS_FOLDER_PATH/$NAME.framework"
 STAMP="$TARGET_TEMP_DIR/embed-device-framework-$NAME.stamp"
+
+# linking_framework: the first embedded framework, other than this one, whose
+# load commands name it. It is empty when none does.
+linking_framework()
+{
+	for candidate in "$TARGET_BUILD_DIR/$FRAMEWORKS_FOLDER_PATH"/*.framework; do
+		[ -d "$candidate" ] || continue
+		candidate_name=$(basename -- "$candidate" .framework)
+		[ "$candidate_name" != "$NAME" ] && [ -f "$candidate/$candidate_name" ] || continue
+		if /usr/bin/otool -L "$candidate/$candidate_name" 2>/dev/null |
+			LC_ALL=C grep -Fq "@rpath/$NAME.framework/$NAME"; then
+			printf '%s\n' "$candidate_name"
+			return 0
+		fi
+	done
+	return 0
+}
+
+SLICE="$XCFRAMEWORK/$SLICE_NAME/$NAME.framework"
+if [ ! -d "$SLICE" ]; then
+	if [ "$OPTIONAL" -eq 1 ]; then
+		LINKER=$(linking_framework)
+		[ -z "$LINKER" ] ||
+			fail "$LINKER links $NAME, and $XCFRAMEWORK has no $SLICE_NAME slice: package it with Kernarium/scripts/package-ios-frameworks.sh"
+		rm -rf -- "$DESTINATION" "$STAMP"
+		printf '%s\n' "$NAME is not packaged for ${PLATFORM_NAME}: not embedded"
+		exit 0
+	fi
+	fail "$XCFRAMEWORK has no device slice; package it with Kernarium/scripts/package-ios-frameworks.sh"
+fi
 
 # tree_digest DIRECTORY: one digest of the mode, content and path of every
 # file and link below DIRECTORY that is embedded, in a fixed order. The names
@@ -96,7 +146,7 @@ embedded_up_to_date()
 # follow the same path explicitly. Xcode gathers that directory into dSYMs in
 # the archive; debug symbols never belong inside the application bundle.
 if [ "${ACTION:-}" = install ]; then
-	SYMBOLS="$XCFRAMEWORK/ios-arm64/dSYMs/$NAME.framework.dSYM"
+	SYMBOLS="$XCFRAMEWORK/$SLICE_NAME/dSYMs/$NAME.framework.dSYM"
 	[ -d "$SYMBOLS" ] || fail "missing debug symbols: $SYMBOLS; repackage the framework"
 	[ -n "${DWARF_DSYM_FOLDER_PATH:-}" ] || fail "the archive has no debug symbols directory"
 	mkdir -p -- "$DWARF_DSYM_FOLDER_PATH"
@@ -106,7 +156,7 @@ fi
 
 REQUEST=$(embed_request)
 if embedded_up_to_date "$REQUEST"; then
-	printf '%s\n' "$NAME is already embedded for the device"
+	printf '%s\n' "$NAME is already embedded for $PLATFORM_NAME"
 	exit 0
 fi
 
@@ -128,4 +178,4 @@ if [ "${CODE_SIGNING_ALLOWED:-YES}" = YES ] &&
 		--generate-entitlement-der "$DESTINATION"
 fi
 printf '%s %s\n' "$REQUEST" "$(tree_digest "$DESTINATION")" >"$STAMP"
-printf '%s\n' "embedded $NAME for the device"
+printf '%s\n' "embedded $NAME for $PLATFORM_NAME"

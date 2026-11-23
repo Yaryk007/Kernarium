@@ -17,6 +17,12 @@ struct Ruler: View {
     var majorOffset: Int = 0
     /// Draw a short tick only every this many positions.
     var minorEvery: Int = 1
+    /// The whole number a long tick stands for (the gibibytes of a memory
+    /// ruler), where the ruler may have more positions than room. Its labels
+    /// then thin out to the round numbers (multiples of 1, 2, 5, 10 ...) that
+    /// do not touch, and so do its ticks (`RulerThinning`). Without it every
+    /// long tick is labelled.
+    var majorNumber: ((Int) -> Int)?
     let label: (Int) -> String
     /// What VoiceOver reads for a position, where its label leaves out a unit.
     var valueText: ((Int) -> String)?
@@ -27,6 +33,9 @@ struct Ruler: View {
     var accessibilityName: String = ""
 
     @State private var dragging = false
+    /// The width the ruler is laid out at, which decides how much of it is
+    /// thinned, for the accessibility steps outside the layout pass.
+    @State private var width: CGFloat = 0
     /// A drag that starts mostly vertical belongs to the scroll view.
     @State private var horizontal: Bool?
 
@@ -37,6 +46,8 @@ struct Ruler: View {
         GeometryReader { geo in
             let step = (geo.size.width - inset * 2) / CGFloat(max(count - 1, 1))
             let x = { (i: Int) -> CGFloat in inset + CGFloat(i) * step }
+            let thinning = makeThinning(positionWidth: step)
+            let shortEvery: Int? = if let thinning { thinning.shortEvery } else { minorEvery }
             ZStack(alignment: .topLeading) {
                 Capsule()
                     .fill(Color.primary.opacity(0.06))
@@ -71,16 +82,21 @@ struct Ruler: View {
                 }
                 ForEach(0..<count, id: \.self) { i in
                     let major = (i - majorOffset) % majorEvery == 0
+                    // A long tick is drawn and labelled unless the ruler is
+                    // crowded and its number is not one of the round ones.
+                    let long = major && (thinning.map { $0.drawsLong(number(i)) } ?? true)
+                    let labelled = major && (thinning.map { $0.labels(number(i)) } ?? true)
+                    let short = !major && (shortEvery.map { (i - majorOffset) % $0 == 0 } ?? false)
                     let warn = warnFrom.map { i >= $0 } ?? false
                     let severe = severeFrom.map { i >= $0 } ?? false
                     let below = i < floor
-                    if major || (i - majorOffset) % minorEvery == 0 {
+                    if long || short {
                         Capsule()
-                            .fill(tickColor(major: major, warn: warn, severe: severe, below: below))
-                            .frame(width: 2, height: major ? 14 : 8)
+                            .fill(tickColor(major: long, warn: warn, severe: severe, below: below))
+                            .frame(width: 2, height: long ? 14 : 8)
                             .position(x: x(i), y: track / 2)
                     }
-                    if major {
+                    if labelled {
                         Text(label(i))
                             .font(.system(size: 12, weight: i == index ? .bold : .medium, design: .rounded).monospacedDigit())
                             .foregroundStyle(labelStyle(selected: i == index, warn: warn, severe: severe, below: below))
@@ -117,18 +133,46 @@ struct Ruler: View {
             )
         }
         .frame(height: 52)
-        .sensoryFeedback(.selection, trigger: index)
+        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width = $0 }
+        .interfaceFeedback(.selection, trigger: index)
         .accessibilityElement()
         .accessibilityLabel(accessibilityName)
         .accessibilityValue((valueText ?? label)(index))
         .accessibilityAdjustableAction { direction in
             switch direction {
-            case .increment: index = min(count - 1, index + 1)
-            case .decrement: index = max(floor, index - 1)
+            case .increment: index = adjusted(forward: true)
+            case .decrement: index = adjusted(forward: false)
             @unknown default: break
             }
         }
     }
+
+    /// Where VoiceOver's increment or decrement goes: one position, or on a
+    /// ruler whose labels are thinned the next labelled one.
+    private func adjusted(forward: Bool) -> Int {
+        let positionWidth = (width - inset * 2) / CGFloat(max(count - 1, 1))
+        guard let thinning = makeThinning(positionWidth: positionWidth), thinning.labelEvery > 1 else {
+            return forward ? min(count - 1, index + 1) : max(floor, index - 1)
+        }
+        return thinning.adjusted(from: index, forward: forward, floor: floor, count: count) { position in
+            (position - majorOffset) % majorEvery == 0 && thinning.labels(number(position))
+        }
+    }
+
+    /// How much of a crowded ruler is drawn; nil where the ruler states no
+    /// numbers to thin by, and then all of it is. A label is about 7.5 points
+    /// to a character.
+    private func makeThinning(positionWidth: CGFloat) -> RulerThinning? {
+        guard majorNumber != nil, count > 1, positionWidth > 0 else { return nil }
+        let longest = stride(from: max(majorOffset, 0), to: count, by: majorEvery)
+            .map { label($0).count }.max() ?? 1
+        return RulerThinning(
+            positionWidth: Double(positionWidth), longEvery: majorEvery, shortEvery: minorEvery,
+            labelWidth: Double(longest) * 7.5
+        )
+    }
+
+    private func number(_ i: Int) -> Int { majorNumber?(i) ?? 0 }
 
     private func set(at x: CGFloat, step: CGFloat) {
         let raw = Int(((x - inset) / step).rounded())
@@ -173,21 +217,31 @@ nonisolated struct HatchPattern: Shape {
 /// with the bound said beneath it. The third is the estimate of the guest's
 /// graphics memory (VRAM) for the chosen memory and vCPUs, which the host
 /// reads from the runtime (`MemoryPolicy.graphicsMemoryMiB`); it is left out
-/// where the host gives none.
+/// where the host gives none. While Camera is on (`cameraLive`) it is the pool
+/// the GPU is given, less what the camera's host-side memory takes out of it.
 struct SystemControls: View {
     @Binding var guest: Guest
     let host: HostDevice
+    var cameraLive = false
 
     var body: some View {
         VStack(spacing: 0) {
             processor
-            Divider().padding(.leading, 58)
-            memory
-            if let vram = host.memory.graphicsMemoryMiB(forMemory: guest.memoryMiB, vCPUs: guest.cores) {
+            // Where the process has no room for any virtual machine's window,
+            // no memory is offered: the row and the estimate that follows it
+            // are left out (`MemoryPolicy.hasRoom`).
+            if host.memory.hasRoom(vCPUs: guest.cores) {
                 Divider().padding(.leading, 58)
-                GraphicsMemoryRow(
-                    estimateMiB: vram, warns: host.memory.risk(guest.memoryMiB, vCPUs: guest.cores) != .none
-                )
+                memory
+                if let vram = host.memory.graphicsMemoryMiB(
+                    forMemory: guest.memoryMiB, vCPUs: guest.cores, cameraLive: cameraLive)
+                {
+                    Divider().padding(.leading, 58)
+                    GraphicsMemoryRow(
+                        estimateMiB: vram,
+                        warns: host.memory.risk(guest.memoryMiB, vCPUs: guest.cores, cameraLive: cameraLive) != .none
+                    )
+                }
             }
         }
         .glassEffect(.regular, in: .rect(cornerRadius: 30))
@@ -195,14 +249,14 @@ struct SystemControls: View {
 
     private var processor: some View {
         ControlRow(
-            title: "Processor", symbol: "cpu",
-            value: Formats.vcpus(guest.cores)
+            title: String(localized: "Processor"), symbol: "cpu",
+            value: CountWords.vcpus(guest.cores)
         ) {
             Ruler(
                 index: Binding(get: { guest.cores - 1 }, set: { guest.setCores($0 + 1, on: host) }),
                 count: host.processorCount,
                 label: { "\($0 + 1)" },
-                accessibilityName: "Processor"
+                accessibilityName: String(localized: "Processor")
             )
         } note: {
             EmptyView()
@@ -217,16 +271,19 @@ struct SystemControls: View {
         // many steps above the bottom of the ruler.
         let bottom = stops.first ?? Limits.minimumMemoryMiB
         let steps = (1024 - bottom % 1024) % 1024 / Limits.memoryStepMiB
-        // Sizes past what a new guest gets turn orange, and past the size
-        // where iOS is likely to close Andarium red where that is a higher
-        // one; the line beneath says why while the chosen size is one of
-        // them, the worse risk alone. Both sizes follow the vCPU count as the
-        // top does.
-        let defaultMiB = host.memory.defaultMemoryMiB(vCPUs: guest.cores)
+        // Sizes past the graphics line (what a new guest gets, or more where
+        // the graphics memory does not fall below 992 MiB above it) turn
+        // orange, and past the size where iOS is likely to close Andarium red
+        // where that is a higher one; the line beneath says why while the
+        // chosen size is one of them, the worse risk alone. Both sizes follow
+        // the vCPU count as the top does.
+        // While Camera is on (`cameraLive`) the line follows the pool the
+        // VRAM row shows, not the budget.
+        let graphicsLineMiB = host.memory.graphicsLineMiB(vCPUs: guest.cores, cameraLive: cameraLive)
         let safeMiB = host.memory.safeMemoryMiB(vCPUs: guest.cores)
-        let distinct = safeMiB > defaultMiB
-        let risk = host.memory.risk(guest.memoryMiB, vCPUs: guest.cores)
-        return ControlRow(title: "Memory", symbol: "memorychip", value: Formats.size(mib: guest.memoryMiB)) {
+        let distinct = safeMiB > graphicsLineMiB
+        let risk = host.memory.risk(guest.memoryMiB, vCPUs: guest.cores, cameraLive: cameraLive)
+        return ControlRow(title: String(localized: "Memory"), symbol: "memorychip", value: Formats.size(mib: guest.memoryMiB)) {
             Ruler(
                 index: Binding(
                     get: { stops.lastIndex(where: { $0 <= guest.memoryMiB }) ?? 0 },
@@ -236,11 +293,12 @@ struct SystemControls: View {
                 majorEvery: 1024 / Limits.memoryStepMiB,
                 majorOffset: steps,
                 minorEvery: 256 / Limits.memoryStepMiB,
+                majorNumber: { stops[$0] / 1024 },
                 label: { Formats.gibibytes(mib: stops[$0]) },
                 valueText: { Formats.size(mib: stops[$0]) },
-                warnFrom: stops.firstIndex { $0 > defaultMiB },
+                warnFrom: stops.firstIndex { $0 > graphicsLineMiB },
                 severeFrom: distinct ? stops.firstIndex { $0 > safeMiB } : nil,
-                accessibilityName: "Memory"
+                accessibilityName: String(localized: "Memory")
             )
         } note: {
             switch risk {
@@ -248,7 +306,7 @@ struct SystemControls: View {
                 Label(MemoryWarning.note(safeMiB: safeMiB), systemImage: "exclamationmark.triangle.fill")
                     .foregroundStyle(distinct ? Color.red : Color.orange)
             case .graphics:
-                Label(GraphicsMemoryWarning.note(defaultMiB: defaultMiB), systemImage: "exclamationmark.triangle.fill")
+                Label(GraphicsMemoryWarning.note(aboveMiB: graphicsLineMiB), systemImage: "exclamationmark.triangle.fill")
                     .foregroundStyle(.orange)
             case .none:
                 EmptyView()
@@ -258,8 +316,9 @@ struct SystemControls: View {
 }
 
 /// The third row of the System sheet: the estimate of the guest's graphics
-/// memory, orange while the chosen memory is above what a new guest gets, with
-/// the note that it is not part of the RAM.
+/// memory, orange while the chosen memory leaves it short
+/// (`MemoryPolicy.isShortOfGraphicsMemory`), with the note that it is not part
+/// of the RAM.
 struct GraphicsMemoryRow: View {
     let estimateMiB: Int
     let warns: Bool
@@ -267,7 +326,10 @@ struct GraphicsMemoryRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             ControlHeader(
-                title: GraphicsMemoryWarning.title, symbol: "cube", value: "\u{2248} " + Formats.size(mib: estimateMiB),
+                title: GraphicsMemoryWarning.title, symbol: "cube",
+                value: String(
+                    localized: "\u{2248} \(Formats.size(mib: estimateMiB))",
+                    comment: "An estimated size of graphics memory, as in ≈ 1.68 GiB: the sign for about, then the size."),
                 valueColor: warns ? .orange : .primary
             )
             Text(GraphicsMemoryWarning.separateNote)
@@ -290,7 +352,7 @@ struct StoragePanel: View {
     let stops: [Int]
 
     var body: some View {
-        ControlRow(title: "Storage", symbol: "internaldrive", value: Formats.size(gib: guest.capacityGiB)) {
+        ControlRow(title: String(localized: "Storage"), symbol: "internaldrive", value: Formats.size(gib: guest.capacityGiB)) {
             Ruler(
                 index: Binding(
                     get: { stops.firstIndex { $0 >= guest.capacityGiB } ?? stops.count - 1 },
@@ -301,7 +363,7 @@ struct StoragePanel: View {
                 majorOffset: 3,
                 label: { "\(stops[$0])" },
                 valueText: { Formats.size(gib: stops[$0]) },
-                accessibilityName: "Storage"
+                accessibilityName: String(localized: "Storage")
             )
         } note: {
             Text("\(Formats.size(bytes: host.freeStorageBytes)) free on this \(host.name)")
@@ -311,7 +373,7 @@ struct StoragePanel: View {
     }
 }
 
-/// An existing guest's storage, the second row of Home's Guest system
+/// An existing guest's storage, the second row of Home's Virtual machine
 /// section: what the guest holds of its capacity, as words and on a bar, a
 /// pending growth or the largest size as a note under the bar, and Resize.
 struct StorageRow: View {
@@ -327,10 +389,10 @@ struct StorageRow: View {
 
     var body: some View {
         SystemRow(
-            symbol: "internaldrive", title: "Storage",
-            subtitle: "\(Formats.size(bytes: guest.usedBytes)) of \(Formats.size(gib: guest.capacityGiB))",
+            symbol: "internaldrive", title: String(localized: "Storage"),
+            subtitle: MeterWords.storage(Formats.size(bytes: guest.usedBytes), of: Formats.size(gib: guest.capacityGiB)),
             button: SystemRowButton(
-                title: "Resize", identifier: "home-storage-resize", isEnabled: !atMaximum, action: resize
+                title: SystemRowButton.resize, identifier: "home-storage-resize", isEnabled: !atMaximum, action: resize
             )
         ) {
             UsageBar(
@@ -470,7 +532,7 @@ struct ResizeSheet: View {
                     majorOffset: 3,
                     label: { "\(stops[$0])" },
                     valueText: { Formats.size(gib: stops[$0]) },
-                    accessibilityName: "Storage"
+                    accessibilityName: String(localized: "Storage")
                 )
                 .padding(.horizontal, 6)
                 UsageBar(used: guest.usedGiB, capacity: Double(capacity))
@@ -505,15 +567,15 @@ struct ResizeSheet: View {
     private func status(_ guest: Guest) -> some View {
         if capacity > guest.capacityGiB {
             line("arrow.up.circle.fill", .accentColor,
-                 "Grows to \(Formats.size(gib: capacity)) at the next start", nil)
+                 String(localized: "Grows to \(Formats.size(gib: capacity)) at the next start"), nil)
         } else if let pending = guest.pendingCapacityGiB {
             line("arrow.uturn.backward.circle.fill", .secondary,
-                 "Stays at \(Formats.size(gib: guest.capacityGiB))",
-                 "The growth to \(Formats.size(gib: pending)) is cancelled.")
+                 String(localized: "Stays at \(Formats.size(gib: guest.capacityGiB))"),
+                 String(localized: "The growth to \(Formats.size(gib: pending)) is cancelled."))
         } else {
             line("internaldrive", .secondary,
-                 "\(Formats.size(bytes: guest.usedBytes)) used of \(Formats.size(gib: guest.capacityGiB))",
-                 "Storage can only grow. A larger size applies at the next start.")
+                 String(localized: "\(Formats.size(bytes: guest.usedBytes)) used of \(Formats.size(gib: guest.capacityGiB))"),
+                 String(localized: "Storage can only grow. A larger size applies at the next start."))
         }
     }
 

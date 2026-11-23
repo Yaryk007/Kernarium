@@ -1,0 +1,29 @@
+{
+  "sourceLanguage" : "en",
+  "strings" : {
+    "Follow developer on %@" : {
+      "comment" : "The row in Info that opens the developer's profile on X. The placeholder is the service's logo, drawn inline where the language puts the name, with no space between it and Chinese or Japanese text. The same text is the row's VoiceOver label, with the name X in the placeholder's place. Follow is X's own verb in each language.",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@でデベロッパをフォロー"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在%@上关注开发者"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在%@上追蹤開發者"
+          }
+        }
+      }
+    }
+  },
+  "version" : "1.0"
+}

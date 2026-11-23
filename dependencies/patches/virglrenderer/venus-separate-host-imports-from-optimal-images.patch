@@ -104,7 +104,7 @@ index be9abd3f2a1e755b19d1c17f3cbd0b8bf013f6ad..28ded7fd9fa1a0ebe1bf7606d4134eaf
  
  /* base class for all objects */
 diff --git a/src/venus/vkr_device_memory.c b/src/venus/vkr_device_memory.c
-index 12ba65bda639525be12e247abbea5a784b640036..82acbc43a7c0a465a1f6050dc46869889cfa883a 100644
+index 4ef34d957d06476b5d5457e5b85358ce4bb987cf..74088a8d857b0df0e83137f4a814bc25cde1a341 100644
 --- a/src/venus/vkr_device_memory.c
 +++ b/src/venus/vkr_device_memory.c
 @@ -254,11 +254,16 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
@@ -169,10 +169,10 @@ index 12ba65bda639525be12e247abbea5a784b640036..82acbc43a7c0a465a1f6050dc4686988
     VkMemoryResourceAllocationSizePropertiesMESA *alloc_size_props =
        vkr_find_struct(args->pMemoryResourceProperties->pNext,
 diff --git a/src/venus/vkr_image.c b/src/venus/vkr_image.c
-index bc236db0aebbc9a9fdcd1a6036a2e721f36757d5..9148f317ff15817e8250883c23278c719a25698e 100644
+index c8a6358a048a3d4cec743df88b090936c48e68ac..8f27a367cd308e8bda6d112dc337e72b8b3cefcb 100644
 --- a/src/venus/vkr_image.c
 +++ b/src/venus/vkr_image.c
-@@ -57,8 +57,9 @@ vkr_dispatch_vkGetImageMemoryRequirements(
+@@ -59,8 +59,9 @@ vkr_dispatch_vkGetImageMemoryRequirements(
  
     vn_replace_vkGetImageMemoryRequirements_args_handle(args);
     vk->GetImageMemoryRequirements(args->device, args->image, args->pMemoryRequirements);
@@ -184,7 +184,7 @@ index bc236db0aebbc9a9fdcd1a6036a2e721f36757d5..9148f317ff15817e8250883c23278c71
  }
  
  static void
-@@ -71,9 +72,10 @@ vkr_dispatch_vkGetImageMemoryRequirements2(
+@@ -73,9 +74,10 @@ vkr_dispatch_vkGetImageMemoryRequirements2(
  
     vn_replace_vkGetImageMemoryRequirements2_args_handle(args);
     vk->GetImageMemoryRequirements2(args->device, args->pInfo, args->pMemoryRequirements);
@@ -198,7 +198,7 @@ index bc236db0aebbc9a9fdcd1a6036a2e721f36757d5..9148f317ff15817e8250883c23278c71
  }
  
  static void
-@@ -240,9 +242,10 @@ vkr_dispatch_vkGetDeviceImageMemoryRequirements(
+@@ -242,9 +244,10 @@ vkr_dispatch_vkGetDeviceImageMemoryRequirements(
     vn_replace_vkGetDeviceImageMemoryRequirements_args_handle(args);
     vk->GetDeviceImageMemoryRequirements(args->device, args->pInfo,
                                          args->pMemoryRequirements);

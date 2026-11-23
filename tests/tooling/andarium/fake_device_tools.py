@@ -7,9 +7,19 @@ The tooling tests put one executable wrapper per tool on PATH; each runs
 named by ``FAKE_STATE``: ``documents/`` is the application's container (the
 runner must leave it as it is), ``commands.jsonl`` records every invocation,
 and ``poweroff`` is written by the guest's power-off command and ends the fake
-console. ``FAKE_*`` variables choose a failure: ADB (``never-ready``), CONSOLE
-(``silent`` after power off), AUTH (``missing`` line), FOCUS (``alert`` or
-``stuck``), GUEST (``dies``) and LOCKED. ``FAKE_START_AFTER=TOOL:OTHER``
+console. ``crash-logs.txt`` lists, one relative path per line, the diagnostic reports
+the device holds (synthetic names: the tests invent them; a file's content is
+its path), ``listing.json`` replaces the listing devicectl prints, and the
+fake ``idevicecrashreport -u UDID DIRECTORY`` empties the store into its
+directory (``FAKE_REPORT_MOVE`` ``keep``: nothing, ``lose``: empties it and
+writes nothing, as a mover that ignores a failed write would). ``FAKE_UDID``
+is the hardware UDID ``info details`` reports (``none``: no UDID, ``fail``: an
+error); ``FAKE_REPORT_LIST`` (``fail``, ``garbage``) and ``FAKE_REPORT_COPY``
+(``fail``, ``short``, ``rename``) break the listing and the copy, and a failure
+prints an invented report name on stderr. Other ``FAKE_*`` variables choose a
+failure: ADB (``never-ready``), CONSOLE (``silent`` after power off), AUTH
+(``missing`` line), FOCUS (``alert`` or ``stuck``), GUEST (``dies``) and
+LOCKED. ``FAKE_START_AFTER=TOOL:OTHER``
 holds TOOL (``launch`` or ``iproxy``) back until OTHER has recorded itself,
 which fixes the order two concurrently started processes appear in
 ``commands.jsonl``; without it that order is the scheduler's. Nothing here
@@ -72,11 +82,113 @@ def devicectl(arguments: list[str]) -> int:
         print(f"passcodeRequired: {'true' if locked else 'false'}")
     elif kind == ["device", "install", "app"]:
         pass
+    elif kind == ["device", "info", "files"]:
+        return info_files(arguments)
+    elif kind == ["device", "info", "details"]:
+        return info_details(arguments)
+    elif kind == ["device", "copy", "from"]:
+        return copy_from(arguments)
     elif kind == ["device", "process", "launch"]:
         return launch(arguments)
     else:
         print(f"unexpected devicectl: {arguments}", file=sys.stderr)
         return 99
+    return 0
+
+
+def option(arguments: list[str], name: str) -> str:
+    return arguments[arguments.index(name) + 1]
+
+
+def crash_logs() -> list[str]:
+    path = STATE / "crash-logs.txt"
+    return path.read_text().split() if path.exists() else []
+
+
+def leak(message: str) -> None:
+    """A tool's stderr that names a report, as a real one might."""
+    print(f"ERROR: {message} (Leaky-2026-01-01-000000.ips)", file=sys.stderr)
+
+
+def emit_json(arguments: list[str], text: str) -> None:
+    target = option(arguments, "--json-output")
+    if target == "-":
+        print(text)
+    else:
+        pathlib.Path(target).write_text(text)
+
+
+def info_files(arguments: list[str]) -> int:
+    """The diagnostic-report listing; any other domain is not modelled."""
+    if option(arguments, "--domain-type") != "systemCrashLogs":
+        print(f"unexpected devicectl: {arguments}", file=sys.stderr)
+        return 99
+    mode = os.environ.get("FAKE_REPORT_LIST")
+    if mode == "fail":
+        leak("the device is not available")
+        return 1
+    if mode == "garbage":
+        emit_json(arguments, "this is not json")
+        return 0
+    override = STATE / "listing.json"
+    if override.exists():
+        emit_json(arguments, override.read_text())
+        return 0
+    files = [{"relativePath": name,
+              "resources": {"isDirectory": False, "isSymbolicLink": False},
+              "metadata": {"size": len(name.encode())}}
+             for name in crash_logs()]
+    emit_json(arguments, json.dumps({"result": {"files": files}}))
+    return 0
+
+
+def info_details(arguments: list[str]) -> int:
+    udid = os.environ.get("FAKE_UDID", "0000AAAA-0123456789ABCDEF")
+    if udid == "fail":
+        print("ERROR: no such device", file=sys.stderr)
+        return 1
+    hardware = {} if udid == "none" else {"udid": udid}
+    emit_json(arguments, json.dumps({"result": {
+        "identifier": "00000000-0000-0000-0000-000000000000",
+        "properties": {"hardware": hardware}}}))
+    return 0
+
+
+def copy_from(arguments: list[str]) -> int:
+    """One report into the destination path, which is a file."""
+    source, target = option(arguments, "--source"), option(
+        arguments, "--destination")
+    mode = os.environ.get("FAKE_REPORT_COPY")
+    if mode == "fail":
+        leak("copy refused")
+        return 1
+    if source not in crash_logs():
+        print("ERROR: no such file node", file=sys.stderr)
+        return 1
+    content = source.encode()
+    if mode == "short":
+        content = content[:-1]
+    if mode == "rename":
+        target += ".renamed"
+    if mode == "link":
+        os.symlink("missing", target)
+        return 0
+    pathlib.Path(target).write_bytes(content)
+    return 0
+
+
+def idevicecrashreport(arguments: list[str]) -> int:
+    """``-u UDID DIRECTORY``: empty the store into DIRECTORY."""
+    record("idevicecrashreport", arguments)
+    mode = os.environ.get("FAKE_REPORT_MOVE")
+    if mode == "keep":
+        return 0
+    directory = pathlib.Path(arguments[-1])
+    directory.mkdir(parents=True, exist_ok=True)
+    for name in crash_logs():
+        if mode != "lose":
+            (directory / pathlib.PurePosixPath(name).name).write_text(name)
+    (STATE / "crash-logs.txt").write_text("")
     return 0
 
 
@@ -262,7 +374,8 @@ def main() -> int:
     if tool == "codesign":
         record("codesign", arguments)
         return 0
-    return {"iproxy": iproxy, "adb": adb}[tool](arguments)
+    return {"iproxy": iproxy, "adb": adb,
+            "idevicecrashreport": idevicecrashreport}[tool](arguments)
 
 
 if __name__ == "__main__":

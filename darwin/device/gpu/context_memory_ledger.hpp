@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -66,7 +67,8 @@ public:
         std::uint32_t contextId {};
         std::uint32_t contexts {};
         std::uint64_t bytes {};
-        /* How long the holder's most recently active context has been quiet. */
+        /* How long the holder's most recently active context has been quiet.
+         * Freeing memory is not activity: see contextActive(). */
         Clock::duration idle {};
         /* The process's command name, or an unnamed context's debug name. */
         std::string name;
@@ -93,7 +95,16 @@ public:
         Clock::time_point now);
     /* The context and everything it held are gone. */
     void contextDestroyed(std::uint32_t contextId) noexcept;
-    /* The context ran a command or a fence retired for it. */
+    /* The context ran a command: a submission, a transfer, or the creation
+     * of a resource. The command counts as activity unless what it did to the
+     * context's memory was to free it. A release (a resource the context
+     * held goes, a Venus allocation is freed, a resource shrinks) withdraws
+     * the credit of the commands the context ran since an allocation, so a
+     * cached application that trims its memory stays as idle as it was and a
+     * context that draws, or allocates, does not. An allocation (a context
+     * gains bytes) makes the credit stand; a command after a release is
+     * credited again. The renderer reports memory later than the command
+     * ran, and a command may free and allocate: the allocation decides. */
     void contextActive(std::uint32_t contextId, Clock::time_point now) noexcept;
 
     /* A resource will exist: makes the room it takes, with no bytes yet and
@@ -151,6 +162,13 @@ public:
 
     [[nodiscard]] std::uint64_t totalBytes() const noexcept;
 
+    /* The guest process of a context: 0 for one the ledger does not know or
+     * whose name carries none. */
+    [[nodiscard]] std::uint32_t processOf(
+        std::uint32_t contextId) const noexcept;
+    /* Whether a guest process has any context. */
+    [[nodiscard]] bool hasProcess(std::uint32_t pid) const noexcept;
+
     /* How many contexts and resources the ledger keeps. */
     struct Counts {
         std::size_t contexts {};
@@ -166,7 +184,26 @@ private:
         bool venus {};
         std::uint64_t resourceBytes {};
         std::uint64_t venusBytes {};
-        Clock::time_point lastActive {};
+        /* When the context was created or last allocated, and when its latest
+         * command ran, which a release withdraws. */
+        Clock::time_point allocatedAt {};
+        Clock::time_point commandAt {};
+        bool commandWithdrawn {};
+
+        /* When the context was last active. */
+        [[nodiscard]] Clock::time_point activeAt() const noexcept
+        {
+            return commandWithdrawn ? allocatedAt
+                                    : std::max(allocatedAt, commandAt);
+        }
+        /* The context gained bytes. */
+        void allocated() noexcept
+        {
+            allocatedAt = std::max(allocatedAt, commandAt);
+            commandWithdrawn = false;
+        }
+        /* The context lost bytes. */
+        void released() noexcept { commandWithdrawn = true; }
     };
     struct Resource {
         std::uint64_t bytes {};

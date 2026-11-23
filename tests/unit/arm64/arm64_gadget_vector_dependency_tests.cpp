@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "arm64_gadget_dependency_reference.hpp"
+#include "arm64_gadget_test_support.hpp"
 #include "cpu/arm64/gadgets/program.hpp"
 #include "cpu/arm64/gadgets/scalar_forwarding.hpp"
 #include "cpu/arm64/layout/assembly_offsets.h"
@@ -25,6 +26,7 @@ constexpr std::uint64_t pc = 0x4000;
 constexpr std::uint32_t svc = 0xd400'0001U;
 
 using uml::testing::require;
+using uml::emulator::tests::LinkedBlock;
 
 std::uint32_t move(unsigned destination, unsigned source)
 {
@@ -242,10 +244,12 @@ void linked_boundaries(uml::memory::Tlb &tlb)
 		for (auto word : code)
 			require(reference::execute(expected, word) == reference::Step::continued);
 	for (bool forwarding : {false, true}) {
-		std::array<std::uintptr_t, 2> terminal{
+		const std::array<std::uintptr_t, 2> terminal{
 			reinterpret_cast<std::uintptr_t>(uml_arm64_gadget_interrupt), pc + 16};
+		const LinkedBlock end_block{pc + 16, 0, terminal};
 		g::BlockLink loop{.guest_pc = pc};
-		g::BlockLink end{.stream = terminal.data(), .instruction_count = 0, .guest_pc = pc + 16};
+		g::BlockLink end{.guest_pc = pc + 16};
+		end_block.link(end);
 		const auto built = g::Builder{}.build(pc, code,
 			[&](std::uint64_t target) -> const g::BlockLink * {
 				if (target == pc) return &loop;
@@ -253,8 +257,8 @@ void linked_boundaries(uml::memory::Tlb &tlb)
 				return &end;
 			}, std::pmr::get_default_resource(), {}, {.vector_forwarding = forwarding});
 		require(built.complete && built.program.instruction_count() == code.size());
-		loop.stream = built.program.words().data();
-		loop.instruction_count = code.size();
+		const LinkedBlock loop_block{built.program};
+		loop_block.link(loop);
 		auto state = initial(0, 0);
 		state.registers[3] = iterations;
 		std::size_t count{};

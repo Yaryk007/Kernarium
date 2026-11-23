@@ -49,7 +49,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  4 files changed, 319 insertions(+)
 
 diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
-index ecc009fa146f9c7c525f41f501df1f211009e980..c3de7629e9eb15f64e4bed92f163a3e0a8577ff8 100644
+index 53e65570132b9f3ae96f6d922543d8ec9391e54f..4770e3c6ee037cbc5545e215fe30a838b7b0f76f 100644
 --- a/src/vrend/vrend_renderer.c
 +++ b/src/vrend/vrend_renderer.c
 @@ -29,6 +29,8 @@
@@ -301,7 +301,7 @@ index ecc009fa146f9c7c525f41f501df1f211009e980..c3de7629e9eb15f64e4bed92f163a3e0
     /* We create the texture views in this function instead of doing it in
      * vrend_renderer_prepare_blit_extra_info because we also delete them here */
     if ((src_res->base.format != info->src.format) && has_feature(feat_texture_view) &&
-@@ -13724,8 +13936,15 @@ vrend_renderer_pipe_resource_set_type(struct vrend_context *ctx,
+@@ -13748,8 +13960,15 @@ vrend_renderer_pipe_resource_set_type(struct vrend_context *ctx,
        };
        struct vrend_resource *gr;
  
@@ -317,7 +317,7 @@ index ecc009fa146f9c7c525f41f501df1f211009e980..c3de7629e9eb15f64e4bed92f163a3e0
  
        gr = vrend_resource_create(&create_args);
        if (!gr)
-@@ -13774,6 +13993,25 @@ vrend_renderer_pipe_resource_set_type(struct vrend_context *ctx,
+@@ -13798,6 +14017,25 @@ vrend_renderer_pipe_resource_set_type(struct vrend_context *ctx,
              return ret;
           }
  
@@ -344,7 +344,7 @@ index ecc009fa146f9c7c525f41f501df1f211009e980..c3de7629e9eb15f64e4bed92f163a3e0
           FREE(gr);
           virgl_error("%s: no EGL/GBM support \n", __func__);
 diff --git a/src/vrend/vrend_renderer.h b/src/vrend/vrend_renderer.h
-index 32088491c8069f41a6fea56997f47be86a3d54d8..7c6034957c31b903c90ab18625e2d42c30deced0 100644
+index e3b98e40ce3f46dc7d3c4ed9487dc3535b75b773..059849b47138ea699983b2c6e37320e5b25f91e9 100644
 --- a/src/vrend/vrend_renderer.h
 +++ b/src/vrend/vrend_renderer.h
 @@ -118,11 +118,30 @@ struct vrend_resource {

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "jit_executor_internal.hpp"
+#include "jit_exclusive_run.hpp"
 
 #include "jit_semantic_reservation.hpp"
 
@@ -136,32 +137,18 @@ inline constexpr std::uint64_t key_state_bits =
     const auto mode = guest_translation_mode(cpu);
     const auto key = translation_key(cpu.pc, mode);
     std::array<std::uint32_t, maximum_block_instructions> instructions{};
-    std::size_t count = 0;
-    while (count < instructions.size()) {
-      std::array<std::byte, sizeof(std::uint32_t)> encoded{};
-      if (!memory.fetch(cpu.pc + count * 4, encoded))
-        break;
-      std::memcpy(&instructions[count], encoded.data(), encoded.size());
-      const auto terminates =
-          obvious_translated_block_terminator(instructions[count]);
-      ++count;
-      if (terminates) {
-        // A compare/exchange retry has a conditional exit before its store.
-        // Look ahead only far enough to recognize that bounded native region.
-        // A speculative fetch failure leaves the ordinary prefix intact.
-        if (count == 3U &&
-            (instructions[0] & 0x3fe0'0000U) == 0x0840'0000U &&
-            (instructions[1] & 0x7fe0'fc1fU) == 0x6b00'001fU &&
-            (instructions[2] & 0xff00'001fU) == 0x5400'0001U) {
-          for (; count < 5U; ++count) {
-            if (!memory.fetch(cpu.pc + count * 4U, encoded))
-              break;
-            std::memcpy(&instructions[count], encoded.data(), encoded.size());
-          }
-        }
-        break;
-      }
-    }
+    /* The span ends at the first block end; a lock sequence's is read on to
+     * its store-exclusive (exclusive_run_span). A speculative fetch failure
+     * leaves the ordinary prefix intact. */
+    const auto count = fetch_translation_words(
+        cpu.pc, instructions,
+        [&](std::uint64_t address, std::uint32_t &word) {
+          std::array<std::byte, sizeof(std::uint32_t)> encoded{};
+          if (!memory.fetch(address, encoded))
+            return false;
+          std::memcpy(&word, encoded.data(), encoded.size());
+          return true;
+        });
     if (count == 0) {
       record_fetch_fault(memory);
       return Event::memory_fault;

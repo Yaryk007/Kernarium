@@ -26,7 +26,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  3 files changed, 30 insertions(+), 6 deletions(-)
 
 diff --git a/src/vrend/vrend_decode.c b/src/vrend/vrend_decode.c
-index eafbab0aa0ffec8b34d15482b6553e863ba733e5..a68f7d4e10b8bcc2b2ccc1d43451cbb85e3ba608 100644
+index 00b79bf515b228a33c0fa93b5af3b9dc4315a730..ad71e76d25a49af8237514ca728324f1df82d24f 100644
 --- a/src/vrend/vrend_decode.c
 +++ b/src/vrend/vrend_decode.c
 @@ -1232,7 +1232,9 @@ static int vrend_decode_create_sub_ctx(struct vrend_context *ctx, const uint32_t
@@ -41,10 +41,10 @@ index eafbab0aa0ffec8b34d15482b6553e863ba733e5..a68f7d4e10b8bcc2b2ccc1d43451cbb8
  }
  
 diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
-index 79d420d61a0c3240e78998fbf18b2f43aa310c30..6bd8338ee52c4190839921dc077d344ed874c63b 100644
+index 370e3954bc198c36d1af44c738117037c054b42c..b8f6570fc62302734cc1b6b37cddbbffd0cc7227 100644
 --- a/src/vrend/vrend_renderer.c
 +++ b/src/vrend/vrend_renderer.c
-@@ -8544,7 +8544,17 @@ struct vrend_context *vrend_create_context(int id, uint32_t nlen, const char *de
+@@ -8568,7 +8568,17 @@ struct vrend_context *vrend_create_context(int id, uint32_t nlen, const char *de
     grctx->shader_cfg.has_vs_layer = has_feature(feat_vs_layer_viewport);
     grctx->shader_cfg.has_vs_viewport_index = has_feature(feat_vs_viewport_index);
  
@@ -63,7 +63,7 @@ index 79d420d61a0c3240e78998fbf18b2f43aa310c30..6bd8338ee52c4190839921dc077d344e
     vrend_renderer_set_sub_ctx(grctx, 0);
  
     int glver = get_glsl_version();
-@@ -14081,26 +14091,37 @@ void vrend_renderer_get_cap_set(uint32_t cap_set, uint32_t *max_ver,
+@@ -14105,26 +14115,37 @@ void vrend_renderer_get_cap_set(uint32_t cap_set, uint32_t *max_ver,
     }
  }
  
@@ -104,7 +104,7 @@ index 79d420d61a0c3240e78998fbf18b2f43aa310c30..6bd8338ee52c4190839921dc077d344e
     sub->parent = ctx;
     vrend_clicbs->make_current(sub->gl_context);
  
-@@ -14147,6 +14168,7 @@ void vrend_renderer_create_sub_ctx(struct vrend_context *ctx, int sub_ctx_id)
+@@ -14171,6 +14192,7 @@ void vrend_renderer_create_sub_ctx(struct vrend_context *ctx, int sub_ctx_id)
        ctx->sub0 = sub;
  
     vrend_set_tweak_from_env(&ctx->sub->tweaks);
@@ -113,7 +113,7 @@ index 79d420d61a0c3240e78998fbf18b2f43aa310c30..6bd8338ee52c4190839921dc077d344e
  
  unsigned vrend_context_has_debug_flag(const struct vrend_context *ctx, enum virgl_debug_flags flag)
 diff --git a/src/vrend/vrend_renderer.h b/src/vrend/vrend_renderer.h
-index d6465e1f4ba53d2671151aecf6e647f66bb330a9..6bc0a60747e4580af7644810f42686f50ff4c365 100644
+index 47da2cd648c81f0bdf7d91fa62f0366ed2711451..6d81b349e179e591279019ae2b97f0916324305b 100644
 --- a/src/vrend/vrend_renderer.h
 +++ b/src/vrend/vrend_renderer.h
 @@ -599,7 +599,7 @@ void vrend_renderer_resource_get_info(struct pipe_resource *pres,

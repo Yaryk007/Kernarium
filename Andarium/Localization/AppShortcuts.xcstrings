@@ -1,0 +1,46 @@
+{
+  "sourceLanguage" : "en",
+  "strings" : {
+    "Open ${target} in ${applicationName}" : {
+      "localizations" : {
+        "en" : {
+          "stringSet" : {
+            "state" : "translated",
+            "values" : [
+              "Open ${target} in ${applicationName}",
+              "Open an Android app in ${applicationName}"
+            ]
+          }
+        },
+        "ja" : {
+          "stringSet" : {
+            "state" : "translated",
+            "values" : [
+              "${applicationName}で${target}を開く",
+              "${applicationName}でAndroidアプリを開く"
+            ]
+          }
+        },
+        "zh-Hans" : {
+          "stringSet" : {
+            "state" : "translated",
+            "values" : [
+              "在${applicationName}中打开${target}",
+              "在${applicationName}中打开Android应用"
+            ]
+          }
+        },
+        "zh-Hant" : {
+          "stringSet" : {
+            "state" : "translated",
+            "values" : [
+              "在${applicationName}中打開${target}",
+              "在${applicationName}中打開Android應用程式"
+            ]
+          }
+        }
+      }
+    }
+  },
+  "version" : "1.0"
+}

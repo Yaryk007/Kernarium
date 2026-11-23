@@ -1,0 +1,35 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+//
+// Where a sideloaded application looks for its updates. Andarium's own
+// xcconfig includes this file; Kernarium has no update notice yet and does
+// not. The maker names the version file in the ignored Update.local.xcconfig
+// beside it (Update.local.xcconfig.example: a host and a path, never a whole
+// address, as `//` starts a comment here and the code builds
+// https://<host><path>). A Release build carries it; every other build, a
+// fork included, has no address, no read and no notice.
+//
+// UPDATE_SOURCE_HOST, UPDATE_SOURCE_PATH and UPDATE_LINK_HOSTS are the local
+// values in Release and empty elsewhere. A non-empty host adds the
+// UPDATE_NOTICE definition to the Info.plist, which then carries the keys the
+// code reads (UpdateSourceHost, UpdateSourcePath, UpdateLinkHosts,
+// UpdateAppIdentifier) and the URL schemes of the sideloading apps the notice
+// can ask about. The tests and the screen captures state UPDATE_SOURCE_HOST,
+// UPDATE_SOURCE_PATH and UPDATE_LINK_HOSTS on the xcodebuild command line to
+// build the keys into a Debug build with a placeholder address.
+
+DEVELOPER_UPDATE_HOST =
+DEVELOPER_UPDATE_PATH =
+DEVELOPER_UPDATE_LINK_HOSTS =
+#include? "Update.local.xcconfig"
+
+UPDATE_SOURCE_HOST =
+UPDATE_SOURCE_HOST[config=Release] = $(DEVELOPER_UPDATE_HOST)
+UPDATE_SOURCE_PATH =
+UPDATE_SOURCE_PATH[config=Release] = $(DEVELOPER_UPDATE_PATH)
+UPDATE_LINK_HOSTS =
+UPDATE_LINK_HOSTS[config=Release] = $(DEVELOPER_UPDATE_LINK_HOSTS)
+
+// An empty host names the setting UPDATE_PLIST_ and gets UPDATE_OFF; any other
+// lands on an undefined name and gets UPDATE_NOTICE.
+UPDATE_PLIST_ = UPDATE_OFF=1
+UPDATE_PLIST_DEFINITION = $(UPDATE_PLIST_$(UPDATE_SOURCE_HOST:identifier):default=UPDATE_NOTICE=1)

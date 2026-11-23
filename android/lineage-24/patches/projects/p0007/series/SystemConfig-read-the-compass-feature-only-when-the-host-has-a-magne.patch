@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 00:18:08 +0000
+Subject: [PATCH] SystemConfig: read the compass feature only when the host has
+ a magnetometer
+
+The product declares android.hardware.sensor.compass when its sensor list
+has a magnetic field sensor, and the list has one only for a host that
+says so at boot (androidboot.kernarium.compass=1, ro.boot.kernarium.compass
+in the guest). Both SKU directories are taken (the vendor's by the camera
+layouts, the ODM's by the haptics), so read one more permission directory
+of the vendor partition, kernarium_compass, when that property is true.
+A guest booted without it reads nothing new and declares no compass.
+---
+ services/core/java/com/android/server/SystemConfig.java | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/services/core/java/com/android/server/SystemConfig.java b/services/core/java/com/android/server/SystemConfig.java
+index f1cb009dab32069706c6377b393b2dc68315c334..6a95bf51daf3745c3e16bcf160e5c897b13fc61d 100644
+--- a/services/core/java/com/android/server/SystemConfig.java
++++ b/services/core/java/com/android/server/SystemConfig.java
+@@ -748,6 +748,15 @@ public class SystemConfig {
+         readPermissions(parser, Environment.buildPath(
+                 Environment.getVendorDirectory(), "etc", "permissions"), vendorPermissionFlag);
+ 
++        // The host that boots the guest says, with androidboot.kernarium.compass=1, that it
++        // has a magnetometer to share. Only then does the product have a compass, so its
++        // feature is declared in a directory of its own, which nothing else reads.
++        if (SystemProperties.getBoolean("ro.boot.kernarium.compass", false)) {
++            readPermissions(parser, Environment.buildPath(
++                    Environment.getVendorDirectory(), "etc", "permissions", "kernarium_compass"),
++                    vendorPermissionFlag);
++        }
++
+         String vendorSkuProperty = SystemProperties.get(VENDOR_SKU_PROPERTY, "");
+         if (!vendorSkuProperty.isEmpty()) {
+             String vendorSkuDir = "sku_" + vendorSkuProperty;

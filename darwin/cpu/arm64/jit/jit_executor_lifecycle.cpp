@@ -72,7 +72,8 @@ JitExecutor::Implementation::Implementation(
   indirect_link_diagnostics_.table_capacity = indirect_links_.capacity();
 #endif
   register_jit_store_participant(store_participant_);
-  SharedTranslationCache::instance().add_executor();
+  if (cache_lease_.shared_translations())
+    SharedTranslationCache::instance().add_executor();
 }
 
 JitExecutor::Implementation::~Implementation() {
@@ -80,7 +81,8 @@ JitExecutor::Implementation::~Implementation() {
     arm64::restore_native_fp_environment(*current_cpu_);
   release_current_reservation();
   unregister_jit_store_participant(store_participant_);
-  SharedTranslationCache::instance().remove_executor();
+  if (cache_lease_.shared_translations())
+    SharedTranslationCache::instance().remove_executor();
   darwin_uml_static_vm_execution_context_destroy(execution_context_);
 }
 

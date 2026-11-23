@@ -20,6 +20,15 @@ uml_add_unit_test(NAME platform-video-decoder
     COMMAND uml_video_decoder_tests ${PROJECT_SOURCE_DIR}/tests/support/video
     LABELS video TIMEOUT 120)
 
+# Losing the hardware session: the decoder's test variant invalidates the
+# session of the next picture, as iOS does to an app that was in the background.
+add_executable(uml_video_decoder_recovery_tests video_decoder_recovery_tests.cpp)
+target_link_libraries(uml_video_decoder_recovery_tests PRIVATE
+    uml_video_decoder_test_variant)
+uml_add_unit_test(NAME platform-video-decoder-recovery
+    COMMAND uml_video_decoder_recovery_tests ${PROJECT_SOURCE_DIR}/tests/support/video
+    LABELS video TIMEOUT 120)
+
 # The decoder's HEVC header readers and output ordering, which need no hardware.
 add_executable(uml_hevc_stream_tests hevc_stream_tests.cpp)
 target_link_libraries(uml_hevc_stream_tests PRIVATE UML::VideoDecoder)
@@ -32,6 +41,14 @@ add_executable(uml_h264_stream_tests h264_stream_tests.cpp)
 target_link_libraries(uml_h264_stream_tests PRIVATE UML::VideoDecoder)
 uml_add_unit_test(NAME platform-h264-stream
     COMMAND uml_h264_stream_tests ${PROJECT_SOURCE_DIR}/tests/support/video
+    LABELS video)
+
+# The decoder's VP9 packet and header readers, which need no hardware and are
+# what its bounds on a guest's packets stand on.
+add_executable(uml_vp9_stream_tests vp9_stream_tests.cpp)
+target_link_libraries(uml_vp9_stream_tests PRIVATE UML::VideoDecoder)
+uml_add_unit_test(NAME platform-vp9-stream
+    COMMAND uml_vp9_stream_tests ${PROJECT_SOURCE_DIR}/tests/support/video
     LABELS video)
 
 # The video encoder backend's Annex B and parameter-set readers, which need no
@@ -61,6 +78,25 @@ uml_add_unit_test(NAME platform-video-encoder-recovery
     COMMAND uml_video_encoder_recovery_tests ${PROJECT_SOURCE_DIR}/tests/support/video
     LABELS video TIMEOUT 300)
 
+# The JPEG size bound, with the sample delivered in two Core Media blocks (the test variant splits it on demand).
+add_executable(uml_video_encoder_jpeg_bound_tests video_encoder_jpeg_bound_tests.cpp)
+target_link_libraries(uml_video_encoder_jpeg_bound_tests PRIVATE
+    uml_video_encoder_test_variant)
+uml_add_unit_test(NAME platform-video-encoder-jpeg-bound
+    COMMAND uml_video_encoder_jpeg_bound_tests
+    LABELS video TIMEOUT 300)
+
+# Discovery against a scripted host, which needs no hardware: a refusal and a
+# ceiling are answers and are stored; a probe the host did not answer is not an
+# answer, leaves the discovery incomplete and out of the cache, and is asked
+# again later, a bounded number of times.
+add_executable(uml_video_encoder_discovery_tests video_encoder_discovery_tests.cpp)
+target_link_libraries(uml_video_encoder_discovery_tests PRIVATE
+    uml_video_encoder_test_variant)
+uml_add_unit_test(NAME platform-video-encoder-discovery
+    COMMAND uml_video_encoder_discovery_tests
+    LABELS video)
+
 # The capability cache, through child processes that find a valid file, no
 # file, or a file they cannot vouch for.
 add_executable(uml_video_encoder_cache_tests video_encoder_cache_tests.cpp)
@@ -73,6 +109,10 @@ uml_add_unit_test(NAME platform-video-encoder-cache
 # that hold them (one holds all it can get) run one at a time.
 set_tests_properties(platform-video-encoder platform-video-encoder-recovery
     platform-video-encoder-cache PROPERTIES RESOURCE_LOCK video-encoder-hardware)
+# A host that left a probe of the discovery unanswered in every discovery the
+# test asked for cannot validate those codecs; the test says so and is skipped,
+# not passed.
+set_tests_properties(platform-video-encoder PROPERTIES SKIP_RETURN_CODE 77)
 
 # The platform's run routing; the transaction tests use its test variant.
 add_executable(uml_run_routing_tests
@@ -112,8 +152,41 @@ uml_add_unit_test(
     NAME platform-host-environment
     COMMAND uml_host_environment_tests)
 
-# The host GPU's fixed budget: the clamp, the guest's half as the maximum, no
-# limit, and when the process is short of the floor.
+# The widest run of address space a process has free: what the settings of an
+# application signed without Extended Virtual Addressing offer a guest by.
+add_executable(uml_address_space_tests address_space_tests.cpp)
+target_include_directories(uml_address_space_tests PRIVATE
+    ${PROJECT_SOURCE_DIR}/darwin/platform)
+uml_add_unit_test(
+    NAME platform-address-space
+    COMMAND uml_address_space_tests)
+
+# The Apple thermal source's notices of a change of the thermal state or of Low
+# Power Mode, until the caller withdraws and after the provider ends.
+add_executable(uml_host_thermal_tests
+    host_thermal_tests.mm
+    $<TARGET_OBJECTS:uml_host_thermal>)
+target_link_libraries(uml_host_thermal_tests PRIVATE
+    UML::PlatformContract
+    "-framework Foundation")
+target_include_directories(uml_host_thermal_tests PRIVATE
+    ${PROJECT_SOURCE_DIR}/darwin/platform)
+uml_add_unit_test(
+    NAME platform-host-thermal
+    COMMAND uml_host_thermal_tests)
+
+# The host's network path: the state every report replaces, which statuses are
+# an outage, and the system monitor's report at each start, until it ends.
+add_executable(uml_host_network_path_tests host_network_path_tests.cpp)
+target_link_libraries(uml_host_network_path_tests PRIVATE
+    UML::HostNetworkPathTestVariant)
+uml_add_unit_test(
+    NAME platform-host-network-path
+    COMMAND uml_host_network_path_tests)
+
+# The host GPU's fixed budget: what the limit leaves above the floor, the
+# guest's RAM where there is no limit, and when the process is short of the
+# floor.
 add_executable(uml_gpu_budget_tests gpu_budget_tests.cpp)
 target_link_libraries(uml_gpu_budget_tests PRIVATE UML::GpuBudget)
 uml_add_unit_test(

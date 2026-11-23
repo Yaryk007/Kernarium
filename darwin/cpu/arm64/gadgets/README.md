@@ -42,13 +42,67 @@ each family at several positions, directly and through a link. The packed
 operand forms are pinned by `arm64-gadget-packed-immediate` and
 `arm64-gadget-test-bit-branch`.
 
+A direct link (`BlockLink` in `program.hpp`) holds its target's first entry
+word and the stream behind it, so following it branches without loading from
+the target's stream first. A block a link names lies behind a 16-byte header
+with its guest PC and instruction count, which a follow reads for the
+retirement limit and its exit; an unlinked link is itself the header of an
+empty block that names `link_exit`. `arm64-gadget-links` follows both.
+
+A block that ends in an epilogue run, SP-based 64-bit loads and at most one
+ADD SP followed by a RET through X30, begins the run with a head
+(`engine/run_heads.inc`) and its operand words, and keeps the run's own words
+behind them; a hint between the run and the RET that the virtual CPU runs as
+a NOP, such as AUTIASP, then emits no word. The head does the run and the
+return when SP is 16-byte aligned and every byte it reads lies in one page the
+TLB holds for reading; otherwise it dispatches the run's first word, so a
+fault, its resume and the retirement count see the ordinary words. A prologue
+run, SP-based 64-bit stores with at least one pair and at most one single, at
+most one SUB SP and one ADD X29, SP, begins with a head the same way, which
+does the stores, SP and X29 when SP is aligned and every byte it writes lies
+in one page the TLB holds for writing, and leaves no register forwarded into
+the instruction behind the run. A row of register moves (MOV Xd, Xm and
+MOV Wd, Wm) is one group: a head that replaces the row's words and needs no
+fallback, since a move cannot fault. The builder hands it the row as a
+parallel copy of two to four destinations with the same result, so the head
+loads every source before it stores; it takes a register forwarded into the
+row from x0 and forwards the row's last destination. Streaming programs, and
+programs built without indirect sites, as single-step builds them, get no
+head.
+`arm64-gadget-run-heads`, `arm64-gadget-prologue-heads` and
+`arm64-gadget-move-heads` check where heads go, each fallback, a fault inside
+or behind one and its resume, and generated runs against a model of the
+instructions.
+
+A transfer through a base register that nothing in its block has written since
+the previous transfer through it in the same direction reuses that transfer's
+translation (`engine/same_base.inc`). The earlier transfer's entry becomes a
+leader, which also keeps the host address it translated in x25; the later one
+becomes a follower, which adds its displacement to x25 when its access lies in
+that guest page and otherwise runs its leader's body, which translates. One
+chain holds x25 at a time, a transfer becomes a leader only when one follows
+it, and a run element is never either. A leader that misses or crosses a page
+re-dispatches its word as its established entry, except the in-place leaders
+that are not baked (an SP base, or a base or data forwarded), which have no
+entry of their form and keep that family's own miss, crossing and alignment
+paths. Either way a fault, its resume and the retirement count are those of the
+block built without the pass. No other gadget names x25
+(`arm64-gadget-same-base-register`). `arm64-gadget-same-base` runs every
+family, every leader's and follower's paths, a fault on either side of a
+follower and its resume, the page's edges and blocks that write the base
+between two transfers against the same guest words built with the pass off;
+`arm64-gadget-same-base-writes` checks the builder's list of the registers each
+instruction writes against the engine.
+
 ## Return ring and target table
 
 A cached return consults a private per-carrier ring of return records that
 linked calls push, and a cached indirect branch the address space's
 direct-mapped target table that every miss exit trains, only after the site's
 cells miss, so a stale or wrong record can only fall back to the ordinary miss
-exit. The executor empties the ring on every address-space switch and after a
+exit. An empty record holds the all-ones PC and no link: a return to that
+address, which a guest can request, leaves through the miss exit like any cold
+return. The executor empties the ring on every address-space switch and after a
 link sweep. The table belongs to the address space's link state and is retired
 with it, so it never names another address space's code.
 

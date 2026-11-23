@@ -239,6 +239,21 @@ void displayStatisticsBelongToTheDisplay()
     require(!service.displayStatistics().has_value());
 }
 
+/* The rate the run was granted is the display's own too: the options state it,
+ * the service reports it while it has its display, and nothing after. */
+void displayRefreshRateBelongsToTheDisplay()
+{
+    InProcessGpuOptions options;
+    options.vncPort = 0;
+    options.width = 64;
+    options.height = 64;
+    InProcessGpuService sixty {std::move(options)};
+    require(sixty.displayRefreshRate() == std::optional<std::uint32_t> {60U},
+        "a display granted nothing has the 60 Hz mode");
+    sixty.stop();
+    require(!sixty.displayRefreshRate().has_value());
+}
+
 /* A guest that restarts itself is a new guest on the same machine. The next
  * connection serves it like the first, the old guest's endpoints are the
  * guest's to close, and a hold the application placed before the restart is
@@ -581,6 +596,7 @@ void runInProcessServiceTests()
 {
     holdRequestsHoldsTheServicesRequests();
     displayStatisticsBelongToTheDisplay();
+    displayRefreshRateBelongsToTheDisplay();
     nextConnectionServesTheNextGuest();
     theGuestEndingDiscardsTheHeldRequests();
     aGuestThatEndsBehindAnOpenGateRunsItsRequests();

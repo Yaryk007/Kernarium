@@ -171,5 +171,54 @@ class CaptureLockTests(unittest.TestCase):
         self.assertIn("home\tHome", listing.getvalue())
 
 
+class CaptureLanguageTests(unittest.TestCase):
+    """`--language` launches the Preview in one of Andarium's languages and names it in the shot."""
+
+    def setUp(self):
+        self.script = load_script()
+        self.shot = next(shot for shot in self.script.SHOTS if shot.id == "home")
+
+    def test_without_a_language_the_launch_is_the_simulators_own(self):
+        self.assertEqual(self.shot.launch_arguments(), ["-screen", "home"])
+
+    def test_a_language_adds_its_locale_to_the_launch(self):
+        self.assertEqual(
+            self.shot.launch_arguments("zh-Hant"),
+            ["-screen", "home", "-AppleLanguages", "(zh-Hant)", "-AppleLocale", "zh_TW"])
+
+    def test_every_language_of_the_application_is_offered(self):
+        self.assertEqual(sorted(self.script.LANGUAGES), ["en", "ja", "zh-Hans", "zh-Hant"])
+
+    def test_an_unknown_language_is_refused_by_the_command_line(self):
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            self.script.main(["--language", "fr", "--list"])
+
+    def test_the_new_shots_of_the_localization_are_listed(self):
+        listing = io.StringIO()
+        with contextlib.redirect_stdout(listing):
+            self.assertEqual(self.script.main(["--list"]), 0)
+        for shot in ("snapshots", "snapshots-detail", "whatsnew-open", "whatsnew-open-unsupported"):
+            self.assertIn(f"{shot}\t", listing.getvalue())
+
+
+class ShotStateTests(unittest.TestCase):
+    """A shot is kept only while the Preview reports that it is on the shot's screen."""
+
+    def setUp(self):
+        self.script = load_script()
+
+    def test_a_shot_ids_are_unique_and_none_is_of_a_removed_feature(self):
+        ids = [shot.id for shot in self.script.SHOTS]
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertFalse([shot.id for shot in self.script.SHOTS if shot.id.startswith("feedback-")])
+
+    def test_a_shot_asks_nothing_of_the_build(self):
+        shot = self.script.SHOTS[0]
+        state = {"pid": 7, "screen": shot.screen, "state": "active"}
+        with mock.patch.object(self.script, "alive", return_value=True), \
+                mock.patch.object(self.script, "app_state", return_value=state):
+            self.assertIsNone(self.script.not_in_front("UDID", 7, shot))
+
+
 if __name__ == "__main__":
     unittest.main()

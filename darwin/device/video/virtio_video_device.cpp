@@ -5,6 +5,8 @@
 #include "video_capabilities.hpp"
 #include "vhost_user_protocol.hpp"
 #include "raw_pitch.hpp"
+#include "unique_descriptor.hpp"
+#include "wake_event.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -169,6 +171,7 @@ const char* profileName(uml::platform::VideoProfile profile) noexcept
     case uml::platform::VideoProfile::hevcMain10: return "hevc-main10";
     case uml::platform::VideoProfile::jpegBaseline: return "jpeg-baseline";
     case uml::platform::VideoProfile::vp9Profile0: return "vp9-profile0";
+    case uml::platform::VideoProfile::vp9Profile2: return "vp9-profile2";
     }
     return "unknown";
 }
@@ -352,10 +355,17 @@ public:
     GuestMapper mapper;
     std::shared_ptr<const uml::virtio::SharedMemoryRegions> regions;
     std::unordered_map<std::uint32_t, Stream> streams;
-    std::deque<std::uint64_t> eventBuffers;
+    /* Events wait here for a buffer of the guest's event queue; the device
+     * holds none of those buffers (see processQueue). */
     std::deque<virtio_video_event> events;
     std::deque<VhostUserQueueCompletion> completions;
+    uml::gpu::UniqueDescriptor queue;
 
+    Implementation() : queue(::kqueue())
+    {
+        if (queue.get() < 0) throw std::runtime_error("Virtio video decoder event queue failed");
+        registerWake(queue.get());
+    }
     ~Implementation() { closeAll("shutdown"); }
 
     static const char* rawName(std::uint32_t format) noexcept
@@ -392,15 +402,13 @@ public:
         for (const auto& [id, stream] : streams) record(id, stream, reason);
     }
 
+    /* Raises an event for the guest. The transport is told to run the event
+     * queue, whose next buffer takes it. */
     void event(std::uint32_t stream, std::uint32_t type)
     {
         if (events.size() >= 64) throw std::runtime_error("video event queue is full");
         events.push_back({type, stream});
-        while (!events.empty() && !eventBuffers.empty()) {
-            completions.push_back({eventBuffers.front(), toBytes(events.front())});
-            eventBuffers.pop_front();
-            events.pop_front();
-        }
+        signalWake(queue.get());
     }
 
     std::vector<std::uint8_t> queued(std::uint32_t stream, std::uint64_t timestamp,
@@ -556,13 +564,16 @@ public:
         for (;;) {
             pump(id, stream);
             if (stream.held.empty() || stream.frames.size() >= framesInFlight) return;
+            /* The request stays held until the decoder has taken its packet, so
+             * a packet it refuses is returned once, with the error, by the
+             * cancellation that follows. */
+            stream.decoder->submit(stream.held.front().packet, stream.held.front().timestamp);
             auto held = std::move(stream.held.front());
             stream.held.pop_front();
             stream.heldBytes -= held.size;
             const auto found = stream.resources.find(
                 resourceKey(VIRTIO_VIDEO_QUEUE_TYPE_INPUT, held.resource));
             if (found != stream.resources.end()) found->second.queued = false;
-            stream.decoder->submit(held.packet, held.timestamp);
             ++stream.packets;
             stream.packetBytes += held.size;
             auto result = load<virtio_video_resource_queue_resp>(queued(id, held.timestamp, 0));
@@ -755,6 +766,11 @@ public:
             if (cap == capabilities.end() || !validQueue(p.queue_type) || !p.frame_width || !p.frame_height ||
                 p.frame_width > cap->maximumWidth || p.frame_height > cap->maximumHeight)
                 throw std::invalid_argument("invalid video parameters");
+            // The range the device states starts at the VP9 minimum, and its hardware opens nothing below it.
+            if (cap->codec == uml::platform::VideoCodec::vp9 &&
+                (p.frame_width < uml::platform::kVp9DecodeMinimumSide ||
+                 p.frame_height < uml::platform::kVp9DecodeMinimumSide))
+                throw std::invalid_argument("video parameters below the advertised minimum");
             if (p.queue_type == VIRTIO_VIDEO_QUEUE_TYPE_INPUT) {
                 if (p.format != stream.coded) {
                     if (!stream.resources.empty() || stream.sourceKnown)
@@ -988,10 +1004,12 @@ VhostUserQueueResult VirtioVideoDevice::processQueue(std::uint32_t index, std::u
             auto result = toBytes(impl.events.front()); impl.events.pop_front();
             return {VhostUserQueueAction::complete, std::move(result)};
         }
-        if (impl.eventBuffers.size() >= uml::gpu::protocol::maximumVirtqueueSize)
-            return {VhostUserQueueAction::retry, {}};
-        impl.eventBuffers.push_back(id);
-        return {VhostUserQueueAction::defer, {}};
+        /* No event is waiting: the buffer stays in the guest's ring until one
+         * is, as an input device's does. A buffer the device held instead
+         * would be a request still pending when the guest suspends, which
+         * resets the device and every stream in it, and no event would reach
+         * the guest again. */
+        return {VhostUserQueueAction::retry, {}};
     }
     if (index != 0 || request.size() < sizeof(virtio_video_cmd_hdr) || capacity < sizeof(virtio_video_cmd_hdr))
         return {VhostUserQueueAction::complete, {}};
@@ -1028,6 +1046,8 @@ void VirtioVideoDevice::reset() noexcept
 {
     auto& impl = *implementation_;
     impl.closeAll("reset");
-    impl.streams.clear(); impl.events.clear(); impl.eventBuffers.clear(); impl.completions.clear();
+    impl.streams.clear(); impl.events.clear(); impl.completions.clear();
 }
+int VirtioVideoDevice::eventDescriptor() const noexcept { return implementation_->queue.get(); }
+void VirtioVideoDevice::drainEventSource() { drainWake(implementation_->queue.get()); }
 } // namespace uml::video

@@ -24,9 +24,9 @@ adapters remain rejected.
 Signed-off-by: Yi Xie <imxieyi@users.noreply.github.com>
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- arch/arm64/um/Kconfig                 |  23 +-
+ arch/arm64/um/Kconfig                 |  25 +-
  arch/arm64/um/Makefile                |  19 +-
- arch/arm64/um/asm/elf.h               | 142 ++---
+ arch/arm64/um/asm/elf.h               | 170 ++----
  arch/arm64/um/asm/mman.h              |   5 +
  arch/arm64/um/asm/processor.h         |  13 +-
  arch/arm64/um/asm/ptrace.h            |  41 +-
@@ -36,7 +36,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  arch/arm64/um/mmap.c                  | 123 +++-
  arch/arm64/um/ptrace.c                | 345 ++++-------
  arch/arm64/um/shared/sysdep/ptrace.h  | 219 ++++---
- arch/arm64/um/signal.c                | 622 ++++++++++++++------
+ arch/arm64/um/signal.c                | 628 ++++++++++++++------
  arch/arm64/um/tls.c                   |  10 +-
  arch/arm64/um/x86_64_syscalls.c       | 806 ++++++++++++++++++++++++++
  arch/arm64/um/x86_syscall_tables.c    |  32 +
@@ -49,13 +49,13 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  fs/open.c                             |   4 +-
  include/linux/eventpoll.h             |  24 +
  include/linux/fs.h                    |   2 +
- 25 files changed, 1980 insertions(+), 692 deletions(-)
+ 25 files changed, 1981 insertions(+), 727 deletions(-)
  create mode 100644 arch/arm64/um/asm/unistd.h
  create mode 100644 arch/arm64/um/x86_64_syscalls.c
  create mode 100644 arch/arm64/um/x86_syscall_tables.c
 
 diff --git a/arch/arm64/um/Kconfig b/arch/arm64/um/Kconfig
-index b0bdc892ebff790cc6bdd8002886b56566f08794..e379296b3128502aafbe5ac48c589da11fe9f37e 100644
+index 1f8ca002428d50244d6501cdb626447b08556dea..fc4b11b5702854b92f7a626abd660ac53bc08788 100644
 --- a/arch/arm64/um/Kconfig
 +++ b/arch/arm64/um/Kconfig
 @@ -23,16 +23,28 @@ config UML_ARM64
@@ -103,11 +103,17 @@ index b0bdc892ebff790cc6bdd8002886b56566f08794..e379296b3128502aafbe5ac48c589da1
  
  config KUSER_HELPERS
  	bool "Enable kuser helpers page for 32-bit applications"
+@@ -92,4 +105,4 @@ config GENERIC_CSUM
+ # are plain system calls.  An AArch32 task has none, and the x86-64 slice's
+ # tasks run x86 code.
+ config UML_ARM64_VDSO
+-	def_bool y
++	def_bool !UML_X86_64_USERSPACE_ONLY
 diff --git a/arch/arm64/um/Makefile b/arch/arm64/um/Makefile
-index c9712aae23d0a57eb3cb47e39e2f718b67cbf40e..8fc740b497d85ddc1e749cb824e826df8e7c227c 100644
+index ca874d4168ca7dc7bcf426ffe7c868a094c21211..3e3d617851f7c6299fd5402158d87c6d38fa4b9f 100644
 --- a/arch/arm64/um/Makefile
 +++ b/arch/arm64/um/Makefile
-@@ -1,11 +1,28 @@
+@@ -1,12 +1,29 @@
  # SPDX-License-Identifier: GPL-2.0
  
  obj-y := bugs.o delay.o fault.o mem.o mmap.o ptrace.o registers.o setjmp.o \
@@ -116,6 +122,7 @@ index c9712aae23d0a57eb3cb47e39e2f718b67cbf40e..8fc740b497d85ddc1e749cb824e826df
 +	x86_64_syscalls.o
  obj-$(CONFIG_UML_ARM64_SME) += sme.o sme_signal.o
  obj-$(CONFIG_UML_ARM64_TAGGED_ADDR_ABI) += tagged_addr.o
+ obj-$(CONFIG_UML_ARM64_VDSO) += vdso/
  obj-$(CONFIG_UML_ARM64_AARCH32) += aarch32.o aarch32_pages.o \
  	armv8_deprecated.o ptrace32.o signal32.o sys32.o sys_compat.o
 +obj-$(CONFIG_UML_X86_64_USERSPACE_ONLY) += x86_syscall_tables.o
@@ -138,7 +145,7 @@ index c9712aae23d0a57eb3cb47e39e2f718b67cbf40e..8fc740b497d85ddc1e749cb824e826df
  # The emulation tracepoint is arm64 Linux's own.
  CFLAGS_armv8_deprecated.o := -I$(srctree)/arch/arm64/kernel
 diff --git a/arch/arm64/um/asm/elf.h b/arch/arm64/um/asm/elf.h
-index 2dc1b1be43dca961e4ce25ff7b2407caa3ccf894..3bfa08cbdb8451ae06f112a645439aa7fccbdbf6 100644
+index 9936ea160c79d86052dd800fdbb15574681d7472..3bfa08cbdb8451ae06f112a645439aa7fccbdbf6 100644
 --- a/arch/arm64/um/asm/elf.h
 +++ b/arch/arm64/um/asm/elf.h
 @@ -4,12 +4,7 @@
@@ -217,7 +224,7 @@ index 2dc1b1be43dca961e4ce25ff7b2407caa3ccf894..3bfa08cbdb8451ae06f112a645439aa7
  typedef elf_greg_t elf_gregset_t[ELF_NGREG];
  
  struct uml_arm64_fpsimd_state {
-@@ -87,79 +77,37 @@ struct uml_arm64_fpsimd_state {
+@@ -87,107 +77,37 @@ struct uml_arm64_fpsimd_state {
  typedef struct uml_arm64_fpsimd_state elf_fpregset_t;
  
  #define ELF_CORE_COPY_REGS(destination, source) do { \
@@ -304,24 +311,52 @@ index 2dc1b1be43dca961e4ce25ff7b2407caa3ccf894..3bfa08cbdb8451ae06f112a645439aa7
 -					  int uses_interp);
 -#endif
 -
--#ifdef CONFIG_UML_ARM64_SME
 -/*
-- * With SME, AT_MINSIGSTKSZ gives the stack the largest signal frame needs,
-- * as on native arm64; without it the vector stays as it was.
+- * What every configuration puts in the auxiliary vector beside the standard
+- * entries: AT_SYSINFO_EHDR, the vDSO's address, where the task has one; and,
+- * with SME, AT_MINSIGSTKSZ, which gives the stack the largest signal frame
+- * needs, as on native arm64.  Without SME the vector stays as it was.
 - */
+-#ifdef CONFIG_UML_ARM64_VDSO
+-#define UML_ARM64_VDSO_DLINFO do { \
+-	if (current->mm->context.vdso) \
+-		NEW_AUX_ENT(AT_SYSINFO_EHDR, current->mm->context.vdso); \
+-} while (0)
+-#else
+-#define UML_ARM64_VDSO_DLINFO do { } while (0)
+-#endif
+-
+-#ifdef CONFIG_UML_ARM64_SME
 -extern unsigned long uml_arm64_minsigstksz;
--#define ARCH_DLINFO do { \
+-#define UML_ARM64_SME_DLINFO do { \
 -	if (uml_arm64_minsigstksz) \
 -		NEW_AUX_ENT(AT_MINSIGSTKSZ, uml_arm64_minsigstksz); \
 -} while (0)
+-#else
+-#define UML_ARM64_SME_DLINFO do { } while (0)
 -#endif
 -
+-#define ARCH_DLINFO do { \
+-	UML_ARM64_VDSO_DLINFO; \
+-	UML_ARM64_SME_DLINFO; \
+-} while (0)
+-
 -#ifdef UML_HOST_DARWIN
--/* Maps the page that holds the sigreturn trampoline (signal.c). */
+-/* Maps the page that holds the sigreturn trampoline (signal.c) and the vDSO. */
 -#define ARCH_HAS_SETUP_ADDITIONAL_PAGES 1
 -struct linux_binprm;
 -extern int arch_setup_additional_pages(struct linux_binprm *bprm,
 -				       int uses_interp);
+-#endif
+-
+-#ifdef CONFIG_UML_ARM64_VDSO
+-/*
+- * Maps the vDSO into the task being executed, which holds mm's mmap lock for
+- * writing, and records its address in mm->context.vdso.  Leaves the task
+- * with no vDSO if the kernel could not build the image.
+- */
+-struct mm_struct;
+-extern int uml_arm64_vdso_map(struct mm_struct *mm);
 -#endif
 -
  #endif
@@ -1403,7 +1438,7 @@ index 977ed7b1df90a8da0b90cfef6a2aae70bd61019e..d233d6e25a6672ef1f94c0df52d51b1b
  extern unsigned long host_fp_size;
  extern int arch_init_registers(int pid);
 diff --git a/arch/arm64/um/signal.c b/arch/arm64/um/signal.c
-index dd560d7da81a046f943d8a318b50737cf2f053eb..775f7b80119886229c864f2b7dd16f9b57b836ba 100644
+index 446a558b37797739112838c80c93b3928f8c700f..775f7b80119886229c864f2b7dd16f9b57b836ba 100644
 --- a/arch/arm64/um/signal.c
 +++ b/arch/arm64/um/signal.c
 @@ -1,9 +1,6 @@
@@ -1555,7 +1590,7 @@ index dd560d7da81a046f943d8a318b50737cf2f053eb..775f7b80119886229c864f2b7dd16f9b
  
  #ifdef UML_HOST_DARWIN
  /* A handler without SA_RESTORER returns here, in the final guest page above
-@@ -24,185 +145,324 @@
+@@ -24,191 +145,324 @@
   */
  #define UML_DARWIN_SIGRETURN_TRAMPOLINE \
  	(UML_DARWIN_TASK_SIZE - 0x100UL)
@@ -1636,6 +1671,7 @@ index dd560d7da81a046f943d8a318b50737cf2f053eb..775f7b80119886229c864f2b7dd16f9b
 -	};
 -	struct mm_struct *mm = current->mm;
 -	struct vm_area_struct *vma;
+-	int ret;
 -
 -	if (!uml_darwin_sigpage)
 -		return -ENOMEM;
@@ -1648,8 +1684,13 @@ index dd560d7da81a046f943d8a318b50737cf2f053eb..775f7b80119886229c864f2b7dd16f9b
 -		UML_DARWIN_SIGRETURN_TRAMPOLINE & PAGE_MASK, PAGE_SIZE,
 -		VM_READ | VM_EXEC | VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC |
 -		VM_SEALED_SYSMAP, &sigpage);
+-	ret = PTR_ERR_OR_ZERO(vma);
+-#ifdef CONFIG_UML_ARM64_VDSO
+-	if (!ret)
+-		ret = uml_arm64_vdso_map(mm);
+-#endif
 -	mmap_write_unlock(mm);
--	return PTR_ERR_OR_ZERO(vma);
+-	return ret;
 +	struct uml_x86_64_task_fpstate *fp = x86_64_task_fpstate(guest);
 +	unsigned int index;
 +
@@ -2025,7 +2066,7 @@ index dd560d7da81a046f943d8a318b50737cf2f053eb..775f7b80119886229c864f2b7dd16f9b
  
  	if (ksig->ka.sa.sa_flags & SA_RESTORER)
  		restorer = (unsigned long)ksig->ka.sa.sa_restorer;
-@@ -213,33 +473,63 @@ int setup_signal_stack_si(unsigned long stack_top, struct ksignal *ksig,
+@@ -219,33 +473,63 @@ int setup_signal_stack_si(unsigned long stack_top, struct ksignal *ksig,
  	else
  		return 1;
  #endif

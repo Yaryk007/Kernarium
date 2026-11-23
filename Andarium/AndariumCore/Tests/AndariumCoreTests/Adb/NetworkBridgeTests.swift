@@ -116,11 +116,11 @@ final class Computer: @unchecked Sendable {
     /// `afterRefusal` runs when a connect failed and its socket is closed,
     /// before the error is thrown; whatever opens there takes the number the
     /// computer let go of, as a parallel test's socket can.
-    init(port: UInt16, afterRefusal: (Int32) -> Void = { _ in }) throws {
+    init(port: UInt16, address: UInt32 = 0x7F00_0001, afterRefusal: (Int32) -> Void = { _ in }) throws {
         // The socket is the computer's only once it is connected: an init
         // that throws after every property is set runs `deinit`, which would
         // close the number again, whoever holds it by then.
-        fd = try Computer.connect(port: port, afterRefusal: afterRefusal)
+        fd = try Computer.connect(port: port, address: address, afterRefusal: afterRefusal)
         var on: Int32 = 1
         _ = setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, socklen_t(MemoryLayout<Int32>.size))
         // A test never waits for a silent or a stalled socket for long.
@@ -129,14 +129,14 @@ final class Computer: @unchecked Sendable {
         _ = setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
     }
 
-    private static func connect(port: UInt16, afterRefusal: (Int32) -> Void) throws -> Int32 {
+    private static func connect(port: UInt16, address host: UInt32, afterRefusal: (Int32) -> Void) throws -> Int32 {
         let fd = socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else { throw AdbError.io(errno) }
         var address = sockaddr_in()
         address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         address.sin_family = sa_family_t(AF_INET)
         address.sin_port = port.bigEndian
-        address.sin_addr = in_addr(s_addr: UInt32(0x7F00_0001).bigEndian)
+        address.sin_addr = in_addr(s_addr: host.bigEndian)
         let connected = withUnsafePointer(to: &address) { pointer in
             pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
                 Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
@@ -282,6 +282,23 @@ struct FileIdentity: Equatable {
     }
 }
 
+/// The addresses of a device that is not the machine the tests run on: a
+/// computer that connects from this machine's loopback is another computer.
+let anotherDevice: @Sendable () -> [InterfaceAddress] = {
+    [InterfaceAddress(name: "en0", isActive: true, isLoopback: false, octets: [192, 0, 2, 10])]
+}
+
+/// A device table a test changes while a bridge reads it.
+final class DeviceTable: @unchecked Sendable {
+    private let lock = NSLock()
+    private var addresses: [InterfaceAddress]
+
+    init(_ addresses: [InterfaceAddress]) { self.addresses = addresses }
+
+    func set(_ addresses: [InterfaceAddress]) { lock.withLock { self.addresses = addresses } }
+    func read() -> [InterfaceAddress] { lock.withLock { addresses } }
+}
+
 /// The listener of ADB over network on loopback against a fake guest: bytes
 /// both ways, backpressure each way, half close, a failed stream, the limit of
 /// computers, stopping and a port in use.
@@ -290,7 +307,8 @@ struct AdbNetworkBridgeTests {
     private func started(
         _ guest: LoopbackGuest, maxPeers: Int = 8
     ) throws -> (AdbNetworkBridge, UInt16) {
-        let bridge = AdbNetworkBridge(port: 0, maxPeers: maxPeers, opener: guest)
+        let bridge = AdbNetworkBridge(
+            port: 0, maxPeers: maxPeers, deviceAddresses: anotherDevice, opener: guest)
         return (bridge, try bridge.start())
     }
 
@@ -480,7 +498,7 @@ struct AdbNetworkBridgeTests {
         #expect(!bridge.isRunning && bridge.peerCount == 0)
         #expect(throws: AdbError.io(ECONNREFUSED)) { try Computer(port: port) }
         // The same port starts again.
-        let again = AdbNetworkBridge(port: port, opener: guest)
+        let again = AdbNetworkBridge(port: port, deviceAddresses: anotherDevice, opener: guest)
         #expect(try again.start() == port)
         again.stop()
     }
@@ -588,9 +606,85 @@ struct AdbNetworkBridgeTests {
         let guest = LoopbackGuest(handler: LoopbackGuest.echo)
         let (first, port) = try started(guest)
         defer { first.stop() }
-        let second = AdbNetworkBridge(port: port, opener: guest)
+        let second = AdbNetworkBridge(port: port, deviceAddresses: anotherDevice, opener: guest)
         #expect(throws: AdbError.io(EADDRINUSE)) { try second.start() }
         #expect(!second.isRunning)
+    }
+
+    // MARK: The device's own processes
+
+    private let loopbackInterface = InterfaceAddress(
+        name: "lo0", isActive: true, isLoopback: true, octets: [127, 0, 0, 1])
+
+    /// A connection from the device itself is closed at once and no stream to
+    /// the guest is opened for it.
+    private func expectRefused(table: @escaping @Sendable () -> [InterfaceAddress]) throws {
+        let guest = LoopbackGuest(handler: LoopbackGuest.echo)
+        let bridge = AdbNetworkBridge(port: 0, deviceAddresses: table, opener: guest)
+        let port = try bridge.start()
+        defer { bridge.stop() }
+        let computer = try Computer(port: port)
+        // The computer may have written before it learns of the refusal.
+        _ = computer.send(Data("hello".utf8))
+        #expect(computer.sawEnd())
+        #expect(bridge.peerCount == 0)
+        #expect(guest.streamsOpened == 0)
+    }
+
+    @Test func aProcessOnTheDevicesLoopbackIsRefused() throws {
+        let loopback = loopbackInterface
+        try expectRefused { [loopback] }
+    }
+
+    @Test func aProcessThatConnectsFromTheDevicesOwnLanAddressIsRefused() throws {
+        // The peer address is what a process of the device shows when it
+        // connects to the Wi-Fi address: the Wi-Fi address itself.
+        let wifi = InterfaceAddress(name: "en0", isActive: true, isLoopback: false, octets: [127, 0, 0, 1])
+        try expectRefused { [wifi] }
+    }
+
+    @Test func aTableThatCannotBeReadRefusesEveryComputer() throws {
+        try expectRefused { [] }
+    }
+
+    @Test func theSystemsOwnTableRefusesTheLoopback() throws {
+        try expectRefused(table: LanAddress.interfaceAddresses)
+    }
+
+    @Test func theSystemsOwnLanAddressRefusesTheDevicesOwnConnection() throws {
+        // A computer that connects to the Wi-Fi address from this machine
+        // arrives from that address.
+        guard let text = LanAddress.current() else { return }
+        let parts = text.split(separator: ".").compactMap { UInt32($0) }
+        guard parts.count == 4 else { return }
+        let address = parts[0] << 24 | parts[1] << 16 | parts[2] << 8 | parts[3]
+        let guest = LoopbackGuest(handler: LoopbackGuest.echo)
+        let bridge = AdbNetworkBridge(port: 0, opener: guest)
+        let port = try bridge.start()
+        defer { bridge.stop() }
+        let computer = try Computer(port: port, address: address)
+        #expect(computer.sawEnd())
+        #expect(guest.streamsOpened == 0)
+    }
+
+    @Test func aComputerElsewhereIsCarriedAndTheTableIsReadForEachConnection() throws {
+        let table = DeviceTable([loopbackInterface])
+        let guest = LoopbackGuest(handler: LoopbackGuest.echo)
+        let bridge = AdbNetworkBridge(port: 0, deviceAddresses: table.read, opener: guest)
+        let port = try bridge.start()
+        defer { bridge.stop() }
+        // The loopback is the device's own: refused, and the listener goes on.
+        let refused = try Computer(port: port)
+        #expect(refused.sawEnd())
+        #expect(guest.streamsOpened == 0)
+        // The device's addresses change; the same peer address is now another
+        // computer's.
+        table.set(anotherDevice())
+        let carried = try Computer(port: port)
+        #expect(carried.send(Data("ask".utf8)))
+        #expect(carried.receive(count: 3) == Data("ask".utf8))
+        #expect(guest.streamsOpened == 1)
+        #expect(bridge.peerCount == 1)
     }
 }
 
@@ -643,6 +737,42 @@ struct LanAddressTests {
         ])
         #expect(found == nil)
         #expect(LanAddress.choose(from: []) == nil)
+    }
+
+    @Test func aPeerIsTheDevicesOwnWhenAnInterfaceHoldsItsAddress() {
+        let table = [
+            address("lo0", [127, 0, 0, 1], loopback: true),
+            address("en0", [192, 0, 2, 23]),
+            address("en1", [198, 51, 100, 8], active: false),
+            address("pdp_ip0", [10, 77, 3, 9]),
+        ]
+        #expect(LanAddress.isOwn([192, 0, 2, 23], among: table))
+        #expect(LanAddress.isOwn([198, 51, 100, 8], among: table))
+        #expect(LanAddress.isOwn([10, 77, 3, 9], among: table))
+        // The whole loopback block is the device's, not only the address the
+        // loopback interface holds.
+        #expect(LanAddress.isOwn([127, 0, 0, 1], among: table))
+        #expect(LanAddress.isOwn([127, 5, 6, 7], among: table))
+    }
+
+    @Test func aPeerElsewhereIsNotTheDevicesOwn() {
+        let table = [
+            address("lo0", [127, 0, 0, 1], loopback: true),
+            address("en0", [192, 0, 2, 23]),
+        ]
+        #expect(!LanAddress.isOwn([192, 0, 2, 24], among: table))
+        #expect(!LanAddress.isOwn([198, 51, 100, 8], among: table))
+        #expect(!LanAddress.isOwn([10, 0, 0, 1], among: table))
+        // Without a loopback interface in the table, loopback is not assumed.
+        #expect(!LanAddress.isOwn([127, 0, 0, 1], among: [address("en0", [192, 0, 2, 23])]))
+        #expect(!LanAddress.isOwn([192, 0, 2, 23], among: []))
+    }
+
+    @Test func anAddressThatIsNotFourOctetsCannotBeJudgedAndCountsAsOwn() {
+        let table = [address("en0", [192, 0, 2, 23])]
+        #expect(LanAddress.isOwn([], among: table))
+        #expect(LanAddress.isOwn([192, 0, 2], among: table))
+        #expect(LanAddress.isOwn([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 192, 0, 2, 23], among: table))
     }
 
     @Test func theDevicesOwnAddressesAreReadable() {

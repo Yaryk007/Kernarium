@@ -1,0 +1,180 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 02:46:48 +0900
+Subject: [PATCH] um: hold a Darwin UBD request while the host's storage is
+ full
+
+A UBD disk is a sparse file on the host's volume. When that volume is
+full, the host fails a write or a flush with ENOSPC although the guest's
+file system still has room; an overwrite can fail too. The Darwin worker
+mapped it to BLK_STS_NOSPC at once. The next failed journal or
+superblock write made jbd2 abort the journal, and ext4 with errors=panic
+stopped the guest at the following handle start. A physical disk never
+fails a write for want of space.
+
+While the guest runs, hold the unit that failed with ENOSPC and redo it,
+after a back-off that doubles from 10 ms to 1 s, until it succeeds or
+the exitcall begins. The file system does not see the failure. The
+driver prints one line when the hold begins and one when it ends, and
+nothing for a retry. The ordered workqueue keeps every later request
+behind the held one, on every disk, so the guest waits for space as it
+would for a slow disk, and whatever needs a held write waits with it: a
+guest's own power-off or restart ends only when the host has room again.
+The worker sleeps as TASK_IDLE, an uninterruptible sleep that neither
+the load average nor the hung-task check counts, and the driver has no
+timeout handler, so nothing in the kernel reports a held request.
+
+A redo is idempotent: it writes the same bytes at the same place, or
+syncs again. It restarts at the segment that failed and restores the
+request offset that do_io() advances. Three cases are not held. A
+discard is a hint that no file system needs and that frees space, so it
+fails as before rather than wait for space it would give back. A COW
+disk redoes its bitmap word from a bitmap the first attempt already
+updated, so a redo would not write the word; Apple launchers build no
+COW pair. And once the exitcall has begun, a held request is woken and
+fails as it did before the hold existed, with the journal abort that
+follows: the machine is going down and the host may never have room. A
+host stop ends the run without waiting for the request.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ arch/um/drivers/ubd_kern.c | 93 +++++++++++++++++++++++++++++++++++---
+ 1 file changed, 86 insertions(+), 7 deletions(-)
+
+diff --git a/arch/um/drivers/ubd_kern.c b/arch/um/drivers/ubd_kern.c
+index 5d75377ba0d3d3e0164702c1c06ffcc24132a257..014713811def177352661c62d89dd1c5b0d00639 100644
+--- a/arch/um/drivers/ubd_kern.c
++++ b/arch/um/drivers/ubd_kern.c
+@@ -497,6 +497,8 @@ static struct os_helper_thread *io_td;
+ static struct workqueue_struct *darwin_ubd_wq;
+ /* Set under ubd_lock once the exitcall has quiesced every disk. */
+ static bool darwin_ubd_stopped;
++/* Where a request held for want of host storage waits (darwin_ubd_hold()). */
++static DECLARE_WAIT_QUEUE_HEAD(darwin_ubd_hold_wq);
+ 
+ /*
+  * UML runs its exitcalls from machine_power_off() and machine_restart()
+@@ -506,14 +508,16 @@ static bool darwin_ubd_stopped;
+  * let destroy_workqueue() complete the requests already handed to it.  A
+  * request submitted later waits in its queue until the run ends, as it
+  * would on a machine that has stopped, instead of reaching a workqueue
+- * that is draining or gone.
++ * that is draining or gone.  A request held for want of host storage
++ * (darwin_ubd_hold()) stops waiting and fails.
+  */
+ static void darwin_ubd_stop(void)
+ {
+ 	int i;
+ 
+ 	mutex_lock(&ubd_lock);
+-	darwin_ubd_stopped = true;
++	WRITE_ONCE(darwin_ubd_stopped, true);
++	wake_up_all(&darwin_ubd_hold_wq);
+ 	for (i = 0; i < MAX_DEV; i++)
+ 		if (ubd_devs[i].disk)
+ 			blk_mq_quiesce_queue(ubd_devs[i].disk->queue);
+@@ -1306,6 +1310,81 @@ static void darwin_ubd_do_segment(struct ubd *dev, struct io_thread_req *io_req,
+ 	do_io(io_req, &desc);
+ }
+ 
++/*
++ * A disk's file lives on the host's volume and is usually sparse, so a write
++ * or a flush can fail for want of host space while the guest's file system
++ * still has room.  A physical disk never fails a write for that, and the
++ * journal of a file system that sees one aborts: ext4 with errors=panic then
++ * stops the guest.  While the guest runs, hold the unit that failed with
++ * ENOSPC (28 on the host, as in Linux) and redo it until the host has room, as
++ * a thin-provisioned array queues its writes while its pool is full.  The file
++ * system does not see the failure.  The ordered workqueue keeps every later
++ * request, on every disk, behind the held one, and whatever needs a held write
++ * waits with it: a guest's own power-off or restart ends only when the host
++ * has room again.
++ *
++ * A redo writes the same bytes at the same place, or syncs again, and the host
++ * keeps what a write did not refuse.  Three cases are not held.  A discard is a
++ * hint that no file system needs and that frees space, so it fails as it
++ * always did instead of waiting for the space it would give back.  A COW
++ * disk's bitmap word is rebuilt from a bitmap the first attempt already
++ * updated, so a redo would skip the write of the word.  And once the exitcall
++ * has begun, a held request is woken and fails as it did before the hold
++ * existed, with the journal abort that follows: the machine is going down and
++ * the host may never have room.  A host stop ends the run without waiting for
++ * the request.
++ *
++ * The worker sleeps as TASK_IDLE, an uninterruptible sleep that neither the
++ * load average nor the hung-task check counts, and the driver has no timeout
++ * handler, so nothing in the kernel reports a held request.
++ */
++static bool darwin_ubd_hold(struct io_thread_req *io_req,
++			    unsigned int *delay_ms, unsigned long *since)
++{
++	if (io_req->error != BLK_STS_NOSPC || !io_req->direct ||
++	    req_op(io_req->req) == REQ_OP_DISCARD ||
++	    READ_ONCE(darwin_ubd_stopped))
++		return false;
++	if (!*delay_ms) {
++		pr_warn("%s: host storage is full; holding I/O until it has room\n",
++			io_req->req->q->disk->disk_name);
++		*since = jiffies;
++		*delay_ms = 10;
++	} else {
++		*delay_ms = min(*delay_ms * 2, 1000U);
++	}
++	wait_event_idle_timeout(darwin_ubd_hold_wq,
++				READ_ONCE(darwin_ubd_stopped),
++				msecs_to_jiffies(*delay_ms));
++	return true;
++}
++
++/* Run one flush or segment, holding it while the host's storage is full. */
++static void darwin_ubd_run(struct ubd *dev, struct io_thread_req *io_req,
++			   char *buffer, unsigned long length,
++			   unsigned long byte_offset)
++{
++	/* do_io() advances the offset past a segment it completed. */
++	u64 offset = io_req->offset;
++	unsigned long since = 0;
++	unsigned int delay_ms = 0;
++
++	do {
++		io_req->offset = offset;
++		io_req->error = BLK_STS_OK;
++		if (req_op(io_req->req) == REQ_OP_FLUSH)
++			do_io(io_req, NULL);
++		else
++			darwin_ubd_do_segment(dev, io_req, buffer, length,
++					      byte_offset);
++	} while (darwin_ubd_hold(io_req, &delay_ms, &since));
++
++	if (delay_ms && io_req->error == BLK_STS_OK)
++		pr_info("%s: host storage has room again after %u ms; I/O resumed\n",
++			io_req->req->q->disk->disk_name,
++			jiffies_to_msecs(jiffies - since));
++}
++
+ static void darwin_ubd_work(struct work_struct *work)
+ {
+ 	struct io_thread_req *io_req =
+@@ -1318,17 +1397,17 @@ static void darwin_ubd_work(struct work_struct *work)
+ 
+ 	switch (req_op(req)) {
+ 	case REQ_OP_FLUSH:
+-		do_io(io_req, NULL);
++		darwin_ubd_run(dev, io_req, NULL, 0, 0);
+ 		break;
+ 	case REQ_OP_DISCARD:
+ 	case REQ_OP_WRITE_ZEROES:
+-		darwin_ubd_do_segment(dev, io_req, NULL, blk_rq_bytes(req),
+-				      byte_offset);
++		darwin_ubd_run(dev, io_req, NULL, blk_rq_bytes(req),
++			       byte_offset);
+ 		break;
+ 	default:
+ 		rq_for_each_segment(bvec, req, iter) {
+-			darwin_ubd_do_segment(dev, io_req, bvec_virt(&bvec),
+-					      bvec.bv_len, byte_offset);
++			darwin_ubd_run(dev, io_req, bvec_virt(&bvec),
++				       bvec.bv_len, byte_offset);
+ 			if (io_req->error)
+ 				goto out;
+ 			byte_offset += bvec.bv_len;

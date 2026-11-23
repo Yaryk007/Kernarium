@@ -1,0 +1,162 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 02:42:17 +0900
+Subject: [PATCH] WifiTrackerLib: show a failed internet check on a validated
+ network
+
+The Wi-Fi of the Darwin UML guest is validated before it is checked,
+and a check that fails leaves the network validated (NetworkMonitor in
+NetworkStack). The stock rules show an internet problem only for a
+network that lacks the validated capability, so Settings and the status
+bar showed nothing for it.
+
+WifiEntry.isInternetCheckFailed() is true for a validated network whose
+latest connectivity report says valid, not skipped, with the HTTPS probe
+attempted and not succeeded. shouldShowXLevelIcon() and the connected
+summary take it as they take a partial connection: the Wi-Fi list shows
+"Limited connection" under "Connected", and the status bar and the quick
+settings internet panel show the Wi-Fi icon with the exclamation mark.
+The report comes from the stock callback WifiTrackerLib already
+registers, so nothing else is read. A network that is not validated, a
+partial one, and one behind a sign-in page keep the stock rules.
+
+A report alone changes the mark of a network that stays validated, and
+it reaches only the listener of the entry, which the status bar's
+repository does not set. WifiPickerTracker now notifies its own
+listeners when a report changes whether an entry shows the mark, as the
+capabilities and the lost handlers do for their changes.
+
+The library's unit tests do not cover this change.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .../src/com/android/wifitrackerlib/Utils.java | 40 ++++++++++++++++++-
+ .../com/android/wifitrackerlib/WifiEntry.java | 13 +++++-
+ .../wifitrackerlib/WifiPickerTracker.java     |  8 ++++
+ 3 files changed, 58 insertions(+), 3 deletions(-)
+
+diff --git a/libs/WifiTrackerLib/src/com/android/wifitrackerlib/Utils.java b/libs/WifiTrackerLib/src/com/android/wifitrackerlib/Utils.java
+index 0035030b0ef6255a755a28d63af17bfe28aa1069..7864d0352e30b69c9b9ebbffc9f14dba9d59e7f5 100644
+--- a/libs/WifiTrackerLib/src/com/android/wifitrackerlib/Utils.java
++++ b/libs/WifiTrackerLib/src/com/android/wifitrackerlib/Utils.java
+@@ -16,6 +16,12 @@
+ 
+ package com.android.wifitrackerlib;
+ 
++import static android.net.ConnectivityDiagnosticsManager.ConnectivityReport.KEY_NETWORK_PROBES_ATTEMPTED_BITMASK;
++import static android.net.ConnectivityDiagnosticsManager.ConnectivityReport.KEY_NETWORK_PROBES_SUCCEEDED_BITMASK;
++import static android.net.ConnectivityDiagnosticsManager.ConnectivityReport.KEY_NETWORK_VALIDATION_RESULT;
++import static android.net.ConnectivityDiagnosticsManager.ConnectivityReport.NETWORK_PROBE_HTTPS;
++import static android.net.ConnectivityDiagnosticsManager.ConnectivityReport.NETWORK_VALIDATION_RESULT_INVALID;
++import static android.net.ConnectivityDiagnosticsManager.ConnectivityReport.NETWORK_VALIDATION_RESULT_VALID;
+ import static android.net.wifi.WifiConfiguration.NetworkSelectionStatus.DISABLED_AUTHENTICATION_FAILURE;
+ import static android.net.wifi.WifiConfiguration.NetworkSelectionStatus.NETWORK_SELECTION_ENABLED;
+ import static android.net.wifi.WifiInfo.SECURITY_TYPE_EAP;
+@@ -253,6 +259,36 @@ public class Utils {
+         }
+     }
+ 
++    /**
++     * Returns whether a network that is validated shows that its internet check failed.
++     *
++     * This device validates its virtual Wi-Fi before it checks it, so the network stays validated
++     * while the check fails, and the stock rules, which look only at the validated capability,
++     * show nothing. The check shows in the connectivity report: the result is valid, not skipped,
++     * and the HTTPS probe was attempted and did not succeed. A network that passed its probes has
++     * the HTTPS probe succeeded, or not attempted, and a network that is not validated, is partial
++     * or is behind a sign-in page keeps the rules it has.
++     */
++    static boolean isInternetCheckFailed(@Nullable NetworkCapabilities networkCapabilities,
++            @Nullable ConnectivityDiagnosticsManager.ConnectivityReport connectivityReport) {
++        if (networkCapabilities == null || connectivityReport == null
++                || !networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
++                || networkCapabilities.hasCapability(
++                        NetworkCapabilities.NET_CAPABILITY_CAPTIVE_PORTAL)
++                || networkCapabilities.hasCapability(
++                        NetworkCapabilities.NET_CAPABILITY_PARTIAL_CONNECTIVITY)) {
++            return false;
++        }
++        final PersistableBundle extras = connectivityReport.getAdditionalInfo();
++        if (extras.getInt(KEY_NETWORK_VALIDATION_RESULT, NETWORK_VALIDATION_RESULT_INVALID)
++                != NETWORK_VALIDATION_RESULT_VALID) {
++            return false;
++        }
++        final int attempted = extras.getInt(KEY_NETWORK_PROBES_ATTEMPTED_BITMASK, 0);
++        final int succeeded = extras.getInt(KEY_NETWORK_PROBES_SUCCEEDED_BITMASK, 0);
++        return (attempted & NETWORK_PROBE_HTTPS) != 0 && (succeeded & NETWORK_PROBE_HTTPS) == 0;
++    }
++
+     static String getConnectedDescription(@NonNull Context context,
+             @Nullable WifiConfiguration wifiConfiguration,
+             @NonNull NetworkCapabilities networkCapabilities,
+@@ -272,6 +308,8 @@ public class Utils {
+         boolean isNoInternetExpected = wifiConfiguration != null
+                 && wifiConfiguration.isNoInternetAccessExpected();
+         boolean isPrivateDnsBroken = !isValidated && networkCapabilities.isPrivateDnsBroken();
++        boolean isInternetCheckFailed = isInternetCheckFailed(networkCapabilities,
++                connectivityReport);
+         boolean isCheckingForInternetAccess = !isValidated && !isPartialConnectivity
+                 && connectivityReport == null && !isNoInternetExpected;
+         boolean isOemNetwork = NonSdkApiWrapper.isOemCapabilities(networkCapabilities);
+@@ -319,7 +357,7 @@ public class Utils {
+             // "Sign in to network"
+             sj.add(context.getString(context.getResources().getIdentifier(
+                     "network_available_sign_in", "string", "android")));
+-        } else if (isPartialConnectivity) {
++        } else if (isPartialConnectivity || isInternetCheckFailed) {
+             // "Limited connection..."
+             sj.add(context.getString(R.string.wifitrackerlib_wifi_limited_connection));
+         } else if (isCheckingForInternetAccess) {
+diff --git a/libs/WifiTrackerLib/src/com/android/wifitrackerlib/WifiEntry.java b/libs/WifiTrackerLib/src/com/android/wifitrackerlib/WifiEntry.java
+index 0035119e4b5e77f7dc7752b7c6dd8b9dc4f46a42..778dcf3192ec1e5eeb6d0f1577a62117cd66dafb 100644
+--- a/libs/WifiTrackerLib/src/com/android/wifitrackerlib/WifiEntry.java
++++ b/libs/WifiTrackerLib/src/com/android/wifitrackerlib/WifiEntry.java
+@@ -380,16 +380,25 @@ public class WifiEntry {
+ 
+     /**
+      * Returns whether the level icon for this network should show an X or not.
+-     * By default, this means any connected network that has no/low-quality internet access.
++     * By default, this means any connected network that has no/low-quality internet access, or
++     * that is validated although its internet check failed.
+      */
+     public boolean shouldShowXLevelIcon() {
+         return getConnectedState() != CONNECTED_STATE_DISCONNECTED
+                 && mConnectivityReport != null
+-                && (!hasInternetAccess() || isLowQuality())
++                && (!hasInternetAccess() || isInternetCheckFailed() || isLowQuality())
+                 && !canSignIn()
+                 && isPrimaryNetwork();
+     }
+ 
++    /**
++     * Returns whether this network is validated although its internet check failed, as the
++     * connectivity report shows it (see {@link Utils#isInternetCheckFailed}).
++     */
++    public synchronized boolean isInternetCheckFailed() {
++        return Utils.isInternetCheckFailed(mNetworkCapabilities, mConnectivityReport);
++    }
++
+     /**
+      * Returns whether this network has validated internet access or not.
+      * Note: This does not necessarily mean the network is the default route.
+diff --git a/libs/WifiTrackerLib/src/com/android/wifitrackerlib/WifiPickerTracker.java b/libs/WifiTrackerLib/src/com/android/wifitrackerlib/WifiPickerTracker.java
+index fc4d8ab1866b5bd776f6ea340b6e3657cf7b5a67..b0e03097db06a38d9d184a2389b3113c7f7247cd 100644
+--- a/libs/WifiTrackerLib/src/com/android/wifitrackerlib/WifiPickerTracker.java
++++ b/libs/WifiTrackerLib/src/com/android/wifitrackerlib/WifiPickerTracker.java
+@@ -437,8 +437,16 @@ public class WifiPickerTracker extends BaseWifiTracker {
+     @Override
+     protected void handleConnectivityReportAvailable(
+             @NonNull ConnectivityDiagnosticsManager.ConnectivityReport connectivityReport) {
++        boolean markChanged = false;
+         for (WifiEntry entry : getAllWifiEntries()) {
++            final boolean markShown = entry.shouldShowXLevelIcon();
+             entry.updateConnectivityReport(connectivityReport);
++            markChanged |= markShown != entry.shouldShowXLevelIcon();
++        }
++        // A report alone can change the mark of a network that stays validated, and nothing else
++        // reaches the listeners of the tracker (the status bar's among them) then.
++        if (markChanged) {
++            notifyOnWifiEntriesChanged(WIFI_ENTRIES_CHANGED_REASON_GENERAL);
+         }
+     }
+ 

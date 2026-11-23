@@ -40,6 +40,7 @@ import run_vk_gl_cts as cts  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "support"))
 import ios_device  # noqa: E402
+import ios_device_reports  # noqa: E402
 import kernarium  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -507,6 +508,7 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--install-timeout", type=int, default=600)
     parser.add_argument("--artifact-root", type=Path,
                         default=DEFAULT_ARTIFACT_ROOT)
+    ios_device_reports.add_arguments(parser)
     options = parser.parse_args(argv)
     if options.cpus < 1 or (
         options.memory_mib is not None and options.memory_mib < 512
@@ -531,6 +533,7 @@ def main(argv: list[str] | None = None) -> int:
     if options.artifact_root.exists():
         fail(f"artifact directory already exists: {options.artifact_root}")
     options.artifact_root.mkdir(parents=True)
+    ios_device_reports.preflight(options, [kernarium.APPLICATION])
 
     if options.app is not None:
         app = options.app.resolve()

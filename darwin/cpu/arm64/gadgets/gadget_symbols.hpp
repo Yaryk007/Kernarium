@@ -2033,6 +2033,69 @@ void uml_arm64_gadget_branch_link_register_cached();
 void uml_arm64_gadget_return_cached();
 void uml_arm64_gadget_return_x30_cached();
 void uml_arm64_gadget_return();
+/* The epilogue run heads (engine/run_heads.inc), by loads and ADD SP count. */
+void uml_arm64_gadget_run_epilogue_1_0();
+void uml_arm64_gadget_run_epilogue_1_1();
+void uml_arm64_gadget_run_epilogue_2_0();
+void uml_arm64_gadget_run_epilogue_2_1();
+void uml_arm64_gadget_run_epilogue_3_0();
+void uml_arm64_gadget_run_epilogue_3_1();
+void uml_arm64_gadget_run_epilogue_4_0();
+void uml_arm64_gadget_run_epilogue_4_1();
+void uml_arm64_gadget_run_epilogue_5_0();
+void uml_arm64_gadget_run_epilogue_5_1();
+void uml_arm64_gadget_run_epilogue_6_0();
+void uml_arm64_gadget_run_epilogue_6_1();
+void uml_arm64_gadget_run_epilogue_7_0();
+void uml_arm64_gadget_run_epilogue_7_1();
+void uml_arm64_gadget_run_epilogue_8_0();
+void uml_arm64_gadget_run_epilogue_8_1();
+/* The prologue run heads, by pairs, single stores and SUB SP count. */
+void uml_arm64_gadget_run_prologue_1_0_0();
+void uml_arm64_gadget_run_prologue_1_0_1();
+void uml_arm64_gadget_run_prologue_1_1_0();
+void uml_arm64_gadget_run_prologue_1_1_1();
+void uml_arm64_gadget_run_prologue_2_0_0();
+void uml_arm64_gadget_run_prologue_2_0_1();
+void uml_arm64_gadget_run_prologue_2_1_0();
+void uml_arm64_gadget_run_prologue_2_1_1();
+void uml_arm64_gadget_run_prologue_3_0_0();
+void uml_arm64_gadget_run_prologue_3_0_1();
+void uml_arm64_gadget_run_prologue_3_1_0();
+void uml_arm64_gadget_run_prologue_3_1_1();
+void uml_arm64_gadget_run_prologue_4_0_0();
+void uml_arm64_gadget_run_prologue_4_0_1();
+void uml_arm64_gadget_run_prologue_4_1_0();
+void uml_arm64_gadget_run_prologue_4_1_1();
+void uml_arm64_gadget_run_prologue_5_0_0();
+void uml_arm64_gadget_run_prologue_5_0_1();
+void uml_arm64_gadget_run_prologue_5_1_0();
+void uml_arm64_gadget_run_prologue_5_1_1();
+void uml_arm64_gadget_run_prologue_6_0_0();
+void uml_arm64_gadget_run_prologue_6_0_1();
+void uml_arm64_gadget_run_prologue_6_1_0();
+void uml_arm64_gadget_run_prologue_6_1_1();
+/* The move run heads, by the width of each move from the first, and the
+ * forms of them that take the first move's source from x0. */
+#define UML_DECLARE_RUN_MOVES(widths) \
+	void uml_arm64_gadget_run_moves_##widths(); \
+	void uml_arm64_gadget_run_moves_##widths##_forward();
+#define UML_DECLARE_RUN_MOVES_2(prefix) \
+	UML_DECLARE_RUN_MOVES(prefix##x) UML_DECLARE_RUN_MOVES(prefix##w)
+#define UML_DECLARE_RUN_MOVES_3(prefix) \
+	UML_DECLARE_RUN_MOVES_2(prefix##x) UML_DECLARE_RUN_MOVES_2(prefix##w)
+#define UML_DECLARE_RUN_MOVES_4(prefix) \
+	UML_DECLARE_RUN_MOVES_3(prefix##x) UML_DECLARE_RUN_MOVES_3(prefix##w)
+UML_DECLARE_RUN_MOVES_2(x)
+UML_DECLARE_RUN_MOVES_2(w)
+UML_DECLARE_RUN_MOVES_3(x)
+UML_DECLARE_RUN_MOVES_3(w)
+UML_DECLARE_RUN_MOVES_4(x)
+UML_DECLARE_RUN_MOVES_4(w)
+#undef UML_DECLARE_RUN_MOVES_4
+#undef UML_DECLARE_RUN_MOVES_3
+#undef UML_DECLARE_RUN_MOVES_2
+#undef UML_DECLARE_RUN_MOVES
 /* Everything a condition has: the branch, its linked and inline forms, and
  * the fused CMP and B.cond in both widths with the same three forms. */
 #define UML_DECLARE_FUSED_COMPARE_BRANCH(kind, width, name) \

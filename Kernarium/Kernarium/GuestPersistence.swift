@@ -148,12 +148,9 @@ final class GuestPersistence {
     ) {
         let assertion = BackgroundTaskAssertion(named: "guest-sync")
         queue.async {
-            let unflushed = kernarium_runtime_loader_quiesce_resident()
+            let settle = GuestSettle.quiesceResident()
             Task { @MainActor in
-                print(
-                    "Kernarium: guest storage settled on \(reason), RAM " +
-                        "kept (\(unflushed) unflushed)"
-                )
+                print("Kernarium: " + settle.logLine(reason: reason, kept: "RAM kept"))
                 assertion.end()
                 finished()
             }
@@ -175,6 +172,31 @@ final class GuestPersistence {
                     "\(enabled ? "on" : "off") (\(result))"
             )
         }
+    }
+
+    /// Asks the runtime to stop the run `stop` belongs to, off the main actor:
+    /// the request may wait for a guest being restored or for the runtime's
+    /// own lock. It goes through the queue of the other guest requests, so it
+    /// comes after a write-back or a suspension that was asked for before it,
+    /// and is made again until the run ends, with the guest's write-back
+    /// before the first that reaches one (`GuestStopDelivery`).
+    ///
+    /// `runtime` is the runtime's write-back and stop, and `interval` how long
+    /// after a request it is made again. A test supplies its own of both.
+    func deliverStop(
+        _ stop: RunStop,
+        every interval: DispatchTimeInterval = GuestStopDelivery.interval,
+        runtime: GuestStopDelivery.Runtime = .loader
+    ) {
+        GuestStopDelivery.deliver(
+            stop, on: queue, every: interval,
+            settle: {
+                GuestStopDelivery.settleBeforeStop(
+                    for: stop, logPrefix: "Kernarium: ", runtime: runtime
+                )
+            },
+            request: runtime.requestStop
+        )
     }
 
     func stopObserving() {
@@ -199,29 +221,18 @@ final class GuestPersistence {
         let assertion = BackgroundTaskAssertion(named: "guest-sync")
         let finished = DispatchSemaphore(value: 0)
         queue.async {
-            let unflushed = switch departure {
-            case .flush: kernarium_runtime_loader_sync()
-            case .quiesce: kernarium_runtime_loader_quiesce()
+            let settle = switch departure {
+            case .flush: GuestSettle.sync()
+            case .quiesce: GuestSettle.quiesce()
             }
             finished.signal()
             Task { @MainActor in
-                GuestPersistence.report(reason: reason, unflushed: unflushed)
+                print("Kernarium: " + settle.logLine(reason: reason))
                 assertion.end()
             }
         }
         if let deadline {
             _ = finished.wait(timeout: deadline)
-        }
-    }
-
-    private static func report(reason: String, unflushed: Int32) {
-        if unflushed > 0 {
-            print(
-                "Kernarium: \(reason) sync left \(unflushed) guest " +
-                "file(s) unflushed"
-            )
-        } else if unflushed == 0 {
-            print("Kernarium: guest storage settled on \(reason)")
         }
     }
 }
@@ -308,6 +319,22 @@ nonisolated struct RuntimeGPUGate: GuestGPUGate {
     func hold() {
         let result = kernarium_runtime_loader_set_gpu_hold(1)
         print("Kernarium: guest GPU requests held on background (\(result))")
+    }
+
+    func hold(within left: TimeInterval) {
+        // A value of 3 or more is the milliseconds the caller's deadline leaves:
+        // the runtime's camera wait takes what is left after the drain's second,
+        // which the deadline does not shorten.
+        let milliseconds = Int32(clamping: Int((left * 1000).rounded(.down)))
+        let result = kernarium_runtime_loader_set_gpu_hold(max(3, milliseconds))
+        print(
+            "Kernarium: guest GPU requests held on background, \(milliseconds) ms left (\(result))"
+        )
+    }
+
+    func holdNow() {
+        let result = kernarium_runtime_loader_set_gpu_hold(2)
+        print("Kernarium: guest GPU requests held at once (\(result))")
     }
 
     func release() {

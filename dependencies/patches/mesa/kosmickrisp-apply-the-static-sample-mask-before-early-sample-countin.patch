@@ -99,10 +99,10 @@ index 25d7aecc45c04ad280e222555cd1271b5edaf963..92ae55f0bf63d4bedddc67b24a96dd38
        struct {
           uint32_t base_group[3];
 diff --git a/src/kosmickrisp/vulkan/kk_cmd_draw.c b/src/kosmickrisp/vulkan/kk_cmd_draw.c
-index 9a8a6529b6f5c30284d502394aebe1613d6df96c..c1609538fff091860a40ed36555750e9b65a1de4 100644
+index a1457b264e611f9f164c7781f920b54d6e1d05b6..97e3d22466c81d39e5f91ea4c25e91aa7b6dfaed 100644
 --- a/src/kosmickrisp/vulkan/kk_cmd_draw.c
 +++ b/src/kosmickrisp/vulkan/kk_cmd_draw.c
-@@ -1824,8 +1824,17 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
+@@ -1825,8 +1825,17 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
        kk_cmd_bind_root_to_argument_table(cmd, desc->root.addr);
     }
  
@@ -122,7 +122,7 @@ index 9a8a6529b6f5c30284d502394aebe1613d6df96c..c1609538fff091860a40ed36555750e9
                                       gfx->occlusion.index * sizeof(uint64_t));
     }
  }
-@@ -1851,6 +1860,22 @@ kk_flush_gfx_state(struct kk_cmd_buffer *cmd)
+@@ -1852,6 +1861,22 @@ kk_flush_gfx_state(struct kk_cmd_buffer *cmd)
        desc->root.draw.clip_statistics != clip_statistics;
     desc->root.draw.clip_statistics = clip_statistics;
  

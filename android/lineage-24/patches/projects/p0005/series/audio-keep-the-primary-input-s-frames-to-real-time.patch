@@ -1,0 +1,458 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 22:25:46 +0000
+Subject: [PATCH] audio: keep the primary input's frames to real time
+
+The primary input takes the frames its client asks for from a pipe that
+an I/O thread fills with the buffers the device captures. When the pipe
+was short it made silence up for the missing frames (a warning in the
+log each time), and its sleep pacing made some up to keep a schedule of
+its own. A recording thus held a gap of silence about that often, the
+captured frames behind it came as late as the gap was long, and the
+timestamps of the input could not be smooth.
+
+The device paces the input, so the pacing of its own goes, with its
+members. A read waits for its frames, and the I/O thread wakes the wait
+each time it has written to the pipe; the wait ends when the thread is
+stopped.
+
+The count has to follow the time as well, because a recorder stamps what
+it reads from the time of the read. When the device delivers nothing for
+a while (the worker of the sound device blocked, a busy host), a read
+that gave up after its bounded wait and made up only its own frames
+left the count behind the time by the stall: a recording held less
+audio than its timestamps spanned, a player that follows the audio
+clock skipped ahead at every gap, and clips played back too fast.
+
+So the frames of the client are due one after the other from a clock
+that starts with the first transfer after the stream starts, pauses,
+goes to standby or changes its device. A read waits for its frames
+until 100 ms after the last of them is due, which covers what the
+device delivers late in the normal course, and makes the missing ones
+up then: the count follows the time through a stall of the device, and
+nothing is made up while the device delivers. A stall leaves the count
+behind the clock by that slack and the delay of the reader, so a stall
+of any length is made up while the reader comes back within the slack.
+A reader that is later than that during a stall restarts the clock
+once, and the stall leaves a gap of its own.
+
+Elapsed time between two reads restarts nothing by itself. A count that
+is more than 200 ms behind the clock as a read starts or ends does:
+the whole process stood still, and the video of the recording has the
+same gap, so the standstill is not caught up and stays a gap in the
+timeline. A read that it stopped holds one buffer of silence for it at
+most. The limit is the slack plus the delay of the reader that a stall
+leaves room for, and bounds how long before a reply a frame was due.
+
+The count may lead the clock by the slack at most: frames that would
+put it further ahead are dropped, oldest first. They are the buffers
+delivered before the clock started, those for time that was made up
+already after a stall, and what a device that is faster than the clock
+delivers in excess. The drop is logged at most every ten seconds, with
+the frames dropped since.
+
+The device's clock and the guest's differ a little. A read that got all
+its frames from the device moves the start of the clock by a small step
+(at most 1 ms) towards a lateness of 10 ms, so that a long recording
+neither reaches the edge of the slack nor falls out of it, and a count
+that a reader's absence left behind the clock (the ring of the device
+overran and lost frames) is back at that lateness within seconds.
+---
+ .../aidl/default/alsa/StreamAlsaMonoPipe.cpp  | 205 +++++++++++++++++-
+ .../include/core-impl/StreamAlsaMonoPipe.h    |  19 ++
+ .../default/include/core-impl/StreamPrimary.h |   4 -
+ audio/aidl/default/primary/StreamPrimary.cpp  |  39 +---
+ 4 files changed, 219 insertions(+), 48 deletions(-)
+
+diff --git a/audio/aidl/default/alsa/StreamAlsaMonoPipe.cpp b/audio/aidl/default/alsa/StreamAlsaMonoPipe.cpp
+index aab177402c05c9ed0769e24ec84d8ba32078cd2e..81b8609440d17824aad7fc9b9851a8a09e3488c5 100644
+--- a/audio/aidl/default/alsa/StreamAlsaMonoPipe.cpp
++++ b/audio/aidl/default/alsa/StreamAlsaMonoPipe.cpp
+@@ -17,6 +17,12 @@
+ #define LOG_TAG "AHAL_StreamAlsaMonoPipe"
+ #include <Log.h>
+ 
++#include <algorithm>
++#include <chrono>
++#include <condition_variable>
++#include <mutex>
++#include <thread>
++
+ #include <media/AidlConversionCppNdk.h>
+ 
+ #include "core-impl/StreamAlsaMonoPipe.h"
+@@ -25,6 +31,36 @@ using aidl::android::hardware::audio::common::getChannelCount;
+ 
+ namespace aidl::android::hardware::audio::core {
+ 
++namespace {
++
++constexpr int64_t kNanosPerSecond = 1'000'000'000;
++
++// How far behind its clock the input's count may be when a read starts or ends, or when a reply
++// reports the position: a stall of the device leaves room for the slack of a read and the delay of
++// the reader. A count further behind is a standstill of the whole process, which is not caught up
++// (the clock starts again), and the limit bounds how long before a reply a frame was due.
++constexpr int64_t kLongestMakeUpNs = 200'000'000;
++
++int64_t steadyNanos() {
++    return std::chrono::duration_cast<std::chrono::nanoseconds>(
++                   std::chrono::steady_clock::now().time_since_epoch())
++            .count();
++}
++
++// The time that a number of frames take at a sample rate, and the frames of a time. Neither
++// overflows for a count of frames or a time of years.
++int64_t framesToNanos(int64_t frames, int64_t sampleRate) {
++    return frames / sampleRate * kNanosPerSecond +
++           frames % sampleRate * kNanosPerSecond / sampleRate;
++}
++
++int64_t nanosToFrames(int64_t nanos, int64_t sampleRate) {
++    return nanos / kNanosPerSecond * sampleRate +
++           nanos % kNanosPerSecond * sampleRate / kNanosPerSecond;
++}
++
++}  // namespace
++
+ StreamAlsaMonoPipe::StreamAlsaMonoPipe(StreamContext* context, const Metadata& metadata,
+                                        int readWriteRetries)
+     : StreamAlsaBase(context, metadata, readWriteRetries) {}
+@@ -66,7 +102,14 @@ StreamAlsaMonoPipe::~StreamAlsaMonoPipe() {
+     return ::android::OK;
+ }
+ 
++::android::status_t StreamAlsaMonoPipe::pause() {
++    // A burst may follow a pause without a start, so the pause ends the clock too.
++    restartInputClock();
++    return StreamAlsaBase::pause();
++}
++
+ ::android::status_t StreamAlsaMonoPipe::start() {
++    restartInputClock();  // Every start begins the clock of the input again, a resume too.
+     if (!mAlsaDeviceProxies.empty()) {
+         // This is a resume after a pause.
+         return ::android::OK;
+@@ -122,15 +165,7 @@ StreamAlsaMonoPipe::~StreamAlsaMonoPipe() {
+     if (mIsInput) {
+         const size_t i = 0;  // For the input case, only support a single device.
+         LOG(VERBOSE) << __func__ << ": reading from sink " << i;
+-        ssize_t framesRead = mSources[i]->read(buffer, frameCount);
+-        LOG_IF(FATAL, framesRead < 0) << "Error reading from the pipe: " << framesRead;
+-        if (ssize_t framesMissing = static_cast<ssize_t>(frameCount) - framesRead;
+-            framesMissing > 0) {
+-            LOG(WARNING) << __func__ << ": incomplete data received, inserting " << framesMissing
+-                         << " frames of silence";
+-            memset(static_cast<char*>(buffer) + framesRead * mFrameSizeBytes, 0,
+-                   framesMissing * mFrameSizeBytes);
+-        }
++        readInput(buffer, frameCount);
+         maxLatency = proxy_get_latency(mAlsaDeviceProxies[i].get());
+     } else {
+         alsa::applyGain(buffer, mGain, bytesToTransfer, mConfig.value().format, mConfig->channels);
+@@ -161,6 +196,149 @@ StreamAlsaMonoPipe::~StreamAlsaMonoPipe() {
+     return ::android::OK;
+ }
+ 
++void StreamAlsaMonoPipe::restartInputClock() {
++    mInputClockRunning = false;
++    mInputStalled = false;
++}
++
++// The frames that the client takes from the input keep to real time. The device paces the input,
++// but what it delivers can stall (the worker of the sound device blocked, a host that is busy), and
++// a recorder stamps what it reads with the time of the read: a stall that the input answers with
++// fewer frames than the time that passed leaves a recording with less audio than its timestamps
++// span, and a player that follows the audio clock skips ahead at every gap. So the frames are due
++// one after the other from a clock that starts with the first transfer after the stream started,
++// paused, went to standby or changed its device (each of them restarts it), and:
++//  - a read waits for its frames until a slack after the last of them is due. The slack covers the
++//    buffers that the device delivers late in the normal course, so that nothing is made up unless
++//    the device stalls;
++//  - the frames that are still missing then are made up (silence) and the clock goes on, so the
++//    count of the client's frames follows the time through the stall, wherever the stall falls:
++//    inside a read or between two reads, since the elapsed time between reads is no sign of a
++//    pause (the whole process can stand still there while the recording goes on);
++//  - the count may lead the clock by the slack at most: frames that would put it further ahead are
++//    dropped, oldest first. They are the buffers that the device delivered before the clock started
++//    (the I/O thread runs from the start of the stream), for time that was made up already after a
++//    stall, or because the device is faster than the clock.
++// A count that is more than 'kLongestMakeUpNs' behind the clock when a read starts, or when it
++// ends, starts the clock again: the whole process stood still, inside a read or between two, and a
++// recording has the same gap in its video, so the standstill is not caught up and stays a gap in
++// the timeline (a read that it stopped holds one buffer of silence for it at most). A stall of the
++// device leaves the count behind by the slack and the delay of the reader, which the limit has room
++// for: a stall of any length is made up without a restart, as long as the reader comes back within
++// the slack. A reader that is later than that during a stall restarts the clock once, and the stall
++// leaves a gap of its own. The I/O thread wakes the wait each time it has written to the pipe, and
++// when it is stopped, which ends the wait as well. The position of the input stays its client's
++// count and the time of the reply.
++void StreamAlsaMonoPipe::readInput(void* buffer, size_t frameCount) {
++    constexpr int64_t kSlackNs = 100'000'000;
++    constexpr int64_t kDropLogIntervalNs = 10'000'000'000;
++    // The clock follows the device's own rate slowly (see below).
++    constexpr int64_t kTargetLatenessNs = 10'000'000;
++    constexpr int64_t kMaxStepNs = 1'000'000;
++    constexpr int64_t kStepDivisor = 64;
++    const size_t i = 0;  // For the input case, only support a single device.
++    const int64_t sampleRate = getContext().getSampleRate();
++    char* const bytes = static_cast<char*>(buffer);
++    int64_t nowNs = steadyNanos();
++    if (!mInputClockRunning ||
++        nowNs - (mInputClockStartNs + framesToNanos(mInputFramesTaken, sampleRate)) >
++                kLongestMakeUpNs) {
++        mInputClockRunning = true;
++        mInputClockStartNs = nowNs;
++        mInputFramesTaken = 0;
++        mInputStalled = false;
++    }
++    const int64_t deadlineNs = mInputClockStartNs +
++                               framesToNanos(mInputFramesTaken + frameCount, sampleRate) + kSlackNs;
++    size_t framesRead = 0;
++    size_t framesDropped = 0;
++    while (framesRead < frameCount) {
++        if (const ssize_t available = mSources[i]->availableToRead(); available > 0) {
++            // The count may be ahead of the frames that are due by the slack at most.
++            const int64_t dueFrames =
++                    nanosToFrames(steadyNanos() + kSlackNs - mInputClockStartNs, sampleRate);
++            const int64_t surplus = mInputFramesTaken + framesRead + available - dueFrames;
++            for (int64_t toDrop = std::min<int64_t>(surplus, available); toDrop > 0;) {
++                // The buffer of the client has room for the frames to drop: they are read and
++                // forgotten.
++                const ssize_t dropped = mSources[i]->read(
++                        bytes + framesRead * mFrameSizeBytes,
++                        std::min<size_t>(static_cast<size_t>(toDrop), frameCount - framesRead));
++                LOG_IF(FATAL, dropped < 0) << "Error reading from the pipe: " << dropped;
++                if (dropped == 0) break;
++                toDrop -= dropped;
++                framesDropped += dropped;
++            }
++        }
++        const ssize_t chunk = mSources[i]->read(bytes + framesRead * mFrameSizeBytes,
++                                                frameCount - framesRead);
++        LOG_IF(FATAL, chunk < 0) << "Error reading from the pipe: " << chunk;
++        framesRead += chunk;
++        nowNs = steadyNanos();
++        if (framesRead >= frameCount || !mIoThreadIsRunning || nowNs >= deadlineNs) {
++            break;
++        }
++        if (chunk == 0) {
++            std::unique_lock lock(mInputMutex);
++            mInputCv.wait_until(lock,
++                                std::chrono::steady_clock::time_point(
++                                        std::chrono::nanoseconds(deadlineNs)),
++                                [&] {
++                                    return !mIoThreadIsRunning ||
++                                           mSources[i]->availableToRead() > 0;
++                                });
++        }
++    }
++    if (framesDropped > 0) {
++        mInputFramesDropped += framesDropped;
++        // A device that is faster than the clock drops a few frames about once a second, so the
++        // message is rate limited like the stall's.
++        if (nowNs - mInputDropLoggedNs >= kDropLogIntervalNs) {
++            LOG(WARNING) << __func__ << ": dropped " << mInputFramesDropped
++                         << " frames since the last message, which would have put the count ahead"
++                         << " of the clock by more than the slack";
++            mInputFramesDropped = 0;
++            mInputDropLoggedNs = nowNs;
++        }
++    }
++    if (const size_t framesMissing = frameCount - framesRead; framesMissing > 0) {
++        memset(bytes + framesRead * mFrameSizeBytes, 0, framesMissing * mFrameSizeBytes);
++        if (mIoThreadIsRunning) {
++            // A stop of the stream ends a wait too, and is no stall. A stall that goes on is
++            // logged once.
++            if (!mInputStalled) {
++                LOG(WARNING) << __func__ << ": the device delivers no frames in time, making"
++                             << " silence up to keep to real time";
++                mInputStalled = true;
++                mInputFramesMadeUp = 0;
++            }
++            mInputFramesMadeUp += framesMissing;
++        }
++    } else if (mInputStalled) {
++        LOG(WARNING) << __func__ << ": the device delivers again, after " << mInputFramesMadeUp
++                     << " frames of silence made up";
++        mInputStalled = false;
++    }
++    if (framesRead == frameCount && framesDropped == 0) {
++        // The clock of the device and the steady clock of the guest differ a little. A read that
++        // got all its frames from the device moves the start of the clock by a small step towards
++        // the lateness that the delivery has in the normal course, so that over a long recording
++        // the stream neither drifts to the edge of the slack, where a read ends with a gap, nor
++        // out of it, where frames are dropped. The reads of a stall or of a drop do not move it.
++        const int64_t lateNs = nowNs - (mInputClockStartNs +
++                                        framesToNanos(mInputFramesTaken + frameCount, sampleRate));
++        mInputClockStartNs +=
++                std::clamp((lateNs - kTargetLatenessNs) / kStepDivisor, -kMaxStepNs, kMaxStepNs);
++    }
++    mInputFramesTaken += frameCount;
++    if (nowNs - (mInputClockStartNs + framesToNanos(mInputFramesTaken, sampleRate)) >
++        kLongestMakeUpNs) {
++        // The read itself was stopped (the process stood still inside it): the standstill is not
++        // caught up, and the next read starts the clock again.
++        mInputClockRunning = false;
++    }
++}
++
+ void StreamAlsaMonoPipe::shutdown() {
+     teardownIo();
+ }
+@@ -185,6 +363,9 @@ void StreamAlsaMonoPipe::inputIoThread(size_t idx) {
+                                            mBufferSizeFrames - bufferFramesWritten);
+                 if (framesWrittenOrError > 0) {
+                     bufferFramesWritten += framesWrittenOrError;
++                    // Wake the wait of the client's 'transfer' for frames.
++                    std::lock_guard lock(mInputMutex);
++                    mInputCv.notify_one();
+                 } else if (framesWrittenOrError == 0) {
+                     // The pipe is full, as the client is behind: try again soon.
+                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
+@@ -232,7 +413,13 @@ void StreamAlsaMonoPipe::outputIoThread(size_t idx) {
+ }
+ 
+ void StreamAlsaMonoPipe::teardownIo() {
++    restartInputClock();  // Standby, a change of device and shutdown all end here.
+     mIoThreadIsRunning = false;
++    {
++        // Wake a 'transfer' that waits for frames: it ends its wait now that the thread is stopped.
++        std::lock_guard lock(mInputMutex);
++        mInputCv.notify_all();
++    }
+     if (mIsInput) {
+         LOG(DEBUG) << __func__ << ": shutting down pipes";
+         for (auto& sink : mSinks) {
+diff --git a/audio/aidl/default/include/core-impl/StreamAlsaMonoPipe.h b/audio/aidl/default/include/core-impl/StreamAlsaMonoPipe.h
+index aaa6b881b90a020dfb011477024221edb33f2885..d664574f17091e694d6909e1f34b506a389852e3 100644
+--- a/audio/aidl/default/include/core-impl/StreamAlsaMonoPipe.h
++++ b/audio/aidl/default/include/core-impl/StreamAlsaMonoPipe.h
+@@ -17,6 +17,9 @@
+ #pragma once
+ 
+ #include <atomic>
++#include <condition_variable>
++#include <cstdint>
++#include <mutex>
+ #include <thread>
+ #include <vector>
+ 
+@@ -39,6 +42,7 @@ class StreamAlsaMonoPipe : public StreamAlsaBase {
+     // Methods of 'DriverInterface'.
+     ::android::status_t standby() override;
+     ::android::status_t start() override;
++    ::android::status_t pause() override;
+     ::android::status_t transfer(void* buffer, size_t frameCount, size_t* actualFrameCount,
+                                  int32_t* latencyMs) override;
+     void shutdown() override;
+@@ -55,6 +59,8 @@ class StreamAlsaMonoPipe : public StreamAlsaBase {
+     ::android::sp<::android::MonoPipeReader> makeSource(::android::MonoPipe* pipe);
+     void inputIoThread(size_t idx);
+     void outputIoThread(size_t idx);
++    void readInput(void* buffer, size_t frameCount);
++    void restartInputClock();
+     void teardownIo();
+ 
+     // All fields below are only used on the worker thread.
+@@ -63,6 +69,19 @@ class StreamAlsaMonoPipe : public StreamAlsaBase {
+     std::vector<::android::sp<::android::MonoPipeReader>> mSources;
+     std::vector<std::thread> mIoThreads;
+     std::atomic<bool> mIoThreadIsRunning = false;  // used by all threads
++    // The input's I/O thread wakes 'transfer', which waits for the frames of the pipe.
++    std::mutex mInputMutex;
++    std::condition_variable mInputCv;
++
++    // The clock that the input's frames keep to (see 'readInput'), on the steady clock. Used by the
++    // thread that calls 'start', 'pause', 'standby' and 'transfer' only.
++    bool mInputClockRunning = false;
++    int64_t mInputClockStartNs = 0;    // when the first frame of the clock is due
++    int64_t mInputFramesTaken = 0;     // the client's frames since then, made-up ones included
++    bool mInputStalled = false;        // the last read made silence up
++    int64_t mInputFramesMadeUp = 0;    // the silence made up in the stall so far
++    int64_t mInputFramesDropped = 0;   // the frames dropped since the last message about them
++    int64_t mInputDropLoggedNs = 0;    // when that message was logged
+ };
+ 
+ }  // namespace aidl::android::hardware::audio::core
+diff --git a/audio/aidl/default/include/core-impl/StreamPrimary.h b/audio/aidl/default/include/core-impl/StreamPrimary.h
+index e9c06b1d7ac659cfe39ef9b4e03a972be9b68468..91018af1ee8526fafdebf7a64f6a0eb7c5c3b463 100644
+--- a/audio/aidl/default/include/core-impl/StreamPrimary.h
++++ b/audio/aidl/default/include/core-impl/StreamPrimary.h
+@@ -52,12 +52,8 @@ class StreamPrimary : public StreamAlsaMonoPipe {
+     // The output writes to its device from 'transfer'.
+     bool outputUsesPipe() const override { return false; }
+ 
+-    const bool mIsAsynchronous;
+-    int64_t mStartTimeNs = 0;
+     // Whether the output's writer has asked for its real-time priority (see 'transfer').
+     bool mWriterPriorityRequested = false;
+-    long mFramesSinceStart = 0;
+-    bool mSkipNextTransfer = false;
+ 
+   private:
+     using AlsaDeviceId = std::pair<int, int>;
+diff --git a/audio/aidl/default/primary/StreamPrimary.cpp b/audio/aidl/default/primary/StreamPrimary.cpp
+index ea17a2d82c77a8a9a0855f9899dc7d2935568f35..3b13ace268447fc5f24b70da0452003dca2bba19 100644
+--- a/audio/aidl/default/primary/StreamPrimary.cpp
++++ b/audio/aidl/default/primary/StreamPrimary.cpp
+@@ -43,7 +43,6 @@ namespace aidl::android::hardware::audio::core {
+ 
+ StreamPrimary::StreamPrimary(StreamContext* context, const Metadata& metadata)
+     : StreamAlsaMonoPipe(context, metadata, 3 /*readWriteRetries*/),
+-      mIsAsynchronous(!!getContext().getAsyncCallback()),
+       mStubDriver(getContext()) {
+     context->startStreamDataProcessor();
+ }
+@@ -88,9 +87,6 @@ StreamPrimary::StreamPrimary(StreamContext* context, const Metadata& metadata)
+         return mStubDriver.start();
+     }
+     RETURN_STATUS_IF_ERROR(StreamAlsaMonoPipe::start());
+-    mStartTimeNs = ::android::uptimeNanos();
+-    mFramesSinceStart = 0;
+-    mSkipNextTransfer = false;
+     return ::android::OK;
+ }
+ 
+@@ -118,37 +114,10 @@ StreamPrimary::StreamPrimary(StreamContext* context, const Metadata& metadata)
+         }
+         return StreamAlsaMonoPipe::transfer(buffer, frameCount, actualFrameCount, latencyMs);
+     }
+-    // This is a workaround for the emulator implementation which has a host-side buffer
+-    // and is not being able to achieve real-time behavior similar to ADSPs (b/302587331).
+-    if (!mSkipNextTransfer) {
+-        RETURN_STATUS_IF_ERROR(
+-                StreamAlsaMonoPipe::transfer(buffer, frameCount, actualFrameCount, latencyMs));
+-    } else {
+-        LOG(DEBUG) << __func__ << ": skipping transfer (" << frameCount << " frames)";
+-        *actualFrameCount = frameCount;
+-        if (mIsInput) memset(buffer, 0, frameCount * mFrameSizeBytes);
+-        mSkipNextTransfer = false;
+-    }
+-    if (!mIsAsynchronous) {
+-        const long bufferDurationUs =
+-                (*actualFrameCount) * MICROS_PER_SECOND / mContext.getSampleRate();
+-        const auto totalDurationUs =
+-                (::android::uptimeNanos() - mStartTimeNs) / NANOS_PER_MICROSECOND;
+-        mFramesSinceStart += *actualFrameCount;
+-        const long totalOffsetUs =
+-                mFramesSinceStart * MICROS_PER_SECOND / mContext.getSampleRate() - totalDurationUs;
+-        LOG(VERBOSE) << __func__ << ": totalOffsetUs " << totalOffsetUs;
+-        if (totalOffsetUs > 0) {
+-            const long sleepTimeUs = std::min(totalOffsetUs, bufferDurationUs);
+-            LOG(VERBOSE) << __func__ << ": sleeping for " << sleepTimeUs << " us";
+-            usleep(sleepTimeUs);
+-        } else {
+-            mSkipNextTransfer = true;
+-        }
+-    } else {
+-        LOG(VERBOSE) << __func__ << ": asynchronous transfer";
+-    }
+-    return ::android::OK;
++    // The input waits for the frames that its device captures and keeps its count to real time (see
++    // 'StreamAlsaMonoPipe::readInput'): the device paces it, and it makes silence up only when the
++    // device stalls.
++    return StreamAlsaMonoPipe::transfer(buffer, frameCount, actualFrameCount, latencyMs);
+ }
+ 
+ ::android::status_t StreamPrimary::refinePosition(StreamDescriptor::Position* position) {

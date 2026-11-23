@@ -1,0 +1,325 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 02:41:23 +0900
+Subject: [PATCH] NetworkMonitor: validate Wi-Fi before its internet check
+
+The Wi-Fi of the Darwin UML guest is virtual: its one network is a
+station on the host's own network. A probe through it reports only
+whether the host reaches the validation servers, and where those are
+blocked a network that has to pass its probes stays unvalidated for
+good: the status bar shows no internet, and applications that wait for
+a validated network do not run.
+
+A Wi-Fi network is now validated first and checked after. NetworkMonitor
+reports it validated, with the skipped bit, as soon as the private DNS
+step passes, so the private DNS settings keep their effect, and then
+probes it as a check: at once, and again after the stock back-off while
+the checks fail. A check that fails, or that a sign-in or block page
+answers in place of the expected answer, only reports what it found. The
+network stays validated, no sign-in notification or captive portal state
+follows, and the next report carries the probes' bits with the HTTPS
+probe attempted and not succeeded, which is how a client tells a failed
+check from a passing one. A forced evaluation checks a network that is
+validated. One that is not, because private DNS failed or the first
+validation is not done, is evaluated as the stock rules say, so a check
+never reports validated a network whose strict private DNS has failed.
+Data stall detection stays off.
+
+A completed check returns to the validated state without evaluating
+private DNS again, and keeps the last private DNS probe's result in its
+report. A failed check therefore costs the network nothing: strict
+private DNS is not probed once for each check, and one failed probe of
+that kind does not report the network invalid. Private DNS keeps its own
+triggers: the first validation, a settings change and its own failures.
+A request to evaluate it that comes while a check starts is deferred to
+ValidatedState, which handles it as the stock rules do. A check that is
+already waiting keeps its time when ValidatedState is entered again. One
+that falls due while private DNS is evaluated is dropped there, and
+ValidatedState posts the next one afresh, late by at most one back-off.
+
+A VPN, which has the Wi-Fi transport of its underlying network but not
+NET_CAPABILITY_NOT_VPN, a test network that replicates Wi-Fi, a network
+under the test URLs that CTS sets, and a network that the stock rules do
+not validate (without internet, or not meant to be the default network)
+keep the stock rules.
+
+The NetworkMonitor unit tests that take a Wi-Fi network through
+validation or data stall detection expect the stock rules.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .../server/connectivity/NetworkMonitor.java   | 163 +++++++++++++++++-
+ 1 file changed, 157 insertions(+), 6 deletions(-)
+
+diff --git a/src/com/android/server/connectivity/NetworkMonitor.java b/src/com/android/server/connectivity/NetworkMonitor.java
+index 39981a7b6b7120ec04b9f5cefcfeeaa2c12cb958..40568dbb90678ca552802f307452d04b4d00df6e 100644
+--- a/src/com/android/server/connectivity/NetworkMonitor.java
++++ b/src/com/android/server/connectivity/NetworkMonitor.java
+@@ -443,6 +443,12 @@ public class NetworkMonitor extends StateMachine {
+      */
+     private static final int CMD_DNS_TIMEOUT = 29;
+ 
++    /**
++     * Message to self to run the internet check of a Wi-Fi network that is already validated (see
++     * {@link #isWifiExemptFromValidation}).
++     */
++    private static final int CMD_WIFI_CHECK = 30;
++
+     // Start mReevaluateDelayMs at this value and double.
+     @VisibleForTesting
+     static final int INITIAL_REEVALUATE_DELAY_MS = 1000;
+@@ -543,6 +549,15 @@ public class NetworkMonitor extends StateMachine {
+     @VisibleForTesting
+     protected boolean mIsBandwidthCheckPassedOrIgnored = false;
+ 
++    // The internet check of a Wi-Fi network that is validated before it is checked (see
++    // isWifiExemptFromValidation). These are accessed on the state machine thread only.
++    // A check has been started on this network.
++    private boolean mWifiCheckStarted = false;
++    // The next evaluation probes instead of skipping the probes.
++    private boolean mWifiCheckDue = false;
++    // How many checks in a row failed.
++    private int mWifiCheckFailures = 0;
++
+     private final State mDefaultState = new DefaultState();
+     private final State mValidatedState = new ValidatedState();
+     private final State mMaybeNotifyState = new MaybeNotifyState();
+@@ -906,7 +921,82 @@ public class NetworkMonitor extends StateMachine {
+         return 0 == mValidations ? ValidationStage.FIRST_VALIDATION : ValidationStage.REVALIDATION;
+     }
+ 
++    /**
++     * Whether this is a Wi-Fi network, which this device validates before it checks it.
++     *
++     * The device's Wi-Fi is virtual: its one network is a station on the host's own network, so
++     * a probe through it reports only whether the host reaches the validation servers. Where those
++     * are blocked a network that has to pass its probes would stay unvalidated for good, and the
++     * applications that wait for a validated network would not run. Such a network is reported
++     * validated, with the skipped bit, once private DNS passes, and is then probed as a check that
++     * only reports what it found: a failed check, and a sign-in or block page in place of the
++     * expected answer, leave the network validated and show in the connectivity report as the HTTPS
++     * probe attempted and not succeeded. A VPN, which has the Wi-Fi transport of its underlying
++     * network but not NET_CAPABILITY_NOT_VPN, a test network that replicates Wi-Fi, a network under
++     * test URLs, which CTS sets, and a network that the stock rules do not validate (without
++     * NET_CAPABILITY_INTERNET, or not meant to be the default network) keep the stock rules.
++     */
++    private boolean isWifiExemptFromValidation() {
++        return mNetworkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
++                && !mNetworkCapabilities.hasTransport(TRANSPORT_TEST)
++                && mNetworkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
++                && mTestCaptivePortalHttpsUrl == null
++                && mTestCaptivePortalHttpUrl == null
++                && mTestCaptivePortalFallbackUrl == null
++                && isValidationRequiredByStockRules();
++    }
++
++    // Posts the check of a validated Wi-Fi network: at once when none has run, and after a back-off
++    // while the last ones failed. One that passed needs no other until an evaluation is forced. A
++    // check that is already waiting keeps its time, so that entering ValidatedState again for
++    // private DNS does not put it off.
++    private void scheduleWifiCheck() {
++        if (hasMessages(CMD_WIFI_CHECK)) return;
++        if (!mWifiCheckStarted) {
++            sendMessage(CMD_WIFI_CHECK);
++        } else if (mWifiCheckFailures > 0) {
++            // The back-off is the stock one (INITIAL_REEVALUATE_DELAY_MS, doubled, up to
++            // MAX_REEVALUATE_DELAY_MS), kept apart from mReevaluateDelayMs, which every entry to
++            // EvaluatingState resets.
++            final int shift = Math.min(mWifiCheckFailures - 1, 20);
++            final long delayMs = Math.min((long) INITIAL_REEVALUATE_DELAY_MS << shift,
++                    MAX_REEVALUATE_DELAY_MS);
++            sendMessageDelayed(CMD_WIFI_CHECK, delayMs);
++        }
++    }
++
++    // Takes the result of a Wi-Fi network's check. Whatever it found, the network returns to
++    // ValidatedState, which reports it validated with the probes' bits. The check does not evaluate
++    // private DNS again, so a failed check does not cost the network the strict private DNS probe,
++    // and one failed probe of that kind does not report the network invalid: private DNS keeps its
++    // own triggers (the first validation, a settings change and its own failures).
++    private void handleWifiCheckResult(@NonNull final CaptivePortalProbeResult probeResult) {
++        mWifiCheckDue = false;
++        if (probeResult.isSuccessful()) {
++            mWifiCheckFailures = 0;
++            validationLog("Wi-Fi internet check passed");
++        } else {
++            mWifiCheckFailures++;
++            // The HTTPS bit tells a failed check from a passing one, and the probes do not always
++            // report it: a sign-in or block page that the HTTP probe answers within a few seconds
++            // ends the probing before the HTTPS probe is reported, and a check without the HTTPS
++            // probe does not have it.
++            if ((mEvaluationState.getProbeCompletedResult() & NETWORK_VALIDATION_PROBE_HTTPS)
++                    == 0) {
++                mEvaluationState.noteProbeResult(NETWORK_VALIDATION_PROBE_HTTPS,
++                        false /* succeeded */);
++            }
++            validationLog("Wi-Fi internet check failed, the network stays validated");
++        }
++        transitionToPrivateDnsEvaluationSuccessState();
++    }
++
+     private boolean isValidationRequired() {
++        return !isWifiExemptFromValidation() && isValidationRequiredByStockRules();
++    }
++
++    // Whether the stock rules require the network to be validated, which Wi-Fi is exempt from.
++    private boolean isValidationRequiredByStockRules() {
+         final boolean dunValidationRequired = isAtLeastU()
+                 || mContext.getResources().getBoolean(R.bool.config_validate_dun_networks);
+         final boolean vpnValidationRequired = SdkLevel.isAtLeastT()
+@@ -1098,6 +1188,16 @@ public class NetworkMonitor extends StateMachine {
+                     }
+                     validationLog(msg);
+                     mUidResponsibleForReeval = message.arg1;
++                    if (isWifiExemptFromValidation() && getCurrentState() == mValidatedState) {
++                        // A Wi-Fi network that is validated is checked again whenever an
++                        // evaluation is forced, and that check takes the place of one that was
++                        // waiting. One that is not validated is evaluated as the stock rules say
++                        // (private DNS, then validated), and ValidatedState posts its check: a
++                        // check never reports a network validated that private DNS has failed.
++                        removeMessages(CMD_WIFI_CHECK);
++                        mWifiCheckStarted = true;
++                        mWifiCheckDue = true;
++                    }
+                     transitionTo(mEvaluatingState);
+                     return HANDLED;
+                 case CMD_CAPTIVE_PORTAL_APP_FINISHED:
+@@ -1331,6 +1431,10 @@ public class NetworkMonitor extends StateMachine {
+             // start periodical polling.
+             sendTcpPollingEvent();
+             maybeStopCollectionAndSendMetrics();
++            // A Wi-Fi network is validated before it is checked: the check follows its report.
++            if (isWifiExemptFromValidation()) {
++                scheduleWifiCheck();
++            }
+         }
+ 
+         private void initSocketTrackingIfRequired() {
+@@ -1355,6 +1459,12 @@ public class NetworkMonitor extends StateMachine {
+                     // separately.
+                     transitionTo(mEvaluatingPrivateDnsState);
+                     break;
++                case CMD_WIFI_CHECK:
++                    if (!isWifiExemptFromValidation()) break;
++                    mWifiCheckStarted = true;
++                    mWifiCheckDue = true;
++                    transitionTo(mEvaluatingState);
++                    break;
+                 case EVENT_DNS_NOTIFICATION:
+                     final DnsStallDetector dsd = getDnsStallDetector();
+                     if (dsd == null) break;
+@@ -1543,8 +1653,10 @@ public class NetworkMonitor extends StateMachine {
+             // Check if the network is captive with Terms & Conditions page. The first network
+             // evaluation for captive networks with T&Cs returns early but NetworkMonitor will then
+             // keep checking for connectivity to determine when the T&Cs are cleared.
++            // A Wi-Fi network is validated before it is checked, and a page in place of the
++            // expected answer does not ask for a sign-in (see isWifiExemptFromValidation).
+             if (isTermsAndConditionsCaptive(mLinkProperties.getCaptivePortalData())
+-                    && mValidations == 0) {
++                    && mValidations == 0 && !isWifiExemptFromValidation()) {
+                 mLastPortalProbeResult = new CaptivePortalProbeResult(
+                         CaptivePortalProbeResult.PORTAL_CODE,
+                         mLinkProperties.getCaptivePortalData().getUserPortalUrl()
+@@ -1565,7 +1677,17 @@ public class NetworkMonitor extends StateMachine {
+             mEvaluatingCapportUrl = mLinkProperties.getCaptivePortalApiUrl();
+             // Reset all current probe results to zero, but retain current validation state until
+             // validation succeeds or fails.
++            final int privateDnsCompleted = mEvaluationState.getProbeCompletedResult()
++                    & NETWORK_VALIDATION_PROBE_PRIVDNS;
++            final int privateDnsResults = mEvaluationState.getProbeResults()
++                    & NETWORK_VALIDATION_PROBE_PRIVDNS;
+             mEvaluationState.clearProbeResults();
++            // The check of a validated Wi-Fi network does not evaluate private DNS again (see
++            // handleWifiCheckResult), so its report keeps the result of the last private DNS probe.
++            if (isWifiExemptFromValidation() && mWifiCheckDue && privateDnsCompleted != 0) {
++                mEvaluationState.noteProbeResult(NETWORK_VALIDATION_PROBE_PRIVDNS,
++                        privateDnsResults != 0);
++            }
+         }
+ 
+         @Override
+@@ -1593,7 +1715,8 @@ public class NetworkMonitor extends StateMachine {
+                     //    packets over the network may be undesirable, for example an extremely
+                     //    expensive metered network, or unwanted leaking of the User Agent string.
+                     // Also don't bother validating networks that the user already said they
+-                    // wanted as-is.
++                    // wanted as-is, nor Wi-Fi (see isWifiExemptFromValidation), which is
++                    // validated at once and probed as a check when one is due.
+                     //
+                     // On networks that need to support private DNS in strict mode (e.g., VPNs, but
+                     // not networks that don't provide Internet access), we still need to perform
+@@ -1605,14 +1728,19 @@ public class NetworkMonitor extends StateMachine {
+                         validationLog("Captive portal is used as is, resolving private DNS");
+                         transitionTo(mEvaluatingPrivateDnsState);
+                         return HANDLED;
++                    } else if (isWifiExemptFromValidation() && mWifiCheckDue) {
++                        mEvaluateAttempts++;
++                        transitionTo(mProbingState);
++                        return HANDLED;
+                     } else if (!isValidationRequired()) {
++                        final String reason = isWifiExemptFromValidation()
++                                ? "Wi-Fi is validated before its internet check"
++                                : "Network would not satisfy default request";
+                         if (isPrivateDnsValidationRequired()) {
+-                            validationLog("Network would not satisfy default request, "
+-                                    + "resolving private DNS");
++                            validationLog(reason + ", resolving private DNS");
+                             transitionTo(mEvaluatingPrivateDnsState);
+                         } else {
+-                            validationLog("Network would not satisfy default request, "
+-                                    + "not validating");
++                            validationLog(reason + ", not validating");
+                             transitionTo(mValidatedState);
+                         }
+                         return HANDLED;
+@@ -1621,6 +1749,15 @@ public class NetworkMonitor extends StateMachine {
+ 
+                     transitionTo(mProbingState);
+                     return HANDLED;
++                case CMD_EVALUATE_PRIVATE_DNS:
++                    // A check does not evaluate private DNS, so a request that reaches the check
++                    // here would be dropped. ProbingState defers it to ValidatedState, which
++                    // evaluates it as the stock states do.
++                    if (isWifiExemptFromValidation() && mWifiCheckDue) {
++                        deferMessage(message);
++                        return HANDLED;
++                    }
++                    return NOT_HANDLED;
+                 case CMD_FORCE_REEVALUATION:
+                     // The evaluation process restarts via EvaluatingState#enter.
+                     final boolean forceAccept = (message.arg2 != 0);
+@@ -1719,6 +1856,8 @@ public class NetworkMonitor extends StateMachine {
+ 
+         @Override
+         public void enter() {
++            // An evaluation that reaches private DNS is not a check of a validated network.
++            mWifiCheckDue = false;
+             mPrivateDnsReevalDelayMs = INITIAL_REEVALUATE_DELAY_MS;
+             mSyncOnlyPrivateDnsConfig = null;
+             if (mDdrEnabled) {
+@@ -2199,6 +2338,15 @@ public class NetworkMonitor extends StateMachine {
+ 
+                     maybeWriteDataStallStats(probeResult);
+ 
++                    if (isWifiExemptFromValidation()) {
++                        // The check of a validated Wi-Fi network only reports what it found: not
++                        // a sign-in notification, a captive portal state, nor an invalid or
++                        // partial result, even when a page answered in place of the expected
++                        // answer.
++                        handleWifiCheckResult(probeResult);
++                        return HANDLED;
++                    }
++
+                     if (probeResult.isSuccessful()) {
+                         // Transit EvaluatingPrivateDnsState to get to Validated
+                         // state (even if no Private DNS validation required).
+@@ -2238,6 +2386,9 @@ public class NetworkMonitor extends StateMachine {
+                 case EVENT_ACCEPT_PARTIAL_CONNECTIVITY:
+                     // Leave the event to DefaultState.
+                     return NOT_HANDLED;
++                case CMD_WIFI_CHECK:
++                    // A check is running; the one that was waiting is not needed.
++                    return HANDLED;
+                 default:
+                     // Wait for probe result and defer events to next state by default.
+                     deferMessage(message);

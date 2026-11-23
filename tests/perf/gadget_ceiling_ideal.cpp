@@ -34,6 +34,8 @@ constexpr std::uint64_t body_pc = 0x1000;
 constexpr std::uint64_t buffer_guest_address = 0x2000'0000;
 constexpr unsigned long generation = 41;
 constexpr std::size_t page_size = DARWIN_UML_GUEST_PAGE_SIZE;
+constexpr std::size_t header_words =
+	gadgets::block_header_bytes / sizeof(std::uintptr_t);
 
 [[noreturn]] void fail(const char *message)
 {
@@ -46,10 +48,32 @@ constexpr std::size_t page_size = DARWIN_UML_GUEST_PAGE_SIZE;
 	return reinterpret_cast<std::uintptr_t>(gadget);
 }
 
+/* `words` behind the header gadgets/program.hpp describes, as the executor
+ * stores a block a link names. Every header here holds a zero instruction
+ * count, the benchmark's defining idealization: it keeps every production
+ * threaded stream inside gadget code instead of taking the ordinary
+ * 4,096-instruction fairness exit to the executor. */
+[[nodiscard]] std::vector<std::uintptr_t> headed(std::uint64_t pc,
+	std::span<const std::uintptr_t> words)
+{
+	std::vector<std::uintptr_t> result(header_words);
+	result[0] = pc;
+	result.insert(result.end(), words.begin(), words.end());
+	return result;
+}
+
+/* Point `link` at words `headed` returned. */
+void link_to(gadgets::BlockLink &link, const std::vector<std::uintptr_t> &words)
+	noexcept
+{
+	link.entry = words[header_words];
+	link.stream = words.data() + header_words + 1;
+}
+
 /* A branch leaving the body, such as a never-taken null check, exits through
  * an interrupt whose recorded PC identifies it. */
 struct Trap final {
-	std::array<std::uintptr_t, 2> stream{};
+	std::vector<std::uintptr_t> words;
 	gadgets::BlockLink link{};
 };
 
@@ -58,14 +82,12 @@ public:
 	explicit IdealWorkload(std::span<const std::uint32_t> body)
 		: body_{body},
 		  end_pc_{body_pc + body.size() * sizeof(std::uint32_t)},
-		  finish_stream_{gadget_address(uml_arm64_gadget_interrupt),
-			  end_pc_},
-		  finish_link_{
-			.stream = finish_stream_.data(),
-			.instruction_count = 0,
-			.guest_pc = end_pc_,
-		  }
+		  finish_words_{headed(end_pc_, std::array{
+			  gadget_address(uml_arm64_gadget_interrupt),
+			  std::uintptr_t{end_pc_}})},
+		  finish_link_{.guest_pc = end_pc_}
 	{
+		link_to(finish_link_, finish_words_);
 		if (body.empty() || body.size() > 64)
 			fail("body must fit one translation window");
 		map_buffer();
@@ -93,12 +115,10 @@ public:
 			programs_.emplace(pc, std::move(result.program));
 		}
 		for (auto &[pc, link] : links_) {
-			link.stream = programs_.at(pc).words().data();
-			/* A zero link count is the benchmark's defining
-			 * idealization. It keeps every production threaded stream
-			 * inside gadget code instead of taking the ordinary
-			 * 4,096-instruction fairness exit to the executor. */
-			link.instruction_count = 0;
+			const auto [target, inserted] = targets_.try_emplace(pc,
+				headed(pc, programs_.at(pc).words()));
+			(void)inserted;
+			link_to(link, target->second);
 		}
 	}
 
@@ -185,13 +205,11 @@ private:
 		}
 		auto &trap = traps_[target];
 		if (trap.link.stream == nullptr) {
-			trap.stream = {gadget_address(uml_arm64_gadget_interrupt),
-				target};
-			trap.link = {
-				.stream = trap.stream.data(),
-				.instruction_count = 0,
-				.guest_pc = target,
-			};
+			trap.words = headed(target, std::array{
+				gadget_address(uml_arm64_gadget_interrupt),
+				std::uintptr_t{target}});
+			trap.link.guest_pc = target;
+			link_to(trap.link, trap.words);
 		}
 		return &trap.link;
 	}
@@ -231,9 +249,12 @@ private:
 
 	std::span<const std::uint32_t> body_;
 	std::uint64_t end_pc_;
-	std::array<std::uintptr_t, 2> finish_stream_;
+	std::vector<std::uintptr_t> finish_words_;
 	gadgets::BlockLink finish_link_;
 	std::map<std::uint64_t, gadgets::BlockLink> links_;
+	/* The words each link names: a copy of its program behind a header.
+	 * The timed run starts in the body's own program. */
+	std::map<std::uint64_t, std::vector<std::uintptr_t>> targets_;
 	std::map<std::uint64_t, Trap> traps_;
 	std::map<std::uint64_t, gadgets::Program> programs_;
 	std::vector<std::uint64_t> pending_;

@@ -1,0 +1,174 @@
+{
+  "sourceLanguage" : "en",
+  "strings" : {
+    "CFBundleDisplayName" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Andarium"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Andarium"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Andarium"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Andarium"
+          }
+        }
+      }
+    },
+    "CFBundleName" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Andarium"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Andarium"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Andarium"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Andarium"
+          }
+        }
+      }
+    },
+    "NSCameraUsageDescription" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Andarium uses the camera only when you turn on Camera, so that apps in the virtual machine can use it."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Andariumは、“カメラ”をオンにしたときだけカメラを使用し、仮想マシン内のアプリが使えるようにします。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "只有在你开启“相机”时，Andarium才会使用相机，以供虚拟机中的应用使用。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "只有在你開啟「相機」時，Andarium才會使用相機，以供虛擬機器中的應用程式使用。"
+          }
+        }
+      }
+    },
+    "NSLocalNetworkUsageDescription" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Apps running in Andarium use this to connect to devices on your local network, such as printers, media servers and computers, and ADB over network uses it to let a computer on your network connect to Andarium. Internet access doesn't need it."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Andarium内で動作するアプリが、プリンタ、メディアサーバ、コンピュータなど、ローカルネットワーク上のデバイスに接続するために使用します。また、“ネットワーク経由のADB”でネットワーク上のコンピュータをAndariumに接続させるためにも使用します。インターネットへのアクセスには必要ありません。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在Andarium中运行的应用会使用此权限连接本地网络上的设备（例如打印机、媒体服务器和电脑），“通过网络使用ADB”也会使用此权限，让你网络上的电脑连接到Andarium。访问互联网不需要此权限。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在Andarium中執行的應用程式會使用此權限連線到區域網路上的裝置（例如印表機、媒體伺服器和電腦），「透過網路使用ADB」也會使用此權限，讓你網路上的電腦連線到Andarium。連線到網際網路不需要此權限。"
+          }
+        }
+      }
+    },
+    "NSLocationWhenInUseUsageDescription" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Andarium shares this device's location only when you turn on Location, so that apps in the virtual machine can use it."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Andariumは、“位置情報”をオンにしたときだけこのデバイスの位置情報を共有し、仮想マシン内のアプリが使えるようにします。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "只有在你开启“位置”时，Andarium才会共享此设备的位置，以供虚拟机中的应用使用。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "只有在你開啟「位置」時，Andarium才會分享此裝置的位置，以供虛擬機器中的應用程式使用。"
+          }
+        }
+      }
+    },
+    "NSMicrophoneUsageDescription" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Andarium records from the microphone only when you turn on Microphone, so that apps in the virtual machine can use it."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Andariumは、“マイク”をオンにしたときだけマイクから録音し、仮想マシン内のアプリが使えるようにします。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "只有在你开启“麦克风”时，Andarium才会使用麦克风录音，以供虚拟机中的应用使用。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "只有在你開啟「麥克風」時，Andarium才會使用麥克風錄音，以供虛擬機器中的應用程式使用。"
+          }
+        }
+      }
+    }
+  },
+  "version" : "1.0"
+}

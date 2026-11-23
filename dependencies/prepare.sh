@@ -41,7 +41,7 @@ Usage: dependencies/prepare.sh [options]
 Options:
   --product NAME  macos (default), ios-network, ios-storage, ios-compression,
                   apple-gpu-vulkan-experiment, kernel-host-tools,
-                  x86-conformance, or all
+                  x86-conformance, andarium-accessibility, or all
   --root PATH     Prepared source root (default: external/sources); a source
                   with paths that differ only by case needs a case-sensitive
                   file system, and is refused on any other

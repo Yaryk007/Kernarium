@@ -22,8 +22,7 @@ Lx86_vector_map2_mask_load_loop\@:
 	tbz x14, #63, Lx86_vector_map2_mask_load_next\@
 	.endif
 	add x7, x25, x19
-	page_cross_check (\element / 8), Lx86_vector_map2_mask_load_cross\@
-	translate_plain 0, UML_X86_64_TLB_READ_PAGE, (\element / 8), Lx86_vector_map2_mask_load_fault\@
+	translate_plain 0, UML_X86_64_TLB_READ_PAGE, (\element / 8), Lx86_vector_map2_mask_load_fault\@, cross=Lx86_vector_map2_mask_load_cross\@
 	.if \element == 32
 	ldr w24, [x7]
 	str w24, [sp, x19]
@@ -125,8 +124,7 @@ Lx86_vector_map2_mask_store_loop\@:
 	ldr x24, [x27, x19]
 	.endif
 	add x7, x25, x19
-	page_cross_check (\element / 8), Lx86_vector_map2_mask_store_cross\@
-	translate_plain 1, UML_X86_64_TLB_WRITE_PAGE, (\element / 8), Lx86_memory_fault
+	translate_plain 1, UML_X86_64_TLB_WRITE_PAGE, (\element / 8), Lx86_memory_fault, cross=Lx86_vector_map2_mask_store_cross\@
 	.if \element == 32
 	str w24, [x7]
 	.else

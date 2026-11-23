@@ -62,13 +62,12 @@ struct ShutdownFlowTests {
         }
         try #require(model.guest != nil && model.busy == nil && model.alert == nil)
 
-        // The guest has not started: no data disk, so Start in recovery waits
-        // and nothing is in use.
-        #expect(model.plan == .firstStart && !model.plan.offersRecovery)
+        // The guest has not started: no data disk, so nothing is in use.
+        #expect(model.plan == .firstStart)
         #expect(model.guest?.usedBytes == 0)
 
         let identity = try entry.adbKeyStore.loadOrCreate()
-        let operations = AdbGuestOperations(identity: identity, clock: GuestRunClock(), device: "device")
+        let operations = AdbGuestOperations(identity: identity, clock: GuestRunClock(), device: "device", run: GuestRunMark.random())
         weak var display: GuestMetalView?
         if memorySnapshots {
             // Allow Instruments to attach before the first boot.
@@ -114,9 +113,8 @@ struct ShutdownFlowTests {
                 #expect(model.plan == .normal)
                 if boot == 1 {
                     // The first run created the data disk and Android wrote to
-                    // it: Home offers recovery and states what the disk holds
-                    // now, not what it held when the guest loaded.
-                    #expect(model.plan.offersRecovery)
+                    // it: Home states what the disk holds now, not what it
+                    // held when the guest loaded.
                     let disk = directory.appendingPathComponent(InstanceFiles.dataDisk)
                     let held = try URL(fileURLWithPath: disk.path).resourceValues(forKeys: [.fileAllocatedSizeKey])
                     let onDisk = UInt64(held.fileAllocatedSize ?? 0)

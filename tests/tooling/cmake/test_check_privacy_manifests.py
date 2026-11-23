@@ -56,7 +56,7 @@ def compile_library(root: Path, name: str, source: str, output: Path) -> None:
     source_path = root / f"{name}.{extension}"
     source_path.write_text(source, encoding="utf-8")
     built = run([
-        "xcrun", "--sdk", "iphoneos", "clang", "-target", "arm64-apple-ios27.0",
+        "xcrun", "--sdk", "iphoneos", "clang", "-target", "arm64-apple-ios26.0",
         "-dynamiclib", "-fobjc-arc", "-framework", "Foundation",
         str(source_path), "-o", str(output),
     ])
@@ -87,7 +87,7 @@ def info(**overrides: object) -> dict:
         "CFBundlePackageType": "FMWK",
         "CFBundleShortVersionString": "1.2",
         "CFBundleVersion": "3",
-        "MinimumOSVersion": "27.0",
+        "MinimumOSVersion": "26.0",
     }
     keys.update(overrides)
     return {key: value for key, value in keys.items() if value is not None}

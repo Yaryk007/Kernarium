@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 03:24:05 +0900
+Subject: [PATCH] zink: make a context's layouts ready where it binds a fbfetch
+ shader
+
+zink_descriptor_util_init_fbfetch() adds the framebuffer fetch binding
+to a context's push descriptor layout, and its only caller was the
+create callback of the screen's live shader cache, so only the context
+that created a fragment shader using framebuffer fetch got it. The cache
+hands the same shader to any context that asks for it, and every guest
+context of the host renderer shares one screen. A second context that
+bound the shader through a cache hit kept a push layout without the
+binding while the shader read it, and KosmicKrisp's ycbcr lookup then
+read the immutable samplers of binding 5 past a layout of five bindings.
+The host ended in the pipeline's NIR lowering, in one field report.
+
+zink_bind_fs_state() now calls it for a shader that uses framebuffer
+fetch, whichever context created the shader. The call is idempotent per
+context. It runs where the context's other state changes do, in the
+threaded context's batch execution: a bind is queued for it, while a
+create callback runs on the thread that makes the shader, a glthread
+worker in a host GL context, and there the call wrote the context's push
+layout while a batch could be running on it. The call in the create
+callback goes, because nothing reads the layout between the create and
+the bind: the layout is read when a draw makes its program and writes
+its descriptors.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/gallium/drivers/zink/zink_program.c | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/src/gallium/drivers/zink/zink_program.c b/src/gallium/drivers/zink/zink_program.c
+index 7e9b92b2eae5c656664f91471dc05f6c4d61e378..a07fefafd127a9f5722a31a265a0e797c270417d 100644
+--- a/src/gallium/drivers/zink/zink_program.c
++++ b/src/gallium/drivers/zink/zink_program.c
+@@ -2432,6 +2432,12 @@ zink_bind_fs_state(struct pipe_context *pctx,
+          ctx->ds3_states |= BITFIELD_BIT(ZINK_DS3_BLEND_A2C);
+       }
+       if (info->fs.uses_fbfetch_output) {
++         /* The screen's live shader cache hands one shader to every context
++          * that asks for it, so the context that created a framebuffer fetch
++          * shader is not the only one that binds it. Each context makes its
++          * own layouts ready for the shader here, on the thread that draws
++          * with them. */
++         zink_descriptor_util_init_fbfetch(ctx);
+          if (info->outputs_read & (BITFIELD_BIT(FRAG_RESULT_DEPTH) | BITFIELD_BIT(FRAG_RESULT_STENCIL)))
+             ctx->fbfetch_outputs |= BITFIELD_BIT(PIPE_MAX_COLOR_BUFS);
+          ctx->fbfetch_outputs |= info->outputs_read >> FRAG_RESULT_DATA0;
+@@ -2843,9 +2849,6 @@ zink_create_gfx_shader_state(struct pipe_context *pctx, const struct pipe_shader
+    else
+       nir = (struct nir_shader *)shader->ir.nir;
+ 
+-   if (nir->info.stage == MESA_SHADER_FRAGMENT && nir->info.fs.uses_fbfetch_output)
+-      zink_descriptor_util_init_fbfetch(zink_context(pctx));
+-
+    struct zink_shader *zs = zink_shader_create(zink_screen(pctx->screen), nir);
+    if (zink_debug & ZINK_DEBUG_NOBGC)
+       gfx_shader_init_job(zs, screen, 0);

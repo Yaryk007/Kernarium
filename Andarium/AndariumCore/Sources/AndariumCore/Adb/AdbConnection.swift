@@ -90,18 +90,26 @@ public final class AdbConnection {
     /// Opens a service, for example `shell,v2,raw:ls` or `sync:`. A service
     /// name may hold NUL characters (`abb_exec` separates its arguments with
     /// them). Throws `serviceRefused` when adbd closes the stream at once.
-    public func open(_ service: String) throws -> AdbStream {
+    /// `sent` is called as soon as the request has been written to the
+    /// transport, before the answer is waited for: from then on adbd may be
+    /// running the service, whatever becomes of the answer. A request that
+    /// could not be written does not call it. `outputLimit` bounds what the
+    /// service may say in all: output that arrives while the caller is still
+    /// sending is held for `read`, and a service that says more ends the call
+    /// with a protocol violation as soon as the excess is accepted.
+    public func open(_ service: String, outputLimit: Int? = nil, sent: (() -> Void)? = nil) throws -> AdbStream {
         let local = nextLocalID
         nextLocalID &+= 1
         var name = Data(service.utf8)
         name.append(0)
         try send(AdbMessage(command: AdbWire.open, arg0: local, payload: name))
+        sent?()
         while true {
             let message = try receive()
             guard message.arg1 == local else { continue }
             switch message.command {
             case AdbWire.okay:
-                return AdbStream(connection: self, localID: local, remoteID: message.arg0)
+                return AdbStream(connection: self, localID: local, remoteID: message.arg0, outputLimit: outputLimit)
             case AdbWire.close:
                 throw AdbError.serviceRefused(service)
             default:
@@ -118,11 +126,14 @@ public final class AdbStream {
     let remoteID: UInt32
     private var queued: [Data] = []
     public private(set) var isClosed = false
+    private let outputLimit: Int?
+    private var accepted = 0
 
-    init(connection: AdbConnection, localID: UInt32, remoteID: UInt32) {
+    init(connection: AdbConnection, localID: UInt32, remoteID: UInt32, outputLimit: Int? = nil) {
         self.connection = connection
         self.localID = localID
         self.remoteID = remoteID
+        self.outputLimit = outputLimit
     }
 
     /// Sends `data` in payloads the peer accepts, one at a time: adbd answers
@@ -178,6 +189,10 @@ public final class AdbStream {
     }
 
     private func accept(_ message: AdbMessage) throws {
+        if let outputLimit {
+            accepted += message.payload.count
+            if accepted > outputLimit { throw AdbError.protocolViolation("more output than \(outputLimit) bytes") }
+        }
         try connection.send(AdbMessage(command: AdbWire.okay, arg0: localID, arg1: remoteID))
         if !message.payload.isEmpty { queued.append(message.payload) }
     }

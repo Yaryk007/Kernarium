@@ -150,14 +150,35 @@ final class Interrupter {
 
     private func play() throws {
         if !connected {
-            try engine.connectNode(player, to: engine.mainMixerNode, format: silence.format)
+            // The calls that throw exist from iOS 27; before it the plain ones
+            // are the only ones.
+            if #available(iOS 27.0, *) {
+                try engine.connectNode(player, to: engine.mainMixerNode, format: silence.format)
+            } else {
+                engine.connect(player, to: engine.mainMixerNode, format: silence.format)
+            }
             connected = true
         }
         if !engine.isRunning { try engine.start() }
         player.stop()
         player.scheduleBuffer(silence, at: nil, options: .loops)
-        try player.playAudio()
+        if #available(iOS 27.0, *) {
+            try player.playAudio()
+        } else {
+            player.play()
+            // Before iOS 27 `play` reports nothing, and it returns with the
+            // player stopped when the engine stopped since it started. A
+            // takeover that is not playing is not a takeover.
+            guard player.isPlaying else { throw PlayerError.notPlaying }
+        }
         MPNowPlayingInfoCenter.default().playbackState = .playing
+    }
+
+    /// What the earlier systems' `play` leaves to the caller to find out.
+    private enum PlayerError: LocalizedError {
+        case notPlaying
+
+        var errorDescription: String? { "the player did not start" }
     }
 
     /// Takes the session as the owner and starts the hold.

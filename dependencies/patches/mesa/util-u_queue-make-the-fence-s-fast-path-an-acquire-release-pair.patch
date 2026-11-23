@@ -1,0 +1,378 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 02:04:53 +0900
+Subject: [PATCH] util/u_queue: make the fence's fast path an acquire/release
+ pair
+
+util_queue_fence_is_signalled() reads a fence's flag with a plain load,
+and util_queue_fence_wait() and u_threaded_context's tc_sync() take a
+set flag as leave to skip the fence's mutex and go on to read what the
+job wrote before it signalled. Nothing ordered those reads after the
+job's stores: the flag is stored with a plain store inside the mutex,
+and a plain load orders nothing that follows it. On arm64 a reader can
+see the flag set and still read what was there before the job.
+
+The threaded context reached it. On the driver thread,
+tc_batch_execute() leaves a batch's fence for the driver's next flush,
+storing it in signal_fences_next_flush[] and counting it in
+num_signal_fences_next_flush, and the queue signals the batch's fence
+after the job. A flush on the thread that owns the context found that
+fence signalled in tc_sync(), skipped the mutex, and
+tc_driver_internal_flush_notify() read the new count with a stale NULL
+entry. util_queue_fence_signal(NULL) then faulted in mtx_lock on the
+host's GL thread, after the batch that tc_trim() queues for an idle
+context.
+
+Make the check an acquire load and the signal a release store, with the
+p_atomic_read() and p_atomic_set() that pair them: __atomic_load_n() and
+__atomic_store_n() with those orders wherever Mesa builds with the GCC
+atomic builtins, which every Apple build does. The timed wait also read
+the flag after it had released the mutex; it reads it under the mutex.
+
+The futex variant of the fence, which Linux builds use and Apple builds
+do not, reads its word relaxed in the same way. It is not changed here:
+no host build compiles it, and the guest's Mesa is a lower layer that
+this topic does not edit.
+
+The test has the shape of that fast path, with the real fence API. A
+writer thread stores a count and an entry and signals a fence. A reader
+thread resets the fence and publishes the round, waits a random short
+time, loads a field in the entry's cache line, checks the fence once
+and, when it is signalled, loads the count and the entry and expects
+both written; otherwise it waits on the fence. The data are relaxed
+atomics, so the fence is the only thing that orders them. A round does
+that for sixteen batches in turn, because a reader that has just waited
+on a fence is right behind the writer, where the stale read shows. A run
+makes 32 million checks in about 15 seconds on Apple silicon. Ten of ten
+runs failed on the unfixed fence, at about 1.6 stale reads per million
+fast paths, most of them the count without the entry that the crash
+showed, and none of ten failed with the pair.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/util/meson.build                        |  13 ++
+ src/util/tests/u_queue_fence_order_test.cpp | 246 ++++++++++++++++++++
+ src/util/u_queue.c                          |   6 +-
+ src/util/u_queue.h                          |   6 +-
+ 4 files changed, 268 insertions(+), 3 deletions(-)
+ create mode 100644 src/util/tests/u_queue_fence_order_test.cpp
+
+diff --git a/src/util/meson.build b/src/util/meson.build
+index 61578d372ae18998608510fabc3d6d9091c8efef..ce9dafefaa5591307d839f9d0261586ccc120476 100644
+--- a/src/util/meson.build
++++ b/src/util/meson.build
+@@ -531,6 +531,19 @@ if with_tests
+     endif
+   endif
+ 
++  test(
++    'u_queue_fence_order',
++    executable(
++      'u_queue_fence_order_test',
++      files('tests/u_queue_fence_order_test.cpp'),
++      dependencies : [idep_mesautil, idep_gtest],
++    ),
++    suite : ['util'],
++    protocol : 'gtest',
++    is_parallel : false,
++    timeout : 180,
++  )
++
+   test(
+     'util_tests',
+     executable(
+diff --git a/src/util/tests/u_queue_fence_order_test.cpp b/src/util/tests/u_queue_fence_order_test.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..71f59e148e72fa7121a93db55571ccad8a509ce2
+--- /dev/null
++++ b/src/util/tests/u_queue_fence_order_test.cpp
+@@ -0,0 +1,246 @@
++/* SPDX-License-Identifier: MIT */
++
++/* A thread that finds a util_queue_fence signalled without taking its mutex
++ * (util_queue_fence_is_signalled, the fast path of util_queue_fence_wait and
++ * of u_threaded_context's tc_sync) goes on to read what the job wrote before
++ * it signalled the fence, so the fence has to order those reads after the
++ * job's writes. On a CPU that reorders loads that takes an acquire load in
++ * util_queue_fence_is_signalled, paired with a release store in
++ * util_queue_fence_signal.
++ *
++ * The test has the shape of the tc_sync fast path. A writer thread plays the
++ * driver thread at the end of a batch: it stores the number of fences it
++ * leaves for the next flush and the fence itself, then signals the fence. A
++ * reader thread plays the thread that owns the context: it loads a field in
++ * the cache line of the stored fence, checks the fence once, and, when it
++ * finds it signalled, loads both stores. The data are relaxed atomics, so
++ * the fence is the only thing that orders them. Without the pairing a
++ * reader sees one store and not the other on Apple silicon, about twice in
++ * a million fast paths, so the test makes tens of millions of checks.
++ */
++
++#include <gtest/gtest.h>
++
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++#include <cstdio>
++#include <thread>
++
++#ifdef __APPLE__
++#include <pthread.h>
++#endif
++
++#include "util/u_queue.h"
++
++namespace {
++
++/* Checks per run, in rounds of one check of each of the batches below. The
++ * deadline bounds a run on a loaded host, and the log shows how many checks it
++ * got through. */
++constexpr int64_t checks = 32 * 1000 * 1000;
++constexpr auto deadline = std::chrono::seconds(150);
++
++/* Batches whose fences the writer signals in turn within one round, and the
++ * reader checks in turn: each check is a chance, and the hand-off between the
++ * threads that starts a round costs more than a check. After the reader waits
++ * for a fence it is right behind the writer, which is where the reordering
++ * shows. */
++constexpr unsigned batches = 16;
++
++/* Spin lengths, in iterations of an empty loop: the reader's delay before it
++ * looks at a fence and the writer's before it stores. */
++constexpr unsigned max_reader_delay = 1000;
++constexpr unsigned max_writer_delay = 100;
++
++#if defined(__GNUC__) || defined(__clang__)
++#define COMPILER_BARRIER() __asm__ __volatile__("" ::: "memory")
++#define NOINLINE __attribute__((noinline))
++#else
++#define COMPILER_BARRIER() std::atomic_signal_fence(std::memory_order_seq_cst)
++#define NOINLINE
++#endif
++
++/* The fields of u_threaded_context that the fast path touches, in the same
++ * cache lines: the ones tc_sync loads first and the first fence the driver
++ * leaves for its next flush share one, the count of them has another, and the
++ * fence is a third. */
++struct alignas(128) Batch {
++   std::atomic<unsigned> last;
++   std::atomic<unsigned> next;
++   std::atomic<void *> entry;
++   alignas(128) std::atomic<unsigned> num;
++   alignas(128) struct util_queue_fence fence;
++};
++
++struct alignas(128) Counter {
++   std::atomic<int64_t> value{-1};
++};
++
++Batch batch[batches];
++Counter go;
++Counter ack;
++int marker;
++
++inline uint64_t
++next_random(uint64_t &state)
++{
++   state = state * 6364136223846793005ULL + 1442695040888963407ULL;
++   return state >> 17;
++}
++
++inline void
++spin(unsigned iterations)
++{
++   for (unsigned i = 0; i < iterations; i++)
++      COMPILER_BARRIER();
++}
++
++/* Work that sits between the check and the loads of the data, as zink_flush
++ * does between tc_sync's check and tc_driver_internal_flush_notify:
++ * arithmetic and branches, nothing that orders memory. */
++NOINLINE unsigned
++unrelated_work(unsigned x)
++{
++   for (unsigned i = 0; i < 24; i++)
++      x = x * 2654435761u + i;
++   return x;
++}
++
++void
++set_qos()
++{
++#ifdef __APPLE__
++   pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
++#endif
++}
++
++void
++writer(int64_t rounds)
++{
++   set_qos();
++
++   uint64_t state = 0x1234567ULL;
++   for (int64_t i = 0; i < rounds; i++) {
++      while (go.value.load(std::memory_order_acquire) < i)
++         COMPILER_BARRIER();
++      if (go.value.load(std::memory_order_relaxed) != i)
++         break;
++
++      for (unsigned k = 0; k < batches; k++) {
++         spin((unsigned)(next_random(state) % (max_writer_delay + 1)));
++
++         /* tc_batch_execute leaves its fence for the driver's next flush. */
++         unsigned n = batch[k].num.load(std::memory_order_relaxed);
++         batch[k].num.store(n + 1, std::memory_order_relaxed);
++         batch[k].entry.store(&marker, std::memory_order_relaxed);
++
++         /* util_queue_thread_func signals the batch's fence. */
++         util_queue_fence_signal(&batch[k].fence);
++      }
++
++      ack.value.store(i, std::memory_order_release);
++   }
++}
++
++} /* namespace */
++
++TEST(UtilQueueFence, SignalledFenceOrdersWhatTheJobWrote)
++{
++   if (std::thread::hardware_concurrency() < 2)
++      GTEST_SKIP() << "one CPU cannot reorder the two threads' accesses";
++
++   set_qos();
++
++   for (unsigned k = 0; k < batches; k++)
++      util_queue_fence_init(&batch[k].fence);
++
++   const auto start = std::chrono::steady_clock::now();
++   const int64_t rounds = checks / batches;
++   int64_t done = 0;
++
++   /* The writer is told how many rounds to expect and leaves its loop early
++    * when the reader stops at the deadline. */
++   std::thread thread(writer, rounds);
++
++   uint64_t state = 0xabcdefULL;
++   int64_t fast = 0, slow = 0, stale_after_wait = 0;
++   /* Stale reads on the fast path, by what the reader did see of the job's
++    * writes: only the count (what the crash this test is from showed), only
++    * the fence in the array, or neither. */
++   int64_t saw_num = 0, saw_entry = 0, saw_neither = 0;
++   unsigned sink = 0;
++
++   for (int64_t i = 0; i < rounds; i++) {
++      if ((i & 0xfff) == 0 &&
++          std::chrono::steady_clock::now() - start > deadline)
++         break;
++
++      /* tc_batch_flush: the batches go back to unsignalled and are published
++       * to the driver thread. */
++      for (unsigned k = 0; k < batches; k++) {
++         util_queue_fence_reset(&batch[k].fence);
++         batch[k].num.store(0, std::memory_order_relaxed);
++         batch[k].entry.store(nullptr, std::memory_order_relaxed);
++         batch[k].last.store((unsigned)i, std::memory_order_relaxed);
++         batch[k].next.store((unsigned)i + 1, std::memory_order_relaxed);
++      }
++      go.value.store(i, std::memory_order_release);
++
++      for (unsigned k = 0; k < batches; k++) {
++         spin((unsigned)(next_random(state) % (max_reader_delay + 1)));
++
++         /* tc_sync: the first loads are the context's batch indices, which
++          * share a cache line with the driver's fences; then one check of the
++          * batch's fence. */
++         unsigned last = batch[k].last.load(std::memory_order_relaxed);
++         if (util_queue_fence_is_signalled(&batch[k].fence)) {
++            sink += unrelated_work(last);
++
++            /* tc_driver_internal_flush_notify: the count, then the fence. */
++            unsigned num = batch[k].num.load(std::memory_order_relaxed);
++            void *entry = batch[k].entry.load(std::memory_order_relaxed);
++            fast++;
++            if (num == 1 && entry != &marker)
++               saw_num++;
++            else if (num != 1 && entry == &marker)
++               saw_entry++;
++            else if (num != 1 && entry != &marker)
++               saw_neither++;
++         } else {
++            util_queue_fence_wait(&batch[k].fence);
++            slow++;
++            if (batch[k].num.load(std::memory_order_relaxed) != 1 ||
++                batch[k].entry.load(std::memory_order_relaxed) != &marker)
++               stale_after_wait++;
++         }
++      }
++
++      while (ack.value.load(std::memory_order_acquire) != i)
++         COMPILER_BARRIER();
++      done = i + 1;
++   }
++
++   if (done < rounds) {
++      /* Release the writer, which waits for the next round. */
++      go.value.store(rounds, std::memory_order_release);
++   }
++   thread.join();
++
++   for (unsigned k = 0; k < batches; k++)
++      util_queue_fence_destroy(&batch[k].fence);
++
++   const int64_t stale = saw_num + saw_entry + saw_neither;
++   printf("trials=%lld fast=%lld slow=%lld stale=%lld (saw only num %lld, "
++          "only entry %lld, neither %lld) stale-after-wait=%lld (sink %u)\n",
++          (long long)(done * batches), (long long)fast, (long long)slow,
++          (long long)stale, (long long)saw_num, (long long)saw_entry,
++          (long long)saw_neither, (long long)stale_after_wait, sink & 1);
++
++   EXPECT_EQ(stale_after_wait, 0)
++      << "a thread that waited on the fence read what the job had not written";
++   EXPECT_EQ(stale, 0)
++      << "a thread that found the fence signalled without waiting did not "
++         "see everything the job had written before it signalled: "
++      << stale << " of " << fast << " fast paths";
++}
+diff --git a/src/util/u_queue.c b/src/util/u_queue.c
+index 1ebdfdbea9ca7583c8f8321850c27750500b1c77..082db931192ab0fa6d24411ed0103f9af5e3a1e5 100644
+--- a/src/util/u_queue.c
++++ b/src/util/u_queue.c
+@@ -164,7 +164,8 @@ void
+ util_queue_fence_signal(struct util_queue_fence *fence)
+ {
+    mtx_lock(&fence->mutex);
+-   fence->signalled = true;
++   /* Release: see util_queue_fence_is_signalled. */
++   p_atomic_set(&fence->signalled, true);
+    u_cnd_monotonic_broadcast(&fence->cond);
+    mtx_unlock(&fence->mutex);
+ }
+@@ -190,9 +191,10 @@ _util_queue_fence_wait_timeout(struct util_queue_fence *fence,
+       if (u_cnd_monotonic_timedwait(&fence->cond, &fence->mutex, &ts) != thrd_success)
+          break;
+    }
++   const bool signalled = fence->signalled;
+    mtx_unlock(&fence->mutex);
+ 
+-   return fence->signalled;
++   return signalled;
+ }
+ 
+ void
+diff --git a/src/util/u_queue.h b/src/util/u_queue.h
+index c1797306d6cad8b8ebd5b6589f5ccfe1ed451d8e..5762d9cde123d92d3bd9d0eb52f1246a7da803a0 100644
+--- a/src/util/u_queue.h
++++ b/src/util/u_queue.h
+@@ -150,7 +150,11 @@ util_queue_fence_reset(struct util_queue_fence *fence)
+ static inline bool
+ util_queue_fence_is_signalled(struct util_queue_fence *fence)
+ {
+-   return fence->signalled != 0;
++   /* Acquire, paired with the release in util_queue_fence_signal: a caller
++    * that finds the fence signalled here skips the mutex and goes on to read
++    * what the job wrote.
++    */
++   return p_atomic_read(&fence->signalled) != 0;
+ }
+ #else
+ static inline void

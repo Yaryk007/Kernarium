@@ -8,6 +8,7 @@
  * gives the slot its write access back.
  */
 #include "allocation_fault.hpp"
+#include "frame_accounting.hpp"
 #include "mach_vm_region_test_support.hpp"
 #include "native_address_space.hpp"
 #include "native_window_test_support.hpp"
@@ -203,6 +204,56 @@ void aFailedConversionKeepsTheSlotWritable()
 		"unmapping the direct slot failed");
 }
 
+/* The table of the kernel's direct ranges names the frame a kernel write
+ * through a buffer reaches. A shadow over part of a recorded direct slot, or
+ * the conversion of the slot to shadows, ends that mapping: the slot's pages
+ * must not resolve to the frame the direct mapping named, which a kernel
+ * write with the user word absent would publish at instead of the real one. */
+void aShadowEndsTheDirectRangeItCovers()
+{
+	using uml::memory::FrameAccounting;
+	ScratchBacking backing{backing_name, 4 * guest_page_size};
+	ScratchBacking other{backing_name, 4 * guest_page_size};
+	WindowSlot slot;
+	auto space = uml::memory::native_address_space();
+	require(space != nullptr, "native address space unavailable");
+	const auto base = slot.address();
+	const auto resolves = [&](std::uintptr_t address) {
+		int descriptor = -1;
+		std::uint64_t offset = 0;
+		return FrameAccounting::resolve_direct(
+			reinterpret_cast<const void *>(address), descriptor, offset);
+	};
+	require(darwin_uml_vm_map(reinterpret_cast<void *>(base),
+		backing.descriptor(), 0, host_page(), PROT_READ | PROT_WRITE,
+		0, 1) == 0, "direct map failed");
+	require(resolves(base) && resolves(base + 3 * guest_page_size),
+		"a direct map was not recorded for kernel writes");
+
+	/* A 4 KiB map of another backing inside the slot is a shadow. */
+	require(darwin_uml_vm_map(reinterpret_cast<void *>(base + guest_page_size),
+		other.descriptor(), 0, guest_page_size, PROT_READ | PROT_WRITE,
+		0, 1) == 0, "the shadow map failed");
+	require(!resolves(base + guest_page_size + 0x10),
+		"a shadow still resolved to the direct mapping it replaced");
+	require(!resolves(base + 3 * guest_page_size),
+		"a slot converted to shadows still resolved to its direct mapping");
+	require(darwin_uml_vm_unmap(reinterpret_cast<void *>(base),
+		host_page()) == 0, "unmapping the shadows failed");
+
+	/* A quarter protect converts a direct slot the same way. */
+	require(darwin_uml_vm_map(reinterpret_cast<void *>(base),
+		backing.descriptor(), 0, host_page(), PROT_READ | PROT_WRITE,
+		0, 1) == 0, "direct map failed");
+	require(resolves(base + 2 * guest_page_size));
+	require(darwin_uml_vm_protect(reinterpret_cast<void *>(base + guest_page_size),
+		guest_page_size, PROT_READ) == 0, "the quarter protect failed");
+	require(!resolves(base + 2 * guest_page_size),
+		"a converted slot still resolved to its direct mapping");
+	require(darwin_uml_vm_unmap(reinterpret_cast<void *>(base),
+		host_page()) == 0, "unmapping the converted slot failed");
+}
+
 } // namespace
 
 int main()
@@ -212,6 +263,7 @@ int main()
 		require(window.entered(), "could not configure the native window");
 		aStoreDuringTheConversionIsKept();
 		aFailedConversionKeepsTheSlotWritable();
+		aShadowEndsTheDirectRangeItCovers();
 	} catch (const std::exception &error) {
 		std::fprintf(stderr, "FAIL: %s\n", error.what());
 		return EXIT_FAILURE;

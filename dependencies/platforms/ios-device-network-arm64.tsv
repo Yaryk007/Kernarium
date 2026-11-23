@@ -3,7 +3,7 @@ field	value
 format	2
 platform	ios
 architecture	arm64
-deployment_target	27.0
+deployment_target	26.0
 linkage	static
 components	pcre2,libffi,proxy-libintl,glib-ios,gvdb,libslirp
 source_manifest	dependencies/manifest.tsv

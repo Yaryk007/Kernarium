@@ -26,14 +26,22 @@ public:
     /* Stops the microphone, so that the system's recording indicator goes
      * out. No delivery is running when it returns. */
     virtual void stop() noexcept = 0;
+    /* Called while the guest records: opens the microphone again if it was
+     * started and lost its engine without being stopped or interrupted. It is
+     * cheap when nothing is wrong, and limits its own retries. */
+    virtual void revive() noexcept {}
 };
 
 /* A capture source that records from the real microphone while the guest
  * records and the user's `MicrophoneSwitch` is on and permitted, and delivers
  * nothing otherwise, so the guest records silence. The input is started only
  * then, and stopped when the guest stops, the switch turns off, or the device
- * resets. The switch's wake-up reaches the transport worker through `waker`,
- * which calls handleEvents(). */
+ * resets. While the switch's standby holds (a camera of the guest is in video
+ * mode) the input is open before the guest records, so that its first period
+ * is not lost to the system opening the microphone; it delivers nothing until
+ * the guest starts, and then only audio captured after the start. The switch's
+ * wake-up reaches the transport worker through `waker`, which calls
+ * handleEvents(). */
 [[nodiscard]] std::unique_ptr<CaptureSource> makeMicrophoneCaptureSource(
     std::shared_ptr<MicrophoneSwitch> microphone,
     std::unique_ptr<MicrophoneInput> input,

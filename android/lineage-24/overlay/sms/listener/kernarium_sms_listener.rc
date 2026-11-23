@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: Apache-2.0
+# The holder of the text message service's vsock port runs on every device, from boot: it keeps the port
+# and starts the service on demand. Init makes the socket the service takes the listening socket through
+# (/dev/socket/kernarium_sms), and starts the holder again if it ever exits.
+service kernarium_sms_listener /system_ext/bin/kernarium_sms_listener
+    class main
+    user nobody
+    group nobody
+    socket kernarium_sms stream 0660 system system
+
+# Started only by the holder, through the control property ctl.start, when a connection waits and no
+# session runs (kernarium_sms_wake.sh).
+service kernarium_sms_wake /system_ext/bin/kernarium_sms_wake.sh
+    user system
+    group system
+    oneshot
+    disabled

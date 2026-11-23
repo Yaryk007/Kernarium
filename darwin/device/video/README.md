@@ -55,14 +55,39 @@ without asking each other.
   highest the platform capability reports, and picture sizes up to its maximum
   per axis. HEVC states levels 1 to 6.2 with no tier. H.264 stops at 5.2,
   because the hardware does not open the 8192 x 4320 frame a level 6 stream may
-  carry. `platform-video-decoder` decodes at the stated maximums, so a host whose
+  carry. VP9 is Profile 0 (8-bit 4:2:0) and, where the hardware decodes it,
+  Profile 2 (10-bit 4:2:0), up to 4096 x 4096 each; the driver's VP9 profile
+  menu lists the profiles the host lists and it publishes no VP9 level
+  control. VideoToolbox's supplemental VP9 decoder is registered from iOS 26.2;
+  on an iOS below it the host reports no VP9 hardware decode. The range is the
+  square Android states for `c2.v4l2.vp9.decoder`,
+  which it applies to both axes, from 64 samples on each. A 10-bit stream
+  reaches an 8-bit capture format narrowed with rounding, as HEVC Main 10 does.
+  `platform-video-decoder` decodes at the stated maximums, so a host whose
   hardware does less fails that test and not a guest.
-- **Flow.** Input is complete Annex B access units or complete JPEG and VP9
-  frames. The coded queue's buffer size follows the picture size the client
-  states. Event buffers are bounded by the transport's virtqueue size, and a
-  full queue applies backpressure instead of completing empty events. The
-  device holds an encoded packet back while the hardware has no capture buffer
-  to decode into.
+- **Flow.** Input is complete Annex B access units, complete JPEG images, or VP9
+  packets: one frame, or a superframe whose hidden frames the hardware decodes
+  with the shown one. The coded queue's buffer size follows the picture size the
+  client states. The device holds an encoded packet back while the hardware has
+  no capture buffer to decode into.
+- **Guest input.** The platform decoder reads the headers of every VP9 frame of
+  a packet, not only the first, and refuses before the hardware sees it, with
+  the decoder as it was, a packet with a truncated or reserved header
+  (colour space 6 included), a last byte that reads as a superframe index
+  marker without an index that fits the packet, a profile other than 0 or 2, a
+  12-bit or non-4:2:0 stream, frames of more than one profile in one packet, or
+  a picture size outside the range, as it refuses an oversized H.264 or HEVC
+  picture. Decoding starts at a packet's last key frame, which replaces what
+  the frames before it refer to; frames before it are validated by header only,
+  so damaged data in one of them goes unnoticed. A packet shows what its last
+  frame shows: nothing when that frame is not shown, as libvpx shows none. A
+  packet that ends in a hidden key frame of another size changes the stream's
+  size with no picture, and its coded buffer comes back once a later picture
+  of that size has been announced and the client has set it, or when the
+  client seeks or drains. An intra-only frame that changes the picture size is
+  not supported, because the size comes from the key frame. Whatever follows a
+  valid header is the hardware's to decode, and its failure ends the stream's
+  pictures with an error until the client seeks.
 
 `UML_VIDEO_ACTIVITY_LOG` names a file in which the device appends the profiles
 it advertised and each stream's codec and totals, since a guest that falls back
@@ -74,6 +99,28 @@ optional `guest-v4l2-decode` runs the real V4L2 driver against every advertised
 profile (see [testing](../../../docs/testing.md) for the guest probe input). The
 tests that use the host's hardware share the `video-encoder-hardware` resource
 lock and run in `check-gpu`.
+
+## Suspend and session loss
+
+A guest suspend disables the rings one after another and enables them in the
+same order, and a ring disable resets a device that still holds a request.
+Neither video device is reset: the event queue never defers, so with no event
+waiting the guest's buffer stays in its ring and the device raises its event
+descriptor when an event comes, and the device asks the transport to keep the
+requests it holds (`keepsDeferredRequestsWhileDisabled()`), the buffers a
+stream has queued. What the device completes while a ring is disabled is
+written to the ring at its enable. A stream therefore goes on after a suspend
+with the next picture or coded buffer, a descriptor opened before it works
+after it, and a session started after it gets its source change. A message that
+changes what a stream refers to, or a driver's teardown, still resets the
+device.
+
+The system may invalidate a platform session, as iOS does to an app that was in
+the background. The decoder then rebuilds it from the stream's stored parameter
+sets, shows nothing until the next sync picture and reports no error; a second
+loss with no picture between is an error to the client. The encoder starts
+again at a key frame. A final loss completes the stream's frames with `ERR` and
+sends `VIRTIO_VIDEO_EVENT_ERROR`.
 
 ## Encoder (device ID 30)
 
@@ -164,3 +211,12 @@ exist, and when, is `encoder_controls.cpp`:
 encoder (`tests/support/video`) and then the host's hardware encoder;
 `video-encoder-capabilities` checks the capability and control tables without a
 device and that the wire lists exactly what discovery found.
+
+`virtio-video-suspend` runs the decoder behind the real transport through a ring
+disable and enable, and `vhost-user-held-requests` checks the transport's side
+of it: requests held, completions and events written at the enable, kicks with
+and without an acknowledgement, and the messages that reset.
+`platform-video-decoder-recovery` and `platform-video-encoder-recovery` lose the
+VideoToolbox session, and `guest-video-suspend` suspends a Linux guest by the
+host's route and its own with both devices idle, with a node opened ahead of
+use, and with a decode and an encode stream in progress.

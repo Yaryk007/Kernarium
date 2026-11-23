@@ -1135,6 +1135,13 @@ void NativeDisplayState::shutdown() noexcept
     });
 }
 
+std::uint32_t NativeDisplay::grantedRefreshRate(
+    std::uint32_t, void*, std::uint32_t, std::uint32_t) noexcept
+{
+    /* The window of a Mac keeps its 60 Hz mode and its on-demand presents. */
+    return 60;
+}
+
 NativeDisplay::NativeDisplay(
     std::uint32_t width,
     std::uint32_t height,
@@ -1142,7 +1149,8 @@ NativeDisplay::NativeDisplay(
     void*,
     native_input::PointerMode pointerMode,
     std::uint32_t maximumDimension,
-    bool autoResizeGuest)
+    bool autoResizeGuest,
+    std::uint32_t)
 {
     auto state = std::make_shared<NativeDisplayState>(
         width,

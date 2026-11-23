@@ -60,10 +60,16 @@ endif()
 
 add_library(KernariumRuntime SHARED
     KernariumAdbChannel.hpp
+    KernariumAndroidRoot.hpp
+    KernariumCamera.hpp
     KernariumConsoleInput.hpp
     KernariumConsoleOutput.hpp
+    KernariumGpuHold.hpp
     KernariumGuestTimeZone.hpp
+    KernariumHostFeatures.hpp
+    KernariumIdentity.hpp
     KernariumKeyWake.hpp
+    KernariumMemoryPressure.hpp
     KernariumRestartLoop.hpp
     KernariumRuntime.h
     KernariumRuntime.mm)
@@ -121,12 +127,18 @@ target_link_libraries(KernariumRuntime PRIVATE
     UML::GpuDevice
     UML::ConsoleDevice
     UML::VsockDevice
+    UML::GnssDevice
     UML::VirtioInput
     UML::NetworkProvider
     "-framework Foundation"
     "-framework Metal"
     "-framework MetalKit"
     "-framework UIKit")
+# Only an Android guest has cameras (KernariumCamera.hpp). The source library
+# carries the device library with it.
+if(KERNARIUM_RUNTIME_ANDROID_GUEST)
+    target_link_libraries(KernariumRuntime PRIVATE UML::CameraSource)
+endif()
 target_compile_definitions(KernariumRuntime PRIVATE
     KERNARIUM_RUNTIME_ANDROID_GUEST=${KERNARIUM_RUNTIME_ANDROID_GUEST}
     KERNARIUM_RUNTIME_GUEST_FLAVOR=${KERNARIUM_RUNTIME_GUEST_FLAVOR}
@@ -162,8 +174,8 @@ add_dependencies(KernariumRuntime
 add_dependencies(KernariumRuntime uml_ios_network_prefix_verify)
 set_property(TARGET KernariumRuntime APPEND PROPERTY LINK_DEPENDS
     "${_kernarium_kernel_image}")
-# The framework's Info.plist (Info.plist.in) names and versions it, as App
-# Store validation requires of every embedded framework. The short version is
+# The framework's Info.plist (Info.plist.in) names and versions it, as the
+# platform's validation requires of every embedded framework. The short version is
 # the kernel series the framework is named for. The bundle version is the
 # loader ABI version the application checks before it loads a runtime, so it
 # moves exactly when the application and a runtime stop being interchangeable.

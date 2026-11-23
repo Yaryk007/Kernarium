@@ -36,15 +36,12 @@ nonisolated struct AdbKeyStore {
         self.tag = tag
     }
 
-    #if !APP_STORE
     /// The key of the guest a launch runs. The ordinary guest keeps the
     /// default tag; an isolated instance is tagged with its name, so erasing
-    /// one never deletes the ordinary guest's key. `base` is for tests. An
-    /// App Store build has no isolated instance.
+    /// one never deletes the ordinary guest's key. `base` is for tests.
     init(instance: String?, base: String = AdbKeyStore.defaultTag) {
         self.init(tag: instance.map { "\(base).instance.\($0)" } ?? base)
     }
-    #endif
 
     private var tagData: Data { Data(tag.utf8) }
 

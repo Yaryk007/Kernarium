@@ -1,0 +1,1360 @@
+{
+  "sourceLanguage" : "en",
+  "strings" : {
+    "%lld vCPUs" : {
+      "localizations" : {
+        "en" : {
+          "variations" : {
+            "plural" : {
+              "one" : {
+                "stringUnit" : {
+                  "state" : "translated",
+                  "value" : "%lld vCPU"
+                }
+              },
+              "other" : {
+                "stringUnit" : {
+                  "state" : "translated",
+                  "value" : "%lld vCPUs"
+                }
+              }
+            }
+          }
+        },
+        "ja" : {
+          "variations" : {
+            "plural" : {
+              "other" : {
+                "stringUnit" : {
+                  "state" : "translated",
+                  "value" : "%lld vCPU"
+                }
+              }
+            }
+          }
+        },
+        "zh-Hans" : {
+          "variations" : {
+            "plural" : {
+              "other" : {
+                "stringUnit" : {
+                  "state" : "translated",
+                  "value" : "%lld个vCPU"
+                }
+              }
+            }
+          }
+        },
+        "zh-Hant" : {
+          "variations" : {
+            "plural" : {
+              "other" : {
+                "stringUnit" : {
+                  "state" : "translated",
+                  "value" : "%lld個vCPU"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "Above %@, games may run out of graphics memory." : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@を超えると、ゲームでグラフィックスメモリが不足する可能性があります。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "超过%@时，游戏可能会耗尽显存。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "超過%@時，遊戲可能會耗盡繪圖記憶體。"
+          }
+        }
+      }
+    },
+    "Andarium crashed" : {
+      "comment" : "Title of Home's card after Andarium itself crashed while Android was running.",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Andariumがクラッシュしました"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Andarium已崩溃"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Andarium已當機"
+          }
+        }
+      }
+    },
+    "Andarium draws the virtual machine with Metal 4, which this %@ does not have, so the virtual machine cannot start here." : {
+      "comment" : "%@ is the device name: iPhone, iPad or Mac.",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "AndariumはMetal 4で仮想マシンを描画しますが、この%@はMetal 4に対応していないため、ここでは仮想マシンを起動できません。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Andarium使用Metal 4绘制虚拟机，而此%@不支持Metal 4，因此虚拟机无法在此启动。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Andarium使用Metal 4繪製虛擬機器，而此%@不支援Metal 4，因此虛擬機器無法在此啟動。"
+          }
+        }
+      }
+    },
+    "Andarium ended while Android was running." : {
+      "comment" : "Home's card after Andarium ended while Android was running, with no known cause.",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Androidの実行中にAndariumが終了しました。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Android运行期间，Andarium已结束。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Android執行期間，Andarium已結束。"
+          }
+        }
+      }
+    },
+    "Andarium stopped on an error of its own while Android was running." : {
+      "comment" : "Home's card after Andarium itself crashed while Android was running.",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Androidの実行中に、Andarium自身のエラーで停止しました。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Android运行期间，Andarium因自身错误而停止。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Android執行期間，Andarium因自身錯誤而停止。"
+          }
+        }
+      }
+    },
+    "Andarium stopped unexpectedly" : {
+      "comment" : "Title of Home's card after Andarium ended while Android was running, with no known cause.",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Andariumが予期せず停止しました"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Andarium意外停止"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Andarium意外停止"
+          }
+        }
+      }
+    },
+    "Android can’t install an app from a single .apk file of %@ or more." : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Androidでは、%@以上の単一の.apkファイルからアプリをインストールできません。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Android无法安装大小为%@或以上的单个.apk文件。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Android無法安裝大小為%@或以上的單一.apk檔案。"
+          }
+        }
+      }
+    },
+    "Android can’t install an app with a part of %@ or more." : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Androidでは、%@以上のパーツを含むアプリをインストールできません。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Android无法安装包含大小为%@或以上部分的应用。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Android無法安裝包含大小為%@或以上部分的應用程式。"
+          }
+        }
+      }
+    },
+    "Android could not resume" : {
+      "comment" : "Title of Home's card after a start that could not bring back the memory Android saved when it was paused.",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Androidを再開できませんでした"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Android无法恢复运行"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Android無法繼續執行"
+          }
+        }
+      }
+    },
+    "Android ran out of graphics memory" : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Androidのグラフィックスメモリが不足しました"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Android显存不足"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Android繪圖記憶體不足"
+          }
+        }
+      }
+    },
+    "Android stopped" : {
+      "comment" : "Title of Home's card after Android's kernel ended the session by itself, or after a stop with no known cause.",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Androidが停止しました"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Android已停止"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Android已停止"
+          }
+        }
+      }
+    },
+    "Android stopped on a kernel error." : {
+      "comment" : "Home's card after Android's kernel stopped on an error of its own.",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Androidはカーネルエラーで停止しました。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Android因内核错误而停止。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Android因核心錯誤而停止。"
+          }
+        }
+      }
+    },
+    "Android stopped unexpectedly." : {
+      "comment" : "Home's card after a stop with no known cause.",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Androidが予期せず停止しました。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Android意外停止。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Android意外停止。"
+          }
+        }
+      }
+    },
+    "Android stopped with a kernel panic." : {
+      "comment" : "Home's card after a kernel panic that left no message.",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Androidはカーネルパニックで停止しました。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Android因内核严重错误而停止。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Android因核心嚴重錯誤而停止。"
+          }
+        }
+      }
+    },
+    "Android stopped with a kernel panic: %@." : {
+      "comment" : "Home's card after a kernel panic. The argument is the kernel's own message, in English, which stays as it is.",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Androidはカーネルパニックで停止しました。%@"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Android因内核严重错误而停止：%@。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Android因核心嚴重錯誤而停止：%@。"
+          }
+        }
+      }
+    },
+    "Android was using almost all the memory iOS allows Andarium. A smaller memory size is safer." : {
+      "comment" : "Home's card after iOS ended Andarium because the memory it used came near the limit.",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "AndroidがiOSでAndariumに許可されているメモリのほぼすべてを使用していました。メモリサイズを小さくする方が安全です。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Android几乎用尽了iOS允许Andarium使用的全部内存。较小的内存大小更安全。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Android幾乎用盡了iOS允許Andarium使用的所有記憶體。較小的記憶體大小更安全。"
+          }
+        }
+      }
+    },
+    "Android’s kernel crashed" : {
+      "comment" : "Title of Home's card after Android's kernel stopped on an error of its own.",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Androidのカーネルがクラッシュしました"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Android内核已崩溃"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Android核心已當機"
+          }
+        }
+      }
+    },
+    "Android’s kernel ended Andarium." : {
+      "comment" : "Home's card after Android's kernel ended the session by itself.",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "AndroidのカーネルがAndariumを終了しました。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Android的内核结束了Andarium。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Android的核心結束了Andarium。"
+          }
+        }
+      }
+    },
+    "Android’s kernel panicked" : {
+      "comment" : "Title of Home's card after Android's kernel panicked, the Linux kernel's own fatal error.",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Androidのカーネルパニック"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Android内核发生严重错误"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Android核心發生嚴重錯誤"
+          }
+        }
+      }
+    },
+    "Android’s memory could not be restored, so it starts again from boot." : {
+      "comment" : "Home's card after a start that could not bring back the memory Android saved when it was paused.",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Androidのメモリを復元できなかったため、起動からやり直します。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无法恢复Android的内存，因此将从启动开始重新运行。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "無法回復Android的記憶體，因此會從開機重新開始。"
+          }
+        }
+      }
+    },
+    "arm64, %lld KiB pages" : {
+      "comment" : "The architecture row of the Info sheet: the CPU architecture, then the size of a memory page, as in arm64, 4 KiB pages.",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "arm64、%lld KiBページ"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "arm64、%lld KiB页面"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "arm64、%lld KiB頁面"
+          }
+        }
+      }
+    },
+    "Dismiss" : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "閉じる"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "关闭"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "關閉"
+          }
+        }
+      }
+    },
+    "Found in Settings while the virtual machine runs" : {
+      "comment" : "Where a feature is found: in the Settings sheet that opens while the virtual machine runs.",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "仮想マシンの実行中は“設定”にあります"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "虚拟机运行时，可在“设置”中找到"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "虛擬機器執行時，可在「設定」中找到"
+          }
+        }
+      }
+    },
+    "Frame rate lowered while this device is hot" : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "デバイスが高温のため、フレームレートを下げています"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "设备温度较高，已降低帧速率"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "裝置溫度較高，已降低影格速率"
+          }
+        }
+      }
+    },
+    "If an app looks broken, swipe it away in Recents and open it again." : {
+      "comment" : "Recents is Android's list of recent apps inside the virtual machine; use the virtual machine's own name for it.",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "アプリの表示がおかしい場合は、“最近使用したアプリ”でそのアプリを上にスワイプして終了し、もう一度開いてください。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "如果应用显示异常，请在“最近使用的应用”中将其划掉，然后重新打开。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "如果應用程式顯示異常，請在「最近使用的應用程式」中將其滑掉，然後重新開啟。"
+          }
+        }
+      }
+    },
+    "iOS ended Andarium" : {
+      "comment" : "Title of Home's card after iOS ended Andarium because the memory it used came near the limit.",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "iOSがAndariumを終了しました"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "iOS结束了Andarium"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "iOS結束了Andarium"
+          }
+        }
+      }
+    },
+    "iOS is likely to close Andarium above %@." : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@を超えると、iOSによってAndariumが終了される可能性が高くなります。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "超过%@时，iOS很可能会关闭Andarium。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "超過%@時，iOS很可能會關閉Andarium。"
+          }
+        }
+      }
+    },
+    "iOS is likely to close Andarium with %@ of virtual machine memory on this %@. %@ or less is safer. Lower it with Edit under Virtual machine." : {
+      "comment" : "Arguments: virtual machine memory, device name, the safer size. Edit and Virtual machine are labels on Home.",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "この%2$@で仮想マシンのメモリが%1$@の場合、iOSによってAndariumが終了される可能性が高くなります。%3$@以下にする方が安全です。“仮想マシン”の“編集”で下げてください。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此%2$@上的虚拟机内存为%1$@时，iOS很可能会关闭Andarium。%3$@或更低更为安全。请使用“虚拟机”下的“编辑”降低内存。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此%2$@上的虛擬機器記憶體為%1$@時，iOS很可能會關閉Andarium。%3$@或更低更為安全。請使用「虛擬機器」下的「編輯」降低記憶體。"
+          }
+        }
+      }
+    },
+    "it could not start (%@)" : {
+      "comment" : "A clause of the line the end screen offers to copy, after \"Virtual machine ended:\". %@ is the reason, in English.",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "起動できませんでした（%@）"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无法启动（%@）"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "無法啟動（%@）"
+          }
+        }
+      }
+    },
+    "it could not start (this device could not give it %@ of memory)" : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "起動できませんでした（このデバイスは%@のメモリを割り当てられませんでした）"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无法启动（此设备无法提供%@内存）"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "無法啟動（此裝置無法提供%@記憶體）"
+          }
+        }
+      }
+    },
+    "it was stopped from the boot screen" : {
+      "comment" : "A clause of the line the end screen offers to copy, after \"Virtual machine ended:\".",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "起動画面から停止されました"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已在启动界面停止"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已在啟動畫面停止"
+          }
+        }
+      }
+    },
+    "list.join" : {
+      "comment" : "Joins two parts of a spoken list: a comma and a space in English, the language's own comma in Chinese and Japanese.",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$@, %2$@"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$@、%2$@"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$@、%2$@"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$@、%2$@"
+          }
+        }
+      }
+    },
+    "Needs an A14 chip or later" : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "A14チップ以降が必要です"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "需要A14或更新的芯片"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "需要A14或更新的晶片"
+          }
+        }
+      }
+    },
+    "runtime result %lld" : {
+      "comment" : "A clause of the line the end screen offers to copy, after \"Virtual machine ended:\". %lld is the number the runtime returned.",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ランタイムの結果%lld"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "运行时结果%lld"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "執行階段結果%lld"
+          }
+        }
+      }
+    },
+    "sentence.join" : {
+      "comment" : "Joins two whole sentences: a space in English, none in Chinese and Japanese.",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$@ %2$@"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$@%2$@"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$@%2$@"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$@%2$@"
+          }
+        }
+      }
+    },
+    "The virtual machine cannot start from %@: its name has a space, comma, colon or quotation mark." : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "仮想マシンは%@から起動できません。名前にスペース、カンマ、コロン、引用符が含まれています。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "虚拟机无法从%@启动：其名称含有空格、逗号、冒号或引号。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "虛擬機器無法從%@啟動：其名稱含有空格、逗號、冒號或引號。"
+          }
+        }
+      }
+    },
+    "The virtual machine doesn’t have enough free space to install this app (%@ needed, %@ available). Free some up in the virtual machine, or give it more storage with Resize." : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "仮想マシンの空き容量が足りないため、このアプリをインストールできません（必要：%@、空き：%@）。仮想マシン内で容量を空けるか、“サイズを変更”でストレージを増やしてください。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "虚拟机的可用空间不足，无法安装此应用（需要%@，可用%@）。请在虚拟机中释放一些空间，或使用“调整大小”为其增加存储空间。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "虛擬機器的可用空間不足，無法安裝此應用程式（需要%@，可用%@）。請在虛擬機器中釋出一些空間，或使用「調整大小」為其增加儲存空間。"
+          }
+        }
+      }
+    },
+    "the virtual machine kept restarting" : {
+      "comment" : "A clause of the line the end screen offers to copy, after \"Virtual machine ended:\".",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "仮想マシンが再起動を繰り返しました"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "虚拟机一直在重新启动"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "虛擬機器一直在重新啟動"
+          }
+        }
+      }
+    },
+    "The virtual machine’s data uses a newer layout than this app version can open. Erase the virtual machine to start again with this one." : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "仮想マシンのデータは、このバージョンのアプリでは開けない新しい形式です。仮想マシンを消去して、このバージョンで最初からやり直してください。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "虚拟机数据的格式比此App版本支持的更新。请抹掉虚拟机，以便用此版本重新开始。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "虛擬機器資料的格式比此App版本支援的更新。請清除虛擬機器，以便用此版本重新開始。"
+          }
+        }
+      }
+    },
+    "The virtual machine’s files do not match this app version. Erase the virtual machine to start again." : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "仮想マシンのファイルがこのバージョンのアプリと一致しません。仮想マシンを消去して最初からやり直してください。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "虚拟机的文件与此App版本不匹配。请抹掉虚拟机以重新开始。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "虛擬機器的檔案與此App版本不相符。請清除虛擬機器以重新開始。"
+          }
+        }
+      }
+    },
+    "There is not enough free storage to set up the virtual machine." : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ストレージの空き容量が足りないため、仮想マシンを設定できません。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "可用存储空间不足，无法设置虚拟机。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "可用儲存空間不足，無法設定虛擬機器。"
+          }
+        }
+      }
+    },
+    "There isn’t enough free space on this %@ to install this app (%@ needed, %@ available). Free up space in Settings › General › %@ Storage and try again." : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "この%@の空き容量が足りないため、このアプリをインストールできません（必要：%@、空き：%@）。“設定”＞“一般”＞“%@ストレージ”で容量を空けてから、もう一度お試しください。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此%@的可用空间不足，无法安装此应用（需要%@，可用%@）。请在“设置”>“通用”>“%@储存空间”中释放空间，然后重试。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此%@的可用空間不足，無法安裝此應用程式（需要%@，可用%@）。請在「設定」>「一般」>「%@儲存空間」中釋出空間，然後再試一次。"
+          }
+        }
+      }
+    },
+    "There’s no app in this file. Choose an .apk, .apks, .xapk or .apkm file that holds an app." : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "このファイルにはアプリが含まれていません。アプリを含む.apk、.apks、.xapk、.apkmのいずれかのファイルを選択してください。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此文件中没有应用。请选择包含应用的.apk、.apks、.xapk或.apkm文件。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此檔案中沒有應用程式。請選擇包含應用程式的.apk、.apks、.xapk或.apkm檔案。"
+          }
+        }
+      }
+    },
+    "This app has no code for this device’s processor. Choose a version of the app made for ARM processors." : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "このアプリには、このデバイスのプロセッサ用のコードがありません。ARMプロセッサ用のバージョンのアプリを選択してください。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此应用没有适用于此设备处理器的代码。请选择适用于ARM处理器的应用版本。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此應用程式沒有適用於此裝置處理器的程式碼。請選擇適用於ARM處理器的應用程式版本。"
+          }
+        }
+      }
+    },
+    "This app version is older than the one the virtual machine last started with, and its data does not go back. Install a newer version of Andarium, or erase the virtual machine to start again with this one." : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "このアプリのバージョンは、仮想マシンが前回起動したときのバージョンより古く、仮想マシンのデータを古いバージョンに戻すことはできません。新しいバージョンのAndariumをインストールするか、仮想マシンを消去してこのバージョンで最初からやり直してください。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此App版本比虚拟机上次启动时使用的版本更旧，且虚拟机数据无法降级到旧版本。请安装更高版本的Andarium，或抹掉虚拟机以使用此版本重新开始。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此App版本比虛擬機器上次啟動時使用的版本更舊，且虛擬機器資料無法降級回舊版本。請安裝較新版本的Andarium，或清除虛擬機器以使用此版本重新開始。"
+          }
+        }
+      }
+    },
+    "This copy of Andarium does not carry a system." : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "このAndariumにはシステムが含まれていません。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此Andarium副本不含系统。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此Andarium拷貝不含系統。"
+          }
+        }
+      }
+    },
+    "This file is damaged or encrypted, so it can’t be installed. Download it again, or choose another file." : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "このファイルは破損しているか暗号化されているため、インストールできません。もう一度ダウンロードするか、別のファイルを選択してください。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此文件已损坏或已加密，因此无法安装。请重新下载，或选择其他文件。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此檔案已損毀或已加密，因此無法安裝。請重新下載，或選擇其他檔案。"
+          }
+        }
+      }
+    },
+    "This file is damaged, or the parts of the app don’t fit together. Download it again, or choose another file." : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "このファイルが破損しているか、アプリの各パーツが一致していません。もう一度ダウンロードするか、別のファイルを選択してください。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此文件已损坏，或应用的各个部分不匹配。请重新下载，或选择其他文件。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此檔案已損毀，或應用程式的各個部分不相符。請重新下載，或選擇其他檔案。"
+          }
+        }
+      }
+    },
+    "This file is encrypted, so it can’t be installed. Choose an app file that isn’t encrypted." : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "このファイルは暗号化されているため、インストールできません。暗号化されていないアプリのファイルを選択してください。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此文件已加密，因此无法安装。请选择未加密的应用文件。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此檔案已加密，因此無法安裝。請選擇未加密的應用程式檔案。"
+          }
+        }
+      }
+    },
+    "This is an app bundle for publishing apps, which can’t be installed. Choose an .apk, .apks, .xapk or .apkm file." : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "これはアプリを公開するためのアプリバンドルで、インストールできません。.apk、.apks、.xapk、.apkmのいずれかのファイルを選択してください。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "这是用于发布应用的应用包，无法安装。请选择.apk、.apks、.xapk或.apkm文件。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "這是用於發布應用程式的應用程式套件，無法安裝。請選擇.apk、.apks、.xapk或.apkm檔案。"
+          }
+        }
+      }
+    },
+    "This isn’t an app. Choose a file that ends in .apk, .apks, .xapk or .apkm." : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "これはアプリではありません。.apk、.apks、.xapk、.apkmのいずれかで終わるファイルを選択してください。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "这不是应用。请选择以.apk、.apks、.xapk或.apkm结尾的文件。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "這不是應用程式。請選擇以.apk、.apks、.xapk或.apkm結尾的檔案。"
+          }
+        }
+      }
+    },
+    "This virtual machine cannot start" : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "この仮想マシンは起動できません"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此虚拟机无法启动"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此虛擬機器無法啟動"
+          }
+        }
+      }
+    },
+    "Virtual machine ended: %@" : {
+      "comment" : "The line of the report the end screen offers to copy that says why the run ended. %@ is a clause such as \"it was stopped from the boot screen\".",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "仮想マシンが終了しました：%@"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "虚拟机已结束：%@"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "虛擬機器已結束：%@"
+          }
+        }
+      }
+    },
+    "Virtual machine ended: %@ after %@" : {
+      "comment" : "The same line when the run's length is known. %1$@ is the clause, %2$@ the time the run lasted, such as 3:17.",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "仮想マシンが終了しました：%1$@（%2$@経過）"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "虚拟机已结束：%1$@，已运行%2$@"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "虛擬機器已結束：%1$@，已執行%2$@"
+          }
+        }
+      }
+    },
+    "Virtual machine memory is high" : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "仮想マシンのメモリが多めです"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "虚拟机内存偏高"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "虛擬機器記憶體偏高"
+          }
+        }
+      }
+    },
+    "VRAM" : {
+      "comment" : "Graphics memory of the virtual machine (video RAM).",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "VRAM"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "VRAM"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "VRAM"
+          }
+        }
+      }
+    },
+    "VRAM is graphics memory, separate from the virtual machine’s RAM." : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "VRAMはグラフィックスメモリで、仮想マシンのRAMとは別です。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "VRAM是显存，与虚拟机的RAM相互独立。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "VRAM是繪圖記憶體，與虛擬機器的RAM各自獨立。"
+          }
+        }
+      }
+    }
+  },
+  "version" : "1.0"
+}

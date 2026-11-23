@@ -6,6 +6,12 @@
 extern "C" {
 #endif
 
+/* guest_code is a bit set. Zero maps a page that is not guest code. Bit 0
+ * marks guest code. Bit 1, meaningful only with bit 0 (the value 3), is the
+ * kernel's fact that no store can change the page while it is mapped: an
+ * up-to-date page-cache page of a read-only file system. The host shares what
+ * it verified about such a page between address spaces and about no other. A
+ * kernel that never sets bit 1 stays correct. */
 int darwin_uml_vm_map(void *address, int fd, unsigned long long offset,
 		      unsigned long length, int protection, int guest_code,
 		      int guest_writable);
@@ -30,8 +36,38 @@ int darwin_uml_vm_walker_lock(unsigned long generation);
 int darwin_uml_vm_walker_unlock(unsigned long generation);
 int darwin_uml_vm_destroy(unsigned long generation);
 int darwin_uml_vm_flush_generation(unsigned long generation);
+/* The generation's own code changed in [address, address + length) by a
+ * flush by address, as an AArch32 cacheflush() makes it: the frames the
+ * generation maps there now are published at their holders, and every
+ * generation hears of a page the generation has no entry for. Returns 0, or
+ * a negative value on failure. */
 int darwin_uml_vm_invalidate_code(unsigned long generation,
 				  unsigned long address, unsigned long length);
+/* Linux wrote length bytes at address in the generation's process, within
+ * one guest page, through its own alias of the frame at fd and offset (the
+ * frame's offset in fd, which Linux still holds): a ptrace, /proc/pid/mem
+ * or process_vm_writev() store. The change is published at every holder of
+ * that frame, whatever the generation maps at address now, and in the
+ * generation when its view of address is that frame and code, or it holds
+ * the frame. A negative fd names no frame, and every generation hears of
+ * the change. Returns 0, or a negative value on failure. */
+int darwin_uml_vm_invalidate_code_frame(unsigned long generation,
+					unsigned long address,
+					unsigned long length, int fd,
+					unsigned long long offset);
+/* Linux wrote the bytes of the whole guest pages [offset, offset + length)
+ * of the frame at fd through its own alias, for no process and at no
+ * user address, into a frame some process maps and runs as code: a write(2),
+ * splice(2) or truncate into a page-cache or memfd frame, or a block
+ * device's read into a page a process pinned (O_DIRECT, io_uring), whether
+ * that page is anonymous or a file's. Any frame of guest RAM is named the
+ * same way, by the fd and offset of its backing. The change is published
+ * at every x86 translation of those pages, whichever address spaces map
+ * them; an arm64 guest follows the architecture's cache maintenance and is
+ * not told. A negative fd names no frame, and every address space hears of
+ * the change. Returns 0, or a negative value on failure. */
+int darwin_uml_vm_invalidate_code_frames(int fd, unsigned long long offset,
+					 unsigned long long length);
 int darwin_uml_vm_sync_from_backing(unsigned long address);
 int darwin_uml_vm_sync_from_buffer(unsigned long address,
 				   const void *buffer, unsigned long length);

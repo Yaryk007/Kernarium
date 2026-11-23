@@ -71,6 +71,16 @@ std::uint32_t NativeDisplay::height() const noexcept
     return state_->geometryPolicy.advertisedSize().height;
 }
 
+std::uint32_t NativeDisplay::refreshRate() const noexcept
+{
+    return state_->refreshRate();
+}
+
+void NativeDisplay::noteModeRefreshRate(std::uint32_t rate) noexcept
+{
+    state_->modeRefreshRateNoted(rate);
+}
+
 int NativeDisplay::resizeEventDescriptor() const noexcept
 {
     return state_->resizeNotifier.descriptor();
@@ -141,8 +151,10 @@ void NativeDisplay::update(
         destinationY,
         width,
         height);
-    if (rectangle.width != 0 && rectangle.height != 0)
+    if (rectangle.width != 0 && rectangle.height != 0) {
+        state_->presentation.recordGuestUpdate();
         state_->presentation.publishCpuFrame();
+    }
 }
 
 void NativeDisplay::fillSelfTestPattern()

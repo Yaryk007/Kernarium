@@ -19,13 +19,28 @@ public struct Guest: Equatable, Codable, Sendable {
     public var cores: Int
     public var memoryMiB: Int
     public var capacityGiB: Int
-    /// A larger capacity that applies when the guest next starts.
+    /// A larger capacity that applies when the guest next starts. It exists
+    /// only on Home: a start applies it as it is handed to the runtime
+    /// (`applyPendingGrowth`).
     public var pendingCapacityGiB: Int?
     public var microphone: Bool
-    /// The person's choice to share the device's accelerometer and gyroscope
-    /// with the guest; nil until they choose, and then it follows the device
-    /// (`motionSensorsOn(available:)`). Stored under `motionSensors`.
-    public var motionChoice: Bool?
+    /// The person's choice to share this device's cameras with the guest, read
+    /// when the guest starts and never during a run (`CameraSession`). Off for
+    /// a new guest and for one stored before the switch existed.
+    public var camera: Bool
+    /// The person's choice to share this device's location with the guest's
+    /// GNSS receiver. Off for a new guest and for one stored before the
+    /// switch existed.
+    public var location: Bool
+    /// The person's choice to let the guest play its haptics (Android's
+    /// vibrator and haptic feedback) on this device's Taptic Engine. On for
+    /// a new guest and for one stored before the switch existed. A game
+    /// controller's rumble is the controller's and not governed by it.
+    public var haptics: Bool
+    /// The person's choice to start Android with root (Magisk), and what the
+    /// application keeps beside it (`RootState`). Off for a new guest and for
+    /// one stored before the switch existed.
+    public var root = RootState()
     /// Whether iCloud and computer backups include the guest's files. Off by
     /// default: the guest is several GiB that Android can set up again.
     public var includeInBackups: Bool
@@ -37,13 +52,13 @@ public struct Guest: Equatable, Codable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case cores, memoryMiB, capacityGiB, pendingCapacityGiB, microphone
-        case includeInBackups
-        case motionChoice = "motionSensors"
+        case includeInBackups, location, haptics, camera, root
     }
 
     public init(
         cores: Int, memoryMiB: Int, capacityGiB: Int, pendingCapacityGiB: Int? = nil,
-        microphone: Bool = false, includeInBackups: Bool = false, motionChoice: Bool? = nil,
+        microphone: Bool = false, includeInBackups: Bool = false,
+        location: Bool = false, haptics: Bool = true, camera: Bool = false, root: RootState = RootState(),
         usedBytes: UInt64 = 0
     ) {
         self.cores = cores
@@ -51,7 +66,10 @@ public struct Guest: Equatable, Codable, Sendable {
         self.capacityGiB = capacityGiB
         self.pendingCapacityGiB = pendingCapacityGiB
         self.microphone = microphone
-        self.motionChoice = motionChoice
+        self.location = location
+        self.haptics = haptics
+        self.camera = camera
+        self.root = root
         self.includeInBackups = includeInBackups
         self.usedBytes = usedBytes
     }
@@ -63,17 +81,11 @@ public struct Guest: Equatable, Codable, Sendable {
         capacityGiB = try values.decode(Int.self, forKey: .capacityGiB)
         pendingCapacityGiB = try values.decodeIfPresent(Int.self, forKey: .pendingCapacityGiB)
         microphone = try values.decode(Bool.self, forKey: .microphone)
+        location = try values.decodeIfPresent(Bool.self, forKey: .location) ?? false
         includeInBackups = try values.decode(Bool.self, forKey: .includeInBackups)
-        motionChoice = try values.decodeIfPresent(Bool.self, forKey: .motionChoice)
-    }
-
-    /// Whether the guest gets the device's motion: the person's choice, else
-    /// on, wherever the device has the sensors to share. It needs no iOS
-    /// permission, and nothing is read until an application in the guest
-    /// uses a sensor (`MotionSampling`). Without sensors it is off, whatever
-    /// was chosen.
-    public func motionSensorsOn(available: Bool) -> Bool {
-        available && (motionChoice ?? true)
+        haptics = try values.decodeIfPresent(Bool.self, forKey: .haptics) ?? true
+        camera = try values.decodeIfPresent(Bool.self, forKey: .camera) ?? false
+        root = try values.decodeIfPresent(RootState.self, forKey: .root) ?? RootState()
     }
 
     public var usedGiB: Double { Double(usedBytes) / Double(Limits.bytesPerGiB) }
@@ -95,7 +107,9 @@ public struct Guest: Equatable, Codable, Sendable {
     public var canGrow: Bool { effectiveCapacityGiB < Limits.capacityRangeGiB.upperBound }
 
     /// Resize: storage only grows, and the growth waits for the next start.
-    /// Choosing the current capacity again cancels a growth not yet applied.
+    /// Choosing the current capacity again cancels a growth not yet applied;
+    /// once a start has been handed to the runtime the growth is applied and
+    /// there is nothing left to cancel.
     /// `maximum` is the largest the carried system accepts, when that is
     /// below the range's.
     public mutating func setCapacity(_ value: Int, maximum: Int = Limits.capacityRangeGiB.upperBound) {
@@ -103,12 +117,18 @@ public struct Guest: Equatable, Codable, Sendable {
         pendingCapacityGiB = value > capacityGiB ? value : nil
     }
 
-    /// A start has finished booting: a pending growth now applies.
-    public mutating func didBoot() {
-        if let pending = pendingCapacityGiB {
-            capacityGiB = pending
-            pendingCapacityGiB = nil
-        }
+    /// A start is handed to the runtime, which grows the data disk to the
+    /// capacity the start carries, whatever the boot kind and however the
+    /// start ends. The growth applies here, so the capacity the guest records
+    /// is never below its disk's. Returns the capacity it grew from, or nil
+    /// when nothing was pending.
+    @discardableResult
+    public mutating func applyPendingGrowth() -> Int? {
+        guard let pending = pendingCapacityGiB else { return nil }
+        let before = capacityGiB
+        capacityGiB = pending
+        pendingCapacityGiB = nil
+        return before
     }
 
     /// The same choices with nothing in it: what Android's own factory reset
@@ -118,6 +138,10 @@ public struct Guest: Equatable, Codable, Sendable {
         guest.capacityGiB = effectiveCapacityGiB
         guest.pendingCapacityGiB = nil
         guest.usedBytes = 0
+        // The data held the Magisk app and what it was given: the choice stays
+        // and the application's memory of them goes.
+        guest.root.attention = nil
+        guest.root.dataDiskReplaced()
         return guest
     }
 
@@ -144,10 +168,13 @@ public struct Guest: Equatable, Codable, Sendable {
 
     /// The memory this guest loads with: a stored size below the minimum or
     /// above the bound of its vCPU count, or off the steps, comes to the
-    /// nearest allowed size.
+    /// nearest allowed size. A stored size of zero is none (a guest set up
+    /// where no size could start, `TwoDiskStorage.save`) and takes the host's
+    /// default for its vCPU count; where no size can start, zero.
     public func memoryWithinBound(on host: HostDevice) -> Guest {
         var guest = self
-        guest.memoryMiB = host.memory.clamped(memoryMiB, vCPUs: cores)
+        let size = memoryMiB > 0 ? memoryMiB : host.memory.defaultMemoryMiB(vCPUs: cores)
+        guest.memoryMiB = host.memory.clamped(size, vCPUs: cores)
         return guest
     }
 }

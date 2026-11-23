@@ -32,8 +32,9 @@ namespace uml::cpu::x86_64::gadgets {
 	return mode == ExecutionMode::compat32 ? 1U : 0U;
 }
 
-/* The unreachable guest address an untrained indirect cell and an empty
- * target-table entry name. */
+/* The vacant key an untrained indirect cell and an empty target-table entry
+ * name, with a safe unlinked fallback link beside it. A guest can branch
+ * there; no block begins at it. */
 [[nodiscard]] constexpr std::uint64_t empty_target(ExecutionMode mode) noexcept
 {
 	return normalize_instruction_pointer(mode, ~std::uint64_t{});
@@ -56,49 +57,54 @@ struct ProgramPages final {
 	std::uint64_t address, std::size_t size) noexcept;
 
 /* A link as translated code follows it, with what a space needs to find and
- * retire it. Laid out as an UnlinkedBlockLink, so an unlinked record's stream
- * is its own link_exit word, and the pair a link is retargeted by is one aligned
- * sixteen bytes. */
+ * retire it. Laid out as an UnlinkedBlockLink, so an unlinked record's pair
+ * enters link_exit with its own header in front of it, and the pair a link is
+ * retargeted by is one aligned sixteen bytes. */
 struct alignas(16) LinkRecord final {
 	explicit LinkRecord(std::uint64_t address) noexcept
 		: unlinked_begin{address}, unlinked_end{address},
 		  fallback_stream{reinterpret_cast<std::uintptr_t>(
 			native::uml_x86_64_gadget_link_exit)},
-		  link{&fallback_stream, 0, address}
+		  link{fallback_stream, &fallback_stream + 1, address}
 	{}
 
 	/* Whether the record links to `body`'s block. */
 	[[nodiscard]] bool names(const Body &body) const noexcept
 	{
-		return link.stream == body.program.native_stream().data();
+		return link.stream == body.program.native_stream().data() + 1;
 	}
 
 	void link_to(const Body &body) noexcept
 	{
-		/* The body's words and bounds are written before the pair that
-		 * makes them reachable. */
+		/* The body's words, count and bounds are written before the pair
+		 * that makes them reachable. */
 		std::atomic_thread_fence(std::memory_order_release);
-		gadget_cache::store_pair(&link.stream,
-			gadget_cache::word_of(body.program.native_stream().data()),
-			body.program.instruction_count());
+		const auto *stream = body.program.native_stream().data();
+		gadget_cache::store_pair(&link.entry, stream[0],
+			gadget_cache::word_of(stream + 1));
 	}
 
 	void reset() noexcept
 	{
-		gadget_cache::store_pair(&link.stream,
-			gadget_cache::word_of(&fallback_stream), 0);
+		gadget_cache::store_pair(&link.entry, fallback_stream,
+			gadget_cache::word_of(&fallback_stream + 1));
 	}
 
-	/* The body a miss may adopt: the latest stored for this address, while no
-	 * store has landed over it. Guarded by the record's shard. */
-	Body *indexed{};
+	/* Zero, the count of the unlinked state's header. */
+	std::uint32_t unlinked_count{};
+	/* Whether the record is on its shard's live list. */
+	bool listed{};
 	std::uint64_t unlinked_begin;
 	std::uint64_t unlinked_end;
 	std::uintptr_t fallback_stream;
 	BlockLink link;
-	bool listed{};
+	/* The body a miss may adopt: the latest stored for this address, while no
+	 * store has landed over it. Guarded by the record's shard. */
+	Body *indexed{};
 };
-static_assert(offsetof(LinkRecord, unlinked_begin) ==
+static_assert(offsetof(LinkRecord, unlinked_count) ==
+		offsetof(UnlinkedBlockLink, unlinked_count) &&
+	offsetof(LinkRecord, unlinked_begin) ==
 		offsetof(UnlinkedBlockLink, unlinked_begin) &&
 	offsetof(LinkRecord, fallback_stream) ==
 		offsetof(UnlinkedBlockLink, fallback_stream) &&
@@ -275,6 +281,14 @@ public:
 		return account_;
 	}
 
+	/* How the asking executor's window sees this address space at epoch
+	 * `now` (gadget_cache::place_use()). */
+	[[nodiscard]] gadget_cache::PlaceUse use(std::uint64_t now) const
+	{
+		return gadget_cache::place_use(attached_, account_, closed(),
+			now);
+	}
+
 	/* ---- Bodies ---- */
 
 	/* The pages a build will cover, held in the page index until unpinned,
@@ -338,7 +352,8 @@ public:
 	void note_store(std::uint64_t address, std::size_t size);
 	/* Answer a code change published up to `changes`: before any executor
 	 * runs the address space at `changes`, the records of the bodies the
-	 * change covers are reset, every one when `reader` cannot describe it. */
+	 * change covers are reset, every one when `reader` cannot describe it or
+	 * the change is the whole space (a range of length 0). */
 	void observe(std::uint64_t changes, ProgramCacheCodeChangeReader reader,
 		void *context);
 	/* The executor that published the changes up to `changes` itself has

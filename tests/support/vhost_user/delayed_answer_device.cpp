@@ -91,6 +91,25 @@ VhostUserQueueResult DelayedAnswerDevice::processQueue(std::uint32_t index,
             return {VhostUserQueueAction::complete, std::move(*answer)};
         }
     }
+    if (postponer_) {
+        if (const auto postponed = postponer_(index, request)) {
+            Held held;
+            if (*postponed != never)
+                held.due = Clock::now() + *postponed;
+            held.completion.requestId = requestId;
+            held.postponed = Postponed {index,
+                std::vector<std::uint8_t>(request.begin(), request.end()), responseCapacity};
+            {
+                std::lock_guard lock(mutex_);
+                held_.push_back(std::move(held));
+            }
+            changed_.notify_all();
+            note(*postponed == never ? "postponed a request until reset"
+                                     : "postponed a request for " +
+                                           std::to_string(postponed->count()) + " ms");
+            return {VhostUserQueueAction::defer, {}};
+        }
+    }
     const auto delay = policy_(index, request);
     auto result = device_->processQueue(index, requestId, request, responseCapacity);
     if (!delay || result.action != VhostUserQueueAction::complete)
@@ -109,23 +128,56 @@ VhostUserQueueResult DelayedAnswerDevice::processQueue(std::uint32_t index,
     return {VhostUserQueueAction::defer, {}};
 }
 
+void DelayedAnswerDevice::setPostponer(Postponer postponer) { postponer_ = std::move(postponer); }
+
 bool DelayedAnswerDevice::takeQueueCompletion(VhostUserQueueCompletion& completion)
 {
     if (device_->takeQueueCompletion(completion))
         return true;
-    {
-        std::lock_guard lock(mutex_);
-        const auto now = Clock::now();
-        auto due = held_.begin();
-        while (due != held_.end() && (!due->due || *due->due > now))
-            ++due;
-        if (due == held_.end())
-            return false;
-        completion = std::move(due->completion);
-        held_.erase(due);
+    for (;;) {
+        Held due_held;
+        {
+            std::lock_guard lock(mutex_);
+            const auto now = Clock::now();
+            auto due = held_.begin();
+            while (due != held_.end() && (!due->due || *due->due > now))
+                ++due;
+            if (due == held_.end())
+                return false;
+            due_held = std::move(*due);
+            held_.erase(due);
+        }
+        if (!due_held.postponed) {
+            completion = std::move(due_held.completion);
+            note("delivered a held answer");
+            return true;
+        }
+        /* The request falls due: the device hears of it now, on the
+         * transport's thread, outside the lock. */
+        const auto requestId = due_held.completion.requestId;
+        note("handed a postponed request to the device");
+        auto result = device_->processQueue(due_held.postponed->queue, requestId,
+                                            due_held.postponed->bytes,
+                                            due_held.postponed->responseCapacity);
+        if (result.action == VhostUserQueueAction::complete) {
+            completion = {requestId, std::move(result.response)};
+            return true;
+        }
+        if (result.action == VhostUserQueueAction::retry) {
+            /* Not taken yet: try again shortly. */
+            due_held.due = Clock::now() + std::chrono::milliseconds(5);
+            due_held.signalled = false;
+            {
+                std::lock_guard lock(mutex_);
+                held_.push_back(std::move(due_held));
+            }
+            changed_.notify_all();
+        }
+        /* A deferred request is the device's now: it completes it through
+         * takeQueueCompletion, which the next call asks first. */
+        if (device_->takeQueueCompletion(completion))
+            return true;
     }
-    note("delivered a held answer");
-    return true;
 }
 
 void DelayedAnswerDevice::reset() noexcept
@@ -142,6 +194,23 @@ void DelayedAnswerDevice::reset() noexcept
 }
 
 void DelayedAnswerDevice::prepareReset() noexcept { device_->prepareReset(); }
+std::vector<std::uint8_t> DelayedAnswerDevice::discardedResponse(
+    std::uint32_t queueIndex, std::span<const std::uint8_t> request) const
+{
+    return device_->discardedResponse(queueIndex, request);
+}
+bool DelayedAnswerDevice::keepsRequestsOnDisabledRing() const noexcept
+{
+    return device_->keepsRequestsOnDisabledRing();
+}
+bool DelayedAnswerDevice::keepsDeferredRequestsWhileDisabled() const noexcept
+{
+    return device_->keepsDeferredRequestsWhileDisabled();
+}
+bool DelayedAnswerDevice::answersKicksBeforeRunning() const noexcept
+{
+    return device_->answersKicksBeforeRunning();
+}
 void DelayedAnswerDevice::setGuestMapper(GuestMapper mapper)
 {
     device_->setGuestMapper(std::move(mapper));

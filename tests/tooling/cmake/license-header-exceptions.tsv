@@ -8,3 +8,4 @@
 # expression differs from the file's header, fails the test, so the list
 # cannot rot.
 kernel/common/video/virtio_video.h	GPL-2.0+	the generated kernel topic carries this header byte for byte; the tag becomes BSD-3-Clause (the body is BSD text) when the topic is amended and every kernel line regenerated with the next kernel rebuild
+tests/integration/android/gamepad_families.py	GPL-2.0-only	transcribes the report layouts of hid-playstation and hid-microsoft, so it keeps the kernel's identifier

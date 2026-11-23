@@ -4,6 +4,7 @@
 #include "runtime/execution_engine.hpp"
 #include "runtime/hibernation_mode.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -17,6 +18,17 @@ inline constexpr std::size_t default_jit_executor_cache_budget =
 inline constexpr std::size_t maximum_jit_executor_cache_budget =
 	256U * 1024U * 1024U;
 
+/* --aot-release=ID,MANIFEST,SYSTEM: the Android release a launch boots, as its
+ * own files state it (its ID and the SHA-256, in lowercase hex, of its manifest
+ * and of its system partition). The launcher that attaches the release states
+ * it (device/block: Storage::releaseIdentity); a launch with none boots no
+ * Android release, and the ahead-of-time component stays off. */
+inline constexpr std::string_view aot_release_prefix{"--aot-release="};
+
+/* The argument that states a release; empty for an identity that is not one. */
+[[nodiscard]] std::string aot_release_argument(std::string_view id,
+	std::string_view manifest_sha256, std::string_view system_sha256);
+
 /*
  * Kernel command-line policy is shared by every composition root.  Keeping
  * it outside the public C ABI makes the policy testable without constructing
@@ -29,7 +41,8 @@ struct EmulatorOptions final {
 	/* Whole-process budget for translated-code caches. Zero selects half of
 	 * guest memory, which is what the guest's own mem= argument reports;
 	 * --jit-cache-budget= overrides it. Private executor caches are capped
-	 * separately so the shared tier receives the remaining budget.
+	 * separately so the shared tier receives the remaining budget, when that
+	 * is enough for one (cpu/arm64/jit/jit_cache_geometry.hpp).
 	 */
 	std::size_t jit_cache_budget{};
 	std::size_t jit_executor_cache_budget{
@@ -58,6 +71,16 @@ struct EmulatorOptions final {
 	/* --session-record=: the file the run records how its session ended in,
 	 * for the next launch (runtime/session_record.hpp). Empty keeps none. */
 	std::string session_record_path;
+	/* --aot, --aot=on|off|auto: ahead-of-time code for the Android image's
+	 * own libraries (cpu/arm64/aot). Auto, the default, is on in a build that
+	 * carries the component unless DARWIN_UML_AOT=0; on fails a launch whose
+	 * build has none. */
+	::uml::runtime::AotSelection aot{::uml::runtime::AotSelection::automatic};
+	/* --aot-release=: the release the launch boots, when it states one. */
+	bool aot_release_stated{};
+	std::string aot_release_id;
+	std::array<std::uint8_t, 32> aot_manifest_sha256{};
+	std::array<std::uint8_t, 32> aot_system_sha256{};
 	std::size_t guest_memory_bytes{};
 	unsigned guest_cpus{1};
 	/* Whether the engines ignore the top byte of a data address. On for every

@@ -85,3 +85,36 @@ uml_add_tooling_test(
         --runners ${PROJECT_SOURCE_DIR}/tests/integration/x86_64
     LABELS x86-64
     TIMEOUT 120)
+
+# x22 holds the run's software-TLB base (`_tlb` in
+# darwin/cpu/x86_64/gadgets/engine/common.inc), so no other source of the
+# x86-64 gadget engine names it, and where the engine object is built, no
+# other instruction of it but the entry's load, the translations' index and
+# the host frame's save and restore.
+set(_uml_x86_64_tlb_register_object)
+if(TARGET uml_x86_64_gadgets AND CMAKE_OBJDUMP)
+    set(_uml_x86_64_tlb_register_object --objdump ${CMAKE_OBJDUMP} --object
+        uml_x86_64_gadgets
+        "$<FILTER:$<TARGET_OBJECTS:uml_x86_64_gadgets>,INCLUDE,/engine[.]S[.]o$>")
+endif()
+uml_add_tooling_test(
+    NAME x86-64-gadget-tlb-register
+    COMMAND ${Python3_EXECUTABLE} -B
+        ${PROJECT_SOURCE_DIR}/tests/tooling/x86_64/test_gadget_tlb_register.py
+        ${PROJECT_SOURCE_DIR} ${_uml_x86_64_tlb_register_object}
+    LABELS cpu;x86-64
+    TIMEOUT 60)
+
+# A helper call may clobber x0 to x17, so no gadget reads one of x2 to x17 on
+# any path after a call before writing it again. The check reads the engine
+# object, so it exists where the object is built.
+if(TARGET uml_x86_64_gadgets AND CMAKE_OBJDUMP)
+    uml_add_tooling_test(
+        NAME x86-64-gadget-helper-clobbers
+        COMMAND ${Python3_EXECUTABLE} -B
+            ${PROJECT_SOURCE_DIR}/tests/tooling/x86_64/test_gadget_helper_clobbers.py
+            --objdump ${CMAKE_OBJDUMP} --object uml_x86_64_gadgets
+            "$<FILTER:$<TARGET_OBJECTS:uml_x86_64_gadgets>,INCLUDE,/engine[.]S[.]o$>"
+        LABELS cpu;x86-64
+        TIMEOUT 300)
+endif()

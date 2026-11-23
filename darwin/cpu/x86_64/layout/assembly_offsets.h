@@ -46,6 +46,8 @@
 #define UML_X86_64_TLB_READ_DATA_MINUS_ADDRESS 8
 #define UML_X86_64_TLB_WRITE_PAGE 16
 #define UML_X86_64_TLB_WRITE_DATA_MINUS_ADDRESS 24
+/* The software TLB is indexed by the low bits of the page number. */
+#define UML_X86_64_TLB_INDEX_BITS 15
 
 #define UML_X86_64_TLB_WRITE_CODE 2
 #define UML_X86_64_TLB_WRITE_CACHED_CODE 4

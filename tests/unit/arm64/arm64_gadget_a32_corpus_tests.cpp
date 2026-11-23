@@ -31,8 +31,20 @@
  * kInterruptDeadline, and the run fails if none did. --passes N repeats the
  * selected records at least N times.
  *
+ * --inject makes the first attempt at chosen exclusive cases end as if the
+ * engine had committed a fault (corpus::kFaultPlans), and checks that a plain
+ * loss is retried and that a loss with another register or TPIDRURO wrong, a
+ * store that reports success and did not write, and a store the pack has fail
+ * with another register wrong each fail on that attempt. A recognized retry
+ * loop (corpus::retry_loop_length) that retires whole passes more than the
+ * pack is retried the same way; one instruction, a pass of another loop's
+ * length, an excess in a case that is no retry loop each fail on that
+ * attempt, and a whole pass on every attempt fails when the attempts are used
+ * up.
+ *
  *   uml_arm64_gadget_a32_corpus_tests PACK [--record NAME[,NAME...]]
  *       [--case TEXT] [--limit N] [--forms FILE] [--passes N] [--interrupt]
+ *       [--inject]
  */
 #include "aarch32_corpus_cpu_state.hpp"
 #include "aarch32_corpus_pack.hpp"
@@ -356,6 +368,9 @@ struct Options final {
 	bool interrupt = false;
 	/* Write the encodings whose cases ran, one per line, to this file. */
 	std::string forms_path;
+	/* Make the engine's first attempt at chosen cases commit each fault of
+	 * corpus::kFaultPlans, and check that it is retried or refused. */
+	bool inject = false;
 
 	/* Whether --record names the record: one name, or several separated
 	 * by commas; none selects every record. */
@@ -467,7 +482,8 @@ void explain(const corpus::Case &test, std::size_t target)
 struct Attempt final {
 	std::string diffs;
 	/* The only differences are a store-exclusive that reported failure where
-	 * the oracle's succeeded and the store it therefore did not make. */
+	 * the oracle's succeeded and the store it therefore did not make, the
+	 * rest of the data being as the pack has it. */
 	bool reservation_lost = false;
 };
 
@@ -476,9 +492,13 @@ struct Attempt final {
 	return test.form.starts_with("STREX") || test.form.starts_with("STLEX");
 }
 
-[[nodiscard]] Attempt run_case(Machine &machine, const corpus::Case &test,
+/* One run of a case. `fault`, for --inject, makes this run end as if the
+ * engine had committed it. */
+[[nodiscard]] Attempt run_case(Machine &machine, std::string_view record,
+			       const corpus::Case &test,
 			       const std::vector<std::uint8_t> &initial_data,
-			       const std::vector<std::uint8_t> &expected_data)
+			       const std::vector<std::uint8_t> &expected_data,
+			       const corpus::FaultPlan *fault = nullptr)
 {
 	const bool thumb = (test.flags & corpus::kFlagThumb) != 0;
 	const std::uint32_t origin = test.origin;
@@ -493,13 +513,27 @@ struct Attempt final {
 	 * which only a program marked as touching them can have. */
 	if (cpu.fp_dirty)
 		saved = cpu.vectors;
+	if (fault != nullptr) {
+		const auto effect = corpus::inject_fault(fault->fault, test,
+							 cpu.registers.data());
+		require(effect.has_value(), "the injected fault does not fit a case");
+		if (effect->put_back) {
+			auto bytes = machine.data();
+			std::copy_n(initial_data.begin() + effect->offset, effect->size,
+				    bytes.begin() + effect->offset);
+			machine.set_data(bytes);
+		}
+		cpu.a32_tpidruro ^= effect->tpidruro_xor;
+	}
 	const auto outcome = classify(machine, cpu, result,
 				      corpus::kCodeBase + origin,
 				      test.halves.size());
 
 	Attempt attempt;
 	auto &diffs = attempt.diffs;
-	std::size_t notes = 0, lost_status = 0, unwritten = 0;
+	std::size_t notes = 0, value_notes = 0, data_notes = 0;
+	bool retired_excess = false;
+	std::vector<std::uint8_t> actual;
 	const auto note = [&](const char *format, auto... values) {
 		char text[200];
 		std::snprintf(text, sizeof(text), format, values...);
@@ -546,8 +580,12 @@ struct Attempt final {
 			   result.reason == ExitReason::breakpoint) {
 			expected += 1;
 		}
-		if (outcome.retired != expected && !(padded && outcome.retired == expected + 1))
-			note("retired %zu vs %zu", test.retired, outcome.retired);
+		const std::size_t retired = outcome.retired + (fault != nullptr ? fault->excess : 0);
+		if (retired != expected && !(padded && retired == expected + 1)) {
+			note("retired %zu vs %zu", test.retired, retired);
+			retired_excess = retired > expected &&
+				corpus::retry_excess_accepted(record, test, retired - expected);
+		}
 		for (unsigned index = 0; index < corpus::kRegisters; ++index) {
 			const auto value = static_cast<std::uint32_t>(cpu.registers[index]);
 			/* A register's slot stays zero-extended: the shared A64
@@ -557,9 +595,7 @@ struct Attempt final {
 				     static_cast<unsigned long long>(cpu.registers[index]));
 			if (value != test.final.r[index]) {
 				note("r%u %#x vs %#x", index, test.final.r[index], value);
-				/* A store-exclusive's status: 0 stored, 1 did not. */
-				if (test.final.r[index] == 0 && value == 1)
-					++lost_status;
+				++value_notes;
 			}
 		}
 		const auto apsr = corpus::apsr_of(cpu);
@@ -581,11 +617,14 @@ struct Attempt final {
 			::uml::cpu::arm64::fpsr_writable_mask | decode::fpscr_nzcv;
 		if (fpscr != (test.final.fpscr & fpscr_mask))
 			note("fpscr %#x vs %#x", test.final.fpscr & fpscr_mask, fpscr);
+		if (static_cast<std::uint32_t>(cpu.a32_tpidruro) != test.final.tpidruro)
+			note("tpidruro %#x vs %#x", test.final.tpidruro,
+			     static_cast<std::uint32_t>(cpu.a32_tpidruro));
 		if (static_cast<std::uint32_t>(cpu.tls) != test.final.tpidrurw)
 			note("tpidrurw %#x vs %#x", test.final.tpidrurw,
 			     static_cast<std::uint32_t>(cpu.tls));
-		if (machine.data() != expected_data) {
-			const auto actual = machine.data();
+		actual = machine.data();
+		if (actual != expected_data) {
 			std::size_t count = 0, first = 0;
 			for (std::size_t index = 0; index < actual.size(); ++index)
 				if (actual[index] != expected_data[index]) {
@@ -593,16 +632,27 @@ struct Attempt final {
 						first = index;
 				}
 			note("data differs in %zu bytes, first at %#zx", count, first);
-			unwritten = actual == initial_data ? 1 : 0;
+			data_notes = 1;
 		}
 	}
-	attempt.reservation_lost = is_store_exclusive(test) && lost_status == 1 &&
-		unwritten == 1 && notes == 2;
+	/* Only registers and data differ, and they differ as a lost reservation
+	 * leaves them: the status register 1 where the pack has 0, the
+	 * store-exclusive's own bytes as the case started with them. */
+	attempt.reservation_lost = is_store_exclusive(test) && value_notes != 0 &&
+		notes == value_notes + data_notes && !actual.empty() &&
+		corpus::lost_exclusive_attempt(test, cpu.registers.data(),
+					       initial_data, expected_data, actual);
+	/* A recognized retry loop absorbs a loss by going round again: the
+	 * registers and data end as the pack has them, after whole passes more
+	 * instructions. */
+	if (retired_excess && notes == 1 && !actual.empty())
+		attempt.reservation_lost = true;
 	return attempt;
 }
 
 void check_case(Machine &machine, const corpus::Record &record,
-		const corpus::Case &test, const Options &options, Totals &totals)
+		const corpus::Case &test, const Options &options, Totals &totals,
+		const corpus::FaultPlan *fault = nullptr)
 {
 	if (needs_absent_extension(test)) {
 		++totals.skipped;
@@ -613,11 +663,12 @@ void check_case(Machine &machine, const corpus::Record &record,
 	++totals.run;
 	totals.forms.insert(test.form);
 
-	auto attempt = run_case(machine, test, initial_data, expected_data);
+	auto attempt = run_case(machine, record.name, test, initial_data, expected_data, fault);
 	unsigned attempts = 1;
 	totals.lost += attempt.reservation_lost ? 1 : 0;
 	while (attempt.reservation_lost && attempts < kExclusiveAttempts) {
-		attempt = run_case(machine, test, initial_data, expected_data);
+		attempt = run_case(machine, record.name, test, initial_data, expected_data,
+				   fault != nullptr && fault->persistent ? fault : nullptr);
 		totals.lost += attempt.reservation_lost ? 1 : 0;
 		++attempts;
 	}
@@ -637,6 +688,39 @@ void check_case(Machine &machine, const corpus::Record &record,
 		if (options.explain)
 			explain(test, test.target);
 	}
+}
+
+/* Runs each fault plan over its cases and reports whether the runner took
+ * every fault as the plan says: a lost reservation retried until the case
+ * agreed, and anything else failed on the first attempt, unretried. */
+[[nodiscard]] bool inject_faults(Machine &machine, const corpus::Pack &pack)
+{
+	bool good = true;
+	Options quiet;
+	quiet.limit = 0;
+	for (const auto &plan : corpus::kFaultPlans) {
+		Totals totals;
+		for (const auto &record : pack.records)
+			for (const auto &test : record.cases)
+				if ((record.profiles & corpus::kProfileBit) != 0 &&
+				    corpus::plan_selects(plan, record, test))
+					check_case(machine, record, test, quiet, totals, &plan);
+		const bool as_planned = totals.run != 0 && totals.skipped == 0 &&
+			/* A fault made on every attempt is retried to the bound, then
+			 * fails. The attempt after an injected loss may itself be a
+			 * real one. */
+			(plan.persistent ? totals.failed == totals.run && totals.retried == 0 &&
+						   totals.lost == totals.run * kExclusiveAttempts
+			 : plan.retried ? totals.failed == 0 && totals.retried == totals.run &&
+						  totals.lost >= totals.run
+					: totals.failed == totals.run && totals.retried == 0 &&
+						  totals.lost == 0);
+		std::printf("  inject %-20s %-22s run %3zu  failed %3zu  retried %3zu  %s\n",
+			    plan.name, plan.record, totals.run, totals.failed, totals.retried,
+			    as_planned ? "as planned" : "NOT AS PLANNED");
+		good = good && as_planned;
+	}
+	return good;
 }
 
 } // namespace
@@ -660,6 +744,8 @@ int main(int argc, char **argv)
 			options.interrupt = true;
 		} else if (argument == "--explain") {
 			options.explain = true;
+		} else if (argument == "--inject") {
+			options.inject = true;
 		} else if (argument == "--limit" && index + 1 < argc) {
 			options.limit = static_cast<std::size_t>(std::atoi(argv[++index]));
 		} else {
@@ -671,6 +757,8 @@ int main(int argc, char **argv)
 	require(path != nullptr, "usage: PACK [--record NAME]");
 	const auto pack = corpus::read_pack(corpus::read_file(path));
 	Machine machine;
+	if (options.inject)
+		return inject_faults(machine, pack) ? 0 : 1;
 	Totals totals;
 	decode::reset_a32_library_exits();
 	decode::count_a32_library_exits(true);

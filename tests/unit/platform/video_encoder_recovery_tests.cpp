@@ -116,6 +116,27 @@ void aSecondLossIsFinal()
     require(again.pictures()[0]->type == VideoFrameType::key, "the new stream starts at a key frame");
 }
 
+/* The system revokes the session of an app in the background while nothing is
+ * in flight, so the first frame after it is refused when it is submitted. */
+void idleSessionInvalidated()
+{
+    std::puts("== idle session invalidated");
+    const auto base = fixturePicture(false);
+    auto encoder = open(settings());
+    const auto before = feed(*encoder, 6, 0, base);
+    requireWhole(before, 6, 0);
+    ::uml::platform::testing::invalidateSession(*encoder);
+    const auto after = feed(*encoder, 6, 100, base);
+    requireWhole(after, 6, 100);
+    const auto frames = after.pictures();
+    require(frames[0]->timestamp == 100 && frames[0]->type == VideoFrameType::key, "the frame after the loss is a key frame");
+    require(hasUnit(VideoCodec::h264, *frames[0], bits::h264NalSps), "carrying the parameter sets");
+    for (unsigned i = 1; i < 6; ++i) require(frames[i]->type == VideoFrameType::predicted, "and the rest follow it");
+    if (hardwareDecodes(VideoEncodeProfile::h264High)) {
+        require(decode(VideoCodec::h264, before).size() == 6 && decode(VideoCodec::h264, after).size() == 6, "both halves decode");
+    }
+}
+
 void lossesWithOutputBetweenAreEachRecovered()
 {
     std::puts("== separate losses");
@@ -161,6 +182,43 @@ void lossBeforeDrainNotice()
     for (unsigned waited = 0; !output.drained && waited < 600; ++waited) collect(*encoder, output, 50);
     requireWhole(output, 3, 0);
 }
+
+/* A session that is lost, or cannot get its hardware, while a property is set
+ * is not a refusal of the property, whether the property is one the stream asked
+ * for or a refinement the encoder may ignore: the configuration is exhausted, so
+ * discovery does not take a refusal for a fact of the host. A property the
+ * encoder does not know is still ignorable when it is only a refinement. */
+constexpr int kInvalidSession = -12903;       // kVTInvalidSessionErr
+constexpr int kAllocationFailed = -12904;     // kVTAllocationFailedErr
+constexpr int kPropertyNotSupported = -12900; // kVTPropertyNotSupportedErr
+
+VideoEncodeStatus configureWithFault(const char* key, int status)
+{
+    ::uml::platform::testing::failProperty(key, status);
+    auto encoder = makeVideoEncoder();
+    const auto result = static_cast<apple_encoder::ProbeEncoder&>(*encoder).configureUnchecked(settings());
+    ::uml::platform::testing::failProperty("", 0);
+    return result;
+}
+
+void anOptionalPropertyThatMeetsALostSession()
+{
+    std::puts("== a lost session at an optional property");
+    // H.264 High sets its entropy mode, which the encoder is free to ignore.
+    require(configureWithFault("H264EntropyMode", kAllocationFailed) == VideoEncodeStatus::exhausted,
+            "an allocation failure at an optional property is not a configuration that works");
+    require(configureWithFault("H264EntropyMode", kInvalidSession) == VideoEncodeStatus::exhausted,
+            "nor is a lost session");
+    require(configureWithFault("ExpectedFrameRate", kInvalidSession) == VideoEncodeStatus::exhausted,
+            "at any optional property");
+    require(configureWithFault("H264EntropyMode", kPropertyNotSupported) == VideoEncodeStatus::ok,
+            "while an optional property the encoder does not know is ignored");
+    // A required property is not a refinement.
+    require(configureWithFault("ProfileLevel", kInvalidSession) == VideoEncodeStatus::exhausted, "a lost session at a required property");
+    require(configureWithFault("ProfileLevel", kPropertyNotSupported) == VideoEncodeStatus::unsupported,
+            "and a required property the encoder does not know is a refusal");
+    require(configureWithFault("", 0) == VideoEncodeStatus::ok, "with no fault, the configuration is made");
+}
 } // namespace
 
 int main(int argc, char** argv)
@@ -173,10 +231,12 @@ int main(int argc, char** argv)
     try {
         oneLossIsRecovered();
         lossInTheMiddle();
+        idleSessionInvalidated();
         aSecondLossIsFinal();
         lossesWithOutputBetweenAreEachRecovered();
         lossWithReordering();
         lossBeforeDrainNotice();
+        anOptionalPropertyThatMeetsALostSession();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());
         return 1;

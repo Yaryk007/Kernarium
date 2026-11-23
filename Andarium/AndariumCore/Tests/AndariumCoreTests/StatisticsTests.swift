@@ -204,3 +204,92 @@ struct StatsSamplingTests {
         #expect(StatsSampling.interval * StatsSampling.memoryEvery == .seconds(2))
     }
 }
+
+/// Which readings reach the views: those that draw something new.
+struct StatsPublishGateTests {
+    /// What a minimal view draws: the figure and the sparkline's history.
+    private struct Drawn: Equatable {
+        var cpu: Int?
+        var history: [Int]
+    }
+
+    /// Offers each form in turn and answers which ones were published.
+    private func published<Form: Equatable>(_ gate: inout StatsPublishGate<Form>, _ forms: [Form]) -> [Bool] {
+        forms.map { gate.admits($0) }
+    }
+
+    @Test func theFirstReadingIsAlwaysPublished() {
+        var gate = StatsPublishGate<String>()
+        // Even one that draws only dashes.
+        let first = published(&gate, ["\u{2013}"])
+        #expect(first == [true])
+        var optional = StatsPublishGate<Int?>()
+        let nothing = published(&optional, [nil])
+        #expect(nothing == [true])
+    }
+
+    @Test func aReadingThatDrawsTheSameIsNotPublished() {
+        var gate = StatsPublishGate<String>()
+        let answers = published(&gate, Array(repeating: "25%", count: 6))
+        #expect(answers == [true, false, false, false, false, false])
+    }
+
+    @Test func aReadingThatDrawsSomethingElseIsPublishedOnce() {
+        var gate = StatsPublishGate<String>()
+        let answers = published(&gate, ["25%", "26%", "26%", "26%"])
+        #expect(answers == [true, true, false, false])
+    }
+
+    @Test func goingBackToAnEarlierFormIsAChangeToo() {
+        var gate = StatsPublishGate<String>()
+        // The views show 26% by the third, so 25% is news to them.
+        let answers = published(&gate, ["25%", "26%", "25%", "25%"])
+        #expect(answers == [true, true, true, false])
+    }
+
+    @Test func aResetPublishesTheNextReadingWhateverItDraws() {
+        var gate = StatsPublishGate<String>()
+        let before = published(&gate, ["25%", "25%"])
+        gate.reset()
+        let after = published(&gate, ["25%", "25%"])
+        gate.reset()
+        gate.reset()
+        let other = published(&gate, ["26%", "26%"])
+        #expect(before == [true, false])
+        #expect(after == [true, false])
+        #expect(other == [true, false])
+    }
+
+    /// A guest that holds its load: the sparkline fills for ten readings, and
+    /// from then on a second goes by without a thing to draw.
+    @Test func aSteadyGuestSettlesOnceTheHistoryIsFull() {
+        var meter = StatsMeter()
+        var gate = StatsPublishGate<Drawn>()
+        var published: [Int] = []
+        // Four vCPUs, one of them busy, 30 frames a second.
+        for step in 0..<60 {
+            meter.record(reading(at: Double(step), busy: Double(step), frames: UInt64(step) * 30))
+            if gate.admits(Drawn(cpu: meter.cpuPercent, history: meter.history)) { published.append(step) }
+        }
+        #expect(meter.cpuPercent == 25)
+        // The first reading, which has no rate, and the ten that fill the
+        // history.
+        #expect(published == Array(0...StatsMeter.historyLength))
+    }
+
+    @Test func aSteadyGuestThatChangesItsLoadPublishesTheChange() {
+        var meter = StatsMeter()
+        var gate = StatsPublishGate<Drawn>()
+        var busy = 0.0
+        var published: [Int] = []
+        for step in 0..<50 {
+            // One vCPU in four busy; two in the 30th second.
+            busy += step == 30 ? 2 : 1
+            meter.record(reading(at: Double(step), busy: busy))
+            if gate.admits(Drawn(cpu: meter.cpuPercent, history: meter.history)) { published.append(step) }
+        }
+        // The burst enters the history at once, every reading after it moves
+        // it along, and the one that pushes it out draws the steady bars again.
+        #expect(published == Array(0...StatsMeter.historyLength) + Array(30...(30 + StatsMeter.historyLength)))
+    }
+}

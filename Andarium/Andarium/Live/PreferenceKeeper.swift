@@ -4,8 +4,9 @@ import AndariumCore
 import Foundation
 import Observation
 
-/// Keeps what the person sets across launches: the display options chosen on
-/// Home and Settings' "Show on screen". Each is written when it changes. A
+/// Keeps what the person sets across launches: Home's "120 Hz", AOT and JIT
+/// rows, the display options chosen on Home, and Settings' "Show on screen",
+/// "Use the pointer as touch" and "When hot". Each is written when it changes. A
 /// value the launch decided for its own run is not written, so a harness
 /// launch never replaces what the person stored (`AppModel.displayOptionsToKeep`,
 /// `showStatsToKeep`).
@@ -30,12 +31,19 @@ final class PreferenceKeeper {
         guard let model else { return }
         if let options = model.displayOptionsToKeep { DisplayOptionsStore.save(options, to: defaults) }
         if let on = model.showStatsToKeep { StatsPreference(defaults: defaults).keep(on) }
+        if let on = model.pointerAsTouchToKeep { PointerPreference(defaults: defaults).keep(on) }
+        if let on = model.heatLimitToKeep { HeatLimitPreference(defaults: defaults).keep(on) }
+        if let on = model.highRefreshToKeep { HighRefreshPreference(defaults: defaults).keep(on) }
+        if let on = model.translatedLibrariesToKeep { TranslatedLibrariesPreference(defaults: defaults).keep(on) }
+        if let on = model.jitToKeep { JitPreference(defaults: defaults).keep(on) }
     }
 
     private func observe() {
         guard let model else { return }
         withObservationTracking {
-            _ = (model.displayOptionsToKeep, model.showStatsToKeep)
+            _ = (model.displayOptionsToKeep, model.showStatsToKeep, model.pointerAsTouchToKeep, model.heatLimitToKeep)
+            _ = model.highRefreshToKeep
+            _ = (model.translatedLibrariesToKeep, model.jitToKeep)
         } onChange: { [weak self] in
             // The model belongs to the main actor, so the change begins there;
             // the write waits until it has been made.

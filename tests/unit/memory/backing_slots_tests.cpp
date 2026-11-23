@@ -50,13 +50,13 @@ void a_pair_keeps_its_slot_and_a_slot_follows_its_pages()
 	BackingSlots slots;
 	require(slots.slots_in_use() == 0);
 
-	const auto one = slots.claim(first.backing(), first.fd());
-	const auto two = slots.claim(second.backing(), second.fd());
+	const auto one = slots.claim(first.backing(), first.fd(), false);
+	const auto two = slots.claim(second.backing(), second.fd(), false);
 	require(one == 0 && two == 1);
 	/* The same pair is the same slot, and the same backing under another
 	 * descriptor is another pair. */
-	require(slots.claim(first.backing(), first.fd()) == one);
-	const auto alias = slots.claim(first.backing(), first.fd() + 1000);
+	require(slots.claim(first.backing(), first.fd(), false) == one);
+	const auto alias = slots.claim(first.backing(), first.fd() + 1000, false);
 	require(alias == 2);
 	require(slots.slots_in_use() == 3);
 
@@ -66,9 +66,9 @@ void a_pair_keeps_its_slot_and_a_slot_follows_its_pages()
 	require(slots.entry(alias, 0).backing == first.backing().get() &&
 		slots.entry(alias, 0).fd == first.fd() + 1000);
 
-	slots.add(one, 0x1000, first.backing(), first.fd());
-	slots.add(one, 0x2000, first.backing(), first.fd());
-	slots.add(two, 0x3000, second.backing(), second.fd());
+	slots.add(one, 0x1000, first.backing(), first.fd(), false);
+	slots.add(one, 0x2000, first.backing(), first.fd(), false);
+	slots.add(two, 0x3000, second.backing(), second.fd(), false);
 	require(slots.pages_in(one) == 2 && slots.pages_in(two) == 1);
 	/* Settling releases the claim nothing used. */
 	slots.settle();
@@ -85,7 +85,7 @@ void a_pair_keeps_its_slot_and_a_slot_follows_its_pages()
 	require(slots.slots_in_use() == 1);
 	require(slots.entry(one, 0).backing == nullptr);
 	Backing third;
-	require(slots.claim(third.backing(), third.fd()) == one);
+	require(slots.claim(third.backing(), third.fd(), false) == one);
 	require(slots.entry(two, 0).backing == second.backing().get());
 	slots.settle();
 	slots.clear();
@@ -97,13 +97,13 @@ void a_change_that_stops_after_its_claims_leaves_nothing_behind()
 	Backing kept;
 	Backing claimed;
 	BackingSlots slots;
-	require(slots.claim(kept.backing(), kept.fd()) == 0);
-	slots.add(0, 0x1000, kept.backing(), kept.fd());
+	require(slots.claim(kept.backing(), kept.fd(), false) == 0);
+	slots.add(0, 0x1000, kept.backing(), kept.fd(), false);
 	slots.settle();
 
 	/* A change claims a slot and room for an overflow page, then fails
 	 * before it counts anything in. */
-	require(slots.claim(claimed.backing(), claimed.fd()) == 1);
+	require(slots.claim(claimed.backing(), claimed.fd(), false) == 1);
 	slots.reserve_overflow(0x5000);
 	require(slots.overflow_pages() == 1);
 	slots.settle();
@@ -124,12 +124,12 @@ void more_backings_than_slots_fall_back_to_the_overflow_table()
 	std::vector<unsigned> claimed;
 	for (unsigned index = 0; index < count; ++index) {
 		const auto &backing = *backings[index];
-		const auto slot = slots.claim(backing.backing(), backing.fd());
+		const auto slot = slots.claim(backing.backing(), backing.fd(), false);
 		claimed.push_back(slot);
 		const std::uint64_t page = (index + 1) * page_size;
 		if (slot == BackingSlots::overflow)
 			slots.reserve_overflow(page);
-		slots.add(slot, page, backing.backing(), backing.fd());
+		slots.add(slot, page, backing.backing(), backing.fd(), false);
 	}
 	slots.settle();
 	for (unsigned index = 0; index < BackingSlots::slot_count; ++index)
@@ -156,7 +156,7 @@ void more_backings_than_slots_fall_back_to_the_overflow_table()
 	/* A page can move from one overflow backing to another in place. */
 	const std::uint64_t moved = (BackingSlots::slot_count + 1) * page_size;
 	slots.add(BackingSlots::overflow, moved, backings[0]->backing(),
-		backings[0]->fd());
+		backings[0]->fd(), false);
 	require(slots.entry(BackingSlots::overflow, moved).backing ==
 		backings[0]->backing().get());
 	slots.settle();
@@ -168,7 +168,7 @@ void more_backings_than_slots_fall_back_to_the_overflow_table()
 	slots.settle();
 	require(slots.slots_in_use() == BackingSlots::slot_count - 1);
 	const auto &late = *backings[count - 1];
-	require(slots.claim(late.backing(), late.fd()) == 0);
+	require(slots.claim(late.backing(), late.fd(), false) == 0);
 	slots.remove(BackingSlots::overflow, moved);
 	slots.settle();
 	require(slots.overflow_pages() ==
@@ -177,6 +177,58 @@ void more_backings_than_slots_fall_back_to_the_overflow_table()
 	slots.settle();
 	slots.clear();
 	require(slots.slots_in_use() == 0 && slots.overflow_pages() == 0);
+}
+
+void the_immutable_fact_is_part_of_a_slots_key()
+{
+	Backing frame;
+	BackingSlots slots;
+	/* Two mappings of one frame and descriptor that disagree on the fact sit
+	 * in different slots, and each slot answers with its own. */
+	const auto plain = slots.claim(frame.backing(), frame.fd(), false);
+	const auto fixed = slots.claim(frame.backing(), frame.fd(), true);
+	require(plain == 0 && fixed == 1);
+	require(slots.claim(frame.backing(), frame.fd(), false) == plain);
+	require(slots.claim(frame.backing(), frame.fd(), true) == fixed);
+	require(!slots.entry(plain, 0).immutable);
+	require(slots.entry(fixed, 0).immutable);
+	require(slots.entry(plain, 0).backing == slots.entry(fixed, 0).backing);
+	slots.add(plain, 0x1000, frame.backing(), frame.fd(), false);
+	slots.add(fixed, 0x2000, frame.backing(), frame.fd(), true);
+	slots.settle();
+	require(slots.slots_in_use() == 2);
+	/* A slot keeps its fact for as long as it holds a page, and a free slot
+	 * is claimed again by whichever kind asks. */
+	slots.remove(plain, 0x1000);
+	slots.settle();
+	require(slots.claim(frame.backing(), frame.fd(), true) == fixed);
+	require(slots.claim(frame.backing(), frame.fd(), false) == plain);
+	slots.settle();
+	slots.clear();
+}
+
+void the_overflow_table_carries_the_immutable_fact()
+{
+	constexpr unsigned count = BackingSlots::slot_count + 2;
+	std::vector<std::unique_ptr<Backing>> backings;
+	for (unsigned index = 0; index < count; ++index)
+		backings.push_back(std::make_unique<Backing>());
+	BackingSlots slots;
+	for (unsigned index = 0; index < BackingSlots::slot_count; ++index)
+		require(slots.claim(backings[index]->backing(),
+			backings[index]->fd(), false) == index);
+	/* All slots taken: both kinds go to the table, each with its own fact. */
+	const auto &extra = *backings[BackingSlots::slot_count];
+	require(slots.claim(extra.backing(), extra.fd(), false) == BackingSlots::overflow);
+	require(slots.claim(extra.backing(), extra.fd(), true) == BackingSlots::overflow);
+	slots.reserve_overflow(0x10000);
+	slots.reserve_overflow(0x11000);
+	slots.add(BackingSlots::overflow, 0x10000, extra.backing(), extra.fd(), false);
+	slots.add(BackingSlots::overflow, 0x11000, extra.backing(), extra.fd(), true);
+	require(!slots.entry(BackingSlots::overflow, 0x10000).immutable);
+	require(slots.entry(BackingSlots::overflow, 0x11000).immutable);
+	slots.settle();
+	slots.clear();
 }
 
 } // namespace
@@ -190,6 +242,10 @@ int main()
 			a_change_that_stops_after_its_claims_leaves_nothing_behind},
 		{"more backings than slots fall back to the overflow table",
 			more_backings_than_slots_fall_back_to_the_overflow_table},
+		{"the immutable fact is part of a slot's key",
+			the_immutable_fact_is_part_of_a_slots_key},
+		{"the overflow table carries the immutable fact",
+			the_overflow_table_carries_the_immutable_fact},
 	};
 	return uml::testing::runNamedTests(tests);
 }

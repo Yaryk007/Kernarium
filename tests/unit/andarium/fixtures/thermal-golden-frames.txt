@@ -1,0 +1,50 @@
+# Golden frames of the thermal wire (vsock 5559), the contract between the
+# guest's thermal HAL (android/lineage-24/overlay/thermal) and the host
+# (Andarium/AndariumCore ThermalProtocol.swift).
+#
+# One frame per line: `name: <hex bytes>`. A line that starts with `#` is a
+# comment, and the comment above a frame says what it means.
+#
+# A record is 8 bytes, host to guest only: "ATH1" (41 54 48 31), one byte with
+# the Android severity the host wants reported (0 NONE, 1 LIGHT, 2 MODERATE,
+# 3 SEVERE, 4 CRITICAL) and three reserved bytes that are zero. Android's
+# EMERGENCY (5) and SHUTDOWN (6) are not severities of the wire.
+#
+# The host's encoder writes every frame that is not a `reject-` frame, and the
+# guest reads each of them as the severity described; the application's policy
+# sends NONE, SEVERE and CRITICAL, and MODERATE while Low Power Mode holds a
+# 120 Hz display to 60, never LIGHT. The guest closes the connection on every
+# `reject-` frame and keeps the severity it had; the host never encodes one.
+
+# NONE: the host's thermal state is nominal or fair, and neither serious nor
+# critical was the state in the last 120 s.
+none: 41 54 48 31 00 00 00 00
+
+# LIGHT: the guest reports it; the application does not send it.
+light: 41 54 48 31 01 00 00 00
+
+# MODERATE: the display is the 120 Hz one and iOS is in Low Power Mode, which holds
+# the screen to 60; the guest renders no more than 60. A host that is also hot
+# sends the hotter severity.
+moderate: 41 54 48 31 02 00 00 00
+
+# SEVERE: serious is the hottest of the host's thermal states now and in the
+# last 120 s (the hold after a state ended), so critical is neither the state
+# nor held; the guest caps the frame rate.
+severe: 41 54 48 31 03 00 00 00
+
+# CRITICAL: the host's thermal state is critical now or was in the last 120 s
+# (the hold after critical ended); the guest caps the frame rate.
+critical: 41 54 48 31 04 00 00 00
+
+# Severity 5 is Android's EMERGENCY, which the guest never reports.
+reject-emergency: 41 54 48 31 05 00 00 00
+
+# Severity 6 is Android's SHUTDOWN, which the guest never reports.
+reject-shutdown: 41 54 48 31 06 00 00 00
+
+# The magic's last byte is 2, not 1: not this protocol's record.
+reject-magic: 41 54 48 32 00 00 00 00
+
+# A reserved byte is not zero.
+reject-reserved: 41 54 48 31 01 00 01 00

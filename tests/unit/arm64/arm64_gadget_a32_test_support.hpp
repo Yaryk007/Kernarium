@@ -117,6 +117,17 @@ public:
 			extra_.back()->descriptor(), 0, page,
 			PROT_READ | PROT_WRITE, 0, 1) == 0);
 	}
+	/* One more code page at `address`, for a block somewhere other than
+	 * code_base; the caller fills the returned backing. */
+	[[nodiscard]] JitBacking &map_code(std::uint32_t address)
+	{
+		extra_.push_back(std::make_unique<JitBacking>(1));
+		require(darwin_uml_static_vm_map(
+			reinterpret_cast<void *>(std::uintptr_t{address}),
+			extra_.back()->descriptor(), 0, page,
+			PROT_READ | PROT_WRITE | PROT_EXEC, 1, 1) == 0);
+		return *extra_.back();
+	}
 	void data32(std::uint32_t offset, std::uint32_t value)
 	{
 		data_.put32(offset, value);

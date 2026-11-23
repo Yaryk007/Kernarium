@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+# Moves a guest that started with an older release to the product's on-screen keyboard
+# default once the system is up (kernarium_keyboard_default.sh).
+service kernarium_keyboard_default /system_ext/bin/kernarium_keyboard_default.sh
+    user root
+    group shell
+    oneshot
+    disabled
+
+on property:sys.boot_completed=1
+    start kernarium_keyboard_default

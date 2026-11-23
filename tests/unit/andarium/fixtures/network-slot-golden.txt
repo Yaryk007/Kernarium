@@ -1,0 +1,5 @@
+network 1
+net-dns answered 5 policy-denied 3 timed-out 2 failed 1
+net-dhcp discovers 1 requests 2 acks 1
+net-tcp attempts 12 established 4 unreachable 2 reset 1
+net-notice denials 2 now wifi

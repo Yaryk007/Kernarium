@@ -1,0 +1,372 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 05:52:43 +0900
+Subject: [PATCH] kosmickrisp: refuse an indirect geometry draw whose buffer
+ sizes wrap
+
+The setup of an indirect geometry draw reserved its buffers from the GPU
+heap with sizes formed in 32 bits: the dynamic-indexed output's index
+buffer is the draw's input primitives times the shader's indices times four
+bytes, and the geometry count buffer of a prefix sum is the primitives times
+the stride. A draw whose product wrapped reserved less than the stages write
+(87382 triangles of 49152 indices, or 393400 triangles of a 2730-index
+shader, reserved 128 KiB and 0.9 MiB for buffers of 4 GiB), and the
+geometry stage wrote past it. The direct draw checks these products in 64
+bits; the indirect setup did not.
+
+poly_gs_indirect_sizes forms every size the setup reserves with a checked
+multiplication (the vertex records, the count buffer and the index buffer,
+each as the product of the draw's counts and a size) and refuses a draw that
+does not fit, which the caller already drops without writing anything. The
+primitive count of the grid uses the unsigned helper, because a vertex count
+above INT_MAX is a negative count to the signed one, and the index buffer
+offset of an indexed draw is widened before it is added to the address.
+
+test_geometry_setup_gpu launches the production setup helper on rows whose
+sizes wrap and reads what it reserves; its checks now fail in every build,
+not only where assert() is compiled in. The prebuilt libkk.spv is regenerated
+for the new setup and amended into the embed topic, as its record requires.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .../vulkan/tests/test_geometry_setup_gpu.c    | 114 +++++++++++++++---
+ src/poly/geometry.h                           |  92 ++++++++++++--
+ 2 files changed, 175 insertions(+), 31 deletions(-)
+
+diff --git a/src/kosmickrisp/vulkan/tests/test_geometry_setup_gpu.c b/src/kosmickrisp/vulkan/tests/test_geometry_setup_gpu.c
+index 5861647d5becdba23ed75ab3d0fc6b9e5c1805ea..10fb0346325192c19629b06681ee6130e17e973d 100644
+--- a/src/kosmickrisp/vulkan/tests/test_geometry_setup_gpu.c
++++ b/src/kosmickrisp/vulkan/tests/test_geometry_setup_gpu.c
+@@ -1,7 +1,15 @@
+ /* SPDX-License-Identifier: MIT */
+ 
+ /* Launch only the production setup helper. Oversized logical draws are never
+- * dispatched, so overflow and stale-record checks need only a bounded heap. */
++ * dispatched, so overflow and stale-record checks need only a bounded heap.
++ *
++ * What a row observes is what the helper leaves behind: the grids it sets or
++ * clears, the draw record, the buffers it reserved (the heap's bottom and the
++ * pointers it published) and the work groups it publishes.  A row whose sizes
++ * wrap 32 bits and that the heap could hold, were the wrapped size the one
++ * reserved, is refused only by a helper that forms the sizes without wrapping.
++ * The helper only reserves: nothing writes the reservation, so a heap that
++ * claims more than the memory behind it is enough. */
+ #include "kosmickrisp/vulkan/kk_cmd_buffer.h"
+ #include "kosmickrisp/vulkan/kk_device.h"
+ 
+@@ -16,14 +24,32 @@ struct setup_case {
+    uint64_t outputs;
+    uint32_t stride, output_vertices;
+    bool publish, valid;
++   /* A dynamic-indexed output of max_indices indices for each primitive
++    * (otherwise a static one per instance), the stride of the geometry count
++    * buffer, which the helper reserves when it is prefix summing, and the size
++    * of the heap the helper reserves from (65536 when zero). */
++   bool dynamic;
++   uint32_t max_indices, count_stride, heap_size;
+ };
+ 
++static unsigned failures;
++#define EXPECT(condition)                                                      \
++   do {                                                                        \
++      if (!(condition)) {                                                      \
++         failures++;                                                           \
++         row_failed = true;                                                    \
++         fprintf(stderr, "geometry setup FAIL %s: %s (%s:%d)\n", test->name,   \
++                 #condition, __FILE__, __LINE__);                              \
++      }                                                                        \
++   } while (0)
++
+ static void
+ check_setup(VkDevice device, VkQueue queue, VkCommandBuffer command,
+             const struct setup_case *test)
+ {
+    const struct vk_device_dispatch_table *api =
+       &kk_device_from_handle(device)->exposed_dispatch_table;
++   bool row_failed = false;
+    const VkCommandBufferBeginInfo begin = {
+       .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+       .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+@@ -37,6 +63,7 @@ check_setup(VkDevice device, VkQueue queue, VkCommandBuffer command,
+    poly_geometry_params_init(&geometry, test->prim, local);
+    geometry.output_vertex_stride = test->stride;
+    geometry.output_vertices = test->output_vertices;
++   geometry.count_buffer_stride = test->count_stride;
+    struct kk_ptr vp = kk_pool_upload(cmd, &vertex, sizeof(vertex), 4);
+    struct kk_ptr gp = kk_pool_upload(cmd, &geometry, sizeof(geometry), 4);
+    const uint32_t draw_words[4] = {test->vertices, test->instances, 0, 0};
+@@ -48,10 +75,10 @@ check_setup(VkDevice device, VkQueue queue, VkCommandBuffer command,
+    const struct poly_heap heap_data = {
+       .base = storage.gpu,
+       .bottom = 16,
+-      .size = 65536,
++      .size = test->heap_size ? test->heap_size : 65536,
+    };
+    struct kk_ptr heap = kk_pool_upload(cmd, &heap_data, sizeof(heap_data), 4);
+-   assert(vp.cpu && gp.cpu && draw.cpu && groups.cpu && storage.cpu && heap.cpu);
++   CHECK(vp.cpu && gp.cpu && draw.cpu && groups.cpu && storage.cpu && heap.cpu);
+    const struct libkk_gs_setup_indirect_args args = {
+       .draw = draw.gpu,
+       .vp = vp.gpu,
+@@ -59,7 +86,10 @@ check_setup(VkDevice device, VkQueue queue, VkCommandBuffer command,
+       .heap = heap.gpu,
+       .vertex_outputs = test->outputs,
+       .prim = test->prim,
+-      .shape = POLY_GS_SHAPE_STATIC_PER_INSTANCE,
++      .is_prefix_summing = test->count_stride != 0,
++      .max_indices = test->max_indices,
++      .shape = test->dynamic ? POLY_GS_SHAPE_DYNAMIC_INDEXED
++                             : POLY_GS_SHAPE_STATIC_PER_INSTANCE,
+       .gs_group_grid = test->publish ? groups.gpu + sizeof(uint32_t) : 0,
+    };
+    libkk_gs_setup_indirect_struct(cmd, kk_grid_1d(1), true, args);
+@@ -76,7 +106,7 @@ check_setup(VkDevice device, VkQueue queue, VkCommandBuffer command,
+    const struct poly_geometry_params *actual_gp = gp.cpu;
+    const struct poly_heap *actual_heap = heap.cpu;
+    const uint32_t *actual_groups = groups.cpu;
+-   assert(actual_groups[0] == guard && actual_groups[4] == guard);
++   EXPECT(actual_groups[0] == guard && actual_groups[4] == guard);
+    const uint32_t primitives = test->valid
+       ? poly_decomposed_prims_for_vertices_u32(test->prim, test->vertices) : 0;
+    const uint32_t expected_vs[6] = {
+@@ -88,27 +118,51 @@ check_setup(VkDevice device, VkQueue queue, VkCommandBuffer command,
+    const uint32_t expected_groups[3] = {
+       primitives / 64 + (primitives % 64 != 0), test->instances, 1,
+    };
+-   for (unsigned i = 0; i < 6; i++) {
+-      assert(actual_vp->grid[i] == (test->valid ? expected_vs[i] : 0));
+-      assert(actual_gp->grid[i] == (test->valid ? expected_gs[i] : 0));
+-   }
+-   for (unsigned i = 0; i < 3; i++) {
+-      const uint32_t expected = !test->publish ? guard
+-         : test->valid ? expected_groups[i] : 0;
+-      assert(actual_groups[1 + i] == expected);
++   const uint32_t zero[6] = {0};
++   EXPECT(memcmp(actual_vp->grid, test->valid ? expected_vs : zero,
++                 sizeof(zero)) == 0);
++   EXPECT(memcmp(actual_gp->grid, test->valid ? expected_gs : zero,
++                 sizeof(zero)) == 0);
++   if (test->publish) {
++      EXPECT(memcmp(actual_groups + 1, test->valid ? expected_groups : zero,
++                    sizeof(expected_groups)) == 0);
++   } else {
++      EXPECT(actual_groups[1] == guard && actual_groups[2] == guard &&
++             actual_groups[3] == guard);
+    }
+    if (!test->valid) {
+       const struct poly_indirect_draw empty = {0};
+-      assert(memcmp(&actual_gp->draw, &empty, sizeof(empty)) == 0);
+-      assert(actual_gp->input_primitives == 0);
+-      assert(actual_gp->output_vertex_buffer == 0);
+-      assert(actual_heap->bottom == heap_data.bottom);
++      EXPECT(memcmp(&actual_gp->draw, &empty, sizeof(empty)) == 0);
++      EXPECT(actual_gp->input_primitives == 0);
++      EXPECT(actual_gp->output_vertex_buffer == 0);
++      EXPECT(actual_gp->output_index_buffer == 0);
++      EXPECT(actual_gp->count_buffer == 0);
++      EXPECT(actual_heap->bottom == heap_data.bottom);
++      if (actual_heap->bottom != heap_data.bottom) {
++         fprintf(stderr, "geometry setup %s: the helper reserved %u bytes\n",
++                 test->name, actual_heap->bottom - heap_data.bottom);
++      }
+    } else {
+-      assert(actual_gp->input_primitives == primitives * test->instances);
+-      assert(actual_heap->bottom >= heap_data.bottom &&
++      EXPECT(actual_gp->input_primitives == primitives * test->instances);
++      EXPECT(actual_heap->bottom >= heap_data.bottom &&
+              actual_heap->bottom < heap_data.size);
++      if (test->dynamic) {
++         /* The index buffer is the whole of what was reserved, 16-byte
++          * aligned, after the count buffer of a prefix sum when there is
++          * one. */
++         const uint32_t indices =
++            primitives * test->instances * test->max_indices;
++         const uint32_t count_B = test->count_stride
++            ? align(primitives * test->instances * test->count_stride, 16) : 0;
++         EXPECT(actual_gp->draw.index_count == indices);
++         EXPECT(actual_heap->bottom ==
++                heap_data.bottom + count_B + align(indices * 4, 16));
++         EXPECT(actual_gp->output_index_buffer ==
++                (uintptr_t)(heap_data.base + heap_data.bottom + count_B));
++      }
+    }
+-   printf("geometry setup PASS %s\n", test->name);
++   if (!row_failed)
++      printf("geometry setup PASS %s\n", test->name);
+ }
+ 
+ int
+@@ -137,6 +191,22 @@ main(void)
+       {"vertex-size-overflow", UINT32_MAX / 16 + 1, 1, MESA_PRIM_POINTS, 1, 0, 0, true, false},
+       {"output-size-overflow", UINT32_MAX / 192 + 1, 1, MESA_PRIM_POINTS, 0, 32, 6, true, false},
+       {"output-alignment-overflow", UINT32_MAX, 1, MESA_PRIM_POINTS, 0, 1, 1, true, false},
++      /* An indirect draw's index buffer is the product of the draw's counts
++       * and the output's indices, then four bytes each.  These sizes wrap 32
++       * bits to one the 16 MiB heap holds, so a helper that forms them in 32
++       * bits reserves a buffer smaller than the one the geometry stage writes:
++       * the maximum a writer reaches (the limits' 49152 indices) over 87382
++       * triangles, and the 2730 indices of a valid 32-invocation shader over
++       * 393400 triangles. */
++      {"dynamic-index-count-wrap", 262146, 1, MESA_PRIM_TRIANGLES, 0, 0, 0, true, false, true, 49152, 0, 16 << 20},
++      {"dynamic-index-bytes-wrap", 1180200, 1, MESA_PRIM_TRIANGLES, 0, 0, 0, true, false, true, 2730, 0, 16 << 20},
++      /* The geometry count buffer of a prefix sum: one stride for each
++       * primitive, here 268435457 of them of 16 bytes (wrapping to 16). */
++      {"count-buffer-bytes-wrap", (1u << 28) + 1, 1, MESA_PRIM_POINTS, 0, 0, 0, true, false, false, 0, 16, 16 << 20},
++      /* Sizes that fit 32 bits are the heap's to refuse or to grant. */
++      {"dynamic-larger-than-heap", 3000, 1, MESA_PRIM_TRIANGLES, 0, 0, 0, true, false, true, 2730, 0, 0},
++      {"dynamic-indexed", 30, 1, MESA_PRIM_TRIANGLES, 0, 0, 0, true, true, true, 2730, 0, 262144},
++      {"dynamic-indexed-prefix-sum", 30, 2, MESA_PRIM_TRIANGLES, 0, 0, 0, true, true, true, 100, 8, 0},
+    };
+    for (unsigned i = 0; i < ARRAY_SIZE(cases); i++) {
+       VK_CHECK(api->ResetCommandPool(device, commands, 0));
+@@ -144,5 +214,9 @@ main(void)
+    }
+    api->DestroyCommandPool(device, commands, NULL);
+    kk_test_destroy(&t);
++   if (failures) {
++      fprintf(stderr, "geometry setup FAILED (%u checks)\n", failures);
++      return 1;
++   }
+    return 0;
+ }
+diff --git a/src/poly/geometry.h b/src/poly/geometry.h
+index 25160b8c0032d43f4a0c5ac4430592f4e22cb84b..2e06f6dbd3aad2b549b3a14c24cb74783b48a204 100644
+--- a/src/poly/geometry.h
++++ b/src/poly/geometry.h
+@@ -314,7 +314,7 @@ poly_index_buffer(uint64_t index_buffer, uint size_el, uint offset_el,
+                   uint elsize_B)
+ {
+    if (offset_el < size_el)
+-      return index_buffer + (offset_el * elsize_B);
++      return index_buffer + (uint64_t)offset_el * elsize_B;
+    else
+       return nir_load_ro_sink_address_poly();
+ }
+@@ -529,9 +529,11 @@ poly_geometry_params_set_draw(struct poly_geometry_params *p,
+                               enum poly_gs_shape shape, uint32_t max_indices,
+                               uint32_t vertex_count, uint32_t instance_count)
+ {
+-   /* Calculate number of primitives input into the GS */
++   /* Calculate number of primitives input into the GS.  An indirect draw's
++    * vertex count is unsigned and may exceed INT_MAX, which the signed
++    * helper reads as a negative count. */
+    const uint32_t prim_per_instance =
+-      u_decomposed_prims_for_vertices(prim, vertex_count);
++      poly_decomposed_prims_for_vertices_u32(prim, vertex_count);
+ 
+    /* Invoke GS as (primitives, instances) */
+    p->grid[0] = prim_per_instance;
+@@ -808,8 +810,69 @@ poly_increment_ia(global uint32_t *ia_vertices, global uint32_t *ia_primitives,
+    poly_increment_counters(ia_primitives, c_prims, c_invs, prims);
+ }
+ 
+-/* Returns false when the heap cannot hold the stage's buffers. The draw's grids
+- * are already set then, so the caller has to clear them. */
++/* The buffers an indirect geometry draw reserves from the heap, each sized
++ * without wrapping, or false when a size is not representable.  The draw's
++ * counts are the application's own, so every product is formed with a check
++ * (a count buffer, the vertex records and the index buffer are each a product
++ * of the draw's counts and a size, and a wrapped product would reserve less
++ * than the stages write) and the index count is held to what a 32-bit index
++ * buffer and its byte size can express, as the direct draw is
++ * (kk_upload_geometry_params).  The rest of what the heap can hold is for the
++ * reservation to say.
++ *
++ *    input_primitives     the primitives of the draw, over all its instances
++ *    vertex_buffer_B      the vertex stage's records
++ *    count_buffer_B       the geometry counts, one stride for each primitive
++ *    index_buffer_B       the dynamic-indexed output's indices, four bytes
++ *                         for each of max_indices for each primitive
++ */
++static inline bool
++poly_gs_indirect_sizes(enum mesa_prim prim, enum poly_gs_shape shape,
++                       uint32_t max_indices, uint32_t count_buffer_stride,
++                       uint64_t vs_outputs, uint32_t vertex_count,
++                       uint32_t instance_count, uint32_t *input_primitives,
++                       uint32_t *vertex_buffer_B, uint32_t *count_buffer_B,
++                       uint32_t *index_buffer_B)
++{
++   const uint32_t per_instance =
++      poly_decomposed_prims_for_vertices_u32(prim, vertex_count);
++   uint32_t records, slots, indices;
++
++   *index_buffer_B = 0;
++   if (!poly_u32_checked_mul(per_instance, instance_count, input_primitives) ||
++       !poly_u32_checked_mul(vertex_count, instance_count, &records) ||
++       !poly_u32_checked_mul(records, util_bitcount64(vs_outputs), &slots) ||
++       !poly_u32_checked_mul(slots, 16, vertex_buffer_B) ||
++       !poly_u32_checked_mul(*input_primitives, count_buffer_stride,
++                             count_buffer_B))
++      return false;
++
++   switch (shape) {
++   case POLY_GS_SHAPE_DYNAMIC_INDEXED:
++      if (!poly_u32_checked_mul(*input_primitives, max_indices, &indices) ||
++          !poly_u32_checked_mul(indices, 4, index_buffer_B))
++         return false;
++      break;
++
++   case POLY_GS_SHAPE_STATIC_PER_INSTANCE:
++      /* The vertices of the raster draw, and the largest index the stage
++       * writes. */
++      if (!poly_u32_checked_mul(*input_primitives, max_indices, &indices))
++         return false;
++      break;
++
++   default:
++      break;
++   }
++
++   return poly_heap_size_can_align(*vertex_buffer_B) &&
++          poly_heap_size_can_align(*count_buffer_B) &&
++          poly_heap_size_can_align(*index_buffer_B);
++}
++
++/* Returns false when the draw's sizes are not representable or the heap cannot
++ * hold the stage's buffers. The draw's grids are already set then, so the
++ * caller has to clear them. */
+ static inline bool
+ poly_gs_setup_indirect(uint64_t index_buffer, constant uint *draw,
+                        global struct poly_vertex_params *vp /* output */,
+@@ -830,6 +893,17 @@ poly_gs_setup_indirect(uint64_t index_buffer, constant uint *draw,
+    poly_geometry_params_set_draw(p, prim, shape, max_indices,
+                                  vertex_count, instance_count);
+ 
++   /* Nothing is reserved for a draw whose sizes wrap: the sizes above were
++    * formed in 32 bits, and the buffers must be the ones the stages write. */
++   uint32_t input_primitives, vertex_buffer_size, count_buffer_size,
++      index_buffer_size;
++   if (!poly_gs_indirect_sizes(prim, shape, max_indices,
++                               p->count_buffer_stride, vs_outputs,
++                               vertex_count, instance_count, &input_primitives,
++                               &vertex_buffer_size, &count_buffer_size,
++                               &index_buffer_size))
++      return false;
++
+    /* If indexing is enabled, the third word is the offset into the index buffer
+     * in elements. Apply that offset now that we have it. For a hardware
+     * indirect draw, the hardware would do this for us, but for software input
+@@ -844,13 +918,9 @@ poly_gs_setup_indirect(uint64_t index_buffer, constant uint *draw,
+    }
+ 
+    /* We need to allocate VS and GS count buffers, do so now */
+-   uint vertex_buffer_size =
+-      poly_tcs_in_size(vertex_count * instance_count, vs_outputs);
+-
+    uint offs;
+    if (is_prefix_summing) {
+-      if (!poly_heap_try_alloc_offs(
+-             heap, p->input_primitives * p->count_buffer_stride, &offs))
++      if (!poly_heap_try_alloc_offs(heap, count_buffer_size, &offs))
+          return false;
+       p->count_buffer = (global uint *)(heap->base + offs);
+    }
+@@ -862,7 +932,7 @@ poly_gs_setup_indirect(uint64_t index_buffer, constant uint *draw,
+    vp->outputs = vs_outputs;
+ 
+    if (shape == POLY_GS_SHAPE_DYNAMIC_INDEXED) {
+-      if (!poly_heap_try_alloc_offs(heap, p->draw.index_count * 4, &offs))
++      if (!poly_heap_try_alloc_offs(heap, index_buffer_size, &offs))
+          return false;
+       p->draw.first_index = offs / 4;
+       p->output_index_buffer = (global uint *)(heap->base + offs);

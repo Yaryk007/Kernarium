@@ -2,6 +2,7 @@
 #pragma once
 
 #include "cpu/arm64/aarch32/guest_key.hpp"
+#include "cpu/arm64/code_synchronization.hpp"
 #include "cpu/arm64/fp_environment.hpp"
 #include "cpu/engine.hpp"
 #include "memory/static_guest_memory.hpp"
@@ -113,6 +114,20 @@ struct GadgetA32Entry : EntryDefaults {
 	}
 };
 
+/* Whether the executor asks for its run to end at this return from
+ * translated code (the gadget executor's renewal_pending()): an address space
+ * it holds was shed or closed, and it lets go of that at the start of its next
+ * run, which begins as soon as this one has ended. An executor without the
+ * notion never asks. */
+template<typename Executor>
+[[nodiscard]] inline bool renewal_pending(const Executor &executor) noexcept
+{
+	if constexpr (requires { executor.renewal_pending(); })
+		return executor.renewal_pending();
+	else
+		return false;
+}
+
 /* The translated engines intentionally share only this boundary adapter.  It
  * owns no translation state and does not select an engine, so each engine can
  * retain its own cache, compiler, and execution implementation. */
@@ -124,15 +139,22 @@ template<typename Entry, bool PollCallback, typename Executor>
 	if (!executor.begin_execution(
 		    request.generation, Entry::guest_pc(request.cpu.pc)))
 		return {.reason = ExitReason::fatal};
+	/* An arm64 run registers its generation as a holder of every frame it
+	 * fetches code from, so that a code synchronization by another process
+	 * reaches it (memory/mmu/code_holders.hpp). The x86 engines share the
+	 * memory and never run through this loop, so they leave it off. */
+	memory.set_code_holder_registration(true);
 	struct ExecutionScope final {
 		Executor &executor;
+		::uml::memory::StaticGuestMemory &memory;
 
 		~ExecutionScope() noexcept
 		{
+			memory.set_code_holder_registration(false);
 			executor.end_execution();
 		}
 	};
-	[[maybe_unused]] const ExecutionScope execution_scope{executor};
+	[[maybe_unused]] const ExecutionScope execution_scope{executor, memory};
 	executor.set_single_step(request.single_step);
 	Entry::prepare(executor, request.cpu);
 	const auto interrupt_pending = [&]() noexcept {
@@ -162,7 +184,16 @@ template<typename Entry, bool PollCallback, typename Executor>
 		};
 	};
 
+	/* Whether to end the run, as a spent budget does, at this return from
+	 * translated code, so that an address space shed or closed meanwhile is
+	 * let go of by the next run and not held, and grown, until this one is
+	 * over. A run that retires one instruction at a time ends on its own. */
+	const auto renewal_ends_run = [&]() noexcept {
+		return !request.single_step && renewal_pending(executor);
+	};
+
 	std::size_t retired = 0;
+	discard_unmapped_code_synchronization();
 	try {
 		for (;;) {
 			if (interrupt_pending())
@@ -193,6 +224,20 @@ template<typename Entry, bool PollCallback, typename Executor>
 				return finish(ExitReason::fatal, retired);
 			}
 			retired += block_instructions;
+			/* An IC IVAU that named an address the address space maps
+			 * nothing at faults as a load does, so that the kernel maps
+			 * the page and the instruction publishes the code change of
+			 * the frame it names. The block ended at the instruction, with
+			 * the PC after it: report the fault at the instruction, which
+			 * has not retired. */
+			if (std::uint64_t unmapped = 0;
+			    take_unmapped_code_synchronization(unmapped)) [[unlikely]] {
+				request.cpu.pc -= sizeof(std::uint32_t);
+				if (retired != 0)
+					--retired;
+				return finish(ExitReason::memory_fault, retired, unmapped,
+					::uml::memory::MemoryAccess::read);
+			}
 			if (executor.preempted())
 				return finish(ExitReason::interrupt, retired);
 			if (request.boundary != nullptr &&
@@ -206,7 +251,8 @@ template<typename Entry, bool PollCallback, typename Executor>
 				 event == EngineEvent::interrupt))
 				return finish(ExitReason::single_step, retired);
 			if (event == EngineEvent::continued) {
-				if (retired < request.instruction_budget)
+				if (retired < request.instruction_budget &&
+					!renewal_ends_run())
 					continue;
 				return finish(ExitReason::instruction_budget, retired);
 			}
@@ -227,7 +273,8 @@ template<typename Entry, bool PollCallback, typename Executor>
 				 */
 				if (interrupt_pending())
 					return finish(ExitReason::interrupt, retired);
-				if (retired < request.instruction_budget)
+				if (retired < request.instruction_budget &&
+					!renewal_ends_run())
 					continue;
 				return finish(ExitReason::instruction_budget, retired);
 			case EngineEvent::illegal_instruction:

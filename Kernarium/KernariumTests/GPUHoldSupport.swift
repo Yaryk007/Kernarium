@@ -30,6 +30,29 @@ nonisolated final class RecordingGate: GuestGPUGate {
     func release() { log.add("release") }
 }
 
+/// A gate that tells the three holds apart and keeps what a hold with a
+/// deadline was told it leaves.
+nonisolated final class BudgetGate: GuestGPUGate, @unchecked Sendable {
+    let log: CallLog
+    private let lock = NSLock()
+    private var told: [TimeInterval] = []
+
+    init(_ log: CallLog) {
+        self.log = log
+    }
+
+    /// The seconds each `hold(within:)` was told its caller's deadline leaves.
+    var left: [TimeInterval] { lock.withLock { told } }
+
+    func hold() { log.add("hold") }
+    func hold(within left: TimeInterval) {
+        lock.withLock { told.append(left) }
+        log.add("hold within")
+    }
+    func holdNow() { log.add("hold now") }
+    func release() { log.add("release") }
+}
+
 /// The bound's timer under a test's control: nothing fires until the test
 /// says so, and a test can fire from whichever thread it likes.
 nonisolated final class ManualHoldTimer: @unchecked Sendable {

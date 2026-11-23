@@ -18,6 +18,18 @@ final class FrameRelay: @unchecked Sendable {
     /// Set on the main thread before the relay is given to the runtime.
     nonisolated(unsafe) var handler: (@MainActor (CVPixelBuffer) -> Void)?
 
+    /// The window let go of the relay. A delivery the runtime made before it
+    /// did may still be waiting on the main queue, and that block holds the
+    /// relay whatever the window does with it, so the relay itself forgets
+    /// where frames go and what it kept: the block then finds nothing to show.
+    /// Called on the main thread, which is where the block runs.
+    func close() {
+        lock.lock()
+        latest = nil
+        lock.unlock()
+        handler = nil
+    }
+
     init(
         hop: @escaping (@escaping @Sendable () -> Void) -> Void = {
             DispatchQueue.main.async(execute: $0)
@@ -47,10 +59,167 @@ final class FrameRelay: @unchecked Sendable {
     }
 }
 
+/// How frames reach the Picture in Picture layer.
+@MainActor
+private protocol PictureInPictureFeed: AnyObject {
+    /// Called whenever the window is prepared, before it is created.
+    func prepare()
+    func enqueue(_ sample: CMSampleBuffer)
+    /// Removes the displayed image as the window is disarmed.
+    func flushRemovingDisplayedImage()
+}
+
+/// iOS 26 and earlier: the frames go to the layer's renderer, each marked to
+/// show as it arrives, and a renderer that iOS failed is flushed before it
+/// takes the next frame.
+@MainActor
+private final class RendererFeed: PictureInPictureFeed {
+    private let layer: AVSampleBufferDisplayLayer
+
+    init(layer: AVSampleBufferDisplayLayer) {
+        self.layer = layer
+    }
+
+    func prepare() {}
+
+    // The renderer's enqueue, flush and status are deprecated in iOS 27,
+    // which feeds the layer through ReceiverFeed and never reaches this.
+    func enqueue(_ sample: CMSampleBuffer) {
+        if let attachments = CMSampleBufferGetSampleAttachmentsArray(
+            sample, createIfNecessary: true
+        ), CFArrayGetCount(attachments) > 0 {
+            let dictionary = unsafeBitCast(
+                CFArrayGetValueAtIndex(attachments, 0),
+                to: CFMutableDictionary.self
+            )
+            CFDictionarySetValue(
+                dictionary,
+                Unmanaged.passUnretained(
+                    kCMSampleAttachmentKey_DisplayImmediately
+                ).toOpaque(),
+                Unmanaged.passUnretained(kCFBooleanTrue).toOpaque()
+            )
+        }
+        let renderer = layer.sampleBufferRenderer
+        // iOS interrupts the layer as the app changes state (-11847); it
+        // takes a flush to accept frames again.
+        if renderer.status == .failed {
+            renderer.flush()
+        }
+        renderer.enqueue(sample)
+    }
+
+    func flushRemovingDisplayedImage() {
+        layer.sampleBufferRenderer.flush(removingDisplayedImage: true)
+    }
+}
+
+/// iOS 27: the frames go through the receiver of a render synchronizer that
+/// runs on the host clock, so a frame stamped with the time it is made is due
+/// as it arrives, and each enqueue reports its outcome.
+@available(iOS 27.0, *)
+@MainActor
+private final class ReceiverFeed: PictureInPictureFeed {
+    private let synchronizer = AVSampleBufferRenderSynchronizer()
+    private let receiver: AVSampleBufferVideoRenderer.Receiver
+
+    init(layer: AVSampleBufferDisplayLayer) {
+        receiver = synchronizer.sampleBufferReceiver(
+            adding: layer.sampleBufferRenderer
+        )
+    }
+
+    func prepare() {
+        // The timeline is the host clock: no wait for media before it runs.
+        let now = CMClockGetTime(CMClockGetHostTimeClock())
+        synchronizer.delaysRateChangeUntilHasSufficientMediaData = false
+        synchronizer.setRate(1, time: now, atHostTime: now)
+    }
+
+    func enqueue(_ sample: CMSampleBuffer) {
+        let ready = CMReadySampleBuffer<CMSampleBuffer.DynamicContent>(
+            unsafeBuffer: sample
+        )
+        switch receiver.enqueueImmediately(ready) {
+        case let .cancelledDueToFlushRequiredToResume(error),
+             let .cancelledDueToError(error):
+            // iOS interrupts the layer as the app changes state (-11847); it
+            // takes a flush to accept frames again.
+            print("Kernarium: picture in picture layer flushed: \(error)")
+            receiver.flush()
+            _ = receiver.enqueueImmediately(ready)
+        default:
+            break
+        }
+    }
+
+    func flushRemovingDisplayedImage() {
+        let receiver = receiver
+        Task { await receiver.flush(removingDisplayedImage: true) }
+    }
+}
+
 private let runtimeFrameSink: kernarium_runtime_frame_sink = { context, buffer in
     guard let context, let buffer else { return }
     let relay = Unmanaged<FrameRelay>.fromOpaque(context).takeUnretainedValue()
     relay.receive(Unmanaged<CVPixelBuffer>.fromOpaque(buffer).takeUnretainedValue())
+}
+
+/// The runtime's frame sink while the window is armed, and the relay it
+/// delivers through. `register` is how the sink reaches the runtime; a test
+/// replaces it to deliver frames as the runtime does.
+@MainActor
+final class FrameMirror {
+    typealias Register = (
+        kernarium_runtime_frame_sink?, UnsafeMutableRawPointer?, UInt32, UInt32
+    ) -> Int32
+
+    private let register: Register
+    private let deliver: @MainActor (CVPixelBuffer) -> Void
+    private var relay: FrameRelay?
+    private(set) var armedRate: UInt32?
+
+    init(
+        deliver: @escaping @MainActor (CVPixelBuffer) -> Void,
+        register: @escaping Register = { kernarium_runtime_loader_set_frame_sink($0, $1, $2, $3) }
+    ) {
+        self.deliver = deliver
+        self.register = register
+    }
+
+    /// Whether the runtime is delivering to the mirror, or a relay is left to let go.
+    var isHolding: Bool { armedRate != nil || relay != nil }
+
+    /// Asks the runtime for frames of at most `width` pixels at `framesPerSecond`;
+    /// the runtime's answer, 0 when it agreed.
+    func arm(width: UInt32, framesPerSecond: UInt32) -> Int32 {
+        if armedRate == framesPerSecond { return 0 }
+        let owner: FrameRelay
+        if let relay {
+            owner = relay
+        } else {
+            owner = FrameRelay()
+            owner.handler = deliver
+            relay = owner
+        }
+        let result = register(
+            runtimeFrameSink, Unmanaged.passUnretained(owner).toOpaque(), width, framesPerSecond
+        )
+        if result == 0 { armedRate = framesPerSecond }
+        return result
+    }
+
+    func disarm() {
+        if armedRate != nil {
+            // Returns only once no delivery is running, so the relay can go.
+            _ = register(nil, nil, 0, 0)
+            armedRate = nil
+        }
+        // A delivery still waiting on the main queue holds the relay: it shows
+        // nothing once the relay is closed.
+        relay?.close()
+        relay = nil
+    }
 }
 
 /// The window that keeps the guest running in the background: iOS shows the
@@ -59,9 +228,9 @@ private let runtimeFrameSink: kernarium_runtime_frame_sink = { context, buffer i
 ///
 /// It owns a sample-buffer layer fed from the runtime's copy of the guest's
 /// display, through the receiver of a render synchronizer that runs on the host
-/// clock, so a frame stamped with the time it is made is due as it arrives.
-/// While the guest's background mode asks for the window, a slow
-/// trickle of frames keeps the layer holding a current picture, which iOS
+/// clock where iOS offers one (27), so a frame stamped with the time it is made
+/// is due as it arrives. While the guest's background mode asks for the window,
+/// a slow trickle of frames keeps the layer holding a current picture, which iOS
 /// needs before it starts the window on its own as the app leaves; the rate
 /// rises once the window is up.
 @MainActor
@@ -79,12 +248,10 @@ final class GuestPictureInPicture: NSObject, PictureInPictureWindow {
     var wanted: () -> Bool = { false }
 
     let layer = AVSampleBufferDisplayLayer()
-    private let synchronizer = AVSampleBufferRenderSynchronizer()
-    private var receiver: AVSampleBufferVideoRenderer.Receiver?
+    private var feed: (any PictureInPictureFeed)?
     private var pictureInPicture: AVPictureInPictureController?
-    private var relay: FrameRelay?
+    private lazy var mirror = FrameMirror { [weak self] buffer in self?.show(buffer) }
     private var guestRunning = false
-    private var armedRate: UInt32?
     private var starting = false
     private var format: CMVideoFormatDescription?
     private var formatSize = CMVideoDimensions(width: 0, height: 0)
@@ -136,15 +303,14 @@ final class GuestPictureInPicture: NSObject, PictureInPictureWindow {
     private func prepareController() {
         guard pictureInPicture == nil else { return }
         configureAudioSession()
-        if receiver == nil {
-            receiver = synchronizer.sampleBufferReceiver(
-                adding: layer.sampleBufferRenderer
-            )
+        if feed == nil {
+            if #available(iOS 27.0, *) {
+                feed = ReceiverFeed(layer: layer)
+            } else {
+                feed = RendererFeed(layer: layer)
+            }
         }
-        // The timeline is the host clock: no wait for media before it runs.
-        let now = CMClockGetTime(CMClockGetHostTimeClock())
-        synchronizer.delaysRateChangeUntilHasSufficientMediaData = false
-        synchronizer.setRate(1, time: now, atHostTime: now)
+        feed?.prepare()
         let source = AVPictureInPictureController.ContentSource(
             sampleBufferDisplayLayer: layer,
             playbackDelegate: self
@@ -195,23 +361,9 @@ final class GuestPictureInPicture: NSObject, PictureInPictureWindow {
     }
 
     private func arm(rate: (width: UInt32, framesPerSecond: UInt32)) {
-        if armedRate == rate.framesPerSecond { return }
-        let owner: FrameRelay
-        if let relay {
-            owner = relay
-        } else {
-            owner = FrameRelay()
-            owner.handler = { [weak self] buffer in self?.show(buffer) }
-            relay = owner
-        }
-        let result = kernarium_runtime_loader_set_frame_sink(
-            runtimeFrameSink,
-            Unmanaged.passUnretained(owner).toOpaque(),
-            rate.width,
-            rate.framesPerSecond
-        )
+        if mirror.armedRate == rate.framesPerSecond { return }
+        let result = mirror.arm(width: rate.width, framesPerSecond: rate.framesPerSecond)
         if result == 0 {
-            armedRate = rate.framesPerSecond
             print(
                 "Kernarium: picture in picture mirror \(rate.width) px, " +
                     "\(rate.framesPerSecond) fps"
@@ -222,18 +374,11 @@ final class GuestPictureInPicture: NSObject, PictureInPictureWindow {
     }
 
     private func disarm() {
-        guard armedRate != nil || relay != nil || pictureInPicture != nil else {
+        guard mirror.isHolding || pictureInPicture != nil else {
             return
         }
-        if armedRate != nil {
-            // Returns only once no delivery is running, so the relay can go.
-            _ = kernarium_runtime_loader_set_frame_sink(nil, nil, 0, 0)
-            armedRate = nil
-        }
-        relay = nil
-        if let receiver {
-            Task { await receiver.flush(removingDisplayedImage: true) }
-        }
+        mirror.disarm()
+        feed?.flushRemovingDisplayedImage()
         format = nil
         if let resignObserver {
             NotificationCenter.default.removeObserver(resignObserver)
@@ -276,21 +421,8 @@ final class GuestPictureInPicture: NSObject, PictureInPictureWindow {
             sampleTiming: &timing,
             sampleBufferOut: &sample
         ) == noErr, let sample else { return }
-        guard let receiver else { return }
-        let ready = CMReadySampleBuffer<CMSampleBuffer.DynamicContent>(
-            unsafeBuffer: sample
-        )
-        switch receiver.enqueueImmediately(ready) {
-        case let .cancelledDueToFlushRequiredToResume(error),
-             let .cancelledDueToError(error):
-            // iOS interrupts the layer as the app changes state (-11847); it
-            // takes a flush to accept frames again.
-            print("Kernarium: picture in picture layer flushed: \(error)")
-            receiver.flush()
-            _ = receiver.enqueueImmediately(ready)
-        default:
-            break
-        }
+        guard let feed else { return }
+        feed.enqueue(sample)
         framesShown += 1
         if framesShown % 150 == 1 {
             print(

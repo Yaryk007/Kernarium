@@ -1,0 +1,135 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 21:00:00 +0000
+Subject: [PATCH] audio: report when the primary input's last frame was due
+
+The frames that the primary input takes follow the clock that its
+reads keep (see the previous change), but a reply still gave the time
+of the reply as the time of the position. After a stall the made-up and
+the late frames come in a burst, and a recorder that stamps what it
+reads from the position stamped all of them at the end of the burst:
+the time line of the audio jumped by the length of the stall, and the
+audio after it trailed the video by as long.
+
+The position of the input keeps its client's count, but its time is now
+when the last frame of the count was due on the clock of the input. The
+steady clock, the uptimeNanos of the reply and the clock of a recorder
+are the same CLOCK_MONOTONIC, so there is nothing to convert. The time
+is never later than the reply's and later than the previous position's,
+whatever the clock does (a restart, the slow re-anchoring). Before the
+first frame after a start, and while the clock does not run, it is the
+reply's time, as before. A read leaves the clock behind by no more than
+the limit of the previous change, or stops it. A reply that finds the
+time older than the limit does the same (the process stood still
+between the end of the read and the reply, or the client has read
+nothing for a while): the next read starts the clock again and the time
+is the reply's. So the reported time is at most that long before the
+reply, also for a status reply with no read before it.
+
+The output's position and the latency of the input are untouched.
+---
+ .../aidl/default/alsa/StreamAlsaMonoPipe.cpp  | 36 +++++++++++++++++--
+ .../include/core-impl/StreamAlsaMonoPipe.h    |  6 +++-
+ audio/aidl/default/primary/StreamPrimary.cpp  |  4 +++
+ 3 files changed, 43 insertions(+), 3 deletions(-)
+
+diff --git a/audio/aidl/default/alsa/StreamAlsaMonoPipe.cpp b/audio/aidl/default/alsa/StreamAlsaMonoPipe.cpp
+index 81b8609440d17824aad7fc9b9851a8a09e3488c5..bbbe0b5cef4b44115ae3b977eccbb346465855a1 100644
+--- a/audio/aidl/default/alsa/StreamAlsaMonoPipe.cpp
++++ b/audio/aidl/default/alsa/StreamAlsaMonoPipe.cpp
+@@ -227,8 +227,8 @@ void StreamAlsaMonoPipe::restartInputClock() {
+ // for: a stall of any length is made up without a restart, as long as the reader comes back within
+ // the slack. A reader that is later than that during a stall restarts the clock once, and the stall
+ // leaves a gap of its own. The I/O thread wakes the wait each time it has written to the pipe, and
+-// when it is stopped, which ends the wait as well. The position of the input stays its client's
+-// count and the time of the reply.
++// when it is stopped, which ends the wait as well. The position of the input is its client's
++// count, with the time that the last of them was due (see 'refineInputPositionTime').
+ void StreamAlsaMonoPipe::readInput(void* buffer, size_t frameCount) {
+     constexpr int64_t kSlackNs = 100'000'000;
+     constexpr int64_t kDropLogIntervalNs = 10'000'000'000;
+@@ -339,6 +339,38 @@ void StreamAlsaMonoPipe::readInput(void* buffer, size_t frameCount) {
+     }
+ }
+ 
++// The time that the reply of an input reports for its position (the frames are the worker's count,
++// unchanged): when the last frame that the client took was due, which is when it was captured, and
++// not when the reply is written. After a stall the made-up and the late frames come in a burst, and
++// replies that carry the time of the reply would place all of them at the time of the burst: a
++// recorder that stamps what it reads from this position then stamps the time that was made up at
++// the end of it, and the audio after it lags the video by as long as the stall was.
++// The time is never later than the reply's and later than the previous one's, whatever the clock
++// does (a restart, the slow re-anchoring). Before the first frame after a start, and whenever the
++// clock is not running, it is the reply's time. The steady clock of the input's clock, the
++// 'uptimeNanos' of the reply and the clock of the recorder (CLOCK_MONOTONIC) are one clock, so the
++// due time needs no conversion. A read leaves the clock behind by no more than 'kLongestMakeUpNs',
++// or stops it, and so does a reply that finds the due time older than that (the process stood
++// still between the end of the read and the reply, or the client has read nothing for a while): the
++// standstill is not caught up, the next read starts the clock again and the time is the reply's.
++// That bounds how long before the reply the reported time can be, for a reply to a read and for a
++// status reply with no read before it alike: a status reply carries the due time of the last read's
++// frames for as long as that is not older than the limit, and its own time after that.
++void StreamAlsaMonoPipe::refineInputPositionTime(int64_t* replyTimeNs) {
++    const int64_t replyNs = *replyTimeNs;
++    int64_t timeNs = replyNs;
++    if (mInputClockRunning && mInputFramesTaken > 0) {
++        const int64_t sampleRate = getContext().getSampleRate();
++        timeNs = mInputClockStartNs + framesToNanos(mInputFramesTaken, sampleRate);
++        if (replyNs - timeNs > kLongestMakeUpNs) {
++            restartInputClock();
++            timeNs = replyNs;
++        }
++    }
++    *replyTimeNs = mInputPositionTimeNs =
++            std::min(replyNs, std::max(timeNs, mInputPositionTimeNs + 1));
++}
++
+ void StreamAlsaMonoPipe::shutdown() {
+     teardownIo();
+ }
+diff --git a/audio/aidl/default/include/core-impl/StreamAlsaMonoPipe.h b/audio/aidl/default/include/core-impl/StreamAlsaMonoPipe.h
+index d664574f17091e694d6909e1f34b506a389852e3..56115d36dc83356f4951df91e98bab5e806f785e 100644
+--- a/audio/aidl/default/include/core-impl/StreamAlsaMonoPipe.h
++++ b/audio/aidl/default/include/core-impl/StreamAlsaMonoPipe.h
+@@ -48,6 +48,9 @@ class StreamAlsaMonoPipe : public StreamAlsaBase {
+     void shutdown() override;
+ 
+   protected:
++    // Sets the time of an input's reply position (see 'readInput'); the frames stay the worker's.
++    void refineInputPositionTime(int64_t* replyTimeNs);
++
+     // Whether the output goes through the pipe and an I/O thread. An output whose device
+     // takes data in real time may instead write to it from 'transfer', which then blocks
+     // until the ALSA ring has room.
+@@ -74,7 +77,7 @@ class StreamAlsaMonoPipe : public StreamAlsaBase {
+     std::condition_variable mInputCv;
+ 
+     // The clock that the input's frames keep to (see 'readInput'), on the steady clock. Used by the
+-    // thread that calls 'start', 'pause', 'standby' and 'transfer' only.
++    // thread that calls 'start', 'pause', 'standby', 'transfer' and 'refinePosition' only.
+     bool mInputClockRunning = false;
+     int64_t mInputClockStartNs = 0;    // when the first frame of the clock is due
+     int64_t mInputFramesTaken = 0;     // the client's frames since then, made-up ones included
+@@ -82,6 +85,7 @@ class StreamAlsaMonoPipe : public StreamAlsaBase {
+     int64_t mInputFramesMadeUp = 0;    // the silence made up in the stall so far
+     int64_t mInputFramesDropped = 0;   // the frames dropped since the last message about them
+     int64_t mInputDropLoggedNs = 0;    // when that message was logged
++    int64_t mInputPositionTimeNs = 0;  // the time that the last reply reported for the position
+ };
+ 
+ }  // namespace aidl::android::hardware::audio::core
+diff --git a/audio/aidl/default/primary/StreamPrimary.cpp b/audio/aidl/default/primary/StreamPrimary.cpp
+index 3b13ace268447fc5f24b70da0452003dca2bba19..e60a7b4706cca8854a3dcd0e16d30f5c61e555b6 100644
+--- a/audio/aidl/default/primary/StreamPrimary.cpp
++++ b/audio/aidl/default/primary/StreamPrimary.cpp
+@@ -141,6 +141,10 @@ StreamPrimary::StreamPrimary(StreamContext* context, const Metadata& metadata)
+     }
+     // Since not all data is actually sent to the HAL, use the position maintained by Stream class
+     // which accounts for all frames passed from / to the client.
++    if (mIsInput) {
++        // The input reports the time that its last frame was due, not the time of the reply.
++        refineInputPositionTime(&position->timeNs);
++    }
+     return ::android::OK;
+ }
+ 

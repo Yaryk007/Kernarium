@@ -239,7 +239,7 @@ void Translator::emit_direct_exit(std::uint64_t target)
 void Translator::emit_fallthrough()
 {
 	close_run();
-	const auto next = input_.key + 4U * unit_;
+	const auto next = key_advance(input_.key, unit_);
 	if (it_.active() && !input_.single) {
 		/* Ended inside an IT block: record where, and leave through the
 		 * executor, whose next entry runs the rest unlinked. */
@@ -1280,7 +1280,7 @@ BuildOutput Translator::run()
 	while (!ended_ && compiled_ < limit_) {
 		if (!input_.single && compiled_ >= soft_limit_ && !it_.active())
 			break;
-		key_ = input_.key + 4U * unit_;
+		key_ = key_advance(input_.key, unit_);
 		if (unit_ >= available_)
 			break;
 		std::size_t length = 1;
@@ -1301,7 +1301,7 @@ BuildOutput Translator::run()
 			raw = word_at(unit_);
 			in = decode_a32(raw, profile_);
 		}
-		next_key_ = key_ + 4U * length;
+		next_key_ = key_advance(key_, length);
 		const FormPlan plan = kFormPlans[static_cast<std::size_t>(in.form)];
 		/* A coprocessor access the profile does not accept, and a
 		 * coprocessor instruction of an extension the profile lacks, are

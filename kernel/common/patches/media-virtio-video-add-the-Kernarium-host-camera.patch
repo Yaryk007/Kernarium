@@ -1,0 +1,3982 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 17:51:23 +0900
+Subject: [PATCH] media: virtio-video: add the Kernarium host camera
+
+The emulator offers the Apple host's cameras as a local experimental
+Virtio device, ID 65533, which speaks the Virtio video protocol of the
+codecs with camera commands added. The existing driver binds it and
+registers, for each camera, a V4L2 capture node and a metadata node,
+from /dev/video10 up, so the decoder and the encoder stay below it in
+the window Android's codec2 scans.
+
+Opening a node starts nothing: a file creates its host stream when it
+sets a format or asks for buffers, and every open file has a stream of
+its own. NV12 is a video stream at a frame rate the device offers, MMAP
+or DMABUF. JPEG and the Bayer formats are stills, one capture per
+queued buffer; a cookie in the timestamp's seconds and the LAST buffer
+flag group the buffers that are exposed together. The metadata node
+returns one exposure record per buffer, matched to frames by sequence.
+A frame's timestamp is its age subtracted from the driver's clock; a
+still is stamped when it completes, because the time of its exposure is
+in the metadata.
+
+The device's controls, with their ranges, are registered for each file
+of a camera and reach the camera through any of its streams. A control
+needs a stream, so a camera keeps a metadata stream for it, which lets a
+torch be written with no capture running. V4L2_CID_PRIVACY and a
+read-only compound control with the camera's description record are
+answered by the driver.
+
+A system suspend stops the streams that hold buffers, which keeps the
+device from being reset, and the resume queues the buffers again. If the
+device was reset anyway, the resume creates the streams, writes the
+controls and attaches the buffers again.
+
+The nodes and what they use outlive the device's removal for as long as
+a file is open.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ drivers/media/virtio/Kconfig                  |    7 +-
+ drivers/media/virtio/Makefile                 |    4 +-
+ drivers/media/virtio/README                   |   10 +-
+ drivers/media/virtio/virtio_video.h           |   62 +-
+ drivers/media/virtio/virtio_video_camera.c    | 1672 +++++++++++++++++
+ drivers/media/virtio/virtio_video_camera.h    |  233 +++
+ .../media/virtio/virtio_video_camera_cmd.c    |  290 +++
+ .../media/virtio/virtio_video_camera_ctrl.c   |  568 ++++++
+ .../media/virtio/virtio_video_camera_dev.c    |  434 +++++
+ drivers/media/virtio/virtio_video_caps.c      |   12 +-
+ drivers/media/virtio/virtio_video_ctrls.c     |   16 +-
+ drivers/media/virtio/virtio_video_device.c    |   48 +-
+ drivers/media/virtio/virtio_video_driver.c    |   68 +-
+ drivers/media/virtio/virtio_video_vq.c        |  132 +-
+ 14 files changed, 3517 insertions(+), 39 deletions(-)
+ create mode 100644 drivers/media/virtio/virtio_video_camera.c
+ create mode 100644 drivers/media/virtio/virtio_video_camera.h
+ create mode 100644 drivers/media/virtio/virtio_video_camera_cmd.c
+ create mode 100644 drivers/media/virtio/virtio_video_camera_ctrl.c
+ create mode 100644 drivers/media/virtio/virtio_video_camera_dev.c
+
+diff --git a/drivers/media/virtio/Kconfig b/drivers/media/virtio/Kconfig
+index e5cde64f45af60d52ded781861575450493aa5d2..a3f4ad7ce56116981ca088c9b3ac9cb35a292eac 100644
+--- a/drivers/media/virtio/Kconfig
++++ b/drivers/media/virtio/Kconfig
+@@ -1,6 +1,6 @@
+ # SPDX-License-Identifier: GPL-2.0-or-later
+ config VIRTIO_VIDEO
+-	tristate "Virtio video decoder and encoder"
++	tristate "Virtio video decoder, encoder and camera"
+ 	depends on VIRTIO && VIDEO_DEV
+ 	select VIDEOBUF2_DMA_SG
+ 	select VIDEOBUF2_DMA_CONTIG
+@@ -8,4 +8,7 @@ config VIRTIO_VIDEO
+ 	help
+ 	  Stateful V4L2 decoding and encoding through the Virtio video
+ 	  queues. A decoder is a device with ID 31 and an encoder a device
+-	  with ID 30 that offers VIRTIO_VIDEO_F_V4L2_CONTROLS.
++	  with ID 30 that offers VIRTIO_VIDEO_F_V4L2_CONTROLS. A camera is a
++	  device with ID 65533 that offers the same feature: it makes a
++	  V4L2 capture node and a metadata node for each camera of the host,
++	  from /dev/video10 up.
+diff --git a/drivers/media/virtio/Makefile b/drivers/media/virtio/Makefile
+index 0774e54bd38c71f00334d53c337b5b3d30a69168..31583ef05238ce7f0a77f895f5f9f742f4bf5fc0 100644
+--- a/drivers/media/virtio/Makefile
++++ b/drivers/media/virtio/Makefile
+@@ -4,4 +4,6 @@ virtio-video-y := virtio_video_driver.o virtio_video_vq.o \
+ 	virtio_video_device.o virtio_video_dec.o \
+ 	virtio_video_enc.o virtio_video_ctrls.o \
+ 	virtio_video_caps.o virtio_video_helpers.o \
+-	virtio_video_blob.o
++	virtio_video_blob.o virtio_video_camera.o \
++	virtio_video_camera_cmd.o virtio_video_camera_ctrl.o \
++	virtio_video_camera_dev.o
+diff --git a/drivers/media/virtio/README b/drivers/media/virtio/README
+index d928f9d09e6d96b4a161cd4c26847f3046b05c4e..8693cd8b4303b2bd2f1e33c31348aa525a266a3f 100644
+--- a/drivers/media/virtio/README
++++ b/drivers/media/virtio/README
+@@ -1,4 +1,4 @@
+-Darwin UML stateful decoder and encoder
++Darwin UML stateful decoder and encoder, and camera
+ 
+ Adapted from OpenSynergy's Virtio video driver in Android common-modules
+ virtual-device commit 4733665ecb4a3adc05f27a59779ee7e1bb247420
+@@ -56,3 +56,11 @@ driver binds it only when the device offers VIRTIO_VIDEO_F_V4L2_CONTROLS.
+   is sent. START, or a restart of either queue, resumes. A coded buffer
+   holding only parameter sets (header mode SEPARATE) carries no frame-type
+   flag.
++
++The camera (device ID 65533, a local experimental ID) is a Virtio device that
++offers VIRTIO_VIDEO_F_V4L2_CONTROLS and carries every camera of the host. The
++driver registers, for each camera, a V4L2 capture node and a metadata node,
++from /dev/video10 up. The nodes, the streams, stills, metadata, controls and
++the suspend behaviour are described in the "Camera" and "Guest nodes" sections
++of kernel/common/video/README.md in the owning Darwin host repository, which is
++the one place that states them.
+diff --git a/drivers/media/virtio/virtio_video.h b/drivers/media/virtio/virtio_video.h
+index e95160addc0f9579ce96f06e31c403974f4861ff..f3063cb1203e2858edd50ff13f2a236d4fc02491 100644
+--- a/drivers/media/virtio/virtio_video.h
++++ b/drivers/media/virtio/virtio_video.h
+@@ -35,6 +35,8 @@
+ #define DRIVER_NAME "virtio-video"
+ 
+ #define VIRTIO_ID_VIDEO_DECODER 31
++/* An experimental ID of the Virtio specification's local range. */
++#define VIRTIO_ID_VIDEO_CAMERA UML_VIRTIO_VIDEO_CAMERA_DEVICE_ID
+ 
+ #define MIN_BUFS_MIN 0
+ #define MIN_BUFS_MAX VIDEO_MAX_FRAME
+@@ -177,6 +179,12 @@ struct virtio_video_vbuffer {
+ 
+ 	void *priv;
+ 	virtio_video_resp_cb resp_cb;
++	/*
++	 * Optional: where the owner keeps a pointer to the command while it
++	 * is pending (set when the ring takes it, cleared before its callback
++	 * runs), for virtio_video_cmd_orphan().
++	 */
++	struct virtio_video_vbuffer **owner;
+ 
+ 	bool is_sync;
+ 	struct completion reclaimed;
+@@ -282,6 +290,19 @@ struct virtio_video_device {
+ 	/* Device ID 30, the encoder; the decoder otherwise. */
+ 	bool encoder;
+ 
++	/*
++	 * Device ID 65533, the camera. Its nodes are registered per camera, not
++	 * through video_dev, and its last user frees it: the driver and every
++	 * registered node hold a reference.
++	 */
++	bool camera;
++	struct kref ref;
++	struct virtio_video_camera *cameras;
++	unsigned int num_cameras;
++	u32 camera_session_flags;
++	/* The camera buffers the device holds: VIRTIO_VIDEO_CAMERA_MAX_QUEUED. */
++	atomic_t cam_queued;
++
+ 	bool has_iommu;
+ 	bool supp_non_contig;
+ 
+@@ -428,8 +449,7 @@ int virtio_video_dec_init(struct virtio_video_device *vvd);
+ int virtio_video_enc_init(struct virtio_video_device *vvd);
+ 
+ void virtio_video_stream_id_get(struct virtio_video_device *vvd,
+-				struct virtio_video_stream *stream,
+-				uint32_t *id);
++				void *stream, uint32_t *id);
+ void virtio_video_stream_id_put(struct virtio_video_device *vvd, uint32_t id);
+ void virtio_video_resource_id_get(struct virtio_video_device *vvd,
+ 				  uint32_t *id);
+@@ -489,11 +509,11 @@ int virtio_video_cmd_query_v4l2_controls(struct virtio_video_device *vvd,
+ 					 uint32_t start_index, void *resp_buf,
+ 					 size_t resp_size, size_t *resp_len);
+ int virtio_video_cmd_set_v4l2_control(struct virtio_video_device *vvd,
+-				      struct virtio_video_stream *stream,
++				      uint32_t stream_id,
+ 				      uint32_t id, int64_t value,
+ 				      const void *payload, uint32_t size);
+ int virtio_video_cmd_get_v4l2_control(struct virtio_video_device *vvd,
+-				      struct virtio_video_stream *stream,
++				      uint32_t stream_id,
+ 				      uint32_t id, int64_t *value,
+ 				      void *payload, uint32_t size);
+ int virtio_video_cmd_set_stream_info(struct virtio_video_device *vvd,
+@@ -505,6 +525,35 @@ int virtio_video_cmd_get_stream_info(struct virtio_video_device *vvd,
+ 				     enum virtio_video_queue_type queue_type,
+ 				     struct video_stream_info *info);
+ 
++/* Commands the camera shares with the codecs (virtio_video_vq.c). */
++void *virtio_video_alloc_req_resp(struct virtio_video_device *vvd,
++				  virtio_video_resp_cb cb,
++				  struct virtio_video_vbuffer **vbuffer_p,
++				  int req_size, int resp_size, void *resp_buf);
++int virtio_video_queue_cmd_buffer(struct virtio_video_device *vvd,
++				  struct virtio_video_vbuffer *vbuf);
++int virtio_video_cmd_sync(struct virtio_video_device *vvd, const void *req,
++			  size_t req_size, void *resp, size_t resp_size,
++			  size_t *resp_len);
++bool virtio_video_cmd_orphan(struct virtio_video_device *vvd,
++			     struct virtio_video_vbuffer **owner);
++int virtio_video_resp_errno(uint32_t type);
++
++/* virtio_video_device.c: attach a buffer's pages to a stream of the device. */
++int virtio_video_attach_buffer(struct virtio_video_device *vvd,
++			       uint32_t stream_id, struct vb2_buffer *vb,
++			       uint32_t *resource_id);
++
++/* virtio_video_camera_dev.c: the camera device. */
++int virtio_video_camera_init(struct virtio_video_device *vvd);
++void virtio_video_camera_deinit(struct virtio_video_device *vvd);
++void virtio_video_camera_put(struct virtio_video_device *vvd);
++void virtio_video_camera_event(struct virtio_video_device *vvd, u32 type,
++			       u32 camera);
++int virtio_video_camera_suspend(struct virtio_video_device *vvd);
++int virtio_video_camera_resume(struct virtio_video_device *vvd);
++u32 virtio_video_camera_wire_to_v4l2(u32 wire_format);
++
+ void virtio_video_queue_res_chg_event(struct virtio_video_stream *stream);
+ void virtio_video_queue_eos_event(struct virtio_video_stream *stream);
+ void virtio_video_handle_error(struct virtio_video_stream *stream);
+@@ -544,6 +593,11 @@ int virtio_video_subscribe_event(struct v4l2_fh *fh,
+ 				 const struct v4l2_event_subscription *sub);
+ 
+ void virtio_video_free_caps_list(struct list_head *caps_list);
++int virtio_video_parse_virtio_capability(struct virtio_video_device *vvd,
++					 void *resp_buf,
++					 struct list_head *ret_fmt_list,
++					 uint32_t *ret_num_fmts);
++void virtio_video_free_format_list(struct list_head *fmts_list);
+ int virtio_video_parse_virtio_capabilities(struct virtio_video_device *vvd,
+ 					   void *input_buf, void *output_buf);
+ void virtio_video_clean_capability(struct virtio_video_device *vvd);
+diff --git a/drivers/media/virtio/virtio_video_camera.c b/drivers/media/virtio/virtio_video_camera.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..dabbc29fcff0c0a1ff8af3bd31fe1055ee34c1fc
+--- /dev/null
++++ b/drivers/media/virtio/virtio_video_camera.c
+@@ -0,0 +1,1672 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * The Virtio camera's V4L2 nodes.
++ *
++ * A camera of the host is a capture node (video and still streams) and a
++ * metadata node (meta streams). Every open file of a node is a stream of its
++ * own on the host, created when the file first needs one (its format is set or
++ * its buffers are requested), never at open: applications open every video
++ * node, and opening must not start the host's camera, which only a queued
++ * buffer does. A file that never needs a stream, such as one that only turns
++ * the torch on, never has one.
++ *
++ * The device decides each plane's size and stride and the driver reports them,
++ * so a client that honors the stride a V4L2 device reports needs no allocator
++ * of its own. The driver's own copy of the rule (virtio_video_cam_fill_pix())
++ * answers TRY_FMT and the formats before a stream exists; S_FMT takes the
++ * device's answer.
++ *
++ * A still stream takes one capture per buffer queued. A client groups the
++ * stills of one capture (a JPEG with its Bayer still) as the HAL does: one
++ * non-zero cookie in the buffers' timestamp field and V4L2_BUF_FLAG_LAST on the
++ * group's last buffer. vb2 clears the flag and copies no timestamp on a
++ * capture queue, so the driver reads both in its VIDIOC_QBUF before vb2 does.
++ */
++#include <linux/module.h>
++#include <linux/sched.h>
++#include <linux/delay.h>
++#include <linux/ktime.h>
++#include <media/v4l2-event.h>
++#include <media/v4l2-ioctl.h>
++#include <media/videobuf2-dma-sg.h>
++
++#include "virtio_video_camera.h"
++
++/* ------------------------------------------------------------------------ */
++/* Formats                                                                  */
++/* ------------------------------------------------------------------------ */
++
++u32 virtio_video_camera_wire_to_v4l2(u32 wire)
++{
++	switch (wire) {
++	case VIRTIO_VIDEO_FORMAT_NV12:
++		return V4L2_PIX_FMT_NV12;
++	case VIRTIO_VIDEO_FORMAT_CAMERA_JPEG:
++		return V4L2_PIX_FMT_JPEG;
++	case VIRTIO_VIDEO_FORMAT_CAMERA_RAW16_RGGB:
++		return V4L2_PIX_FMT_SRGGB16;
++	case VIRTIO_VIDEO_FORMAT_CAMERA_RAW16_GRBG:
++		return V4L2_PIX_FMT_SGRBG16;
++	case VIRTIO_VIDEO_FORMAT_CAMERA_RAW16_GBRG:
++		return V4L2_PIX_FMT_SGBRG16;
++	case VIRTIO_VIDEO_FORMAT_CAMERA_RAW16_BGGR:
++		return V4L2_PIX_FMT_SBGGR16;
++	default:
++		return 0;
++	}
++}
++
++static u32 cam_v4l2_to_wire(u32 fourcc)
++{
++	switch (fourcc) {
++	case V4L2_PIX_FMT_NV12:
++		return VIRTIO_VIDEO_FORMAT_NV12;
++	case V4L2_PIX_FMT_JPEG:
++		return VIRTIO_VIDEO_FORMAT_CAMERA_JPEG;
++	case V4L2_PIX_FMT_SRGGB16:
++		return VIRTIO_VIDEO_FORMAT_CAMERA_RAW16_RGGB;
++	case V4L2_PIX_FMT_SGRBG16:
++		return VIRTIO_VIDEO_FORMAT_CAMERA_RAW16_GRBG;
++	case V4L2_PIX_FMT_SGBRG16:
++		return VIRTIO_VIDEO_FORMAT_CAMERA_RAW16_GBRG;
++	case V4L2_PIX_FMT_SBGGR16:
++		return VIRTIO_VIDEO_FORMAT_CAMERA_RAW16_BGGR;
++	default:
++		return 0;
++	}
++}
++
++/* NV12 is a video stream, everything else a capture node offers a still. */
++static u32 cam_kind_of(u32 fourcc)
++{
++	return fourcc == V4L2_PIX_FMT_NV12 ? VIRTIO_VIDEO_CAMERA_STREAM_VIDEO :
++					     VIRTIO_VIDEO_CAMERA_STREAM_STILL;
++}
++
++struct video_format *
++virtio_video_cam_find_format(struct virtio_video_camera *cam, u32 pixelformat)
++{
++	struct video_format *fmt;
++
++	list_for_each_entry(fmt, &cam->video_formats, formats_list_entry)
++		if (fmt->desc.format == pixelformat)
++			return fmt;
++	list_for_each_entry(fmt, &cam->still_formats, formats_list_entry)
++		if (fmt->desc.format == pixelformat)
++			return fmt;
++
++	return NULL;
++}
++
++static struct video_format *cam_nth_format(struct virtio_video_camera *cam,
++					   unsigned int n)
++{
++	struct video_format *fmt;
++
++	list_for_each_entry(fmt, &cam->video_formats, formats_list_entry)
++		if (fmt->desc.format && n-- == 0)
++			return fmt;
++	list_for_each_entry(fmt, &cam->still_formats, formats_list_entry)
++		if (fmt->desc.format && n-- == 0)
++			return fmt;
++
++	return NULL;
++}
++
++static u32 cam_clamp_step(u32 value, const struct virtio_video_format_range *r)
++{
++	value = clamp(value, r->min, r->max);
++	if (r->step > 1)
++		value = r->min + DIV_ROUND_CLOSEST(value - r->min, r->step) *
++				 r->step;
++
++	return min(value, r->max);
++}
++
++/* The size the format offers nearest to the one asked for. */
++static void cam_pick_size(const struct video_format *fmt, u32 *width,
++			  u32 *height)
++{
++	u64 best = U64_MAX;
++	u32 best_w = *width, best_h = *height;
++	unsigned int i;
++
++	for (i = 0; i < fmt->desc.num_frames; i++) {
++		const struct virtio_video_format_frame *frame =
++			&fmt->frames[i].frame;
++		u32 w = cam_clamp_step(*width, &frame->width);
++		u32 h = cam_clamp_step(*height, &frame->height);
++		u64 distance = (u64)abs_diff(w, *width) + abs_diff(h, *height);
++
++		if (distance < best) {
++			best = distance;
++			best_w = w;
++			best_h = h;
++		}
++	}
++
++	*width = best_w;
++	*height = best_h;
++}
++
++/*
++ * A new file's size: the largest the format offers that is no bigger than
++ * 1280 x 720, else the smallest.
++ */
++static void cam_default_size(const struct video_format *fmt, u32 *width,
++			     u32 *height)
++{
++	const struct virtio_video_format_frame *best = NULL, *smallest = NULL;
++	unsigned int i;
++
++	for (i = 0; i < fmt->desc.num_frames; i++) {
++		const struct virtio_video_format_frame *frame =
++			&fmt->frames[i].frame;
++		u64 area = (u64)frame->width.min * frame->height.min;
++
++		if (frame->width.min <= 1280 && frame->height.min <= 720 &&
++		    (!best || area > (u64)best->width.min * best->height.min))
++			best = frame;
++		if (!smallest ||
++		    area < (u64)smallest->width.min * smallest->height.min)
++			smallest = frame;
++	}
++	if (!best)
++		best = smallest;
++	if (best) {
++		*width = best->width.min;
++		*height = best->height.min;
++	}
++}
++
++/* The layout the device uses: rows padded to 16 bytes, planes back to back. */
++static void cam_fill_pix(struct v4l2_pix_format_mplane *pix, u32 fourcc,
++			 u32 width, u32 height)
++{
++	u32 stride;
++	u64 size;
++
++	memset(pix, 0, sizeof(*pix));
++	pix->width = width;
++	pix->height = height;
++	pix->pixelformat = fourcc;
++	pix->field = V4L2_FIELD_NONE;
++	pix->num_planes = 1;
++
++	switch (fourcc) {
++	case V4L2_PIX_FMT_NV12:
++		stride = ALIGN(width, 16);
++		size = (u64)stride * (height + height / 2);
++		pix->colorspace = V4L2_COLORSPACE_REC709;
++		pix->xfer_func = V4L2_XFER_FUNC_709;
++		pix->ycbcr_enc = V4L2_YCBCR_ENC_709;
++		pix->quantization = V4L2_QUANTIZATION_FULL_RANGE;
++		break;
++	case V4L2_PIX_FMT_JPEG:
++		stride = 0;
++		size = (u64)width * height * 3 / 2 +
++		       VIRTIO_VIDEO_CAMERA_EXIF_GAP;
++		pix->colorspace = V4L2_COLORSPACE_JPEG;
++		pix->xfer_func = V4L2_XFER_FUNC_SRGB;
++		pix->ycbcr_enc = V4L2_YCBCR_ENC_601;
++		pix->quantization = V4L2_QUANTIZATION_FULL_RANGE;
++		break;
++	default:
++		stride = ALIGN(2 * width, 16);
++		size = (u64)stride * height;
++		pix->colorspace = V4L2_COLORSPACE_RAW;
++		break;
++	}
++
++	pix->plane_fmt[0].bytesperline = stride;
++	pix->plane_fmt[0].sizeimage = min_t(u64, size, U32_MAX);
++}
++
++/* The format TRY_FMT settles on; it never fails for an unknown one. */
++static void cam_try_pix(struct virtio_video_camera *cam,
++			struct v4l2_pix_format_mplane *pix)
++{
++	struct video_format *fmt = virtio_video_cam_find_format(cam,
++								pix->pixelformat);
++	u32 width = pix->width, height = pix->height;
++
++	if (!fmt)
++		fmt = virtio_video_cam_find_format(cam, V4L2_PIX_FMT_NV12) ?:
++		      cam_nth_format(cam, 0);
++	if (!fmt)
++		return;
++
++	if (!width || !height)
++		cam_default_size(fmt, &width, &height);
++	else
++		cam_pick_size(fmt, &width, &height);
++
++	cam_fill_pix(pix, fmt->desc.format, width, height);
++}
++
++/* ------------------------------------------------------------------------ */
++/* The host stream of a file                                                */
++/* ------------------------------------------------------------------------ */
++
++static struct virtio_video_device *cam_vvd(struct virtio_video_cam_file *file)
++{
++	return file->cam->vvd;
++}
++
++/*
++ * Reserves one of the buffers the device may hold in all
++ * (VIRTIO_VIDEO_CAMERA_MAX_QUEUED); a buffer over the budget is refused.
++ */
++static bool cam_buffer_reserve(struct virtio_video_device *vvd)
++{
++	if (atomic_inc_return(&vvd->cam_queued) <= VIRTIO_VIDEO_CAMERA_MAX_QUEUED)
++		return true;
++	atomic_dec(&vvd->cam_queued);
++
++	return false;
++}
++
++/* A buffer left the device: its answer came, or it was taken back. */
++static void cam_inflight_dec(struct virtio_video_cam_file *file)
++{
++	atomic_dec(&cam_vvd(file)->cam_queued);
++	atomic_dec(&file->inflight);
++}
++
++/* Notes a sequence handed to the client, so a reset can carry on after it. */
++static void cam_note_sequence(struct virtio_video_camera *cam, u32 sequence)
++{
++	int next = sequence + 1, seen = atomic_read(&cam->seq_next);
++
++	while (next - seen > 0 &&
++	       !atomic_try_cmpxchg(&cam->seq_next, &seen, next))
++		;
++}
++
++static void cam_stream_destroy(struct virtio_video_cam_file *file)
++{
++	struct virtio_video_device *vvd = cam_vvd(file);
++
++	if (!file->stream_id)
++		return;
++
++	virtio_video_cmd_stream_destroy(vvd, file->stream_id);
++	virtio_video_stream_id_put(vvd, file->stream_id);
++	file->stream_id = 0;
++}
++
++static int cam_stream_create(struct virtio_video_cam_file *file)
++{
++	struct virtio_video_device *vvd = cam_vvd(file);
++	char name[TASK_COMM_LEN];
++	uint32_t id;
++	int ret;
++
++	get_task_comm(name, current);
++	virtio_video_stream_id_get(vvd, file, &id);
++	if ((int)id <= 0)
++		return -ENOMEM;
++
++	ret = virtio_video_cam_cmd_stream_create(vvd, id, file->cam->index,
++						 file->kind, name);
++	if (ret) {
++		virtio_video_stream_id_put(vvd, id);
++		return ret;
++	}
++
++	file->stream_id = id;
++
++	return 0;
++}
++
++/*
++ * Tells the device the stream's format and learns the layout it picked and, for
++ * video, the frame interval it runs at.
++ */
++static int cam_stream_configure(struct virtio_video_cam_file *file)
++{
++	struct virtio_video_device *vvd = cam_vvd(file);
++	struct virtio_video_params params = {}, got = {};
++	bool capture = file->node->type == CAM_NODE_CAPTURE;
++	u32 plane_size, stride, minimum;
++	int ret;
++
++	params.queue_type = cpu_to_le32(VIRTIO_VIDEO_QUEUE_TYPE_OUTPUT);
++	params.format = cpu_to_le32(file->wire_format);
++	params.min_buffers = cpu_to_le32(1);
++	params.max_buffers = cpu_to_le32(VB2_MAX_FRAME);
++	params.num_planes = cpu_to_le32(1);
++	if (capture) {
++		params.frame_width = cpu_to_le32(file->pix.width);
++		params.frame_height = cpu_to_le32(file->pix.height);
++		params.crop.width = params.frame_width;
++		params.crop.height = params.frame_height;
++		params.frame_rate = cpu_to_le32(file->interval_denominator /
++						max(file->interval_numerator, 1u));
++		params.plane_formats[0].plane_size =
++			cpu_to_le32(file->pix.plane_fmt[0].sizeimage);
++		params.plane_formats[0].stride =
++			cpu_to_le32(file->pix.plane_fmt[0].bytesperline);
++	} else {
++		params.plane_formats[0].plane_size =
++			cpu_to_le32(sizeof(struct virtio_video_camera_meta));
++	}
++
++	ret = virtio_video_cam_cmd_set_params(vvd, file->stream_id, &params);
++	if (ret)
++		return ret;
++
++	ret = virtio_video_cam_cmd_get_params(vvd, file->stream_id, &got);
++	if (ret)
++		return ret;
++
++	if (le32_to_cpu(got.num_planes) < 1)
++		return -EIO;
++	plane_size = le32_to_cpu(got.plane_formats[0].plane_size);
++	stride = le32_to_cpu(got.plane_formats[0].stride);
++	/*
++	 * Nothing under what the driver itself works out for the format, and
++	 * nothing over what the device takes as a resource: vb2 would
++	 * allocate whatever it was told.
++	 */
++	minimum = capture ? file->pix.plane_fmt[0].sizeimage :
++			    sizeof(struct virtio_video_camera_meta);
++	if (plane_size < minimum ||
++	    plane_size > VIRTIO_VIDEO_CAMERA_MAX_PLANE_SIZE)
++		return -EIO;
++
++	file->plane_size = plane_size;
++	if (capture) {
++		file->pix.plane_fmt[0].sizeimage = plane_size;
++		file->pix.plane_fmt[0].bytesperline = stride;
++	} else {
++		file->meta_fmt.buffersize = plane_size;
++	}
++
++	if (file->kind == VIRTIO_VIDEO_CAMERA_STREAM_VIDEO) {
++		/* Whatever the guest asked for, the device runs at a rate it has. */
++		if (file->interval_numerator && file->interval_denominator)
++			virtio_video_cam_cmd_set_interval(vvd, file->stream_id,
++							  file->interval_numerator,
++							  file->interval_denominator);
++		virtio_video_cam_cmd_get_interval(vvd, file->stream_id,
++						  &file->interval_numerator,
++						  &file->interval_denominator);
++	}
++
++	return 0;
++}
++
++/* Creates the file's host stream and configures it. */
++static int cam_stream_setup(struct virtio_video_cam_file *file)
++{
++	int ret;
++
++	ret = cam_stream_create(file);
++	if (ret)
++		return ret;
++
++	ret = cam_stream_configure(file);
++	if (ret)
++		cam_stream_destroy(file);
++
++	return ret;
++}
++
++static int cam_stream_ensure(struct virtio_video_cam_file *file)
++{
++	return file->stream_id ? 0 : cam_stream_setup(file);
++}
++
++/* ------------------------------------------------------------------------ */
++/* vb2                                                                      */
++/* ------------------------------------------------------------------------ */
++
++static int cam_queue_setup(struct vb2_queue *vq, unsigned int *nbuffers,
++			   unsigned int *nplanes, unsigned int sizes[],
++			   struct device *alloc_devs[])
++{
++	struct virtio_video_cam_file *file = vb2_get_drv_priv(vq);
++
++	if (!file->stream_id)
++		return -EIO;
++
++	if (*nplanes)
++		return *nplanes == 1 && sizes[0] >= file->plane_size ?
++		       0 : -EINVAL;
++
++	*nplanes = 1;
++	sizes[0] = file->plane_size;
++
++	return 0;
++}
++
++static int cam_buf_init(struct vb2_buffer *vb)
++{
++	struct virtio_video_cam_file *file = vb2_get_drv_priv(vb->vb2_queue);
++	struct virtio_video_cam_buffer *buf = to_cam_buffer(vb);
++	u32 id = 0;
++	int ret;
++
++	INIT_LIST_HEAD(&buf->parked);
++	buf->cmd = NULL;
++	buf->attached = false;
++
++	ret = virtio_video_attach_buffer(cam_vvd(file), file->stream_id, vb,
++					 &id);
++	/* A buffer the device cannot map is not one the client may queue. */
++	if (ret == -ENOTTY)
++		ret = -EINVAL;
++	if (ret)
++		return ret;
++
++	buf->resource_id = id;
++	buf->attached = true;
++
++	return 0;
++}
++
++static void cam_buf_cleanup(struct vb2_buffer *vb)
++{
++	struct virtio_video_cam_file *file = vb2_get_drv_priv(vb->vb2_queue);
++	struct virtio_video_cam_buffer *buf = to_cam_buffer(vb);
++
++	if (buf->resource_id)
++		virtio_video_resource_id_put(cam_vvd(file), buf->resource_id);
++	buf->resource_id = 0;
++	buf->attached = false;
++}
++
++static int cam_buf_prepare(struct vb2_buffer *vb)
++{
++	struct virtio_video_cam_file *file = vb2_get_drv_priv(vb->vb2_queue);
++	struct virtio_video_cam_buffer *buf = to_cam_buffer(vb);
++	u32 id = buf->resource_id;
++	int ret;
++
++	if (vb2_plane_size(vb, 0) < file->plane_size)
++		return -EINVAL;
++
++	/*
++	 * The device forgot the buffer when it was reset, or the stream it was
++	 * attached to was destroyed: attach it again.
++	 */
++	if (!buf->attached && id) {
++		ret = cam_stream_ensure(file);
++		if (ret)
++			return ret;
++		ret = virtio_video_attach_buffer(cam_vvd(file), file->stream_id,
++						 vb, &id);
++		if (ret == -ENOTTY)
++			ret = -EINVAL;
++		if (ret)
++			return ret;
++		buf->attached = true;
++	}
++
++	return 0;
++}
++
++/* Hands a buffer to the device. */
++static int cam_send_buffer(struct virtio_video_cam_file *file,
++			   struct virtio_video_cam_buffer *buf)
++{
++	int ret;
++
++	/* A cookie and a group mean something to a still stream only. */
++	if (file->kind != VIRTIO_VIDEO_CAMERA_STREAM_STILL) {
++		buf->cookie = 0;
++		buf->group_more = false;
++	}
++
++	if (!cam_buffer_reserve(cam_vvd(file)))
++		return -EBUSY;
++	atomic_inc(&file->inflight);
++	ret = virtio_video_cam_cmd_queue(cam_vvd(file), file->stream_id, buf);
++	if (ret) {
++		cam_inflight_dec(file);
++		wake_up(&file->idle);
++	}
++
++	return ret;
++}
++
++static void cam_buf_queue(struct vb2_buffer *vb)
++{
++	struct virtio_video_cam_file *file = vb2_get_drv_priv(vb->vb2_queue);
++	struct virtio_video_cam_buffer *buf = to_cam_buffer(vb);
++
++	if (cam_send_buffer(file, buf)) {
++		vb2_set_plane_payload(vb, 0, 0);
++		vb2_buffer_done(vb, VB2_BUF_STATE_ERROR);
++	}
++}
++
++/*
++ * The metadata record of a buffer, in the pages the device wrote it to. Not
++ * through vb2_plane_vaddr(): that is a second mapping of the same pages, and
++ * this host's does not show the device's writes. A metadata buffer is always
++ * the node's own memory (see cam_init_queue), a page or more from its start.
++ */
++static struct virtio_video_camera_meta *cam_meta_record(struct vb2_buffer *vb)
++{
++	struct sg_table *sgt = vb2_dma_sg_plane_desc(vb, 0);
++
++	if (!sgt || !sgt->sgl ||
++	    sgt->sgl->length < sizeof(struct virtio_video_camera_meta))
++		return NULL;
++	return sg_virt(sgt->sgl);
++}
++
++/*
++ * The device's answer to a queued buffer, under the command queue's lock with
++ * interrupts off. The frame's timestamp is its age: the driver stamps it with
++ * its own clock minus that, as the monotonic clock the HAL converts. A still
++ * carries only the guest's cookie back, and its metadata record has the
++ * exposure's duration and no time, so a still is stamped when it completes. A
++ * failed buffer carries no payload; while a suspend stops the stream, the
++ * buffers the device returns as failed (video and metadata) are kept to be
++ * queued again instead of going back to the client.
++ */
++void virtio_video_cam_complete(struct virtio_video_cam_buffer *buf,
++			       const struct virtio_video_camera_queue_resp *resp)
++{
++	struct vb2_buffer *vb = &buf->vb.vb2_buf;
++	struct virtio_video_cam_file *file = vb2_get_drv_priv(vb->vb2_queue);
++	enum vb2_buffer_state state = VB2_BUF_STATE_DONE;
++	u32 flags = VIRTIO_VIDEO_DEQUEUE_FLAG_ERR;
++	u64 age = 0, now = ktime_get_ns();
++	u32 size = 0, wire_sequence = 0;
++	unsigned long irq;
++
++	if (resp) {
++		flags = le32_to_cpu(resp->base.flags);
++		age = le64_to_cpu(resp->base.timestamp);
++		size = le32_to_cpu(resp->base.data_sizes[0]);
++		wire_sequence = (u32)le64_to_cpu(resp->sequence);
++	}
++	buf->cmd = NULL;
++
++	if (flags & VIRTIO_VIDEO_DEQUEUE_FLAG_ERR) {
++		if (READ_ONCE(file->parking) &&
++		    file->kind != VIRTIO_VIDEO_CAMERA_STREAM_STILL) {
++			spin_lock_irqsave(&file->park_lock, irq);
++			list_add_tail(&buf->parked, &file->parked);
++			spin_unlock_irqrestore(&file->park_lock, irq);
++			goto out;
++		}
++		state = VB2_BUF_STATE_ERROR;
++		size = 0;
++		/* A failed buffer has no sequence of the device's: the stream's. */
++		buf->vb.sequence = file->sequence;
++	} else {
++		/*
++		 * The device counts from zero after a reset; the camera's
++		 * sequences, the metadata's too, go on from the highest
++		 * delivered.
++		 */
++		buf->vb.sequence = wire_sequence +
++				   atomic_read(&file->cam->seq_offset);
++		file->sequence = buf->vb.sequence + 1;
++		switch (file->kind) {
++		case VIRTIO_VIDEO_CAMERA_STREAM_VIDEO:
++			/* A frame fills the plane. */
++			size = file->plane_size;
++			break;
++		case VIRTIO_VIDEO_CAMERA_STREAM_META:
++			size = size ?: sizeof(struct virtio_video_camera_meta);
++			break;
++		default:
++			/* A JPEG says how long it is; a Bayer still fills the plane. */
++			size = size ?: file->plane_size;
++			break;
++		}
++		/* A buffer that claims more than it holds failed. */
++		if (size > vb2_plane_size(vb, 0)) {
++			state = VB2_BUF_STATE_ERROR;
++			size = 0;
++		}
++		/*
++		 * The record names its exposure by the device's sequence, which
++		 * is what the client matches to a frame by: it is carried on
++		 * the same way.
++		 */
++		if (state == VB2_BUF_STATE_DONE &&
++		    file->kind == VIRTIO_VIDEO_CAMERA_STREAM_META) {
++			struct virtio_video_camera_meta *meta = cam_meta_record(vb);
++			u32 offset = atomic_read(&file->cam->seq_offset);
++
++			if (meta && offset && size >= sizeof(*meta))
++				meta->sequence = cpu_to_le64(
++					le64_to_cpu(meta->sequence) + offset);
++		}
++	}
++	cam_note_sequence(file->cam, buf->vb.sequence);
++
++	vb->timestamp = file->kind == VIRTIO_VIDEO_CAMERA_STREAM_STILL ?
++			now : now - min(age, now);
++	buf->vb.field = V4L2_FIELD_NONE;
++	vb2_set_plane_payload(vb, 0, size);
++	vb2_buffer_done(vb, state);
++out:
++	cam_inflight_dec(file);
++	wake_up(&file->idle);
++}
++
++/*
++ * Takes back what the device holds of a file's buffers when it cannot say so
++ * itself. A buffer whose command the device still has is orphaned, so its
++ * answer finds no buffer. With `park`, the buffers a suspend stopped wait for
++ * the resume (stills do not: a capture that was never taken is a failed one);
++ * otherwise every buffer the driver owns goes back to the client as failed.
++ */
++static void cam_take_back(struct virtio_video_cam_file *file, bool park)
++{
++	struct vb2_queue *q = &file->vq;
++	unsigned long irq;
++	unsigned int i;
++
++	for (i = 0; i < q->max_num_buffers; i++) {
++		struct vb2_buffer *vb = vb2_get_buffer(q, i);
++		struct virtio_video_cam_buffer *buf;
++
++		if (!vb || vb->state != VB2_BUF_STATE_ACTIVE)
++			continue;
++		buf = to_cam_buffer(vb);
++
++		if (virtio_video_cmd_orphan(cam_vvd(file), &buf->cmd)) {
++			cam_inflight_dec(file);
++			if (park &&
++			    file->kind != VIRTIO_VIDEO_CAMERA_STREAM_STILL) {
++				spin_lock_irqsave(&file->park_lock, irq);
++				list_add_tail(&buf->parked, &file->parked);
++				spin_unlock_irqrestore(&file->park_lock, irq);
++				continue;
++			}
++		} else if (park || vb->state != VB2_BUF_STATE_ACTIVE) {
++			/*
++			 * Parked already, or answered while this looked: the
++			 * orphan above ordered us after its callback.
++			 */
++			continue;
++		}
++
++		spin_lock_irqsave(&file->park_lock, irq);
++		list_del_init(&buf->parked);
++		spin_unlock_irqrestore(&file->park_lock, irq);
++		vb2_set_plane_payload(vb, 0, 0);
++		vb2_buffer_done(vb, VB2_BUF_STATE_ERROR);
++	}
++
++	/*
++	 * A response callback that was running on another CPU holds the command
++	 * queue's lock until it is done with the file.
++	 */
++	spin_lock_irqsave(&cam_vvd(file)->commandq.qlock, irq);
++	spin_unlock_irqrestore(&cam_vvd(file)->commandq.qlock, irq);
++	wake_up(&file->idle);
++}
++
++static int cam_start_streaming(struct vb2_queue *q, unsigned int count)
++{
++	return 0;
++}
++
++/*
++ * Stops the device's work on a file's buffers, and does not return until it
++ * cannot write one any more. The device completes what it holds as failed,
++ * after it answers the clear, so the answer and then every buffer are waited
++ * for. A device that does not say so in time may still write a buffer, and the
++ * pages of one the client gets back are the client's to reuse: the stream is
++ * destroyed instead. The destroy is only queued here, so the wait for the
++ * buffers goes on after it, without a limit, in steps that say so: the device
++ * takes the ring in order and completes every buffer it holds when it
++ * processes either command, so the wait ends when the device does its work,
++ * and a removal ends it whatever the device does, because it clears the
++ * queue's ready flag and virtio_video_cancel_cmds() then returns every
++ * command, a buffer's among them. The buffers of a destroyed stream must be
++ * attached to a new one before they are queued again.
++ */
++static void cam_halt_stream(struct virtio_video_cam_file *file)
++{
++	struct virtio_video_device *vvd = cam_vvd(file);
++	struct vb2_queue *q = &file->vq;
++	unsigned int i;
++
++	if (!file->stream_id)
++		return;
++
++	if (!virtio_video_cam_cmd_clear(vvd, file->stream_id, false) &&
++	    wait_event_timeout(file->idle, !atomic_read(&file->inflight), HZ) > 0)
++		return;
++
++	v4l2_warn(&vvd->v4l2_dev,
++		  "camera %u: the device did not stop a stream in time: destroying it\n",
++		  file->cam->index);
++	cam_stream_destroy(file);
++	for (i = 0; i < q->max_num_buffers; i++) {
++		struct vb2_buffer *vb = vb2_get_buffer(q, i);
++
++		if (vb)
++			to_cam_buffer(vb)->attached = false;
++	}
++
++	while (!wait_event_timeout(file->idle,
++				   !atomic_read(&file->inflight) ||
++				   !READ_ONCE(vvd->commandq.ready), 5 * HZ))
++		v4l2_warn(&vvd->v4l2_dev,
++			  "camera %u: still waiting for the device to give back a stream's buffers\n",
++			  file->cam->index);
++}
++
++/*
++ * Stops the stream; the buffers go back to the client as failed only after
++ * the device has stopped writing them.
++ */
++static void cam_stop_streaming(struct vb2_queue *q)
++{
++	struct virtio_video_cam_file *file = vb2_get_drv_priv(q);
++
++	cam_halt_stream(file);
++	cam_take_back(file, false);
++}
++
++static const struct vb2_ops cam_vb2_ops = {
++	.queue_setup = cam_queue_setup,
++	.buf_init = cam_buf_init,
++	.buf_prepare = cam_buf_prepare,
++	.buf_cleanup = cam_buf_cleanup,
++	.buf_queue = cam_buf_queue,
++	.start_streaming = cam_start_streaming,
++	.stop_streaming = cam_stop_streaming,
++	.wait_prepare = vb2_ops_wait_prepare,
++	.wait_finish = vb2_ops_wait_finish,
++};
++
++static int cam_init_queue(struct virtio_video_cam_file *file)
++{
++	struct virtio_video_device *vvd = cam_vvd(file);
++	struct vb2_queue *q = &file->vq;
++
++	q->type = file->node->type == CAM_NODE_CAPTURE ?
++		  V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE :
++		  V4L2_BUF_TYPE_META_CAPTURE;
++	/* A metadata record is read from the node's own memory. */
++	q->io_modes = file->node->type == CAM_NODE_CAPTURE ?
++		      VB2_MMAP | VB2_DMABUF : VB2_MMAP;
++	q->ops = &cam_vb2_ops;
++	q->mem_ops = &vb2_dma_sg_memops;
++	q->buf_struct_size = sizeof(struct virtio_video_cam_buffer);
++	q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
++	q->lock = &file->lock;
++	q->dev = vvd->v4l2_dev.dev;
++	q->drv_priv = file;
++	q->gfp_flags = virtio_video_gfp_flags(vvd);
++	q->min_queued_buffers = 0;
++
++	return vb2_queue_init(q);
++}
++
++/* ------------------------------------------------------------------------ */
++/* ioctls                                                                   */
++/* ------------------------------------------------------------------------ */
++
++static int cam_querycap(struct file *file, void *fh,
++			struct v4l2_capability *cap)
++{
++	struct virtio_video_cam_file *f = to_cam_file(file);
++
++	strscpy(cap->driver, DRIVER_NAME, sizeof(cap->driver));
++	snprintf(cap->card, sizeof(cap->card), "Virtio camera %u",
++		 f->cam->index);
++	snprintf(cap->bus_info, sizeof(cap->bus_info), "virtio-camera:%u",
++		 f->cam->index);
++
++	return 0;
++}
++
++static int cam_enum_fmt(struct file *file, void *fh, struct v4l2_fmtdesc *fmtdesc)
++{
++	struct virtio_video_cam_file *f = to_cam_file(file);
++	struct video_format *fmt;
++
++	if (fmtdesc->type != V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
++		return -EINVAL;
++
++	fmt = cam_nth_format(f->cam, fmtdesc->index);
++	if (!fmt)
++		return -EINVAL;
++
++	fmtdesc->pixelformat = fmt->desc.format;
++	fmtdesc->flags = 0;
++
++	return 0;
++}
++
++static int cam_g_fmt(struct file *file, void *fh, struct v4l2_format *format)
++{
++	struct virtio_video_cam_file *f = to_cam_file(file);
++	int ret;
++
++	ret = mutex_lock_interruptible(&f->lock);
++	if (ret)
++		return ret;
++	format->fmt.pix_mp = f->pix;
++	mutex_unlock(&f->lock);
++
++	return 0;
++}
++
++static int cam_try_fmt(struct file *file, void *fh, struct v4l2_format *format)
++{
++	struct virtio_video_cam_file *f = to_cam_file(file);
++
++	cam_try_pix(f->cam, &format->fmt.pix_mp);
++
++	return 0;
++}
++
++static int cam_s_fmt(struct file *file, void *fh, struct v4l2_format *format)
++{
++	struct virtio_video_cam_file *f = to_cam_file(file);
++	struct v4l2_pix_format_mplane pix = format->fmt.pix_mp;
++	struct v4l2_pix_format_mplane old_pix;
++	u32 old_kind, old_wire;
++	int ret;
++
++	ret = mutex_lock_interruptible(&f->lock);
++	if (ret)
++		return ret;
++	old_pix = f->pix;
++	old_kind = f->kind;
++	old_wire = f->wire_format;
++	if (vb2_is_busy(&f->vq)) {
++		ret = -EBUSY;
++		goto out;
++	}
++
++	cam_try_pix(f->cam, &pix);
++
++	/* The kind of stream is the format's, and a stream cannot change it. */
++	f->pix = pix;
++	f->kind = cam_kind_of(pix.pixelformat);
++	f->wire_format = cam_v4l2_to_wire(pix.pixelformat);
++	if (f->stream_id && f->kind != old_kind)
++		cam_stream_destroy(f);
++
++	if (f->stream_id)
++		ret = cam_stream_configure(f);
++	else
++		ret = cam_stream_setup(f);
++	if (ret) {
++		/* The device keeps the stream it had. */
++		f->pix = old_pix;
++		f->kind = old_kind;
++		f->wire_format = old_wire;
++		goto out;
++	}
++
++	format->fmt.pix_mp = f->pix;
++out:
++	mutex_unlock(&f->lock);
++
++	return ret;
++}
++
++static int cam_enum_framesizes(struct file *file, void *fh,
++			       struct v4l2_frmsizeenum *fsize)
++{
++	struct virtio_video_cam_file *f = to_cam_file(file);
++	const struct virtio_video_format_frame *frame;
++	struct video_format *fmt;
++
++	fmt = virtio_video_cam_find_format(f->cam, fsize->pixel_format);
++	if (!fmt || fsize->index >= fmt->desc.num_frames)
++		return -EINVAL;
++
++	frame = &fmt->frames[fsize->index].frame;
++	if (frame->width.min == frame->width.max &&
++	    frame->height.min == frame->height.max) {
++		fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
++		fsize->discrete.width = frame->width.min;
++		fsize->discrete.height = frame->height.min;
++		return 0;
++	}
++
++	/* A range is one record. */
++	if (fsize->index)
++		return -EINVAL;
++	fsize->type = V4L2_FRMSIZE_TYPE_STEPWISE;
++	fsize->stepwise.min_width = frame->width.min;
++	fsize->stepwise.max_width = frame->width.max;
++	fsize->stepwise.step_width = max(frame->width.step, 1u);
++	fsize->stepwise.min_height = frame->height.min;
++	fsize->stepwise.max_height = frame->height.max;
++	fsize->stepwise.step_height = max(frame->height.step, 1u);
++
++	return 0;
++}
++
++/*
++ * The frame rates a video size runs at, as the lowest and highest rate of the
++ * ranges the device lists for it. Whatever is asked in between, the device runs
++ * at a rate it has.
++ */
++static bool cam_rate_envelope(struct virtio_video_camera *cam, u32 width,
++			      u32 height, u32 *low, u32 *high)
++{
++	struct video_format *fmt = virtio_video_cam_find_format(cam,
++								V4L2_PIX_FMT_NV12);
++	unsigned int i, j;
++
++	*low = U32_MAX;
++	*high = 0;
++	if (!fmt)
++		return false;
++
++	for (i = 0; i < fmt->desc.num_frames; i++) {
++		const struct video_format_frame *vf = &fmt->frames[i];
++
++		if (width < vf->frame.width.min || width > vf->frame.width.max ||
++		    height < vf->frame.height.min ||
++		    height > vf->frame.height.max)
++			continue;
++		for (j = 0; j < vf->frame.num_rates; j++) {
++			*low = min(*low, vf->frame_rates[j].min);
++			*high = max(*high, vf->frame_rates[j].max);
++		}
++	}
++
++	return *high != 0 && *low != 0 && *low <= *high;
++}
++
++static int cam_enum_frameintervals(struct file *file, void *fh,
++				   struct v4l2_frmivalenum *fival)
++{
++	struct virtio_video_cam_file *f = to_cam_file(file);
++	u32 low, high;
++
++	if (fival->index || fival->pixel_format != V4L2_PIX_FMT_NV12 ||
++	    !cam_rate_envelope(f->cam, fival->width, fival->height, &low,
++			       &high))
++		return -EINVAL;
++
++	if (low == high) {
++		fival->type = V4L2_FRMIVAL_TYPE_DISCRETE;
++		fival->discrete.numerator = 1;
++		fival->discrete.denominator = low;
++		return 0;
++	}
++
++	fival->type = V4L2_FRMIVAL_TYPE_CONTINUOUS;
++	fival->stepwise.min.numerator = 1;
++	fival->stepwise.min.denominator = high;
++	fival->stepwise.max.numerator = 1;
++	fival->stepwise.max.denominator = low;
++	fival->stepwise.step.numerator = 1;
++	fival->stepwise.step.denominator = 1;
++
++	return 0;
++}
++
++static int cam_g_parm(struct file *file, void *fh, struct v4l2_streamparm *parm)
++{
++	struct virtio_video_cam_file *f = to_cam_file(file);
++	int ret;
++
++	ret = mutex_lock_interruptible(&f->lock);
++	if (ret)
++		return ret;
++	memset(&parm->parm, 0, sizeof(parm->parm));
++	parm->parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
++	parm->parm.capture.timeperframe.numerator = f->interval_numerator;
++	parm->parm.capture.timeperframe.denominator = f->interval_denominator;
++	mutex_unlock(&f->lock);
++
++	return 0;
++}
++
++static int cam_s_parm(struct file *file, void *fh, struct v4l2_streamparm *parm)
++{
++	struct virtio_video_cam_file *f = to_cam_file(file);
++	struct v4l2_fract wanted = parm->parm.capture.timeperframe;
++	int ret;
++
++	ret = mutex_lock_interruptible(&f->lock);
++	if (ret)
++		return ret;
++
++	/* Only a video stream has a rate. */
++	if (f->kind == VIRTIO_VIDEO_CAMERA_STREAM_VIDEO && wanted.numerator &&
++	    wanted.denominator) {
++		u32 low, high, rate;
++
++		/* The device runs at a rate it has and says which. */
++		if (cam_rate_envelope(f->cam, f->pix.width, f->pix.height, &low,
++				      &high)) {
++			rate = clamp(DIV_ROUND_CLOSEST(wanted.denominator,
++						       wanted.numerator),
++				     low, high);
++			wanted.numerator = 1;
++			wanted.denominator = rate;
++		}
++		if (f->stream_id) {
++			u32 numerator, denominator;
++
++			/* What the stream keeps is what the device answers. */
++			ret = virtio_video_cam_cmd_set_interval(cam_vvd(f),
++								f->stream_id,
++								wanted.numerator,
++								wanted.denominator);
++			if (!ret)
++				ret = virtio_video_cam_cmd_get_interval(cam_vvd(f),
++									f->stream_id,
++									&numerator,
++									&denominator);
++			if (!ret) {
++				f->interval_numerator = numerator;
++				f->interval_denominator = denominator;
++			}
++		} else {
++			/* The stream's creation settles it with the device. */
++			f->interval_numerator = wanted.numerator;
++			f->interval_denominator = wanted.denominator;
++		}
++	}
++
++	memset(&parm->parm, 0, sizeof(parm->parm));
++	parm->parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
++	parm->parm.capture.timeperframe.numerator = f->interval_numerator;
++	parm->parm.capture.timeperframe.denominator = f->interval_denominator;
++	mutex_unlock(&f->lock);
++
++	return ret;
++}
++
++/*
++ * The buffers a client asks for need the stream, and the buffers it gives back
++ * are forgotten by the device in the same call (the device holds 128 per
++ * stream, and a client that reallocates would run out).
++ */
++static int cam_free_buffers(struct virtio_video_cam_file *file, u32 memory)
++{
++	struct v4l2_requestbuffers none = {
++		.type = file->vq.type,
++		.memory = memory,
++	};
++	int ret;
++
++	if (!vb2_get_num_buffers(&file->vq))
++		return 0;
++
++	ret = vb2_reqbufs(&file->vq, &none);
++	if (ret)
++		return ret;
++	if (file->stream_id)
++		virtio_video_cam_cmd_clear(cam_vvd(file), file->stream_id,
++					   true);
++
++	return 0;
++}
++
++static int cam_reqbufs(struct file *file, void *fh,
++		       struct v4l2_requestbuffers *rb)
++{
++	struct virtio_video_cam_file *f = to_cam_file(file);
++	int ret;
++
++	ret = mutex_lock_interruptible(&f->lock);
++	if (ret)
++		return ret;
++
++	ret = cam_free_buffers(f, rb->memory);
++	if (ret)
++		goto out;
++	if (rb->count) {
++		ret = cam_stream_ensure(f);
++		if (ret)
++			goto out;
++	}
++	ret = vb2_reqbufs(&f->vq, rb);
++out:
++	mutex_unlock(&f->lock);
++
++	return ret;
++}
++
++static int cam_create_bufs(struct file *file, void *fh,
++			   struct v4l2_create_buffers *create)
++{
++	struct virtio_video_cam_file *f = to_cam_file(file);
++	int ret;
++
++	ret = mutex_lock_interruptible(&f->lock);
++	if (ret)
++		return ret;
++	ret = cam_stream_ensure(f);
++	if (!ret)
++		ret = vb2_create_bufs(&f->vq, create);
++	mutex_unlock(&f->lock);
++
++	return ret;
++}
++
++static int cam_querybuf(struct file *file, void *fh, struct v4l2_buffer *b)
++{
++	struct virtio_video_cam_file *f = to_cam_file(file);
++	int ret;
++
++	ret = mutex_lock_interruptible(&f->lock);
++	if (ret)
++		return ret;
++	ret = vb2_querybuf(&f->vq, b);
++	mutex_unlock(&f->lock);
++
++	return ret;
++}
++
++static int cam_prepare_buf(struct file *file, void *fh, struct v4l2_buffer *b)
++{
++	struct virtio_video_cam_file *f = to_cam_file(file);
++	int ret;
++
++	ret = mutex_lock_interruptible(&f->lock);
++	if (ret)
++		return ret;
++	ret = vb2_prepare_buf(&f->vq, NULL, b);
++	mutex_unlock(&f->lock);
++
++	return ret;
++}
++
++/*
++ * A still's group is in the buffer the client queues: a non-zero cookie in the
++ * timestamp's seconds, and V4L2_BUF_FLAG_LAST on the group's last buffer. vb2
++ * keeps neither on a capture queue, so they are read here, into the buffer, for
++ * the command that queues it.
++ */
++static int cam_qbuf(struct file *file, void *fh, struct v4l2_buffer *b)
++{
++	struct virtio_video_cam_file *f = to_cam_file(file);
++	struct vb2_buffer *vb;
++	int ret;
++
++	ret = mutex_lock_interruptible(&f->lock);
++	if (ret)
++		return ret;
++
++	vb = b->type == f->vq.type ? vb2_get_buffer(&f->vq, b->index) : NULL;
++	if (vb && vb->state == VB2_BUF_STATE_DEQUEUED) {
++		struct virtio_video_cam_buffer *buf = to_cam_buffer(vb);
++
++		buf->cookie = (u64)b->timestamp.tv_sec;
++		buf->group_more = buf->cookie && !(b->flags & V4L2_BUF_FLAG_LAST);
++	}
++	ret = vb2_qbuf(&f->vq, NULL, b);
++	mutex_unlock(&f->lock);
++
++	return ret;
++}
++
++static int cam_dqbuf(struct file *file, void *fh, struct v4l2_buffer *b)
++{
++	struct virtio_video_cam_file *f = to_cam_file(file);
++	int ret;
++
++	ret = mutex_lock_interruptible(&f->lock);
++	if (ret)
++		return ret;
++	/* vb2 releases the lock while it waits for a buffer. */
++	ret = vb2_dqbuf(&f->vq, b, file->f_flags & O_NONBLOCK);
++	mutex_unlock(&f->lock);
++
++	return ret;
++}
++
++static int cam_expbuf(struct file *file, void *fh, struct v4l2_exportbuffer *e)
++{
++	struct virtio_video_cam_file *f = to_cam_file(file);
++	int ret;
++
++	ret = mutex_lock_interruptible(&f->lock);
++	if (ret)
++		return ret;
++	ret = vb2_expbuf(&f->vq, e);
++	mutex_unlock(&f->lock);
++
++	return ret;
++}
++
++static int cam_streamon(struct file *file, void *fh, enum v4l2_buf_type type)
++{
++	struct virtio_video_cam_file *f = to_cam_file(file);
++	int ret;
++
++	ret = mutex_lock_interruptible(&f->lock);
++	if (ret)
++		return ret;
++	ret = vb2_streamon(&f->vq, type);
++	mutex_unlock(&f->lock);
++
++	return ret;
++}
++
++static int cam_streamoff(struct file *file, void *fh, enum v4l2_buf_type type)
++{
++	struct virtio_video_cam_file *f = to_cam_file(file);
++	int ret;
++
++	ret = mutex_lock_interruptible(&f->lock);
++	if (ret)
++		return ret;
++	ret = vb2_streamoff(&f->vq, type);
++	mutex_unlock(&f->lock);
++
++	return ret;
++}
++
++static const struct v4l2_ioctl_ops cam_capture_ioctl_ops = {
++	.vidioc_querycap = cam_querycap,
++	.vidioc_enum_fmt_vid_cap = cam_enum_fmt,
++	.vidioc_g_fmt_vid_cap_mplane = cam_g_fmt,
++	.vidioc_s_fmt_vid_cap_mplane = cam_s_fmt,
++	.vidioc_try_fmt_vid_cap_mplane = cam_try_fmt,
++	.vidioc_enum_framesizes = cam_enum_framesizes,
++	.vidioc_enum_frameintervals = cam_enum_frameintervals,
++	.vidioc_g_parm = cam_g_parm,
++	.vidioc_s_parm = cam_s_parm,
++	.vidioc_reqbufs = cam_reqbufs,
++	.vidioc_create_bufs = cam_create_bufs,
++	.vidioc_querybuf = cam_querybuf,
++	.vidioc_prepare_buf = cam_prepare_buf,
++	.vidioc_qbuf = cam_qbuf,
++	.vidioc_dqbuf = cam_dqbuf,
++	.vidioc_expbuf = cam_expbuf,
++	.vidioc_streamon = cam_streamon,
++	.vidioc_streamoff = cam_streamoff,
++	.vidioc_subscribe_event = v4l2_ctrl_subscribe_event,
++	.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
++};
++
++/* The metadata node has one format: the device's record. */
++static int cam_meta_enum_fmt(struct file *file, void *fh,
++			     struct v4l2_fmtdesc *fmtdesc)
++{
++	if (fmtdesc->index)
++		return -EINVAL;
++
++	fmtdesc->pixelformat = V4L2_META_FMT_VIRTIO_CAMERA;
++	strscpy(fmtdesc->description, "Virtio camera metadata",
++		sizeof(fmtdesc->description));
++
++	return 0;
++}
++
++static int cam_meta_g_fmt(struct file *file, void *fh, struct v4l2_format *format)
++{
++	struct virtio_video_cam_file *f = to_cam_file(file);
++	int ret;
++
++	ret = mutex_lock_interruptible(&f->lock);
++	if (ret)
++		return ret;
++	format->fmt.meta = f->meta_fmt;
++	mutex_unlock(&f->lock);
++
++	return 0;
++}
++
++static int cam_meta_try_fmt(struct file *file, void *fh,
++			    struct v4l2_format *format)
++{
++	return cam_meta_g_fmt(file, fh, format);
++}
++
++static const struct v4l2_ioctl_ops cam_meta_ioctl_ops = {
++	.vidioc_querycap = cam_querycap,
++	.vidioc_enum_fmt_meta_cap = cam_meta_enum_fmt,
++	.vidioc_g_fmt_meta_cap = cam_meta_g_fmt,
++	.vidioc_s_fmt_meta_cap = cam_meta_try_fmt,
++	.vidioc_try_fmt_meta_cap = cam_meta_try_fmt,
++	.vidioc_reqbufs = cam_reqbufs,
++	.vidioc_create_bufs = cam_create_bufs,
++	.vidioc_querybuf = cam_querybuf,
++	.vidioc_prepare_buf = cam_prepare_buf,
++	.vidioc_qbuf = cam_qbuf,
++	.vidioc_dqbuf = cam_dqbuf,
++	.vidioc_expbuf = cam_expbuf,
++	.vidioc_streamon = cam_streamon,
++	.vidioc_streamoff = cam_streamoff,
++	.vidioc_subscribe_event = v4l2_ctrl_subscribe_event,
++	.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
++};
++
++/* ------------------------------------------------------------------------ */
++/* Files                                                                    */
++/* ------------------------------------------------------------------------ */
++
++static int cam_open(struct file *filp)
++{
++	struct video_device *vdev = video_devdata(filp);
++	struct virtio_video_cam_node *node =
++		container_of(vdev, struct virtio_video_cam_node, vdev);
++	struct virtio_video_camera *cam = node->cam;
++	struct virtio_video_cam_file *file;
++	int ret;
++
++	file = kzalloc(sizeof(*file), GFP_KERNEL);
++	if (!file)
++		return -ENOMEM;
++
++	file->cam = cam;
++	file->node = node;
++	mutex_init(&file->lock);
++	init_waitqueue_head(&file->idle);
++	atomic_set(&file->inflight, 0);
++	spin_lock_init(&file->park_lock);
++	INIT_LIST_HEAD(&file->parked);
++	INIT_LIST_HEAD(&file->entry);
++	file->interval_numerator = 1;
++	file->interval_denominator = 30;
++
++	if (node->type == CAM_NODE_CAPTURE) {
++		struct video_format *fmt =
++			virtio_video_cam_find_format(cam, V4L2_PIX_FMT_NV12) ?:
++			cam_nth_format(cam, 0);
++		u32 width = 0, height = 0;
++
++		if (!fmt) {
++			ret = -EIO;
++			goto err_free;
++		}
++		cam_default_size(fmt, &width, &height);
++		cam_fill_pix(&file->pix, fmt->desc.format, width, height);
++		file->kind = cam_kind_of(fmt->desc.format);
++		file->wire_format = cam_v4l2_to_wire(fmt->desc.format);
++		file->plane_size = file->pix.plane_fmt[0].sizeimage;
++	} else {
++		file->kind = VIRTIO_VIDEO_CAMERA_STREAM_META;
++		file->wire_format = VIRTIO_VIDEO_FORMAT_CAMERA_META;
++		file->meta_fmt.dataformat = V4L2_META_FMT_VIRTIO_CAMERA;
++		file->meta_fmt.buffersize = sizeof(struct virtio_video_camera_meta);
++		file->plane_size = sizeof(struct virtio_video_camera_meta);
++	}
++
++	ret = cam_init_queue(file);
++	if (ret)
++		goto err_free;
++
++	v4l2_fh_init(&file->fh, vdev);
++	file->fh.ctrl_handler = &cam->hdl;
++	filp->private_data = &file->fh;
++
++	mutex_lock(&cam->lock);
++	list_add_tail(&file->entry, &cam->files);
++	mutex_unlock(&cam->lock);
++	v4l2_fh_add(&file->fh, filp);
++
++	return 0;
++
++err_free:
++	mutex_destroy(&file->lock);
++	kfree(file);
++
++	return ret;
++}
++
++static int cam_release(struct file *filp)
++{
++	struct virtio_video_cam_file *file = to_cam_file(filp);
++	struct virtio_video_camera *cam = file->cam;
++
++	mutex_lock(&cam->lock);
++	list_del_init(&file->entry);
++	mutex_unlock(&cam->lock);
++
++	mutex_lock(&file->lock);
++	vb2_queue_release(&file->vq);
++	cam_stream_destroy(file);
++	mutex_unlock(&file->lock);
++
++	v4l2_fh_del(&file->fh, filp);
++	v4l2_fh_exit(&file->fh);
++	mutex_destroy(&file->lock);
++	kfree(file);
++
++	return 0;
++}
++
++static __poll_t cam_poll(struct file *filp, struct poll_table_struct *wait)
++{
++	struct virtio_video_cam_file *file = to_cam_file(filp);
++	__poll_t ret;
++
++	if (mutex_lock_interruptible(&file->lock))
++		return EPOLLERR;
++	ret = vb2_poll(&file->vq, filp, wait);
++	mutex_unlock(&file->lock);
++
++	return ret;
++}
++
++static int cam_mmap(struct file *filp, struct vm_area_struct *vma)
++{
++	struct virtio_video_cam_file *file = to_cam_file(filp);
++
++	return vb2_mmap(&file->vq, vma);
++}
++
++static const struct v4l2_file_operations cam_fops = {
++	.owner = THIS_MODULE,
++	.open = cam_open,
++	.release = cam_release,
++	.poll = cam_poll,
++	.unlocked_ioctl = video_ioctl2,
++	.mmap = cam_mmap,
++};
++
++/* ------------------------------------------------------------------------ */
++/* Suspend, reset                                                           */
++/* ------------------------------------------------------------------------ */
++
++/*
++ * Stops a file's stream for a system suspend. The device then holds none of its
++ * buffers, and keeps the stream through the suspend; the video and metadata
++ * buffers it returned as failed wait for the resume.
++ */
++int virtio_video_cam_suspend_file(struct virtio_video_cam_file *file)
++{
++	int ret = 0;
++
++	if (!file->stream_id || !atomic_read(&file->inflight))
++		return 0;
++
++	WRITE_ONCE(file->parking, true);
++	cam_halt_stream(file);
++	cam_take_back(file, true);
++	WRITE_ONCE(file->parking, false);
++
++	return ret;
++}
++
++/*
++ * The device was reset and forgot the file's stream: make it again under the
++ * same ID, with the same format and buffers.
++ */
++void virtio_video_cam_restore_file(struct virtio_video_cam_file *file,
++				   bool reset)
++{
++	struct virtio_video_device *vvd = cam_vvd(file);
++	struct vb2_queue *q = &file->vq;
++	unsigned int i;
++	int ret;
++
++	if (!reset || !file->stream_id)
++		return;
++
++	ret = virtio_video_cam_cmd_stream_create(vvd, file->stream_id,
++						 file->cam->index, file->kind,
++						 "resume");
++	if (!ret)
++		ret = cam_stream_configure(file);
++
++	for (i = 0; !ret && i < q->max_num_buffers; i++) {
++		struct vb2_buffer *vb = vb2_get_buffer(q, i);
++		struct virtio_video_cam_buffer *buf;
++		u32 id;
++
++		if (!vb)
++			continue;
++		buf = to_cam_buffer(vb);
++		if (!buf->attached)
++			continue;
++		/* An imported buffer that is not queued has no mapping. */
++		if (vb->memory == VB2_MEMORY_DMABUF &&
++		    vb->state != VB2_BUF_STATE_ACTIVE) {
++			buf->attached = false;
++			continue;
++		}
++		id = buf->resource_id;
++		ret = virtio_video_attach_buffer(vvd, file->stream_id, vb, &id);
++	}
++
++	if (ret) {
++		v4l2_err(&vvd->v4l2_dev,
++			 "camera %u: cannot restore a stream after the reset (%d)\n",
++			 file->cam->index, ret);
++		vb2_queue_error(q);
++	}
++}
++
++/* Queues the buffers a suspend kept, in the order the client queued them. */
++void virtio_video_cam_requeue_file(struct virtio_video_cam_file *file)
++{
++	struct virtio_video_cam_buffer *buf;
++	unsigned long irq;
++
++	for (;;) {
++		spin_lock_irqsave(&file->park_lock, irq);
++		buf = list_first_entry_or_null(&file->parked,
++					       struct virtio_video_cam_buffer,
++					       parked);
++		if (buf)
++			list_del_init(&buf->parked);
++		spin_unlock_irqrestore(&file->park_lock, irq);
++		if (!buf)
++			return;
++
++		/* The suspend destroyed the stream these were attached to. */
++		if (!buf->attached && buf->resource_id) {
++			u32 id = buf->resource_id;
++
++			if (!cam_stream_ensure(file) &&
++			    !virtio_video_attach_buffer(cam_vvd(file),
++							file->stream_id,
++							&buf->vb.vb2_buf, &id))
++				buf->attached = true;
++		}
++		if (!buf->attached || cam_send_buffer(file, buf)) {
++			vb2_set_plane_payload(&buf->vb.vb2_buf, 0, 0);
++			vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_ERROR);
++		}
++	}
++}
++
++/* ------------------------------------------------------------------------ */
++/* Nodes                                                                    */
++/* ------------------------------------------------------------------------ */
++
++static void cam_node_release(struct video_device *vdev)
++{
++	struct virtio_video_cam_node *node =
++		container_of(vdev, struct virtio_video_cam_node, vdev);
++
++	virtio_video_camera_put(node->cam->vvd);
++}
++
++static int cam_register_node(struct virtio_video_camera *cam,
++			     struct virtio_video_cam_node *node,
++			     enum virtio_video_cam_node_type type)
++{
++	struct video_device *vdev = &node->vdev;
++	struct virtio_video_device *vvd = cam->vvd;
++	int ret;
++
++	node->cam = cam;
++	node->type = type;
++	vdev->v4l2_dev = &vvd->v4l2_dev;
++	vdev->fops = &cam_fops;
++	vdev->release = cam_node_release;
++	vdev->vfl_dir = VFL_DIR_RX;
++	vdev->ctrl_handler = &cam->hdl;
++	/* The files lock themselves: each has its own queue. */
++	vdev->lock = NULL;
++	if (type == CAM_NODE_CAPTURE) {
++		vdev->ioctl_ops = &cam_capture_ioctl_ops;
++		vdev->device_caps = V4L2_CAP_VIDEO_CAPTURE_MPLANE |
++				    V4L2_CAP_STREAMING;
++	} else {
++		vdev->ioctl_ops = &cam_meta_ioctl_ops;
++		vdev->device_caps = V4L2_CAP_META_CAPTURE | V4L2_CAP_STREAMING;
++	}
++	snprintf(vdev->name, sizeof(vdev->name), "virtio-camera%u-%s",
++		 cam->index, type == CAM_NODE_CAPTURE ? "capture" : "meta");
++	video_set_drvdata(vdev, node);
++
++	/*
++	 * The node's release drops this reference, so it is taken before the
++	 * node exists. A registration that fails never calls the release.
++	 */
++	kref_get(&vvd->ref);
++	ret = video_register_device(vdev, VFL_TYPE_VIDEO,
++				    VIRTIO_VIDEO_CAMERA_FIRST_NODE);
++	if (ret) {
++		virtio_video_camera_put(vvd);
++		return ret;
++	}
++
++	/*
++	 * A free number is looked for upward from the first, and below it only
++	 * when none above is free; the codecs' nodes must never share the
++	 * range they are scanned in with a camera. Unregistering the node
++	 * releases it, which drops the reference.
++	 */
++	if (vdev->num < VIRTIO_VIDEO_CAMERA_FIRST_NODE) {
++		video_unregister_device(vdev);
++		return -ENODEV;
++	}
++
++	node->registered = true;
++
++	v4l2_info(&vvd->v4l2_dev, "camera %u: /dev/video%d (%s)\n", cam->index,
++		  vdev->num, type == CAM_NODE_CAPTURE ? "capture" : "metadata");
++
++	return 0;
++}
++
++int virtio_video_cam_register_nodes(struct virtio_video_camera *cam)
++{
++	int ret;
++
++	ret = cam_register_node(cam, &cam->capture, CAM_NODE_CAPTURE);
++	if (ret)
++		return ret;
++
++	ret = cam_register_node(cam, &cam->meta, CAM_NODE_META);
++	if (ret)
++		virtio_video_cam_unregister_nodes(cam);
++
++	return ret;
++}
++
++void virtio_video_cam_unregister_nodes(struct virtio_video_camera *cam)
++{
++	if (cam->meta.registered) {
++		cam->meta.registered = false;
++		video_unregister_device(&cam->meta.vdev);
++	}
++	if (cam->capture.registered) {
++		cam->capture.registered = false;
++		video_unregister_device(&cam->capture.vdev);
++	}
++}
+diff --git a/drivers/media/virtio/virtio_video_camera.h b/drivers/media/virtio/virtio_video_camera.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..e1547651ce3cfc9228ad503ca3cfa460dcf806fa
+--- /dev/null
++++ b/drivers/media/virtio/virtio_video_camera.h
+@@ -0,0 +1,233 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * The Virtio camera: a capture node and a metadata node for each camera of the
++ * host, both on the stream and buffer machinery of the codecs.
++ *
++ * Locking, outermost first:
++ *   file->lock       one open file's ioctls and its vb2 queue (q->lock).
++ *   camera->lock     the camera's list of open files; suspend and resume.
++ *   camera->hdl      the control handler's lock, shared by the camera's files.
++ *   camera->carrier_lock   the control carrier stream.
++ * The command queue's lock is innermost: a response callback runs under it
++ * with interrupts off, so it only completes vb2 buffers and never sends a
++ * command.
++ */
++#ifndef _VIRTIO_VIDEO_CAMERA_H
++#define _VIRTIO_VIDEO_CAMERA_H
++
++#include <linux/kref.h>
++#include <linux/mutex.h>
++#include <linux/spinlock.h>
++#include <linux/wait.h>
++#include <media/v4l2-ctrls.h>
++#include <media/v4l2-fh.h>
++#include <media/videobuf2-v4l2.h>
++
++#include "virtio_video.h"
++
++/*
++ * The first V4L2 minor of a camera node. The codec nodes stay below it: the
++ * Android codec2 V4L2 device scans only /dev/video0 to 9, and ten camera nodes
++ * must not push the decoder and the encoder out of that window.
++ */
++#define VIRTIO_VIDEO_CAMERA_FIRST_NODE 10
++
++/* The metadata format: the device's struct virtio_video_camera_meta. */
++#define V4L2_META_FMT_VIRTIO_CAMERA v4l2_fourcc('V', 'C', 'A', 'M')
++
++/* The bytes the device reserves in a JPEG still for the Exif segment. */
++#define VIRTIO_VIDEO_CAMERA_EXIF_GAP 65000
++
++/*
++ * The most a plane may hold: the device refuses a resource larger than this
++ * (darwin/device/video/guest_buffers.cpp), so a stream that reports more is
++ * one it cannot serve.
++ */
++#define VIRTIO_VIDEO_CAMERA_MAX_PLANE_SIZE (128U << 20)
++
++/*
++ * The buffers of every kind (frames, stills and metadata) and of every camera
++ * that the device may hold at once. Each takes two descriptors of the command
++ * queue's 256, and a client that queues without end, as several metadata
++ * files can, would leave no room for a command, whose wait for room has no
++ * end: 64 descriptors stay for commands. The HAL queues at most 16 metadata
++ * buffers and two for each of the five streams Android allows (a camera in use
++ * holds 26), so three cameras at once hold 78.
++ */
++#define VIRTIO_VIDEO_CAMERA_MAX_QUEUED 96
++
++enum virtio_video_cam_node_type {
++	CAM_NODE_CAPTURE,
++	CAM_NODE_META,
++};
++
++struct virtio_video_camera;
++
++struct virtio_video_cam_node {
++	struct video_device vdev;
++	struct virtio_video_camera *cam;
++	enum virtio_video_cam_node_type type;
++	bool registered;
++};
++
++/* A control the device lists, and the order in which the guest wrote it. */
++struct virtio_video_cam_ctrl {
++	struct v4l2_ctrl *ctrl;
++	struct video_v4l2_control desc;
++	u64 written;
++};
++
++struct virtio_video_camera {
++	struct virtio_video_device *vvd;
++	u32 index;
++	/* The device's struct virtio_video_camera_desc, as it came. */
++	u8 desc_raw[sizeof(struct virtio_video_camera_desc)];
++	bool blocked;
++
++	struct virtio_video_cam_node capture;
++	struct virtio_video_cam_node meta;
++
++	struct mutex lock;
++	struct list_head files;
++
++	/* The formats of video streams and of still streams. */
++	struct list_head video_formats;
++	struct list_head still_formats;
++
++	/*
++	 * The sequence the next frame, still or record may carry at the least,
++	 * and what a reset of the device adds to the sequences it counts again
++	 * from zero, so that the sequences of a camera never go back.
++	 */
++	atomic_t seq_next;
++	atomic_t seq_offset;
++
++	struct v4l2_ctrl_handler hdl;
++	struct virtio_video_cam_ctrl *ctrls;
++	unsigned int num_ctrls;
++	/* Under the handler's lock: how many writes the guest has made. */
++	u64 writes;
++
++	/*
++	 * The control carrier: a metadata stream that carries the controls'
++	 * commands, because the device takes them through a stream of the camera
++	 * and a file may have none (a torch needs no stream). Created on first
++	 * use and never given a buffer. 0 until then.
++	 */
++	struct mutex carrier_lock;
++	u32 carrier_id;
++};
++
++/* One open file of a node. */
++struct virtio_video_cam_file {
++	struct v4l2_fh fh;
++	struct virtio_video_camera *cam;
++	struct virtio_video_cam_node *node;
++	struct vb2_queue vq;
++	struct mutex lock;
++	/* In camera->files, under camera->lock. */
++	struct list_head entry;
++
++	/* The host stream, 0 while the file has none. */
++	u32 stream_id;
++	u32 kind;
++	u32 wire_format;
++
++	/* The format, with the layout the device reported once it has one. */
++	struct v4l2_pix_format_mplane pix;
++	struct v4l2_meta_format meta_fmt;
++	u32 plane_size;
++	u32 interval_numerator;
++	u32 interval_denominator;
++
++	/* The sequence after the last buffer the device answered. */
++	u32 sequence;
++
++	/* Buffers handed to the device whose answer has not come. */
++	atomic_t inflight;
++	wait_queue_head_t idle;
++	/* Set while a suspend stops the stream: failed buffers are kept. */
++	bool parking;
++	spinlock_t park_lock;
++	struct list_head parked;
++};
++
++struct virtio_video_cam_buffer {
++	struct vb2_v4l2_buffer vb;
++	/* The pending RESOURCE_QUEUE, for virtio_video_cmd_orphan(). */
++	struct virtio_video_vbuffer *cmd;
++	struct list_head parked;
++	u32 resource_id;
++	bool attached;
++	/* A still's group: the guest's cookie and whether more members follow. */
++	u64 cookie;
++	bool group_more;
++};
++
++static inline struct virtio_video_cam_file *to_cam_file(struct file *file)
++{
++	return container_of(file->private_data, struct virtio_video_cam_file,
++			    fh);
++}
++
++static inline struct virtio_video_cam_buffer *
++to_cam_buffer(struct vb2_buffer *vb)
++{
++	return container_of(to_vb2_v4l2_buffer(vb),
++			    struct virtio_video_cam_buffer, vb);
++}
++
++/* virtio_video_camera_dev.c */
++struct virtio_video_camera *
++virtio_video_cam_find(struct virtio_video_device *vvd, u32 index);
++
++/* virtio_video_camera.c */
++int virtio_video_cam_register_nodes(struct virtio_video_camera *cam);
++void virtio_video_cam_unregister_nodes(struct virtio_video_camera *cam);
++void virtio_video_cam_restore_file(struct virtio_video_cam_file *file,
++				   bool reset);
++int virtio_video_cam_suspend_file(struct virtio_video_cam_file *file);
++void virtio_video_cam_requeue_file(struct virtio_video_cam_file *file);
++struct video_format *virtio_video_cam_find_format(struct virtio_video_camera *cam,
++						  u32 pixelformat);
++
++/* virtio_video_camera_ctrl.c */
++int virtio_video_cam_ctrls_init(struct virtio_video_camera *cam);
++void virtio_video_cam_ctrls_free(struct virtio_video_camera *cam);
++int virtio_video_cam_carrier(struct virtio_video_camera *cam, u32 *stream_id);
++int virtio_video_cam_ctrls_reapply(struct virtio_video_camera *cam);
++
++/* virtio_video_camera_cmd.c: the camera's own commands. */
++int virtio_video_cam_cmd_query(struct virtio_video_device *vvd, u32 start,
++			       void *resp, size_t resp_size, size_t *len);
++int virtio_video_cam_cmd_query_formats(struct virtio_video_device *vvd,
++				       u32 camera, u32 kind, void *resp,
++				       size_t resp_size);
++int virtio_video_cam_cmd_query_controls(struct virtio_video_device *vvd,
++					u32 camera, u32 start, void *resp,
++					size_t resp_size, size_t *len);
++int virtio_video_cam_cmd_stream_create(struct virtio_video_device *vvd,
++				       u32 stream_id, u32 camera, u32 kind,
++				       const char *tag);
++int virtio_video_cam_cmd_set_params(struct virtio_video_device *vvd,
++				    u32 stream_id,
++				    const struct virtio_video_params *params);
++int virtio_video_cam_cmd_get_params(struct virtio_video_device *vvd,
++				    u32 stream_id,
++				    struct virtio_video_params *params);
++int virtio_video_cam_cmd_clear(struct virtio_video_device *vvd, u32 stream_id,
++			       bool detach);
++int virtio_video_cam_cmd_set_interval(struct virtio_video_device *vvd,
++				      u32 stream_id, u32 numerator,
++				      u32 denominator);
++int virtio_video_cam_cmd_get_interval(struct virtio_video_device *vvd,
++				      u32 stream_id, u32 *numerator,
++				      u32 *denominator);
++int virtio_video_cam_cmd_queue(struct virtio_video_device *vvd, u32 stream_id,
++			       struct virtio_video_cam_buffer *buf);
++
++/* The completion of a RESOURCE_QUEUE, run under the command queue's lock. */
++void virtio_video_cam_complete(struct virtio_video_cam_buffer *buf,
++			       const struct virtio_video_camera_queue_resp *resp);
++
++#endif /* _VIRTIO_VIDEO_CAMERA_H */
+diff --git a/drivers/media/virtio/virtio_video_camera_cmd.c b/drivers/media/virtio/virtio_video_camera_cmd.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..c5d7f6225770347ee09d8bbda04f9724fbc94483
+--- /dev/null
++++ b/drivers/media/virtio/virtio_video_camera_cmd.c
+@@ -0,0 +1,290 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * The Virtio camera's commands.
++ *
++ * The camera takes the codecs' stream commands for everything but its queries
++ * and the creation of a stream, and it answers each of them, so the driver
++ * waits for the answer wherever it depends on the device's word that the
++ * command took effect. The one command that does not wait is the one that
++ * hands the device a buffer: its answer is the frame.
++ */
++#include "virtio_video_camera.h"
++
++static int cam_cmd_status(const void *resp, size_t len, size_t want,
++			  u32 type_ok)
++{
++	const struct virtio_video_cmd_hdr *hdr = resp;
++	u32 type;
++
++	if (len < sizeof(*hdr))
++		return -EIO;
++
++	type = le32_to_cpu(hdr->type);
++	if (type != type_ok)
++		return virtio_video_resp_errno(type) ?: -EIO;
++	if (len < want)
++		return -EIO;
++
++	return 0;
++}
++
++/* Sends a command that is answered with a bare header. */
++static int cam_cmd_nodata(struct virtio_video_device *vvd, const void *req,
++			  size_t size)
++{
++	struct virtio_video_cmd_hdr resp = {};
++	size_t len = 0;
++	int ret;
++
++	ret = virtio_video_cmd_sync(vvd, req, size, &resp, sizeof(resp), &len);
++	if (ret)
++		return ret;
++
++	return cam_cmd_status(&resp, len, sizeof(resp),
++			      VIRTIO_VIDEO_RESP_OK_NODATA);
++}
++
++int virtio_video_cam_cmd_query(struct virtio_video_device *vvd, u32 start,
++			       void *resp, size_t resp_size, size_t *len)
++{
++	struct virtio_video_camera_query req = {
++		.hdr.type = cpu_to_le32(VIRTIO_VIDEO_CMD_CAMERA_QUERY),
++		.start_index = cpu_to_le32(start),
++	};
++	int ret;
++
++	ret = virtio_video_cmd_sync(vvd, &req, sizeof(req), resp, resp_size,
++				    len);
++	if (ret)
++		return ret;
++
++	return cam_cmd_status(resp, *len,
++			      sizeof(struct virtio_video_camera_query_resp),
++			      VIRTIO_VIDEO_RESP_OK_CAMERA_QUERY);
++}
++
++int virtio_video_cam_cmd_query_formats(struct virtio_video_device *vvd,
++				       u32 camera, u32 kind, void *resp,
++				       size_t resp_size)
++{
++	struct virtio_video_camera_query_formats req = {
++		.hdr.type = cpu_to_le32(VIRTIO_VIDEO_CMD_CAMERA_QUERY_FORMATS),
++		.camera_index = cpu_to_le32(camera),
++		.kind = cpu_to_le32(kind),
++	};
++	size_t len = 0;
++	int ret;
++
++	ret = virtio_video_cmd_sync(vvd, &req, sizeof(req), resp, resp_size,
++				    &len);
++	if (ret)
++		return ret;
++
++	return cam_cmd_status(resp, len,
++			      sizeof(struct virtio_video_query_capability_resp),
++			      VIRTIO_VIDEO_RESP_OK_QUERY_CAPABILITY);
++}
++
++int virtio_video_cam_cmd_query_controls(struct virtio_video_device *vvd,
++					u32 camera, u32 start, void *resp,
++					size_t resp_size, size_t *len)
++{
++	struct virtio_video_camera_query_controls req = {
++		.hdr.type = cpu_to_le32(VIRTIO_VIDEO_CMD_CAMERA_QUERY_CONTROLS),
++		.camera_index = cpu_to_le32(camera),
++		.start_index = cpu_to_le32(start),
++	};
++	int ret;
++
++	ret = virtio_video_cmd_sync(vvd, &req, sizeof(req), resp, resp_size,
++				    len);
++	if (ret)
++		return ret;
++
++	return cam_cmd_status(resp, *len,
++			      sizeof(struct virtio_video_query_v4l2_controls_resp),
++			      VIRTIO_VIDEO_RESP_OK_QUERY_V4L2_CONTROLS);
++}
++
++int virtio_video_cam_cmd_stream_create(struct virtio_video_device *vvd,
++				       u32 stream_id, u32 camera, u32 kind,
++				       const char *tag)
++{
++	struct virtio_video_camera_stream_create req = {
++		.hdr.type = cpu_to_le32(VIRTIO_VIDEO_CMD_CAMERA_STREAM_CREATE),
++		.hdr.stream_id = cpu_to_le32(stream_id),
++		.camera_index = cpu_to_le32(camera),
++		.kind = cpu_to_le32(kind),
++	};
++
++	strscpy((char *)req.tag, tag, sizeof(req.tag));
++
++	return cam_cmd_nodata(vvd, &req, sizeof(req));
++}
++
++int virtio_video_cam_cmd_set_params(struct virtio_video_device *vvd,
++				    u32 stream_id,
++				    const struct virtio_video_params *params)
++{
++	struct virtio_video_set_params req = {
++		.hdr.type = cpu_to_le32(VIRTIO_VIDEO_CMD_SET_PARAMS),
++		.hdr.stream_id = cpu_to_le32(stream_id),
++		.params = *params,
++	};
++
++	return cam_cmd_nodata(vvd, &req, sizeof(req));
++}
++
++/*
++ * Reads a stream's parameters. -ENOENT says the device has no such stream,
++ * which is how a driver finds that the device was reset.
++ */
++int virtio_video_cam_cmd_get_params(struct virtio_video_device *vvd,
++				    u32 stream_id,
++				    struct virtio_video_params *params)
++{
++	struct virtio_video_get_params req = {
++		.hdr.type = cpu_to_le32(VIRTIO_VIDEO_CMD_GET_PARAMS),
++		.hdr.stream_id = cpu_to_le32(stream_id),
++		.queue_type = cpu_to_le32(VIRTIO_VIDEO_QUEUE_TYPE_OUTPUT),
++	};
++	struct virtio_video_get_params_resp resp = {};
++	size_t len = 0;
++	int ret;
++
++	ret = virtio_video_cmd_sync(vvd, &req, sizeof(req), &resp,
++				    sizeof(resp), &len);
++	if (ret)
++		return ret;
++
++	ret = cam_cmd_status(&resp, len, sizeof(resp),
++			     VIRTIO_VIDEO_RESP_OK_GET_PARAMS);
++	if (ret)
++		return ret;
++
++	*params = resp.params;
++
++	return 0;
++}
++
++/*
++ * Stops a stream's capture and completes what it holds as failed
++ * (QUEUE_CLEAR); the completions follow the answer. With `detach` the stream
++ * also forgets the buffers it was given.
++ */
++int virtio_video_cam_cmd_clear(struct virtio_video_device *vvd, u32 stream_id,
++			       bool detach)
++{
++	if (detach) {
++		struct virtio_video_queue_detach_resources req = {
++			.cmd_type = cpu_to_le32(VIRTIO_VIDEO_CMD_QUEUE_DETACH_RESOURCES),
++			.stream_id = cpu_to_le32(stream_id),
++			.queue_type = cpu_to_le32(VIRTIO_VIDEO_QUEUE_TYPE_OUTPUT),
++		};
++
++		return cam_cmd_nodata(vvd, &req, sizeof(req));
++	} else {
++		struct virtio_video_queue_clear req = {
++			.hdr.type = cpu_to_le32(VIRTIO_VIDEO_CMD_QUEUE_CLEAR),
++			.hdr.stream_id = cpu_to_le32(stream_id),
++			.queue_type = cpu_to_le32(VIRTIO_VIDEO_QUEUE_TYPE_OUTPUT),
++		};
++
++		return cam_cmd_nodata(vvd, &req, sizeof(req));
++	}
++}
++
++int virtio_video_cam_cmd_set_interval(struct virtio_video_device *vvd,
++				      u32 stream_id, u32 numerator,
++				      u32 denominator)
++{
++	struct virtio_video_set_stream_info req = {
++		.hdr.type = cpu_to_le32(VIRTIO_VIDEO_CMD_SET_STREAM_INFO),
++		.hdr.stream_id = cpu_to_le32(stream_id),
++		.info.queue_type = cpu_to_le32(VIRTIO_VIDEO_QUEUE_TYPE_OUTPUT),
++		.info.frame_interval_numerator = cpu_to_le32(numerator),
++		.info.frame_interval_denominator = cpu_to_le32(denominator),
++	};
++
++	return cam_cmd_nodata(vvd, &req, sizeof(req));
++}
++
++int virtio_video_cam_cmd_get_interval(struct virtio_video_device *vvd,
++				      u32 stream_id, u32 *numerator,
++				      u32 *denominator)
++{
++	struct virtio_video_get_stream_info req = {
++		.hdr.type = cpu_to_le32(VIRTIO_VIDEO_CMD_GET_STREAM_INFO),
++		.hdr.stream_id = cpu_to_le32(stream_id),
++		.queue_type = cpu_to_le32(VIRTIO_VIDEO_QUEUE_TYPE_OUTPUT),
++	};
++	struct virtio_video_get_stream_info_resp resp = {};
++	size_t len = 0;
++	int ret;
++
++	ret = virtio_video_cmd_sync(vvd, &req, sizeof(req), &resp,
++				    sizeof(resp), &len);
++	if (ret)
++		return ret;
++
++	ret = cam_cmd_status(&resp, len, sizeof(resp),
++			     VIRTIO_VIDEO_RESP_OK_STREAM_INFO);
++	if (ret)
++		return ret;
++
++	*numerator = le32_to_cpu(resp.info.frame_interval_numerator);
++	*denominator = le32_to_cpu(resp.info.frame_interval_denominator);
++
++	return 0;
++}
++
++/*
++ * The answer to a RESOURCE_QUEUE is the buffer's frame, so the driver does not
++ * wait for it; the callback hands the buffer back to vb2. The command points
++ * the buffer at itself while it is pending, which lets the buffer's owner take
++ * it back and stop the callback reaching a buffer that is gone.
++ */
++static void cam_queue_cb(struct virtio_video_device *vvd,
++			 struct virtio_video_vbuffer *vbuf)
++{
++	const struct virtio_video_camera_queue_resp *resp = (void *)vbuf->resp_buf;
++	struct virtio_video_cam_buffer *buf = vbuf->priv;
++
++	/* The buffer was taken back: nothing waits for the answer. */
++	if (!buf)
++		return;
++
++	if (vbuf->resp_len < sizeof(*resp) ||
++	    le32_to_cpu(resp->base.hdr.type) !=
++	    VIRTIO_VIDEO_RESP_OK_RESOURCE_QUEUE)
++		resp = NULL;
++
++	virtio_video_cam_complete(buf, resp);
++}
++
++int virtio_video_cam_cmd_queue(struct virtio_video_device *vvd, u32 stream_id,
++			       struct virtio_video_cam_buffer *buf)
++{
++	struct virtio_video_resource_queue *req;
++	struct virtio_video_vbuffer *vbuf;
++
++	req = virtio_video_alloc_req_resp(vvd, cam_queue_cb, &vbuf,
++					  sizeof(*req),
++					  sizeof(struct virtio_video_camera_queue_resp),
++					  NULL);
++	if (IS_ERR(req))
++		return PTR_ERR(req);
++
++	req->cmd_type = cpu_to_le32(VIRTIO_VIDEO_CMD_RESOURCE_QUEUE);
++	req->stream_id = cpu_to_le32(stream_id);
++	req->queue_type = cpu_to_le32(VIRTIO_VIDEO_QUEUE_TYPE_OUTPUT);
++	req->resource_id = cpu_to_le32(buf->resource_id);
++	if (buf->group_more)
++		req->flags = cpu_to_le32(VIRTIO_VIDEO_CAMERA_QUEUE_F_GROUP_MORE);
++	req->timestamp = cpu_to_le64(buf->cookie);
++
++	vbuf->priv = buf;
++	vbuf->owner = &buf->cmd;
++
++	return virtio_video_queue_cmd_buffer(vvd, vbuf);
++}
+diff --git a/drivers/media/virtio/virtio_video_camera_ctrl.c b/drivers/media/virtio/virtio_video_camera_ctrl.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..ba252c4ade1471f6a6da357fbbc383fcef2d01cf
+--- /dev/null
++++ b/drivers/media/virtio/virtio_video_camera_ctrl.c
+@@ -0,0 +1,568 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * The Virtio camera's V4L2 controls.
++ *
++ * The device lists the controls of each camera with their type, range, step,
++ * default, menu skip mask and flags, and the driver registers that list as the
++ * device describes it, for every file of the camera's two nodes: one control
++ * handler per camera. A control this kernel has no name or menu for is left
++ * out, so a newer device never makes an older driver refuse to probe. A menu's
++ * skipped values fail with EINVAL and an integer is clamped to its range by the
++ * framework, as the device would have it.
++ *
++ * The device takes a camera's controls through a stream of the camera, and
++ * applies them asynchronously, not per request. A file need not have a stream
++ * (a torch needs none), so the controls travel on a stream of their own, the
++ * control carrier, which the driver creates on first use. Two controls come
++ * from the driver and not from the device: the read-only privacy control, set
++ * when the session starts blocked, and the camera's description.
++ *
++ * A device reset takes the values the device held. The driver remembers in
++ * which order the guest wrote each control and writes them again, in that
++ * order, after a reset; it does not write the controls the guest never did
++ * (focus, for one, moves the lens only once it was written).
++ */
++#include "virtio_video_camera.h"
++
++/* More controls than this are not a camera's. */
++#define VIRTIO_VIDEO_CAM_MAX_CTRLS 256
++/* The most a compound control carries, in bytes. */
++#define VIRTIO_VIDEO_CAM_MAX_COMPOUND 64
++
++static const char * const cam_still_flash_menu[] = {
++	"Off", "Automatic", "On", NULL,
++};
++
++static const char * const cam_rotate_menu[] = {
++	"None", "90 Degrees", "180 Degrees", "270 Degrees", "Automatic", NULL,
++};
++
++static const char * const cam_test_pattern_menu[] = {
++	"Disabled", "Test Pattern", NULL,
++};
++
++struct cam_private_ctrl {
++	u32 id;
++	const char *name;
++	const char * const *menu;
++};
++
++static const struct cam_private_ctrl cam_private_ctrls[] = {
++	{ VIRTIO_VIDEO_CAMERA_CID_EXPOSURE_NS, "Exposure Time, Nanoseconds" },
++	{ VIRTIO_VIDEO_CAMERA_CID_ISO, "ISO Sensitivity, Device" },
++	{ VIRTIO_VIDEO_CAMERA_CID_WB_GAIN_RED, "White Balance Gain, Red" },
++	{ VIRTIO_VIDEO_CAMERA_CID_WB_GAIN_GREEN, "White Balance Gain, Green" },
++	{ VIRTIO_VIDEO_CAMERA_CID_WB_GAIN_BLUE, "White Balance Gain, Blue" },
++	{ VIRTIO_VIDEO_CAMERA_CID_ZOOM_Q16, "Zoom Ratio, Q16" },
++	{ VIRTIO_VIDEO_CAMERA_CID_AE_REGION, "Auto Exposure Region" },
++	{ VIRTIO_VIDEO_CAMERA_CID_AF_REGION, "Auto Focus Region" },
++	{ VIRTIO_VIDEO_CAMERA_CID_STILL_FLASH, "Still Flash",
++	  cam_still_flash_menu },
++	{ VIRTIO_VIDEO_CAMERA_CID_ROTATE_AND_CROP, "Rotate and Crop",
++	  cam_rotate_menu },
++	{ VIRTIO_VIDEO_CAMERA_CID_DESCRIPTION, "Camera Description" },
++};
++
++static const struct cam_private_ctrl *cam_private(u32 id)
++{
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(cam_private_ctrls); i++)
++		if (cam_private_ctrls[i].id == id)
++			return &cam_private_ctrls[i];
++
++	return NULL;
++}
++
++static const char *cam_ctrl_name(u32 id)
++{
++	const struct cam_private_ctrl *p = cam_private(id);
++
++	return p ? p->name : v4l2_ctrl_get_name(id);
++}
++
++/* The menu's names, or NULL if this kernel has none for the control. */
++static const char * const *cam_ctrl_menu(u32 id, unsigned int *items)
++{
++	const struct cam_private_ctrl *p = cam_private(id);
++	const char * const *menu;
++
++	if (p)
++		menu = p->menu;
++	else if (id == V4L2_CID_TEST_PATTERN)
++		menu = cam_test_pattern_menu;
++	else
++		menu = v4l2_ctrl_get_menu(id);
++	if (!menu)
++		return NULL;
++
++	for (*items = 0; menu[*items]; (*items)++)
++		;
++
++	return menu;
++}
++
++/* Whether the device's description of a control can be registered. */
++static bool cam_ctrl_usable(const struct video_v4l2_control *c)
++{
++	unsigned int items;
++
++	if (!cam_ctrl_name(c->id))
++		return false;
++
++	/* The driver reads a volatile control as a number, never a compound. */
++	if (c->type == V4L2_CTRL_TYPE_U32 &&
++	    (c->flags & VIRTIO_VIDEO_V4L2_CTRL_F_VOLATILE))
++		return false;
++
++	switch (c->type) {
++	case V4L2_CTRL_TYPE_INTEGER:
++		/* The framework keeps an integer control in 32 bits. */
++		return c->minimum <= c->maximum && c->maximum >= S32_MIN &&
++		       c->minimum <= S32_MAX &&
++		       c->default_value >= c->minimum &&
++		       c->default_value <= c->maximum;
++	case V4L2_CTRL_TYPE_INTEGER64:
++		return c->minimum <= c->maximum &&
++		       c->default_value >= c->minimum &&
++		       c->default_value <= c->maximum;
++	case V4L2_CTRL_TYPE_BOOLEAN:
++		return c->default_value == 0 || c->default_value == 1;
++	case V4L2_CTRL_TYPE_BUTTON:
++		return true;
++	case V4L2_CTRL_TYPE_BITMASK:
++		return !c->step && !c->minimum && c->maximum > 0 &&
++		       c->maximum <= U32_MAX &&
++		       !(c->default_value & ~c->maximum);
++	case V4L2_CTRL_TYPE_MENU:
++		if (!cam_ctrl_menu(c->id, &items) || c->minimum != 0 ||
++		    c->maximum < 0 || c->maximum >= items ||
++		    c->maximum >= BITS_PER_LONG_LONG ||
++		    c->default_value < 0 || c->default_value > c->maximum ||
++		    (c->menu_skip_mask & BIT_ULL(c->default_value)))
++			return false;
++		return true;
++	case V4L2_CTRL_TYPE_U32:
++		return c->elem_size && !(c->elem_size % 4) &&
++		       c->elem_size <= VIRTIO_VIDEO_CAM_MAX_COMPOUND;
++	default:
++		return false;
++	}
++}
++
++/* ------------------------------------------------------------------------ */
++/* The control carrier                                                      */
++/* ------------------------------------------------------------------------ */
++
++static int cam_carrier_create(struct virtio_video_camera *cam, u32 id)
++{
++	return virtio_video_cam_cmd_stream_create(cam->vvd, id, cam->index,
++						  VIRTIO_VIDEO_CAMERA_STREAM_META,
++						  "controls");
++}
++
++/* The stream the camera's control commands travel on. */
++int virtio_video_cam_carrier(struct virtio_video_camera *cam, u32 *stream_id)
++{
++	struct virtio_video_device *vvd = cam->vvd;
++	uint32_t id;
++	int ret = 0;
++
++	mutex_lock(&cam->carrier_lock);
++	if (!cam->carrier_id) {
++		virtio_video_stream_id_get(vvd, cam, &id);
++		if ((int)id <= 0) {
++			ret = -ENOMEM;
++		} else {
++			ret = cam_carrier_create(cam, id);
++			if (ret)
++				virtio_video_stream_id_put(vvd, id);
++			else
++				cam->carrier_id = id;
++		}
++	}
++	*stream_id = cam->carrier_id;
++	mutex_unlock(&cam->carrier_lock);
++
++	return ret;
++}
++
++/* The device was reset and forgot the carrier: make it again. */
++static int cam_carrier_restore(struct virtio_video_camera *cam)
++{
++	int ret = 0;
++
++	mutex_lock(&cam->carrier_lock);
++	if (cam->carrier_id)
++		ret = cam_carrier_create(cam, cam->carrier_id);
++	mutex_unlock(&cam->carrier_lock);
++
++	return ret;
++}
++
++/* ------------------------------------------------------------------------ */
++/* Values                                                                   */
++/* ------------------------------------------------------------------------ */
++
++/* Writes one control to the device, from the handler's new value. */
++static int cam_write_ctrl(struct virtio_video_camera *cam,
++			  struct v4l2_ctrl *ctrl, bool current_value)
++{
++	union v4l2_ctrl_ptr ptr = current_value ? ctrl->p_cur : ctrl->p_new;
++	__le32 words[VIRTIO_VIDEO_CAM_MAX_COMPOUND / 4];
++	u32 stream_id;
++	int64_t value;
++	int ret;
++
++	ret = virtio_video_cam_carrier(cam, &stream_id);
++	if (ret)
++		return ret;
++
++	if (ctrl->type == V4L2_CTRL_TYPE_U32) {
++		unsigned int i, n = ctrl->elems;
++
++		if (n > ARRAY_SIZE(words))
++			return -EINVAL;
++		for (i = 0; i < n; i++)
++			words[i] = cpu_to_le32(ptr.p_u32[i]);
++		return virtio_video_cmd_set_v4l2_control(cam->vvd, stream_id,
++							 ctrl->id, 0, words,
++							 n * sizeof(__le32));
++	}
++
++	if (ctrl->type == V4L2_CTRL_TYPE_BUTTON)
++		value = 1;
++	else if (ctrl->type == V4L2_CTRL_TYPE_INTEGER64)
++		value = *ptr.p_s64;
++	else
++		value = *ptr.p_s32;
++
++	return virtio_video_cmd_set_v4l2_control(cam->vvd, stream_id, ctrl->id,
++						 value, NULL, 0);
++}
++
++static int cam_s_ctrl(struct v4l2_ctrl *ctrl)
++{
++	struct virtio_video_camera *cam =
++		container_of(ctrl->handler, struct virtio_video_camera, hdl);
++	struct virtio_video_cam_ctrl *cc = ctrl->priv;
++	int ret;
++
++	ret = cam_write_ctrl(cam, ctrl, false);
++	if (ret)
++		return ret;
++
++	/* A button has no value to put back after a reset. */
++	if (ctrl->type != V4L2_CTRL_TYPE_BUTTON)
++		cc->written = ++cam->writes;
++
++	return 0;
++}
++
++static int cam_g_volatile_ctrl(struct v4l2_ctrl *ctrl)
++{
++	struct virtio_video_camera *cam =
++		container_of(ctrl->handler, struct virtio_video_camera, hdl);
++	u32 stream_id;
++	int64_t value = 0;
++	int ret;
++
++	ret = virtio_video_cam_carrier(cam, &stream_id);
++	if (ret)
++		return ret;
++
++	ret = virtio_video_cmd_get_v4l2_control(cam->vvd, stream_id, ctrl->id,
++						&value, NULL, 0);
++	if (ret)
++		return ret;
++
++	value = clamp_t(s64, value, ctrl->minimum, ctrl->maximum);
++	/* A 64-bit control keeps its value in the data area, not in val. */
++	if (ctrl->type == V4L2_CTRL_TYPE_INTEGER64)
++		*ctrl->p_new.p_s64 = value;
++	else
++		*ctrl->p_new.p_s32 = value;
++
++	return 0;
++}
++
++static const struct v4l2_ctrl_ops cam_ctrl_ops = {
++	.s_ctrl = cam_s_ctrl,
++	.g_volatile_ctrl = cam_g_volatile_ctrl,
++};
++
++/*
++ * Writes the controls the guest wrote to a device that was reset, in the order
++ * it wrote them. Under the handler's lock, so no write passes it.
++ */
++int virtio_video_cam_ctrls_reapply(struct virtio_video_camera *cam)
++{
++	u64 done = 0;
++	int ret = 0;
++
++	ret = cam_carrier_restore(cam);
++	if (ret)
++		return ret;
++
++	mutex_lock(cam->hdl.lock);
++	for (;;) {
++		struct virtio_video_cam_ctrl *next = NULL;
++		unsigned int i;
++
++		for (i = 0; i < cam->num_ctrls; i++) {
++			struct virtio_video_cam_ctrl *cc = &cam->ctrls[i];
++
++			if (cc->written > done &&
++			    (!next || cc->written < next->written))
++				next = cc;
++		}
++		if (!next)
++			break;
++		done = next->written;
++		ret = cam_write_ctrl(cam, next->ctrl, true);
++		if (ret)
++			break;
++	}
++	mutex_unlock(cam->hdl.lock);
++
++	return ret;
++}
++
++/* ------------------------------------------------------------------------ */
++/* Registration                                                             */
++/* ------------------------------------------------------------------------ */
++
++static void cam_register_ctrl(struct virtio_video_camera *cam,
++			      struct virtio_video_cam_ctrl *cc)
++{
++	const struct video_v4l2_control *c = &cc->desc;
++	struct v4l2_ctrl_config cfg = {
++		.ops = &cam_ctrl_ops,
++		.id = c->id,
++		.name = cam_ctrl_name(c->id),
++		.type = c->type,
++		.min = c->minimum,
++		.max = c->maximum,
++		.step = c->step ? c->step : 1,
++		.def = c->default_value,
++	};
++	enum v4l2_ctrl_type fill_type;
++	unsigned int items;
++	const char *name;
++	s64 min, max, def;
++	u64 step;
++	u32 flags;
++
++	v4l2_ctrl_fill(c->id, &name, &fill_type, &min, &max, &step, &def,
++		       &flags);
++	cfg.flags = flags;
++	if (c->flags & VIRTIO_VIDEO_V4L2_CTRL_F_READ_ONLY)
++		cfg.flags |= V4L2_CTRL_FLAG_READ_ONLY;
++	if (c->flags & VIRTIO_VIDEO_V4L2_CTRL_F_VOLATILE)
++		cfg.flags |= V4L2_CTRL_FLAG_VOLATILE;
++
++	switch (c->type) {
++	case V4L2_CTRL_TYPE_INTEGER:
++		cfg.min = max_t(s64, c->minimum, S32_MIN);
++		cfg.max = min_t(s64, c->maximum, S32_MAX);
++		cfg.def = clamp_t(s64, c->default_value, cfg.min, cfg.max);
++		break;
++	case V4L2_CTRL_TYPE_BOOLEAN:
++		cfg.min = 0;
++		cfg.max = 1;
++		cfg.step = 1;
++		break;
++	case V4L2_CTRL_TYPE_BUTTON:
++		cfg.min = cfg.max = cfg.def = 0;
++		cfg.step = 0;
++		break;
++	case V4L2_CTRL_TYPE_BITMASK:
++		cfg.min = 0;
++		cfg.step = 0;
++		break;
++	case V4L2_CTRL_TYPE_MENU:
++		cfg.qmenu = cam_ctrl_menu(c->id, &items);
++		cfg.step = 0;
++		cfg.menu_skip_mask = c->menu_skip_mask;
++		break;
++	case V4L2_CTRL_TYPE_U32:
++		cfg.dims[0] = c->elem_size / 4;
++		cfg.min = 0;
++		cfg.max = U32_MAX;
++		cfg.step = 1;
++		cfg.def = 0;
++		break;
++	default:
++		break;
++	}
++
++	cc->ctrl = v4l2_ctrl_new_custom(&cam->hdl, &cfg, cc);
++}
++
++/* The two controls the driver answers itself. */
++static void cam_register_own_ctrls(struct virtio_video_camera *cam)
++{
++	struct v4l2_ctrl_config privacy = {
++		.id = V4L2_CID_PRIVACY,
++		.name = "Privacy",
++		.type = V4L2_CTRL_TYPE_BOOLEAN,
++		.min = 0,
++		.max = 1,
++		.step = 1,
++		.def = cam->blocked,
++		.flags = V4L2_CTRL_FLAG_READ_ONLY,
++	};
++	struct v4l2_ctrl_config description = {
++		.id = VIRTIO_VIDEO_CAMERA_CID_DESCRIPTION,
++		.name = cam_ctrl_name(VIRTIO_VIDEO_CAMERA_CID_DESCRIPTION),
++		.type = V4L2_CTRL_TYPE_U8,
++		.min = 0,
++		.max = 255,
++		.step = 1,
++		.dims = { sizeof(cam->desc_raw) },
++		.flags = V4L2_CTRL_FLAG_READ_ONLY,
++	};
++	struct v4l2_ctrl *ctrl;
++
++	v4l2_ctrl_new_custom(&cam->hdl, &privacy, NULL);
++
++	ctrl = v4l2_ctrl_new_custom(&cam->hdl, &description, NULL);
++	if (ctrl) {
++		memcpy(ctrl->p_cur.p_u8, cam->desc_raw, sizeof(cam->desc_raw));
++		memcpy(ctrl->p_new.p_u8, cam->desc_raw, sizeof(cam->desc_raw));
++	}
++}
++
++/*
++ * Fetches the camera's control list, a page of descriptors at a time, and
++ * keeps the ones this kernel can register.
++ */
++static int cam_query_ctrls(struct virtio_video_camera *cam)
++{
++	struct virtio_video_device *vvd = cam->vvd;
++	struct virtio_video_query_v4l2_controls_resp *resp;
++	size_t size = vvd->max_resp_len;
++	u32 start = 0, total = 0;
++	int ret = 0;
++
++	if (size < sizeof(*resp) + sizeof(struct virtio_video_v4l2_control_desc))
++		return -EINVAL;
++
++	resp = kzalloc(size, GFP_KERNEL);
++	if (!resp)
++		return -ENOMEM;
++
++	for (;;) {
++		const struct virtio_video_v4l2_control_desc *descs = (void *)(resp + 1);
++		u32 num, next, i;
++		size_t len;
++
++		ret = virtio_video_cam_cmd_query_controls(vvd, cam->index,
++							  start, resp, size,
++							  &len);
++		if (ret)
++			break;
++
++		num = le32_to_cpu(resp->num_descs);
++		if (num > (len - sizeof(*resp)) / sizeof(*descs)) {
++			ret = -EIO;
++			break;
++		}
++		total += num;
++		if (total > VIRTIO_VIDEO_CAM_MAX_CTRLS) {
++			ret = -EIO;
++			break;
++		}
++
++		for (i = 0; i < num; i++) {
++			struct virtio_video_cam_ctrl *ctrls, *cc;
++			struct video_v4l2_control c = {};
++
++			c.id = le32_to_cpu(descs[i].id);
++			c.type = le32_to_cpu(descs[i].type);
++			c.minimum = le64_to_cpu(descs[i].minimum);
++			c.maximum = le64_to_cpu(descs[i].maximum);
++			c.step = le64_to_cpu(descs[i].step);
++			c.default_value = le64_to_cpu(descs[i].default_value);
++			c.menu_skip_mask = le64_to_cpu(descs[i].menu_skip_mask);
++			c.flags = le32_to_cpu(descs[i].flags);
++			c.elem_size = le32_to_cpu(descs[i].elem_size);
++
++			/* The driver answers these two, whatever the device says. */
++			if (c.id == V4L2_CID_PRIVACY ||
++			    c.id == VIRTIO_VIDEO_CAMERA_CID_DESCRIPTION)
++				continue;
++			if (!cam_ctrl_usable(&c)) {
++				v4l2_dbg(1, vvd->debug, &vvd->v4l2_dev,
++					 "camera %u: control %#x (type %u) is not one this kernel can register\n",
++					 cam->index, c.id, c.type);
++				continue;
++			}
++
++			ctrls = krealloc_array(cam->ctrls, cam->num_ctrls + 1,
++					       sizeof(*ctrls), GFP_KERNEL);
++			if (!ctrls) {
++				ret = -ENOMEM;
++				goto out;
++			}
++			cam->ctrls = ctrls;
++			cc = &ctrls[cam->num_ctrls++];
++			memset(cc, 0, sizeof(*cc));
++			cc->desc = c;
++		}
++
++		next = le32_to_cpu(resp->next_index);
++		if (!next)
++			break;
++		/* Every page moves forward, or the list never ends. */
++		if (!num || next <= start) {
++			ret = -EIO;
++			break;
++		}
++		start = next;
++	}
++out:
++	kfree(resp);
++
++	return ret;
++}
++
++int virtio_video_cam_ctrls_init(struct virtio_video_camera *cam)
++{
++	unsigned int i;
++	int ret;
++
++	ret = cam_query_ctrls(cam);
++	if (ret)
++		goto err;
++
++	ret = v4l2_ctrl_handler_init(&cam->hdl, cam->num_ctrls + 2);
++	if (ret)
++		goto err;
++
++	cam_register_own_ctrls(cam);
++	for (i = 0; i < cam->num_ctrls && !cam->hdl.error; i++)
++		cam_register_ctrl(cam, &cam->ctrls[i]);
++
++	ret = cam->hdl.error;
++	if (ret) {
++		v4l2_ctrl_handler_free(&cam->hdl);
++		goto err;
++	}
++
++	return 0;
++err:
++	kfree(cam->ctrls);
++	cam->ctrls = NULL;
++	cam->num_ctrls = 0;
++
++	return ret;
++}
++
++void virtio_video_cam_ctrls_free(struct virtio_video_camera *cam)
++{
++	v4l2_ctrl_handler_free(&cam->hdl);
++	kfree(cam->ctrls);
++	cam->ctrls = NULL;
++	cam->num_ctrls = 0;
++}
+diff --git a/drivers/media/virtio/virtio_video_camera_dev.c b/drivers/media/virtio/virtio_video_camera_dev.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..a174706a1628b94b375e0b9d11685ce5bc109acf
+--- /dev/null
++++ b/drivers/media/virtio/virtio_video_camera_dev.c
+@@ -0,0 +1,434 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * The Virtio camera device.
++ *
++ * One device carries every camera of the host. The driver asks which there are
++ * (VIRTIO_VIDEO_CMD_CAMERA_QUERY), what each offers, and which controls it has,
++ * and registers a capture node and a metadata node for each, from /dev/video10
++ * up (see virtio_video_camera.h). The camera is a device of its own kind, not a
++ * video_device of the codecs': the nodes outlive its removal for as long as a
++ * file is open, so what they use is freed by the last of them, through the
++ * reference the driver and every registered node hold on the device.
++ *
++ * A system suspend stops the streams that hold buffers, so the device holds no
++ * request while the rings are off. The transport keeps a request the device
++ * holds across a ring disable all the same; a change of the guest's memory or
++ * of a ring, or a teardown, is what resets the device. If it was reset, the
++ * resume finds the streams gone and makes them again, with their controls and
++ * buffers.
++ */
++#include "virtio_video_camera.h"
++
++struct virtio_video_camera *
++virtio_video_cam_find(struct virtio_video_device *vvd, u32 index)
++{
++	unsigned int i;
++
++	for (i = 0; i < vvd->num_cameras; i++)
++		if (vvd->cameras[i].index == index)
++			return &vvd->cameras[i];
++
++	return NULL;
++}
++
++/* Reads the formats a camera's video or still streams offer. */
++static int cam_query_formats(struct virtio_video_camera *cam, u32 kind,
++			     struct list_head *list)
++{
++	struct virtio_video_device *vvd = cam->vvd;
++	struct virtio_video_query_capability_resp *resp;
++	u32 count = 0;
++	int ret;
++
++	resp = kzalloc(vvd->max_caps_len, GFP_KERNEL);
++	if (!resp)
++		return -ENOMEM;
++
++	ret = virtio_video_cam_cmd_query_formats(vvd, cam->index, kind, resp,
++						 vvd->max_caps_len);
++	/* A camera with no video, or no stills, has an empty list. */
++	if (!ret && le32_to_cpu(resp->num_descs))
++		ret = virtio_video_parse_virtio_capability(vvd, resp, list,
++							   &count);
++	if (ret)
++		virtio_video_free_format_list(list);
++	kfree(resp);
++
++	return ret;
++}
++
++static int cam_setup(struct virtio_video_camera *cam)
++{
++	struct virtio_video_device *vvd = cam->vvd;
++	int ret;
++
++	cam->blocked = vvd->camera_session_flags &
++		       VIRTIO_VIDEO_CAMERA_SESSION_F_BLOCKED;
++
++	ret = cam_query_formats(cam, VIRTIO_VIDEO_CAMERA_STREAM_VIDEO,
++				&cam->video_formats);
++	if (ret)
++		return ret;
++
++	ret = cam_query_formats(cam, VIRTIO_VIDEO_CAMERA_STREAM_STILL,
++				&cam->still_formats);
++	if (ret)
++		return ret;
++
++	if (list_empty(&cam->video_formats) && list_empty(&cam->still_formats))
++		return -ENODEV;
++
++	ret = virtio_video_cam_ctrls_init(cam);
++	if (ret)
++		return ret;
++
++	return virtio_video_cam_register_nodes(cam);
++}
++
++/* Asks the device which cameras it has. */
++static int cam_query_cameras(struct virtio_video_device *vvd)
++{
++	struct virtio_video_camera_query_resp *resp;
++	size_t size = vvd->max_resp_len;
++	u32 start = 0, expected = 0;
++	bool first = true;
++	int ret;
++
++	if (size < sizeof(*resp) + sizeof(struct virtio_video_camera_desc))
++		return -EINVAL;
++
++	resp = kzalloc(size, GFP_KERNEL);
++	if (!resp)
++		return -ENOMEM;
++
++	for (;;) {
++		const struct virtio_video_camera_desc *descs = (void *)(resp + 1);
++		u32 num, next, i, total;
++		size_t len;
++
++		ret = virtio_video_cam_cmd_query(vvd, start, resp, size, &len);
++		if (ret)
++			break;
++
++		if (le32_to_cpu(resp->desc_size) != sizeof(*descs)) {
++			v4l2_err(&vvd->v4l2_dev,
++				 "camera descriptions of %u bytes, not %zu\n",
++				 le32_to_cpu(resp->desc_size), sizeof(*descs));
++			ret = -EIO;
++			break;
++		}
++
++		total = le32_to_cpu(resp->num_cameras);
++		num = le32_to_cpu(resp->num_descs);
++		if (total > VIRTIO_VIDEO_CAMERA_MAX_CAMERAS ||
++		    num > (len - sizeof(*resp)) / sizeof(*descs)) {
++			ret = -EIO;
++			break;
++		}
++		/*
++		 * The array is sized by the first page's total, and every page
++		 * after it must say the same: the device could otherwise
++		 * have the driver write past the array.
++		 */
++		if (first) {
++			expected = total;
++			first = false;
++		} else if (total != expected) {
++			ret = -EIO;
++			break;
++		}
++		vvd->camera_session_flags = le32_to_cpu(resp->session_flags);
++
++		if (!vvd->cameras && expected) {
++			vvd->cameras = kcalloc(expected, sizeof(*vvd->cameras),
++					       GFP_KERNEL);
++			if (!vvd->cameras) {
++				ret = -ENOMEM;
++				break;
++			}
++		}
++		if (vvd->num_cameras + num > expected) {
++			ret = -EIO;
++			break;
++		}
++
++		for (i = 0; i < num; i++) {
++			struct virtio_video_camera *cam =
++				&vvd->cameras[vvd->num_cameras];
++			u32 index = le32_to_cpu(descs[i].index);
++
++			/* Every other command names a camera by this. */
++			if (index >= VIRTIO_VIDEO_CAMERA_MAX_CAMERAS ||
++			    virtio_video_cam_find(vvd, index)) {
++				ret = -EIO;
++				goto out;
++			}
++			cam->vvd = vvd;
++			cam->index = index;
++			memcpy(cam->desc_raw, &descs[i], sizeof(cam->desc_raw));
++			mutex_init(&cam->lock);
++			mutex_init(&cam->carrier_lock);
++			INIT_LIST_HEAD(&cam->files);
++			INIT_LIST_HEAD(&cam->video_formats);
++			INIT_LIST_HEAD(&cam->still_formats);
++			vvd->num_cameras++;
++		}
++
++		next = le32_to_cpu(resp->next_index);
++		if (!next)
++			break;
++		/* Every page moves forward, or the list never ends. */
++		if (!num || next <= start) {
++			ret = -EIO;
++			break;
++		}
++		start = next;
++	}
++out:
++	kfree(resp);
++
++	return ret;
++}
++
++/*
++ * The sizes of the wire structures the driver reads and writes in place: a
++ * layout change of the shared header shows here, at build time, rather than as
++ * a device the driver misreads.
++ */
++static void cam_check_wire_sizes(void)
++{
++	BUILD_BUG_ON(sizeof(struct virtio_video_cmd_hdr) != 8);
++	BUILD_BUG_ON(sizeof(struct virtio_video_params) != 112);
++	BUILD_BUG_ON(sizeof(struct virtio_video_get_params) != 16);
++	BUILD_BUG_ON(sizeof(struct virtio_video_get_params_resp) != 120);
++	BUILD_BUG_ON(sizeof(struct virtio_video_set_params) != 120);
++	BUILD_BUG_ON(sizeof(struct virtio_video_stream_create) != 88);
++	BUILD_BUG_ON(sizeof(struct virtio_video_resource_queue) != 64);
++	BUILD_BUG_ON(sizeof(struct virtio_video_resource_queue_resp) != 56);
++	BUILD_BUG_ON(sizeof(struct virtio_video_queue_clear) != 16);
++	BUILD_BUG_ON(sizeof(struct virtio_video_query_capability) != 16);
++	BUILD_BUG_ON(sizeof(struct virtio_video_query_capability_resp) != 16);
++	BUILD_BUG_ON(sizeof(struct virtio_video_v4l2_control_desc) != 64);
++	BUILD_BUG_ON(sizeof(struct virtio_video_v4l2_control_value) != 16);
++	BUILD_BUG_ON(sizeof(struct virtio_video_v4l2_controls) != 16);
++	BUILD_BUG_ON(sizeof(struct virtio_video_v4l2_controls_resp) != 16);
++	BUILD_BUG_ON(sizeof(struct virtio_video_camera_query) != 16);
++	BUILD_BUG_ON(sizeof(struct virtio_video_camera_desc) != 328);
++	BUILD_BUG_ON(sizeof(struct virtio_video_camera_query_resp) != 32);
++	BUILD_BUG_ON(sizeof(struct virtio_video_camera_query_formats) != 16);
++	BUILD_BUG_ON(sizeof(struct virtio_video_camera_query_controls) != 16);
++	BUILD_BUG_ON(sizeof(struct virtio_video_camera_stream_create) != 88);
++	BUILD_BUG_ON(sizeof(struct virtio_video_camera_queue_resp) != 64);
++	BUILD_BUG_ON(sizeof(struct virtio_video_camera_meta) != 168);
++	/* The rest the camera's commands and answers carry or parse. */
++	BUILD_BUG_ON(sizeof(struct virtio_video_stream_destroy) != 8);
++	BUILD_BUG_ON(sizeof(struct virtio_video_resource_attach) != 16);
++	BUILD_BUG_ON(sizeof(struct virtio_video_resource_sg_list) != 8);
++	BUILD_BUG_ON(sizeof(struct virtio_video_resource_sg_entry) != 16);
++	BUILD_BUG_ON(sizeof(struct virtio_video_queue_detach_resources) != 16);
++	BUILD_BUG_ON(sizeof(struct virtio_video_get_stream_info) != 16);
++	BUILD_BUG_ON(sizeof(struct virtio_video_get_stream_info_resp) != 40);
++	BUILD_BUG_ON(sizeof(struct virtio_video_set_stream_info) != 40);
++	BUILD_BUG_ON(sizeof(struct virtio_video_stream_info) != 32);
++	BUILD_BUG_ON(sizeof(struct virtio_video_query_v4l2_controls) != 16);
++	BUILD_BUG_ON(sizeof(struct virtio_video_query_v4l2_controls_resp) != 16);
++	BUILD_BUG_ON(sizeof(struct virtio_video_format_desc) != 24);
++	BUILD_BUG_ON(sizeof(struct virtio_video_format_frame) != 40);
++	BUILD_BUG_ON(sizeof(struct virtio_video_format_range) != 16);
++	BUILD_BUG_ON(sizeof(struct virtio_video_event) != 8);
++}
++
++int virtio_video_camera_init(struct virtio_video_device *vvd)
++{
++	unsigned int i, registered = 0;
++	int ret;
++
++	cam_check_wire_sizes();
++
++	/*
++	 * The format parser frees what it parsed from these on a failure, and a
++	 * camera never fills them: only the codecs' init makes them empty.
++	 */
++	INIT_LIST_HEAD(&vvd->input_fmt_list);
++	INIT_LIST_HEAD(&vvd->output_fmt_list);
++
++	ret = cam_query_cameras(vvd);
++	if (ret)
++		return ret;
++
++	/* A device with no camera is a device with nothing to register. */
++	if (!vvd->num_cameras)
++		return 0;
++
++	for (i = 0; i < vvd->num_cameras; i++) {
++		struct virtio_video_camera *cam = &vvd->cameras[i];
++
++		ret = cam_setup(cam);
++		if (ret) {
++			/* The others stay: one camera failing is not the device. */
++			v4l2_err(&vvd->v4l2_dev,
++				 "camera %u cannot be registered (%d)\n",
++				 cam->index, ret);
++			continue;
++		}
++		registered++;
++	}
++
++	return registered ? 0 : -ENODEV;
++}
++
++/* The device is going away: no node opens or answers an ioctl any more. */
++void virtio_video_camera_deinit(struct virtio_video_device *vvd)
++{
++	unsigned int i;
++
++	for (i = 0; i < vvd->num_cameras; i++)
++		virtio_video_cam_unregister_nodes(&vvd->cameras[i]);
++}
++
++static void virtio_video_camera_free(struct kref *ref)
++{
++	struct virtio_video_device *vvd =
++		container_of(ref, struct virtio_video_device, ref);
++	unsigned int i;
++
++	for (i = 0; i < vvd->num_cameras; i++) {
++		struct virtio_video_camera *cam = &vvd->cameras[i];
++
++		virtio_video_free_format_list(&cam->video_formats);
++		virtio_video_free_format_list(&cam->still_formats);
++		virtio_video_cam_ctrls_free(cam);
++		mutex_destroy(&cam->lock);
++		mutex_destroy(&cam->carrier_lock);
++	}
++	kfree(vvd->cameras);
++
++	virtio_video_free_vbufs(vvd);
++	v4l2_device_unregister(&vvd->v4l2_dev);
++	idr_destroy(&vvd->resource_idr);
++	idr_destroy(&vvd->stream_idr);
++	mutex_destroy(&vvd->eventq.lock);
++	mutex_destroy(&vvd->video_dev_mutex);
++	kfree(vvd);
++}
++
++void virtio_video_camera_put(struct virtio_video_device *vvd)
++{
++	kref_put(&vvd->ref, virtio_video_camera_free);
++}
++
++/*
++ * The camera events say what the host did to a camera: it became unavailable or
++ * available, or its capture was interrupted or resumed. Nothing in the guest
++ * depends on them: the frames carry the same news in their flags and metadata,
++ * and the buffers keep arriving.
++ */
++void virtio_video_camera_event(struct virtio_video_device *vvd, u32 type,
++			       u32 camera)
++{
++	switch (type) {
++	case VIRTIO_VIDEO_EVENT_CAMERA_AVAILABLE:
++	case VIRTIO_VIDEO_EVENT_CAMERA_UNAVAILABLE:
++	case VIRTIO_VIDEO_EVENT_CAMERA_INTERRUPTED:
++	case VIRTIO_VIDEO_EVENT_CAMERA_RESUMED:
++		v4l2_dbg(1, vvd->debug, &vvd->v4l2_dev,
++			 "camera %u: event %#x\n", camera, type);
++		break;
++	default:
++		v4l2_warn(&vvd->v4l2_dev, "camera %u: unknown event %#x\n",
++			  camera, type);
++		break;
++	}
++}
++
++/*
++ * The userspace is frozen here, so no ioctl runs and the files' locks are not
++ * needed; the camera's lock keeps its list of files still.
++ */
++int virtio_video_camera_suspend(struct virtio_video_device *vvd)
++{
++	unsigned int i;
++
++	for (i = 0; i < vvd->num_cameras; i++) {
++		struct virtio_video_camera *cam = &vvd->cameras[i];
++		struct virtio_video_cam_file *file;
++
++		mutex_lock(&cam->lock);
++		list_for_each_entry(file, &cam->files, entry)
++			virtio_video_cam_suspend_file(file);
++		mutex_unlock(&cam->lock);
++	}
++
++	return 0;
++}
++
++/* The stream the resume asks the device about, to learn whether it was reset. */
++static u32 cam_probe_stream(struct virtio_video_camera *cam)
++{
++	struct virtio_video_cam_file *file;
++	u32 id = 0;
++
++	mutex_lock(&cam->lock);
++	if (cam->carrier_id)
++		id = cam->carrier_id;
++	else
++		list_for_each_entry(file, &cam->files, entry)
++			if (file->stream_id) {
++				id = file->stream_id;
++				break;
++			}
++	mutex_unlock(&cam->lock);
++
++	return id;
++}
++
++int virtio_video_camera_resume(struct virtio_video_device *vvd)
++{
++	bool probed = false, reset = false;
++	unsigned int i;
++
++	for (i = 0; i < vvd->num_cameras; i++) {
++		struct virtio_video_camera *cam = &vvd->cameras[i];
++		struct virtio_video_cam_file *file;
++
++		/*
++		 * A reset takes every stream at once, so asking about one says
++		 * it for all.
++		 */
++		if (!probed) {
++			u32 id = cam_probe_stream(cam);
++
++			if (id) {
++				struct virtio_video_params params;
++
++				probed = true;
++				reset = virtio_video_cam_cmd_get_params(vvd, id,
++									&params) ==
++					-ENOENT;
++				if (reset)
++					v4l2_info(&vvd->v4l2_dev,
++						  "the device was reset: restoring the streams\n");
++			}
++		}
++
++		mutex_lock(&cam->lock);
++		if (reset) {
++			/*
++			 * The device counts from zero again; the camera's
++			 * sequences go on from the highest delivered.
++			 */
++			atomic_set(&cam->seq_offset, atomic_read(&cam->seq_next));
++			list_for_each_entry(file, &cam->files, entry)
++				virtio_video_cam_restore_file(file, true);
++			if (virtio_video_cam_ctrls_reapply(cam))
++				v4l2_err(&vvd->v4l2_dev,
++					 "camera %u: cannot write the controls again\n",
++					 cam->index);
++		}
++		list_for_each_entry(file, &cam->files, entry)
++			virtio_video_cam_requeue_file(file);
++		mutex_unlock(&cam->lock);
++	}
++
++	return 0;
++}
+diff --git a/drivers/media/virtio/virtio_video_caps.c b/drivers/media/virtio/virtio_video_caps.c
+index 34b9e404418c8778a385ca97f8d43c26dd7c2912..ca070cebabfa51acfe1fa702b9a9c29eaa7aa88f 100644
+--- a/drivers/media/virtio/virtio_video_caps.c
++++ b/drivers/media/virtio/virtio_video_caps.c
+@@ -53,6 +53,12 @@ static void virtio_video_free_fmts(struct virtio_video_device *vvd)
+ 	virtio_video_free_fmt(&vvd->output_fmt_list);
+ }
+ 
++/* A list of formats that does not belong to the device, a camera's. */
++void virtio_video_free_format_list(struct list_head *fmts_list)
++{
++	virtio_video_free_fmt(fmts_list);
++}
++
+ static void virtio_video_copy_fmt_range(struct virtio_video_format_range *d_rge,
+ 					struct virtio_video_format_range *s_rge)
+ {
+@@ -138,7 +144,11 @@ static size_t virtio_video_parse_virtio_fmt(struct virtio_video_device *vvd,
+ 
+ 	fmt_desc->mask = le64_to_cpu(virtio_fmt_desc->mask);
+ 	fmt_desc->planes_layout = le32_to_cpu(virtio_fmt_desc->planes_layout);
+-	if (vvd->encoder) {
++	if (vvd->camera) {
++		/* A format this kernel has no name for is zero, and unlisted. */
++		fmt_desc->format = virtio_video_camera_wire_to_v4l2(
++			le32_to_cpu(virtio_fmt_desc->format));
++	} else if (vvd->encoder) {
+ 		u32 wire = le32_to_cpu(virtio_fmt_desc->format);
+ 
+ 		if (wire >= VIRTIO_VIDEO_FORMAT_CODED_MIN) {
+diff --git a/drivers/media/virtio/virtio_video_ctrls.c b/drivers/media/virtio/virtio_video_ctrls.c
+index d3f6fbd6c3accb83412ab9d13bbefd9477d5cc0b..980349a5425b5adcd93b919213c33eff537ec609 100644
+--- a/drivers/media/virtio/virtio_video_ctrls.c
++++ b/drivers/media/virtio/virtio_video_ctrls.c
+@@ -212,12 +212,14 @@ static int virtio_video_ctrl_s_ctrl(struct v4l2_ctrl *ctrl)
+ 		return -EIO;
+ 
+ 	if (ctrl->type >= V4L2_CTRL_COMPOUND_TYPES)
+-		return virtio_video_cmd_set_v4l2_control(vvd, stream, ctrl->id,
+-							 0, ctrl->p_new.p,
++		return virtio_video_cmd_set_v4l2_control(vvd, stream->stream_id,
++							 ctrl->id, 0,
++							 ctrl->p_new.p,
+ 							 ctrl->elem_size);
+ 
+ 	/* A button has no value; the device runs it when it is set. */
+-	return virtio_video_cmd_set_v4l2_control(vvd, stream, ctrl->id,
++	return virtio_video_cmd_set_v4l2_control(vvd, stream->stream_id,
++						 ctrl->id,
+ 						 ctrl->type == V4L2_CTRL_TYPE_BUTTON ?
+ 						 1 : ctrl->val, NULL, 0);
+ }
+@@ -233,13 +235,13 @@ static int virtio_video_ctrl_g_volatile_ctrl(struct v4l2_ctrl *ctrl)
+ 		return -EIO;
+ 
+ 	if (ctrl->type >= V4L2_CTRL_COMPOUND_TYPES)
+-		return virtio_video_cmd_get_v4l2_control(vvd, stream, ctrl->id,
+-							 &value,
++		return virtio_video_cmd_get_v4l2_control(vvd, stream->stream_id,
++							 ctrl->id, &value,
+ 							 ctrl->p_new.p,
+ 							 ctrl->elem_size);
+ 
+-	ret = virtio_video_cmd_get_v4l2_control(vvd, stream, ctrl->id, &value,
+-						NULL, 0);
++	ret = virtio_video_cmd_get_v4l2_control(vvd, stream->stream_id,
++						ctrl->id, &value, NULL, 0);
+ 	if (ret)
+ 		return ret;
+ 
+diff --git a/drivers/media/virtio/virtio_video_device.c b/drivers/media/virtio/virtio_video_device.c
+index c5890d5ffd08efc55661477756ad3b7a6cb1ae2e..13a3bd600f6958d3e5aa767f35e4fc0848cab3f8 100644
+--- a/drivers/media/virtio/virtio_video_device.c
++++ b/drivers/media/virtio/virtio_video_device.c
+@@ -333,22 +333,25 @@ static size_t virtio_video_sglist_capacity(struct vb2_buffer *vb,
+ }
+ 
+ /*
+- * Attaches a buffer to the device by sending the scatter list of each plane,
+- * one after another, as the payload of a RESOURCE_ATTACH command. The list is
+- * proportional to the buffer's runs of pages, so it is built in chunks and
+- * sent as a descriptor each; no allocation here is larger than one chunk.
++ * Attaches a buffer to a stream of the device by sending the scatter list of
++ * each plane, one after another, as the payload of a RESOURCE_ATTACH command.
++ * The list is proportional to the buffer's runs of pages, so it is built in
++ * chunks and sent as a descriptor each; no allocation here is larger than one
++ * chunk. A zero *resource_id asks for a new resource ID, which is returned
++ * through it; a non-zero one attaches the buffer again under the ID the
++ * device last knew it by (a camera does after the device was reset).
+  */
+-int virtio_video_buf_init(struct vb2_buffer *vb)
++int virtio_video_attach_buffer(struct virtio_video_device *vvd,
++			       uint32_t stream_id, struct vb2_buffer *vb,
++			       uint32_t *resource_id)
+ {
+ 	int ret = 0;
+ 	struct virtio_video_payload *payload;
+ 	size_t buf_size = 0, offset = 0;
+-	unsigned int i, used, resource_id, nents;
++	unsigned int i, used, nents;
++	uint32_t id = *resource_id;
+ 	struct vb2_queue *vq = vb->vb2_queue;
+ 	enum v4l2_buf_type queue_type = vq->type;
+-	struct virtio_video_stream *stream = vb2_get_drv_priv(vq);
+-	struct virtio_video_buffer *virtio_vb = to_virtio_vb(vb);
+-	struct virtio_video_device *vvd = to_virtio_vd(stream->video_dev);
+ 	bool blob = vb->memory != VB2_MEMORY_DMABUF &&
+ 		    vq->mem_ops == &virtio_video_blob_memops;
+ 
+@@ -401,18 +404,37 @@ int virtio_video_buf_init(struct vb2_buffer *vb)
+ 	if (offset < buf_size)
+ 		virtio_video_payload_trim(payload, offset);
+ 
+-	virtio_video_resource_id_get(vvd, &resource_id);
++	if (!id)
++		virtio_video_resource_id_get(vvd, &id);
+ 
+-	ret = virtio_video_cmd_resource_attach(vvd, stream->stream_id,
+-					       resource_id,
++	ret = virtio_video_cmd_resource_attach(vvd, stream_id, id,
+ 					       to_virtio_queue_type(queue_type),
+ 					       payload);
+ 	if (ret) {
+-		virtio_video_resource_id_put(vvd, resource_id);
++		if (!*resource_id)
++			virtio_video_resource_id_put(vvd, id);
+ 		virtio_video_payload_free(payload);
+ 		return ret;
+ 	}
+ 
++	*resource_id = id;
++
++	return 0;
++}
++
++int virtio_video_buf_init(struct vb2_buffer *vb)
++{
++	int ret;
++	uint32_t resource_id = 0;
++	struct virtio_video_stream *stream = vb2_get_drv_priv(vb->vb2_queue);
++	struct virtio_video_buffer *virtio_vb = to_virtio_vb(vb);
++	struct virtio_video_device *vvd = to_virtio_vd(stream->video_dev);
++
++	ret = virtio_video_attach_buffer(vvd, stream->stream_id, vb,
++					 &resource_id);
++	if (ret)
++		return ret;
++
+ 	virtio_vb->queued = false;
+ 	virtio_vb->resource_id = resource_id;
+ 
+diff --git a/drivers/media/virtio/virtio_video_driver.c b/drivers/media/virtio/virtio_video_driver.c
+index 79b064e2db38be50d3b1ecea941a5330e2529b0a..97150d7802bebbe18c0e8c177cb0e0fdc00286bf 100644
+--- a/drivers/media/virtio/virtio_video_driver.c
++++ b/drivers/media/virtio/virtio_video_driver.c
+@@ -20,6 +20,7 @@
+ #include <linux/dma-map-ops.h>
+ 
+ #include "virtio_video.h"
++#include "virtio_video_camera.h"
+ 
+ static unsigned int debug;
+ module_param(debug, uint, 0644);
+@@ -84,9 +85,17 @@ static int virtio_video_probe(struct virtio_device *vdev)
+ 	 * An encoder is described by its V4L2 controls and stream information,
+ 	 * which only a device that offers them can answer.
+ 	 */
+-	if (vdev->id.device == VIRTIO_ID_VIDEO_ENCODER &&
++	if ((vdev->id.device == VIRTIO_ID_VIDEO_ENCODER ||
++	     vdev->id.device == VIRTIO_ID_VIDEO_CAMERA) &&
+ 	    !virtio_has_feature(vdev, VIRTIO_VIDEO_F_V4L2_CONTROLS)) {
+-		dev_err(dev, "an encoder must support V4L2 controls\n");
++		dev_err(dev, "an encoder and a camera must support V4L2 controls\n");
++		return -ENODEV;
++	}
++
++	/* A camera's buffers are pages the device reads and writes in place. */
++	if (vdev->id.device == VIRTIO_ID_VIDEO_CAMERA &&
++	    !virtio_has_feature(vdev, VIRTIO_VIDEO_F_RESOURCE_NON_CONTIG)) {
++		dev_err(dev, "a camera must support non-contiguous buffers\n");
+ 		return -ENODEV;
+ 	}
+ 
+@@ -99,7 +108,9 @@ static int virtio_video_probe(struct virtio_device *vdev)
+ 		return -ENOMEM;
+ 
+ 	vvd->encoder = vdev->id.device == VIRTIO_ID_VIDEO_ENCODER;
++	vvd->camera = vdev->id.device == VIRTIO_ID_VIDEO_CAMERA;
+ 	vvd->vid_dev_nr = vvd->encoder ? vid_nr_enc : vid_nr_dec;
++	kref_init(&vvd->ref);
+ 	vvd->vdev = vdev;
+ 	vvd->debug = debug;
+ 	vvd->use_dma_mem = use_dma_mem;
+@@ -193,6 +204,17 @@ static int virtio_video_probe(struct virtio_device *vdev)
+ 	vvd->commandq.ready = true;
+ 	vvd->eventq.ready = true;
+ 
++	if (vvd->camera) {
++		ret = virtio_video_camera_init(vvd);
++		if (ret) {
++			v4l2_err(&vvd->v4l2_dev,
++				 "failed to init the virtio camera\n");
++			goto err_camera;
++		}
++
++		return 0;
++	}
++
+ 	ret = virtio_video_device_init(vvd);
+ 	if (ret) {
+ 		v4l2_err(&vvd->v4l2_dev,
+@@ -205,6 +227,13 @@ static int virtio_video_probe(struct virtio_device *vdev)
+ 
+ 	return 0;
+ 
++err_camera:
++	/* The nodes it registered, if any, hold the device until they close. */
++	virtio_video_camera_deinit(vvd);
++	virtio_video_stop(vvd);
++	virtio_video_camera_put(vvd);
++	return ret;
++
+ err_init:
+ err_events:
+ err_config:
+@@ -237,15 +266,49 @@ static void virtio_video_remove(struct virtio_device *vdev)
+ 	struct virtio_video_device *vvd = vdev->priv;
+ 	struct device *video = &vvd->video_dev.dev;
+ 
++	if (vvd->camera) {
++		/* The driver's reference outlives the stop, the nodes' the files. */
++		virtio_video_camera_deinit(vvd);
++		virtio_video_stop(vvd);
++		virtio_video_camera_put(vvd);
++		return;
++	}
++
+ 	get_device(video);
+ 	virtio_video_device_deinit(vvd);
+ 	virtio_video_stop(vvd);
+ 	put_device(video);
+ }
+ 
++/*
++ * A system suspend stops the camera's streams that hold buffers, so the device
++ * is not reset for holding a request; the resume makes good what a reset took
++ * all the same. The codecs keep their requests across a suspend at the
++ * transport and need nothing here.
++ */
++static int virtio_video_suspend(struct device *dev)
++{
++	struct virtio_device *vdev = dev_to_virtio(dev);
++	struct virtio_video_device *vvd = vdev->priv;
++
++	return vvd->camera ? virtio_video_camera_suspend(vvd) : 0;
++}
++
++static int virtio_video_resume(struct device *dev)
++{
++	struct virtio_device *vdev = dev_to_virtio(dev);
++	struct virtio_video_device *vvd = vdev->priv;
++
++	return vvd->camera ? virtio_video_camera_resume(vvd) : 0;
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(virtio_video_pm_ops, virtio_video_suspend,
++				virtio_video_resume);
++
+ static struct virtio_device_id id_table[] = {
+ 	{ VIRTIO_ID_VIDEO_ENCODER, VIRTIO_DEV_ANY_ID },
+ 	{ VIRTIO_ID_VIDEO_DECODER, VIRTIO_DEV_ANY_ID },
++	{ VIRTIO_ID_VIDEO_CAMERA, VIRTIO_DEV_ANY_ID },
+ 	{ 0 },
+ };
+ 
+@@ -261,6 +324,7 @@ static struct virtio_driver virtio_video_driver = {
+ 	.feature_table_size = ARRAY_SIZE(features),
+ 	.driver.name = DRIVER_NAME,
+ 	.driver.owner = THIS_MODULE,
++	.driver.pm = pm_sleep_ptr(&virtio_video_pm_ops),
+ 	.id_table = id_table,
+ 	.probe = virtio_video_probe,
+ 	.remove = virtio_video_remove,
+diff --git a/drivers/media/virtio/virtio_video_vq.c b/drivers/media/virtio/virtio_video_vq.c
+index 7ec70f745dd4b8dbece8515cc53bf5cbf544a02e..15d3b6de6d0086f587c1e409a7029e51a184223f 100644
+--- a/drivers/media/virtio/virtio_video_vq.c
++++ b/drivers/media/virtio/virtio_video_vq.c
+@@ -146,8 +146,7 @@ void virtio_video_resource_id_put(struct virtio_video_device *vvd, uint32_t id)
+ }
+ 
+ void virtio_video_stream_id_get(struct virtio_video_device *vvd,
+-				struct virtio_video_stream *stream,
+-				uint32_t *id)
++				void *stream, uint32_t *id)
+ {
+ 	int handle;
+ 
+@@ -180,6 +179,20 @@ static bool vbuf_is_pending(struct virtio_video_device *vvd,
+ 	return false;
+ }
+ 
++/*
++ * A command that names its owner is pointed at by it for as long as it is
++ * pending, and drops the pointer before its callback runs or it is freed, so
++ * the owner can take the command back (virtio_video_cmd_orphan()) without
++ * ever reaching a command that is gone. Under the queue's lock.
++ */
++static void vbuf_disown(struct virtio_video_vbuffer *vbuf)
++{
++	if (vbuf->owner) {
++		*vbuf->owner = NULL;
++		vbuf->owner = NULL;
++	}
++}
++
+ /* Frees a command on no list, apart from the data it was given. */
+ static void put_vbuf(struct virtio_video_device *vvd,
+ 		     struct virtio_video_vbuffer *vbuf)
+@@ -192,6 +205,7 @@ static void put_vbuf(struct virtio_video_device *vvd,
+ static void free_vbuf(struct virtio_video_device *vvd,
+ 		      struct virtio_video_vbuffer *vbuf)
+ {
++	vbuf_disown(vbuf);
+ 	list_del(&vbuf->pending_list_entry);
+ 	virtio_video_payload_free(vbuf->payload);
+ 	put_vbuf(vvd, vbuf);
+@@ -220,6 +234,7 @@ void virtio_video_cmd_cb(struct virtqueue *vq)
+ 
+ 			/* The used length is the device's word: keep it inside the buffer. */
+ 			vbuf->resp_len = min_t(unsigned int, len, vbuf->resp_size);
++			vbuf_disown(vbuf);
+ 			if (vbuf->resp_cb)
+ 				vbuf->resp_cb(vvd, vbuf);
+ 
+@@ -393,6 +408,7 @@ void virtio_video_cancel_cmds(struct virtio_video_device *vvd)
+ 		}
+ 
+ 		vbuf->resp_len = 0;
++		vbuf_disown(vbuf);
+ 		if (vbuf->resp_cb)
+ 			vbuf->resp_cb(vvd, vbuf);
+ 
+@@ -406,6 +422,31 @@ void virtio_video_cancel_cmds(struct virtio_video_device *vvd)
+ 	spin_unlock_irqrestore(&vvd->commandq.qlock, flags);
+ }
+ 
++/*
++ * Takes back a command whose owner no longer wants its answer: the command
++ * stays on the ring and its callback runs, but finds no private data. Returns
++ * whether the command was still pending, and so whether its callback will not
++ * run for the owner. The owner's pointer is cleared under the queue's lock, so
++ * a callback that is running when this is called has finished by the time
++ * this returns.
++ */
++bool virtio_video_cmd_orphan(struct virtio_video_device *vvd,
++			     struct virtio_video_vbuffer **owner)
++{
++	struct virtio_video_vbuffer *vbuf;
++	unsigned long flags;
++
++	spin_lock_irqsave(&vvd->commandq.qlock, flags);
++	vbuf = *owner;
++	if (vbuf) {
++		vbuf->priv = NULL;
++		vbuf_disown(vbuf);
++	}
++	spin_unlock_irqrestore(&vvd->commandq.qlock, flags);
++
++	return vbuf != NULL;
++}
++
+ /* Every command buffer has been freed, and the queues are gone. */
+ void virtio_video_free_vbufs(struct virtio_video_device *vvd)
+ {
+@@ -434,7 +475,7 @@ static void *virtio_video_alloc_req(struct virtio_video_device *vvd,
+ 	return vbuf->buf;
+ }
+ 
+-static void *
++void *
+ virtio_video_alloc_req_resp(struct virtio_video_device *vvd,
+ 			    virtio_video_resp_cb cb,
+ 			    struct virtio_video_vbuffer **vbuffer_p,
+@@ -475,7 +516,7 @@ static bool virtio_video_cmd_room(struct virtio_video_device *vvd,
+  * A command that cannot be queued, because the device is gone or the ring
+  * refused it, is freed here; its payload stays the caller's.
+  */
+-static int
++int
+ virtio_video_queue_cmd_buffer(struct virtio_video_device *vvd,
+ 			      struct virtio_video_vbuffer *vbuf)
+ {
+@@ -531,6 +572,8 @@ virtio_video_queue_cmd_buffer(struct virtio_video_device *vvd,
+ 		vbuf->id = vvd->vbufs_sent++;
+ 		list_add_tail(&vbuf->pending_list_entry,
+ 			      &vvd->pending_vbuf_list);
++		if (vbuf->owner)
++			*vbuf->owner = vbuf;
+ 		virtqueue_kick(vvd->commandq.vq);
+ 	}
+ 	spin_unlock_irqrestore(&vvd->commandq.qlock, flags);
+@@ -612,6 +655,13 @@ static void virtio_video_handle_event(struct virtio_video_device *vvd,
+ 	uint32_t stream_id = evt->stream_id;
+ 	struct video_device *vd = &vvd->video_dev;
+ 
++	/* A camera's events name a camera, not a stream. */
++	if (vvd->camera) {
++		virtio_video_camera_event(vvd, le32_to_cpu(evt->event_type),
++					  le32_to_cpu(evt->stream_id));
++		return;
++	}
++
+ 	mutex_lock(vd->lock);
+ 
+ 	stream = idr_find(&vvd->stream_idr, stream_id);
+@@ -1295,7 +1345,7 @@ int virtio_video_cmd_query_v4l2_controls(struct virtio_video_device *vvd,
+ }
+ 
+ int virtio_video_cmd_set_v4l2_control(struct virtio_video_device *vvd,
+-				      struct virtio_video_stream *stream,
++				      uint32_t stream_id,
+ 				      uint32_t id, int64_t value,
+ 				      const void *payload, uint32_t size)
+ {
+@@ -1317,7 +1367,7 @@ int virtio_video_cmd_set_v4l2_control(struct virtio_video_device *vvd,
+ 		return PTR_ERR(req_p);
+ 
+ 	req_p->hdr.type = cpu_to_le32(VIRTIO_VIDEO_CMD_SET_V4L2_CONTROLS);
+-	req_p->hdr.stream_id = cpu_to_le32(stream->stream_id);
++	req_p->hdr.stream_id = cpu_to_le32(stream_id);
+ 	req_p->num_controls = cpu_to_le32(1);
+ 	entry = (void *)(req_p + 1);
+ 	entry->id = cpu_to_le32(id);
+@@ -1339,7 +1389,7 @@ int virtio_video_cmd_set_v4l2_control(struct virtio_video_device *vvd,
+ }
+ 
+ int virtio_video_cmd_get_v4l2_control(struct virtio_video_device *vvd,
+-				      struct virtio_video_stream *stream,
++				      uint32_t stream_id,
+ 				      uint32_t id, int64_t *value,
+ 				      void *payload, uint32_t size)
+ {
+@@ -1365,7 +1415,7 @@ int virtio_video_cmd_get_v4l2_control(struct virtio_video_device *vvd,
+ 	}
+ 
+ 	req_p->hdr.type = cpu_to_le32(VIRTIO_VIDEO_CMD_GET_V4L2_CONTROLS);
+-	req_p->hdr.stream_id = cpu_to_le32(stream->stream_id);
++	req_p->hdr.stream_id = cpu_to_le32(stream_id);
+ 	req_p->num_controls = cpu_to_le32(1);
+ 	entry = (void *)(req_p + 1);
+ 	entry->id = cpu_to_le32(id);
+@@ -1482,3 +1532,69 @@ int virtio_video_cmd_get_stream_info(struct virtio_video_device *vvd,
+ 
+ 	return 0;
+ }
++
++/*
++ * Sends one command and waits for its answer, which is copied to `resp` for
++ * `resp_size` bytes; `resp_len` says how many of them the device wrote. The
++ * camera's commands use it, because each of them depends on the device's word
++ * that it took effect.
++ */
++int virtio_video_cmd_sync(struct virtio_video_device *vvd, const void *req,
++			  size_t req_size, void *resp, size_t resp_size,
++			  size_t *resp_len)
++{
++	struct virtio_video_vbuffer *vbuf;
++	struct virtio_video_answer answer = {};
++	void *buf;
++	int ret;
++
++	if (req_size > MAX_INLINE_CMD_SIZE)
++		return -EINVAL;
++
++	buf = virtio_video_alloc_req_resp(vvd, virtio_video_answer_cb, &vbuf,
++					  req_size, resp_size, resp);
++	if (IS_ERR(buf))
++		return PTR_ERR(buf);
++
++	memcpy(buf, req, req_size);
++	vbuf->priv = &answer;
++
++	ret = virtio_video_queue_cmd_buffer_sync(vvd, vbuf);
++	if (ret)
++		return ret;
++
++	if (resp_len)
++		*resp_len = answer.len;
++
++	return 0;
++}
++
++/* The errno an answer's header type stands for. */
++int virtio_video_resp_errno(uint32_t type)
++{
++	switch (type) {
++	case VIRTIO_VIDEO_RESP_OK_NODATA:
++	case VIRTIO_VIDEO_RESP_OK_QUERY_CAPABILITY:
++	case VIRTIO_VIDEO_RESP_OK_RESOURCE_QUEUE:
++	case VIRTIO_VIDEO_RESP_OK_GET_PARAMS:
++	case VIRTIO_VIDEO_RESP_OK_QUERY_CONTROL:
++	case VIRTIO_VIDEO_RESP_OK_GET_CONTROL:
++	case VIRTIO_VIDEO_RESP_OK_QUERY_V4L2_CONTROLS:
++	case VIRTIO_VIDEO_RESP_OK_V4L2_CONTROLS:
++	case VIRTIO_VIDEO_RESP_OK_STREAM_INFO:
++	case VIRTIO_VIDEO_RESP_OK_CAMERA_QUERY:
++		return 0;
++	case VIRTIO_VIDEO_RESP_ERR_INVALID_STREAM_ID:
++		return -ENOENT;
++	case VIRTIO_VIDEO_RESP_ERR_INVALID_PARAMETER:
++	case VIRTIO_VIDEO_RESP_ERR_INVALID_RESOURCE_ID:
++	case VIRTIO_VIDEO_RESP_ERR_UNSUPPORTED_CONTROL:
++		return -EINVAL;
++	case VIRTIO_VIDEO_RESP_ERR_OUT_OF_MEMORY:
++		return -ENOMEM;
++	case VIRTIO_VIDEO_RESP_ERR_BUSY:
++		return -EBUSY;
++	default:
++		return -EIO;
++	}
++}

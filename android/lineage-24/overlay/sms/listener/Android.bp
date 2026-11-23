@@ -1,0 +1,37 @@
+// SPDX-License-Identifier: Apache-2.0
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+// The holder of the text message service's vsock port (overlay/sms): it keeps
+// port 5560 from boot without reading it, starts the service through the waker
+// when a connection waits, and passes the service the listening socket. It is a
+// plain daemon of the core domains, installed on system_ext, with no rule of its
+// own for binder, so that the process that holds the vsock socket between
+// sessions is not the framework's client. The service holds the same socket
+// during a session and is a binder client, as it was when it held the port itself.
+cc_binary {
+    name: "kernarium_sms_listener",
+    init_rc: ["kernarium_sms_listener.rc"],
+    system_ext_specific: true,
+    cpp_std: "c++20",
+    srcs: ["main.cpp"],
+    shared_libs: [
+        "libbase",
+        "libcutils",
+        "liblog",
+        "libselinux",
+    ],
+    cflags: ["-Wall", "-Wextra", "-Werror"],
+}
+
+// Starts the service's process: `cmd activity start-service` as the system user,
+// which alone may start a service that no other application may. It runs in a
+// core domain of its own (kernarium_sms_wake) because it is the framework's
+// client, which the holder, a vsock socket's owner, is not.
+sh_binary {
+    name: "kernarium_sms_wake_script",
+    src: "kernarium_sms_wake.sh",
+    system_ext_specific: true,
+    filename_from_src: true,
+}

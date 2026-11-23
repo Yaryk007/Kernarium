@@ -201,6 +201,60 @@ void checkCpuFrame(Display& display)
         "a CPU frame was not presented into the windowless layer");
 }
 
+/* Every accepted guest update counts once as an offered frame, however it is
+ * shown: the 120 Hz display link paces by this count, and a path it missed
+ * would be paced as an idle guest. A direct Metal texture, a CPU update of a
+ * 2-D resource and a readback each add one; an update that touches no pixel
+ * and a scanout that was refused add none, and a scanout refused for the
+ * direct path that is then read back counts once, not for the attempt as
+ * well (the guest's frames and the CPU fallback's together would say two). */
+void checkOfferedFrames(id<MTLTexture> texture)
+{
+    auto display = makeOffscreen(
+        {.drawableWidth = 640, .drawableHeight = 360});
+    const auto offered = [&] { return display->statistics().offeredFrames; };
+    require(offered() == 0, "a new display has offered frames");
+
+    /* Direct. */
+    require(offer(*display, texture), "the display refused a scanout");
+    require(offered() == 1, "a direct scanout did not count once");
+
+    /* A scanout with no texture is refused and is no frame. */
+    uml::gpu::MetalScanout refusedScanout =
+        uml::gpu::testing::wholeScanout(texture, width, height);
+    refusedScanout.texture = nullptr;
+    require(!uml::gpu::presentAccepted(display->presentMetal(refusedScanout)),
+        "a scanout with no texture was accepted");
+    require(offered() == 1, "a refused scanout counted");
+
+    /* A 2-D resource flushed to the CPU path. */
+    const auto image =
+        uml::gpu::testing::solidImage({0, 255, 0, 255}, width, height);
+    const auto update = [&](std::uint32_t updatedWidth) {
+        display->update(
+            image, width, height, static_cast<std::size_t>(width) * 4U,
+            uml::gpu::protocol::GpuFormat::b8g8r8a8Unorm, 0, 0, 0, 0,
+            updatedWidth, height);
+    };
+    update(width);
+    require(offered() == 2, "a 2-D update did not count once");
+    update(0);
+    require(offered() == 2, "an update that touched no pixel counted");
+
+    /* A readback: the direct attempt is refused, the fallback is recorded and
+     * the pixels are updated, which is one frame. */
+    const auto before = display->statistics();
+    (void)display->presentMetal(refusedScanout);
+    display->recordCpuFallbackFrame();
+    update(width);
+    const auto after = display->statistics();
+    require(after.offeredFrames == before.offeredFrames + 1,
+        "a readback did not count once");
+    require(after.guestFrames + after.cpuFallbackFrames ==
+                before.guestFrames + before.cpuFallbackFrames + 2,
+        "the guest and fallback counters no longer count a readback twice");
+}
+
 /* The mirror runs while the display lives and stops with it, and is off
  * unless it was asked for. */
 void checkMirror(id<MTLTexture> texture)
@@ -278,6 +332,7 @@ int run()
         checkBurst(*display, texture);
         checkCpuFrame(*display);
     }
+    checkOfferedFrames(texture);
     checkMirror(texture);
     checkTeardownUnderLoad(texture);
     return EXIT_SUCCESS;

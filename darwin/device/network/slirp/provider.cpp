@@ -29,10 +29,16 @@
 namespace uml::network {
 namespace {
 
-using uml::platform::UniqueDescriptor;
+/* An IPv4 address as the number the frame parser reads (network order bytes
+ * read big endian). */
+constexpr std::uint32_t ipv4_value(const dns::Ipv4Address &address) noexcept
+{
+	return (static_cast<std::uint32_t>(address[0]) << 24) |
+		(static_cast<std::uint32_t>(address[1]) << 16) |
+		(static_cast<std::uint32_t>(address[2]) << 8) | address[3];
+}
 
-constexpr std::array<unsigned char, 6> default_mac{
-	0x52, 0x54, 0x00, 0x12, 0x34, 0x56};
+using uml::platform::UniqueDescriptor;
 
 bool create_pipe(std::array<UniqueDescriptor, 2> &result) noexcept
 {
@@ -126,15 +132,43 @@ int SlirpProvider::open(std::span<unsigned char, 6> mac,
 		if (!ensure_pipe(wake_pipe_) || !ensure_pipe(receive_pipe_))
 			return errno == 0 ? -EIO : -errno;
 
+		/* The guest may not address the host itself (answer_locally), so
+		 * the network does not come up without the host's addresses to
+		 * refuse. */
+		host_addresses_read_at_ = {};
+		host_address_retry_at_ = {};
+		host_addresses_distrust_logged_ = false;
+		if (!read_host_addresses_now())
+			return -EIO;
+		/* A hold of an earlier instance is over with it: the reports of
+		 * this one are read from here. */
+		address_reset_hold_.clear();
+		address_reset_table_.reset();
+		path_reports_seen_ = path_state_.reports();
+		path_outages_seen_ = path_state_.uncarried_reports();
+#if UML_SLIRP_TESTING
+		path_reports_handled_for_testing_.store(
+			path_reports_seen_, std::memory_order_release);
+#endif
+
 		SlirpConfig config{};
 		config.version = 6;
 		config.in_enabled = true;
 		config.restricted = 0;
+		/* Without this SLiRP maps the gateway address, and the broadcast
+		 * address, to 127.0.0.1 of the host: a guest process would reach
+		 * every service on the application's own loopback. What the guest
+		 * reaches through the gateway is SLiRP's own: DHCP, ICMP echo, and
+		 * DNS, which the provider answers itself. The host's other addresses
+		 * are refused in answer_locally. */
+		config.disable_host_loopback = true;
 		/* SLiRP's DNS proxy sends a guest's queries to the host's first
 		 * configured server, usually a local-network router. The
 		 * provider answers the name server itself (answer_locally and
 		 * HostResolver), so SLiRP never addresses that server. */
 		config.disable_dns = true;
+		/* The attempts of a link that ended wait for no answer. */
+		observer_.reset();
 		(void)inet_pton(AF_INET, network_address, &config.vnetwork);
 		(void)inet_pton(AF_INET, network_mask, &config.vnetmask);
 		(void)inet_pton(AF_INET, host_alias_address, &config.vhost);
@@ -180,6 +214,8 @@ int SlirpProvider::open(std::span<unsigned char, 6> mac,
 #else
 			const auto stream_paths = dns_stream_paths();
 #endif
+			resolver_.set_counters(&counters_);
+			resolver_.set_network_path(&path_state_);
 			if (resolver_.start(
 				    [this](std::span<const std::uint8_t> frame) {
 					    try {
@@ -217,18 +253,87 @@ int SlirpProvider::open(std::span<unsigned char, 6> mac,
 							"over TCP at %s\n", server);
 				}
 			}
+#if UML_SLIRP_TESTING
+			install_guest_forwards_for_testing();
+#endif
+			/* A SYN to a name server whose forward carries DNS is
+			 * answered by SLiRP itself: no connection attempt. */
+			observer_.serve_dns_streams(
+				name_server_stream_ ? ipv4_value(nameserver_ipv4) : 0,
+				gateway_stream_ ? ipv4_value(host_alias_ipv4) : 0);
+			/* The system reports the current path at once and each change
+			 * after, and nothing else wakes the provider; a report wakes
+			 * the event loop, which decides what it means for the guest's
+			 * connections, so every open registers that wake. The first
+			 * open makes the monitor and it lives as long as the provider:
+			 * across every stop and reopen (a guest's restart) and across
+			 * a failed open, for it belongs to the provider and not to the
+			 * open that made it. It runs on a thread of its own whose Mach
+			 * port the system's start-up ties to it: a monitor made again
+			 * at each boot would let that thread's port go and leave the
+			 * process one short of its first boot's, which the restart
+			 * audit (guest-restart) reports. A monitor the system gave
+			 * none for never reports: an open makes another. */
+			path_state_.set_observer(notify_callback, this);
+#if UML_SLIRP_TESTING
+			if (!path_monitor_for_testing_ && path_monitor_) {
+				path_monitor_.reset();
+				/* Its last report is not the state of what
+				 * follows, and none is running now to write
+				 * another. */
+				path_state_.report(true);
+			}
+			const bool monitored = path_monitor_for_testing_;
+#else
+			constexpr bool monitored = true;
+#endif
+			if (path_monitor_ && path_monitor_->failed())
+				path_monitor_.reset();
+			if (monitored && !path_monitor_) {
+#if UML_SLIRP_TESTING
+				auto &make = path_monitor_factory_for_testing_;
+				path_monitor_ = make ? make(path_state_) :
+					uml::platform::
+					makeAppleHostNetworkPathMonitor(
+						path_state_);
+				path_monitors_made_for_testing_.fetch_add(
+					1, std::memory_order_relaxed);
+#else
+				path_monitor_ = uml::platform::
+					makeAppleHostNetworkPathMonitor(path_state_);
+#endif
+			}
 			worker_ = std::jthread{[this](std::stop_token stop_token) {
 				event_loop(stop_token);
 			}};
-		} catch (const std::system_error &) {
+		} catch (...) {
+			/* A thread or the path monitor that could not be made (the
+			 * system is out of memory): nothing of this open may stay but
+			 * a monitor already installed, which belongs to the provider
+			 * and keeps reporting, so that a later open() starts the
+			 * resolver again. */
+			path_state_.set_observer(nullptr, nullptr);
 			resolver_.stop();
 			slirp_.reset();
 			return -EIO;
 		}
 		started_.store(true, std::memory_order_release);
 	}
-	std::ranges::copy(default_mac, mac.begin());
+	std::ranges::copy(mac_, mac.begin());
 	mtu = 1500;
+	return 0;
+}
+
+int SlirpProvider::set_mac(std::span<const unsigned char, 6> mac)
+{
+	const bool zero = std::ranges::all_of(
+		mac, [](unsigned char byte) { return byte == 0; });
+	if ((mac[0] & 0x01U) != 0 || zero ||
+	    std::equal(router_mac_prefix.begin(), router_mac_prefix.end(),
+		       mac.begin()))
+		return -EINVAL;
+	std::lock_guard lock{start_mutex_};
+	std::ranges::copy(mac, mac_.begin());
 	return 0;
 }
 
@@ -304,6 +409,15 @@ void SlirpProvider::stop() noexcept
 	/* The resolver delivers into the receive ring from its own thread;
 	 * once it is joined nothing can refill the ring cleared below. */
 	resolver_.stop();
+	/* No report wakes a loop that is gone; the one in flight finishes first. */
+	path_state_.set_observer(nullptr, nullptr);
+	/* A monitor that works keeps the state current across the stop. With
+	 * none (the test build's default), or one the system gave no monitor
+	 * (it never reports and the next open replaces it), no one does, and
+	 * an outage that was reported is over: a reopen starts as a host with
+	 * a path does. */
+	if (!path_monitor_ || path_monitor_->failed())
+		path_state_.report(true);
 #if UML_SLIRP_TESTING
 	notify_receive_cleanup_for_testing();
 #endif
@@ -321,6 +435,7 @@ void SlirpProvider::stop() noexcept
 	}
 	slirp_.reset();
 	timers_.clear();
+	address_reset_hold_.clear();
 }
 
 #if UML_SLIRP_TESTING
@@ -476,6 +591,67 @@ void SlirpProvider::notify_receive_cleanup_for_testing() noexcept
 	}
 	io_pause_condition_.notify_all();
 }
+
+/* "ADDRESS:PORT=PATH": the environment's form of a GuestForward. */
+static bool parse_guest_forward_for_testing(
+	std::string_view text, SlirpProvider::GuestForward &forward) noexcept
+{
+	const auto colon = text.find(':');
+	const auto equals = text.find('=');
+	if (colon == std::string_view::npos || equals == std::string_view::npos ||
+		colon > equals || equals + 1 >= text.size())
+		return false;
+	unsigned int port = 0;
+	const auto digits = text.substr(colon + 1, equals - colon - 1);
+	const auto parsed = std::from_chars(
+		digits.data(), digits.data() + digits.size(), port);
+	if (parsed.ec != std::errc{} ||
+		parsed.ptr != digits.data() + digits.size() || port == 0 ||
+		port > 65535U)
+		return false;
+	forward.guest_address = std::string{text.substr(0, colon)};
+	forward.guest_port = static_cast<std::uint16_t>(port);
+	forward.path = std::string{text.substr(equals + 1)};
+	return true;
+}
+
+void SlirpProvider::install_guest_forwards_for_testing() noexcept
+{
+	try {
+		auto forwards = guest_forwards_for_testing_;
+		if (const char *environment =
+				std::getenv("UML_TEST_SLIRP_GUEST_FORWARD");
+			environment != nullptr) {
+			std::string_view rest{environment};
+			while (!rest.empty()) {
+				const auto comma = rest.find(',');
+				GuestForward forward;
+				if (parse_guest_forward_for_testing(
+						rest.substr(0, comma), forward))
+					forwards.push_back(std::move(forward));
+				else
+					std::fprintf(stderr,
+						"UML_TEST_SLIRP_GUEST_FORWARD: bad forward\n");
+				if (comma == std::string_view::npos)
+					break;
+				rest.remove_prefix(comma + 1);
+			}
+		}
+		for (const auto &forward : forwards) {
+			in_addr address{};
+			if (inet_pton(AF_INET, forward.guest_address.c_str(),
+						  &address) != 1 ||
+				slirp_add_unix(slirp_.get(), forward.path.c_str(), &address,
+							   forward.guest_port) != 0)
+				std::fprintf(stderr,
+					"Unable to forward guest %s:%u to %s\n",
+					forward.guest_address.c_str(),
+					static_cast<unsigned int>(forward.guest_port),
+					forward.path.c_str());
+		}
+	} catch (...) {
+	}
+}
 #endif
 
 } // namespace uml::network
@@ -545,14 +721,25 @@ extern "C" int uml_slirp_net_open(
 {
 	if (context == nullptr || mac == nullptr || mtu == nullptr)
 		return -EINVAL;
-#ifndef UML_APP_STORE_RUNTIME
 	if (const auto *disabled = std::getenv("UML_DISABLE_NETWORK");
 	    disabled != nullptr && disabled[0] != '\0' && disabled[0] != '0')
 		return -ENETDOWN;
-#endif
 	try {
 		return static_cast<uml::network::SlirpProvider *>(context)->open(
 			std::span<unsigned char, 6>{mac, 6}, *mtu);
+	} catch (...) {
+		return -EIO;
+	}
+}
+
+extern "C" int uml_slirp_net_set_mac(
+	void *context, const unsigned char mac[6])
+{
+	if (context == nullptr || mac == nullptr)
+		return -EINVAL;
+	try {
+		return static_cast<uml::network::SlirpProvider *>(context)->set_mac(
+			std::span<const unsigned char, 6>{mac, 6});
 	} catch (...) {
 		return -EIO;
 	}
@@ -609,6 +796,29 @@ extern "C" int uml_slirp_net_add_forward(
 	} catch (...) {
 		return -EIO;
 	}
+}
+
+extern "C" int uml_slirp_net_read_counters(
+	void *context, uml_slirp_net_counters *counters)
+{
+	if (context == nullptr || counters == nullptr)
+		return -EINVAL;
+	const auto counts =
+		static_cast<uml::network::SlirpProvider *>(context)->counters();
+	*counters = {
+		.dns_answered = counts.dns_answered,
+		.dns_policy_denied = counts.dns_policy_denied,
+		.dns_timed_out = counts.dns_timed_out,
+		.dns_failed = counts.dns_failed,
+		.dhcp_discovers = counts.dhcp_discovers,
+		.dhcp_requests = counts.dhcp_requests,
+		.dhcp_acks = counts.dhcp_acks,
+		.tcp_attempts = counts.tcp_attempts,
+		.tcp_established = counts.tcp_established,
+		.tcp_unreachable = counts.tcp_unreachable,
+		.tcp_reset = counts.tcp_reset,
+	};
+	return 0;
 }
 
 extern "C" void uml_slirp_net_stop(void *context)

@@ -43,16 +43,40 @@ target_compile_definitions(uml_memory_shared_backing PRIVATE
 set(_uml_static_mmu_sources
     mmu/address_layout.cpp
     mmu/address_space.cpp
+    mmu/code_holders.cpp
     mmu/execution_gate.cpp
     mmu/mapped_backing.cpp)
+# The x86-64 guest's frame accounting; no other product compiles it.
+if(UML_BUILD_X86_64_GUEST)
+    list(APPEND _uml_static_mmu_sources mmu/frame_accounting.cpp)
+endif()
 
-add_library(uml_static_mmu OBJECT ${_uml_static_mmu_sources})
-uml_declare_architecture_target(uml_static_mmu memory)
-target_link_libraries(uml_static_mmu PRIVATE UML::BridgeAbi UML::MemoryContract)
-target_include_directories(uml_static_mmu PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/mmu)
-target_compile_definitions(uml_static_mmu PRIVATE
-    UML_MEMORY_ALLOCATION_TESTING=0)
+# The static MMU, compiled twice at most. The compilation every product links
+# carries no count audit in any configuration. A diagnostics build of the AOT
+# runtime reports the executable-mapping counts of a real guest run
+# (darwin/memory/count_audit.hpp) and links a second compilation of the same
+# sources with the audit instead; UML_STATIC_MMU_TARGET names the one a
+# composition links, as UML_AOT_RUNTIME_TARGET does for the runtime. The audit
+# exists only where the diagnostics runtime that reads it is built.
+function(_uml_add_static_mmu TARGET AUDIT)
+    add_library(${TARGET} OBJECT ${_uml_static_mmu_sources})
+    uml_declare_architecture_target(${TARGET} memory)
+    target_link_libraries(${TARGET} PRIVATE UML::BridgeAbi UML::MemoryContract)
+    target_include_directories(${TARGET} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/mmu)
+    target_compile_definitions(${TARGET} PRIVATE
+        UML_MEMORY_ALLOCATION_TESTING=0
+        UML_MEMORY_COUNT_AUDIT=${AUDIT})
+endfunction()
+
+_uml_add_static_mmu(uml_static_mmu 0)
+if(UML_AOT_DIAGNOSTICS AND UML_AOT_IMAGE)
+    _uml_add_static_mmu(uml_static_mmu_audited 1)
+    set_property(GLOBAL PROPERTY UML_STATIC_MMU_TARGET uml_static_mmu_audited)
+else()
+    set_property(GLOBAL PROPERTY UML_STATIC_MMU_TARGET uml_static_mmu)
+endif()
+get_property(_uml_static_mmu_target GLOBAL PROPERTY UML_STATIC_MMU_TARGET)
 
 add_library(uml_static_guest_memory OBJECT static_guest_memory.cpp)
 uml_declare_architecture_target(uml_static_guest_memory memory)
@@ -108,7 +132,7 @@ target_link_libraries(uml_memory_component INTERFACE
     UML::MemorySharedBacking)
 target_sources(uml_memory_component INTERFACE
     $<TARGET_OBJECTS:uml_memory_shared_backing>
-    $<TARGET_OBJECTS:uml_static_mmu>
+    $<TARGET_OBJECTS:${_uml_static_mmu_target}>
     $<TARGET_OBJECTS:uml_static_guest_memory>
     $<TARGET_OBJECTS:uml_memory_vm_bridge>)
 if(TARGET uml_native_mmu)
@@ -117,6 +141,12 @@ if(TARGET uml_native_mmu)
 endif()
 
 if(UML_BUILD_UNIT_TESTS)
+    # The audited compilation of the static MMU, built to be read and linked
+    # by nothing: the packaging rows (tests/tooling/cmake) need an audited
+    # object to refuse, and the unit tree has no AOT image, so the
+    # diagnostics composition's own copy does not exist where the gate runs.
+    _uml_add_static_mmu(uml_static_mmu_audit_probe 1)
+
     # Fault injection and white-box ownership queries recompile the exact
     # production implementation manifests under a test-only policy. Ordinary
     # products contain neither the probe atomics nor their conditional calls.
@@ -131,6 +161,19 @@ if(UML_BUILD_UNIT_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/mmu)
     target_compile_definitions(uml_static_mmu_test_variant PUBLIC
         UML_MEMORY_ALLOCATION_TESTING=1)
+
+    # The fetch path with an observer that holds a reader between its read of
+    # a frame and its return, for the row that publishes in that window.
+    add_library(uml_static_guest_memory_test_variant OBJECT
+        static_guest_memory.cpp)
+    uml_declare_architecture_target(uml_static_guest_memory_test_variant memory)
+    target_link_libraries(uml_static_guest_memory_test_variant PRIVATE
+        UML::BridgeAbi
+        UML::MemoryContract)
+    target_include_directories(uml_static_guest_memory_test_variant PRIVATE
+        ${PROJECT_SOURCE_DIR}/darwin)
+    target_compile_definitions(uml_static_guest_memory_test_variant PUBLIC
+        UML_STATIC_GUEST_MEMORY_TESTING=1)
 
     if(TARGET uml_native_mmu)
         add_library(uml_native_mmu_test_variant OBJECT

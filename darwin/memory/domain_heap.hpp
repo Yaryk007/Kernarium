@@ -51,6 +51,15 @@ public:
 	/* Address space reserved, in bytes. */
 	[[nodiscard]] static std::size_t reservation() noexcept;
 
+	/* Makes the reservation now where the first block would. It is lazy, and a
+	 * process with little address space (an iOS application without Extended
+	 * Virtual Addressing) can have none left by the time a block is first
+	 * needed: the block is then null and its caller throws std::bad_alloc.
+	 * A host that starts a guest asks first, and so learns before the guest's
+	 * first mapping needs a block. True when the region is reserved, now or
+	 * before. */
+	[[nodiscard]] bool reserve() noexcept;
+
 	/* `bytes` is a multiple of the host page. Null when the region has no
 	 * such range or the reservation could not be made. */
 	[[nodiscard]] void *take(std::size_t bytes, int tag) noexcept;

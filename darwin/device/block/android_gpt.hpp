@@ -75,6 +75,10 @@ GptImage buildGpt(std::uint64_t diskBytes, std::uint32_t entryCount,
 class File final {
 public:
 	explicit File(const std::filesystem::path &path);
+	/* The regular file `name` in the open directory `directory`, opened
+	 * without following a link at `name`; its size and type are read from
+	 * the opened descriptor. */
+	File(int directory, const char *name);
 	~File();
 	File(const File &) = delete;
 	File &operator=(const File &) = delete;

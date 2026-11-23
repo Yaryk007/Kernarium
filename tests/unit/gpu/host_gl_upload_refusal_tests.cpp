@@ -8,7 +8,7 @@
 // runs the context's draws, and took the application down with it.
 //
 // The contract under test is what the host does when the upload memory of a
-// draw is refused:
+// draw is refused, and no memory the host can give back would make the room:
 //
 //  - the host survives the refusal, however many draws meet it;
 //  - the draw that could not be set up is skipped and raises
@@ -16,18 +16,20 @@
 //  - once the memory comes back, draws are made again: the state the refused
 //    draw left unfinished is set up again by the next one.
 //
-// The draws here upload 32 KiB of constants each, so a few dozen of them fill
-// one of the uploader's 2 MiB buffers, and the buffers of the draws still in
-// flight cannot be freed: the budget runs out within a few hundred draws.
+// The budget is a pool the test states for the driver (host_gl_injected_pool
+// .hpp). Live textures take the room its limit leaves before the first draw
+// asks for its upload buffer, so that the host has nothing to give back: it
+// gives back what finished work holds when a draw's upload is refused, and
+// tries once more (host_gl_refusal_retry_tests.cpp), which makes the room
+// for draws whose budget the work in flight holds.
 
+#include "host_gl_injected_pool.hpp"
 #include "host_gl_test_support.hpp"
-#include "host_gpu_memory.hpp"
 #include "require.hpp"
 #include "virgl_renderer.hpp"
 
 #include <epoxy/gl.h>
 
-#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstddef>
@@ -37,17 +39,17 @@
 #include <exception>
 #include <memory>
 #include <thread>
+#include <vector>
 
 namespace {
 
+using uml::gpu::testing::InjectedPool;
 using uml::gpu::testing::skipWithoutRenderer;
 using uml::testing::require;
 using namespace std::chrono_literals;
 
 constexpr std::uint64_t mebibyte = 1024ULL * 1024ULL;
-constexpr std::uint64_t roomBytes = 48 * mebibyte;
 constexpr int drawsPerRound = 256;
-constexpr int maximumDraws = 40000;
 constexpr int refusedRounds = 3;
 
 constexpr const char* vertexShader = R"(#version 450 core
@@ -71,12 +73,23 @@ void main()
 }
 )";
 
-// What the pool counts: the larger of Metal's allocation and the graphics
-// footprint, since nothing here is imported.
-[[nodiscard]] std::uint64_t used() noexcept
+// Makes 1 MiB textures until the pool refuses one, which leaves it less than
+// a mebibyte of room.
+[[nodiscard]] std::vector<GLuint> holdPool()
 {
-    return std::max(uml::platform::hostGpuAllocatedBytes(),
-        uml::platform::hostGraphicsFootprintBytes());
+    std::vector<GLuint> held;
+    while (held.size() < 256) {
+        GLuint texture = 0;
+        glGenTextures(1, &texture);
+        glBindTexture(GL_TEXTURE_2D, texture);
+        glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, 512, 512);
+        if (glGetError() != GL_NO_ERROR) {
+            glDeleteTextures(1, &texture);
+            break;
+        }
+        held.push_back(texture);
+    }
+    return held;
 }
 
 // Draws a point at the first pixel of the bound target, in the colour of
@@ -99,15 +112,15 @@ void drawPoint(GLint indexLocation, int index)
 
 int main()
 {
-    // The pool takes its limit when the renderer starts, and counts everything
-    // the process holds, so the limit is what is held now plus the room.
-    uml::gpu::VirglRenderer::setDeviceMemoryLimit(used() + roomBytes);
     std::unique_ptr<uml::gpu::VirglRenderer> renderer;
     try {
         renderer = std::make_unique<uml::gpu::VirglRenderer>();
     } catch (const std::exception& error) {
         return skipWithoutRenderer(error);
     }
+    // The renderer states its own pool when it starts, which this replaces:
+    // the driver charges its allocations to this one from here on.
+    InjectedPool pool;
 
     uml::gpu::HostGlProvider provider;
     const auto current = uml::gpu::testing::currentContext(provider, 4, 6);
@@ -144,17 +157,21 @@ int main()
     glUniform4fv(valuesLocation, 1, green.data());
     glClearColor(1.0F, 0.0F, 0.0F, 1.0F);
     glClear(GL_COLOR_BUFFER_BIT);
-    drawPoint(indexLocation, 0);
     glFinish();
-    require(glGetError() == GL_NO_ERROR, "the first draw raised an error");
-    require(firstPixel() == std::array<std::uint8_t, 4> {0, 255, 0, 255},
-        "the first draw did not show the program's colour");
+    require(glGetError() == GL_NO_ERROR, "the clear raised an error");
 
-    // Draws until the budget refuses the uploader's next buffer. The draws
-    // that follow keep meeting the refusal.
+    // Live textures take what the limit leaves before the first draw uploads
+    // anything: eight of them, and the next is refused.
+    pool.limit(8 * mebibyte);
+    auto held = holdPool();
+    require(!held.empty() && pool.refusals() > 0, "the budget was not filled");
+
+    // Every round of draws meets the refusal: the host has no memory to give
+    // back, and the draws are skipped with GL_OUT_OF_MEMORY.
+    const auto begin = std::chrono::steady_clock::now();
     int draws = 0;
     int refused = 0;
-    while (refused < refusedRounds && draws < maximumDraws) {
+    for (int round = 0; round < refusedRounds; ++round) {
         for (int index = 0; index < drawsPerRound; ++index)
             drawPoint(indexLocation, ++draws);
         const GLenum error = glGetError();
@@ -165,17 +182,24 @@ int main()
                 "a draw raised an error other than out of memory");
         }
     }
+    const auto elapsed = std::chrono::steady_clock::now() - begin;
     std::fprintf(stderr,
-        "%d draws; %d rounds of %d met a refused upload (limit %.1f MiB over "
-        "%.1f MiB)\n",
-        draws, refused, drawsPerRound, static_cast<double>(roomBytes) / mebibyte,
-        static_cast<double>(used()) / mebibyte);
+        "%d draws in %lld ms; %d rounds of %d met a refused upload; the pool "
+        "refused %u requests\n",
+        draws,
+        static_cast<long long>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(elapsed)
+                .count()),
+        refused, drawsPerRound, pool.refusals());
     require(refused > 0,
         "the budget never refused a draw's upload, so nothing was proven");
+    require(elapsed < 20s, "the refused draws took too long");
 
-    // The GPU finishes what the draws before the refusal started, which gives
-    // the memory back; the next draws set their state up again and show their
-    // colour.
+    // The limit goes, and the held textures with it; the next draws set their
+    // state up again and show their colour.
+    pool.unlimit();
+    glDeleteTextures(static_cast<GLsizei>(held.size()), held.data());
+    held.clear();
     glFinish();
     (void)glGetError();
     glClear(GL_COLOR_BUFFER_BIT);

@@ -18,6 +18,35 @@ struct GuestGPUHoldTests {
     }
 
     @Test
+    func aHoldWithADeadlineTellsTheGateWhatItLeaves() {
+        let log = CallLog()
+        let gate = BudgetGate(log)
+        let hold = GuestGPUHold(gate: gate, timer: ManualHoldTimer().timer)
+
+        #expect(hold.hold(before: DispatchTime.now() + .milliseconds(2500)))
+        #expect(log.entries == ["hold within"])
+        let left = gate.left
+        #expect(left.count == 1)
+        #expect((2.3...2.5).contains(left.first ?? 0))
+
+        #expect(hold.release())
+        // A deadline that has passed is told as what is left of it: nothing.
+        #expect(hold.hold(before: DispatchTime.now() - .milliseconds(100)))
+        #expect((gate.left.last ?? 1) <= 0)
+    }
+
+    @Test
+    func aHoldWithNoDeadlineWaitsForTheCameraAsItAlwaysDid() {
+        let log = CallLog()
+        let gate = BudgetGate(log)
+        let hold = GuestGPUHold(gate: gate, timer: ManualHoldTimer().timer)
+
+        #expect(hold.hold())
+        #expect(log.entries == ["hold"])
+        #expect(gate.left.isEmpty)
+    }
+
+    @Test
     func aHoldTakenIsTakenOnceAndReleasedOnce() {
         let rig = Rig()
 
@@ -111,9 +140,11 @@ struct GuestGPUHoldTests {
         #expect(landed.entries == ["second"])
     }
 
-    /// Both paths racing for the hold take it once between them.
+    /// Both paths racing for the hold take it between them. The bound does not
+    /// wait for a hold that is landing, so the gate may be told twice (the
+    /// runtime's gate is one state), and it is released once.
     @Test
-    func theBoundAndTheHoldRacingTakeTheHoldOnce() async {
+    func theBoundAndTheHoldRacingTakeTheHold() async {
         for _ in 0..<200 {
             let rig = Rig()
             rig.hold.arm(after: 1.5)
@@ -121,9 +152,72 @@ struct GuestGPUHoldTests {
                 group.addTask { rig.timer.fire() }
                 group.addTask { rig.hold.hold() }
             }
-            #expect(rig.log.entries == ["hold"])
+            #expect(rig.hold.isHeld)
+            #expect(rig.log.entries.allSatisfy { $0 == "hold" })
+            #expect((1...2).contains(rig.log.entries.count))
             #expect(rig.hold.release())
+            #expect(rig.log.entries.last == "release")
         }
+    }
+
+    /// The edge's main path holds through the gate, which on an Android guest
+    /// waits for the guest's camera video to stop before it holds. The bound
+    /// fires meanwhile, because the edge is already late: it holds at once,
+    /// without that wait and without waiting for the main path, and the main
+    /// path's wait ends and finds the gate held. One release gives it back.
+    @Test
+    nonisolated func aBoundThatFiresWhileTheHoldWaitsForTheCameraHoldsAtOnce() {
+        final class WaitingGate: GuestGPUGate, @unchecked Sendable {
+            let log = CallLog()
+            let began = DispatchSemaphore(value: 0)
+            let proceed = DispatchSemaphore(value: 0)
+
+            func hold() {
+                log.add("hold begins")
+                began.signal()
+                // Bounded, so a bound that does not end the wait fails the
+                // test instead of hanging it.
+                if proceed.wait(timeout: .now() + .seconds(3)) == .timedOut {
+                    log.add("hold timed out")
+                }
+                log.add("hold ends")
+            }
+
+            /// The runtime's hold at once ends the wait that is pending.
+            func holdNow() {
+                log.add("holdNow")
+                proceed.signal()
+            }
+
+            func release() { log.add("release") }
+        }
+        let gate = WaitingGate()
+        let timer = ManualHoldTimer()
+        let hold = GuestGPUHold(gate: gate, timer: timer.timer)
+        let landed = CallLog()
+        hold.arm(after: 1.5) { landed.add("landed") }
+
+        let finished = DispatchSemaphore(value: 0)
+        let result = CallLog()
+        let mainPath = Thread {
+            result.add(hold.hold() ? "took" : "found it taken")
+            finished.signal()
+        }
+        mainPath.start()
+        #expect(gate.began.wait(timeout: .now() + .seconds(5)) == .success)
+        // The main path is waiting on the gate. Firing the bound returns
+        // without waiting for it.
+        timer.fire()
+        #expect(Array(gate.log.entries.prefix(2)) == ["hold begins", "holdNow"])
+        #expect(landed.entries == ["landed"])
+
+        #expect(finished.wait(timeout: .now() + .seconds(5)) == .success)
+        #expect(result.entries == ["took"])
+        #expect(gate.log.entries == ["hold begins", "holdNow", "hold ends"])
+        #expect(hold.isHeld)
+        #expect(hold.release())
+        #expect(!hold.release())
+        #expect(gate.log.entries.last == "release")
     }
 
     /// The point of the bound: the main thread is blocked, as it is while it

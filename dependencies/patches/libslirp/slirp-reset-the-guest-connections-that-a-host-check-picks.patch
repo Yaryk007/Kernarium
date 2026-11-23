@@ -1,0 +1,125 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 16:23:32 +0900
+Subject: [PATCH] slirp: reset the guest connections that a host check picks
+
+A host socket whose local address has gone cannot carry its connection
+any more, yet nothing tells libslirp: the host stack either keeps
+retransmitting until it gives up, or, for a connection only the server
+writes on, never reports an error. The guest waits on a connection that
+ends in a clean close long after, or never.
+
+slirp_reset_tcp_flows() asks a callback about the host socket of each
+connection the guest opened that is connecting or connected, and drops
+each one the callback picks the way a failed host socket is dropped:
+the guest is sent a reset and the socket is closed. A host forward's
+listener and the connections accepted from it, and a connection without
+a descriptor, are not asked. The application calls it from the thread
+that drives the instance, as it calls slirp_input(). The callback only
+answers about the descriptor it is given: it does not call into the
+instance, change its connections or close that descriptor.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/libslirp.h   | 18 ++++++++++++++++++
+ src/libslirp.map |  1 +
+ src/slirp.c      | 38 ++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 57 insertions(+)
+
+diff --git a/src/libslirp.h b/src/libslirp.h
+index 240dfe8bc525507944319603308b54822acebda5..4b0d465fc07b7d8e4d64bad669c4b038cc9c0a27 100644
+--- a/src/libslirp.h
++++ b/src/libslirp.h
+@@ -97,6 +97,8 @@ typedef int (*SlirpAddPollCb)(int fd, int events, void *opaque);
+ typedef int (*SlirpAddPollSocketCb)(slirp_os_socket fd, int events, void *opaque);
+ /* Callback for libslirp to get polling result */
+ typedef int (*SlirpGetREventsCb)(int idx, void *opaque);
++/* Callback for slirp_reset_tcp_flows to pick a connection by its host socket */
++typedef bool (*SlirpSelectSocketCb)(slirp_os_socket fd, void *opaque);
+ 
+ /* For now libslirp creates only a timer for the IPv6 RA */
+ typedef enum SlirpTimerId {
+@@ -294,6 +296,22 @@ SLIRP_EXPORT
+ void slirp_pollfds_poll(Slirp *slirp, int select_error,
+                         SlirpGetREventsCb get_revents, void *opaque);
+ 
++/* This is called by the application, from the thread that drives the
++ * instance, to end guest TCP connections whose host socket the application
++ * says is of no use any more (its local address is gone). should_reset is
++ * called once for the host socket of each connection that the guest opened
++ * and that is connecting or connected; a host forward's listener and the
++ * connections accepted from it are not asked. Each connection it returns
++ * true for is dropped as a failed host connection is: the guest is sent a
++ * reset and the host socket is closed. Returns the number dropped.
++ *
++ * should_reset only answers about the descriptor it is given: it must not
++ * call into this instance, add, change or close its connections, or close
++ * that descriptor, because the walk holds the connections that follow. */
++SLIRP_EXPORT
++int slirp_reset_tcp_flows(Slirp *slirp, SlirpSelectSocketCb should_reset,
++                          void *opaque);
++
+ /* This is called by the application when the guest emits a packet on the
+  * guest network, to be interpreted by slirp. */
+ SLIRP_EXPORT
+diff --git a/src/libslirp.map b/src/libslirp.map
+index 315bdf093707e08108560cf0d7aebcc4f89e0cbb..d9addf6649b3bed035fb79deb4d77f2fd46301a3 100644
+--- a/src/libslirp.map
++++ b/src/libslirp.map
+@@ -41,6 +41,7 @@ SLIRP_4.7 {
+ 
+ SLIRP_4.9 {
+     slirp_pollfds_fill_socket;
++    slirp_reset_tcp_flows;
+     slirp_set_debug;
+     slirp_reset_debug;
+ } SLIRP_4.7;
+diff --git a/src/slirp.c b/src/slirp.c
+index c577ab4f380144b6f52ee285161e342f8549df27..d198ca8e9495387fffbc24c0822df8f394e3ff63 100644
+--- a/src/slirp.c
++++ b/src/slirp.c
+@@ -1225,6 +1225,44 @@ void slirp_pollfds_poll(Slirp *slirp, int select_error,
+     if_start(slirp);
+ }
+ 
++/*
++ * Drop the guest's TCP connections whose host socket should_reset() picks,
++ * as a host socket that fails is dropped: tcp_drop() sends the guest a reset
++ * once the guest's SYN has been received, then closes the socket and frees
++ * the connection.
++ *
++ * Only a connection the guest opened and that still has its host socket is
++ * asked. A listener and the connections accepted from a host forward are not
++ * the guest's outbound flows, and a socket without a descriptor has nothing
++ * to ask about (NOFDREF covers a connection whose host side is closed).
++ */
++int slirp_reset_tcp_flows(Slirp *slirp, SlirpSelectSocketCb should_reset,
++                          void *opaque)
++{
++    struct socket *so, *so_next;
++    int dropped = 0;
++
++    g_return_val_if_fail(slirp != NULL, 0);
++    g_return_val_if_fail(should_reset != NULL, 0);
++
++    for (so = slirp->tcb.so_next; so != &slirp->tcb; so = so_next) {
++        so_next = so->so_next;
++
++        if ((so->so_state & (SS_NOFDREF | SS_FACCEPTCONN | SS_INCOMING |
++                             SS_HOSTFWD)) ||
++            !(so->so_state & (SS_ISFCONNECTING | SS_ISFCONNECTED)) ||
++            not_valid_socket(so->s)) {
++            continue;
++        }
++        if (!should_reset(so->s, opaque)) {
++            continue;
++        }
++        tcp_drop(sototcpcb(so), ECONNRESET);
++        dropped++;
++    }
++    return dropped;
++}
++
+ static void arp_input(Slirp *slirp, const uint8_t *pkt, int pkt_len)
+ {
+     const struct slirp_arphdr *ah =

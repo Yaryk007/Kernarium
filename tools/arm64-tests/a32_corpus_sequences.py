@@ -22,13 +22,22 @@ one the instructions give one by one.
   shifted or not, and MOVW) and the conditional VFP VMOV of a register, each
   under conditions that pass and fail; and conditional runs that mix them
   with loads and stores, in A32 and in Thumb IT blocks.
+
+The exclusive-retry suite is a compare-and-swap loop whose compare mismatch (a
+branch out of the pair) or failed condition (a store-exclusive under a
+condition code or an IT block) reaches a store-exclusive that has no
+load-exclusive of its own. The monitor is still armed there, so the store
+succeeds and the loop ends after one pass, as single-stepping gives; an engine
+that clears the monitor on the way out never ends it. A32: word, byte and
+halfword pairs; Thumb: B<cond>.N, B<cond>.W, CBNZ, and IT and ITE blocks. The
+paths where the compare matches are the controls.
 """
 
 from __future__ import annotations
 
 __import__("sys").dont_write_bytecode = True
 
-from a32_corpus_control import Prog, cond_flags  # noqa: E402
+from a32_corpus_control import Prog, arm_tail, cond_flags, thumb_tail  # noqa: E402
 from a32_corpus_memory import D, READ_ONLY  # noqa: E402
 from a32_corpus_plan import FLAGS, Case, Context, decode, pattern  # noqa: E402
 
@@ -471,4 +480,159 @@ def suite_sequences(context: Context) -> list[Case]:
     return results
 
 
-SUITES = {SUITE: suite_sequences}
+# exclusive-retry --------------------------------------------------------------------------------------
+
+RETRY_SUITE = "exclusive-retry"
+RETRY_ADDRESS = D + 0x1040
+RETRY_VALUE = 41  # the word at the address when the loop starts
+NE = 1
+
+
+def a32_branch(cond: int, here: int, target: int) -> int:
+    return cond << 28 | 0x0A000000 | ((target - (here + 8)) >> 2) & 0xFFFFFF
+
+
+def t16_branch(cond: int, here: int, target: int) -> int:
+    """B<cond>.N (encoding T1)."""
+    return 0xD000 | cond << 8 | ((target - (here + 4)) >> 1) & 0xFF
+
+
+def t32_branch(cond: int, here: int, target: int) -> tuple[int, int]:
+    """B<cond>.W (encoding T3) for an offset within 2 KiB."""
+    offset = ((target - (here + 4)) >> 1) & 0x3FFFF
+    return 0xF000 | cond << 6 | offset >> 11 & 0x3F, 0x8000 | offset & 0x7FF
+
+
+def t16_cbnz(register: int, here: int, target: int) -> int:
+    value = (target - (here + 4)) >> 1
+    return 0xB900 | (value >> 5 & 1) << 9 | (value & 31) << 3 | register
+
+
+def retry_case(context: Context, state: str, items: list[tuple], number: int, name: str, target_label: str,
+               retired: int, initial: dict, expect: dict) -> Case:
+    """One loop. `items` are ("label", name), ("w", word) in A32, ("h", half) or
+    ("hh", first, second) in Thumb, ("b", cond, label), ("bw", cond, label),
+    ("cbnz", register, label) and ("tail",). The word at RETRY_ADDRESS starts
+    as RETRY_VALUE; `target_label` marks the instruction under test; `expect`
+    gives the final value of registers `initial` sets."""
+    size = ({"w": 4, "b": 4, "tail": 4} if state == ARM
+            else {"h": 2, "hh": 4, "b": 2, "bw": 4, "cbnz": 2, "tail": 4})
+    offsets, here = {}, 0
+    for item in items:
+        if item[0] == "label":
+            offsets[item[1]] = here
+        else:
+            here += size[item[0]]
+    p = Program(context, state)
+    ordinals = {}
+    here = 0
+    for item in items:
+        kind = item[0]
+        if kind == "label":
+            ordinals[item[1]] = len(p.forms)
+            continue
+        if kind == "w":
+            p.a32(item[1])
+        elif kind == "h":
+            p.t16(item[1])
+        elif kind == "hh":
+            p.t32(item[1] << 16 | item[2])
+        elif kind == "b" and state == ARM:
+            p.a32(a32_branch(item[1], here, offsets[item[2]]))
+        elif kind == "b":
+            p.t16(t16_branch(item[1], here, offsets[item[2]]))
+        elif kind == "bw":
+            first, second = t32_branch(item[1], here, offsets[item[2]])
+            p.t32(first << 16 | second)
+        elif kind == "cbnz":
+            p.t16(t16_cbnz(item[1], here, offsets[item[2]]))
+        elif state == ARM:
+            p.a32(arm_tail(here))
+        else:
+            first, second = thumb_tail(here)
+            p.t32(first << 16 | second)
+        here += size[kind]
+    target = ordinals[target_label]
+    letter = "a" if state == ARM else "t"
+    case = Case(RETRY_SUITE, f"{p.forms[target]}/{name}.{letter}", p.forms[target], state,
+                p.prog.program(state), target, f"{RECIPES[number % len(RECIPES)]}-{letter}",
+                {"r0": RETRY_ADDRESS, "r3": 0, **initial},
+                data_patches=[(0x1040, RETRY_VALUE.to_bytes(4, "little"))], straight=False,
+                retired=retired)
+    case.expect = {key: (value - case.initial[key]) & MASK for key, value in expect.items()}
+    return case
+
+
+def suite_exclusive_retry(context: Context) -> list[Case]:
+    results: list[Case] = []
+    # A32. The compare is against r1, which holds the loaded value plus one
+    # (a mismatch) or the value itself (a match, the control).
+    ldrex, ldrexb, ldrexh = 0xE1903F9F, 0xE1D03F9F, 0xE1F03F9F
+    cmp_r3_r1, cmp_r12_0, cmp_r6_0 = 0xE1530001, 0xE35C0000, 0xE3560000
+    strex_r12_r2, strex_r6_r7 = 0xE180CF92, 0xE1806F97
+    arm_regs = {"r1": RETRY_VALUE + 1, "r2": 42, "r4": 55, "r6": 9, "r7": 43, "r12": 0xDEAD}
+    arm_done = {"r3": RETRY_VALUE, "r6": 0, "r12": 0xDEAD}
+
+    def arm(name, target, items, initial=None, expect=None):
+        results.append(retry_case(context, ARM, items, len(results), name, target, 7,
+                                  {**arm_regs, **(initial or {})}, {**arm_done, **(expect or {})}))
+
+    # A branch out of the pair to a store-exclusive of its own: word and byte.
+    for suffix, load, first, second in (("", ldrex, strex_r12_r2, strex_r6_r7),
+                                       ("_byte", ldrexb, 0xE1C0CF92, 0xE1C06F97)):
+        arm(f"side_exit{suffix}", "second", [
+            ("label", "load"), ("w", load), ("w", cmp_r3_r1), ("b", NE, "second"),
+            ("w", first), ("w", cmp_r12_0), ("b", NE, "load"), ("tail",),
+            ("label", "second"), ("w", second), ("w", cmp_r6_0), ("b", NE, "load"), ("tail",)])
+    arm("side_exit_match", "first", [
+        ("label", "load"), ("w", ldrex), ("w", cmp_r3_r1), ("b", NE, "second"),
+        ("label", "first"), ("w", strex_r12_r2), ("w", cmp_r12_0), ("b", NE, "load"), ("tail",),
+        ("label", "second"), ("w", strex_r6_r7), ("w", cmp_r6_0), ("b", NE, "load"), ("tail",)],
+        {"r1": RETRY_VALUE}, {"r6": 9, "r12": 0})
+    # A store-exclusive under a condition that fails, then one with no load of
+    # its own: STREXEQ then STREX, STREXEQ then STREXNE, and the halfword pair.
+    arm("cond_failed", "second", [
+        ("label", "load"), ("w", ldrex), ("w", cmp_r3_r1), ("w", 0x0180CF92),
+        ("label", "second"), ("w", strex_r6_r7), ("w", cmp_r6_0), ("b", NE, "load"), ("tail",)])
+    arm("cond_failed_ne", "second", [
+        ("label", "load"), ("w", ldrex), ("w", cmp_r3_r1), ("w", 0x0180CF92),
+        ("label", "second"), ("w", 0x1180CF94), ("w", cmp_r12_0), ("b", NE, "load"), ("tail",)],
+        None, {"r6": 9, "r12": 0})
+    arm("cond_failed_half", "second", [
+        ("label", "load"), ("w", ldrexh), ("w", cmp_r3_r1), ("w", 0x01E0CF92),
+        ("label", "second"), ("w", 0xE1E06F97), ("w", cmp_r6_0), ("b", NE, "load"), ("tail",)])
+
+    # Thumb. The status registers are low so that the compares are 16-bit.
+    ldrex_t, strex_r5_r2, strex_r6_r7_t, strex_r5_r4 = (
+        (0xE850, 0x3F00), (0xE840, 0x2500), (0xE840, 0x7600), (0xE840, 0x4500))
+    cmp_r3_r1_t, cmp_r5_0, cmp_r6_0_t = 0x428B, 0x2D00, 0x2E00
+    thumb_regs = {"r1": RETRY_VALUE + 1, "r2": 42, "r4": 55, "r5": 9, "r6": 9, "r7": 43}
+    thumb_done = {"r3": RETRY_VALUE, "r5": 9, "r6": 0}
+
+    def thumb(name, target, retired, items, initial=None, expect=None):
+        results.append(retry_case(context, THUMB, items, len(results), name, target, retired,
+                                  {**thumb_regs, **(initial or {})}, {**thumb_done, **(expect or {})}))
+
+    exits = [("label", "second"), ("hh", *strex_r6_r7_t), ("h", cmp_r6_0_t), ("b", NE, "load"), ("tail",)]
+    store = [("hh", *strex_r5_r2), ("h", cmp_r5_0), ("b", NE, "load"), ("tail",)]
+    thumb("side_exit_n", "second", 7, [
+        ("label", "load"), ("hh", *ldrex_t), ("h", cmp_r3_r1_t), ("b", NE, "second"), *store, *exits])
+    thumb("side_exit_w", "second", 7, [
+        ("label", "load"), ("hh", *ldrex_t), ("h", cmp_r3_r1_t), ("bw", NE, "second"), *store, *exits])
+    thumb("side_exit_cbnz", "second", 6, [
+        ("label", "load"), ("hh", *ldrex_t), ("cbnz", 3, "second"), *store, *exits])
+    thumb("side_exit_match_n", "first", 7, [
+        ("label", "load"), ("hh", *ldrex_t), ("h", cmp_r3_r1_t), ("b", NE, "second"),
+        ("label", "first"), *store, *exits], {"r1": RETRY_VALUE}, {"r5": 0, "r6": 9})
+    # A store in an IT block is not fused; its loop ends through the semantic path.
+    thumb("it_eq", "second", 8, [
+        ("label", "load"), ("hh", *ldrex_t), ("h", cmp_r3_r1_t), ("h", 0xBF08), ("hh", *strex_r5_r2),
+        *exits])
+    thumb("it_ite", "second", 8, [
+        ("label", "load"), ("hh", *ldrex_t), ("h", cmp_r3_r1_t), ("h", 0xBF0C), ("hh", *strex_r5_r2),
+        ("label", "second"), ("hh", *strex_r5_r4), ("h", cmp_r5_0), ("b", NE, "load"), ("tail",)],
+        None, {"r5": 0, "r6": 9})
+    return results
+
+
+SUITES = {SUITE: suite_sequences, RETRY_SUITE: suite_exclusive_retry}

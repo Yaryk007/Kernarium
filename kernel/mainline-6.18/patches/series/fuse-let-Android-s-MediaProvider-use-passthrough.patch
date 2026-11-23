@@ -1,0 +1,564 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Daniel Rosenberg <drosen@google.com>
+Date: Mon, 1 Jul 2024 14:56:24 -0700
+Subject: [PATCH] fuse: let Android's MediaProvider use passthrough
+
+Upstream FUSE passthrough cannot serve Android's shared storage, which
+MediaProvider serves as a FUSE daemon without CAP_SYS_ADMIN. Upstream
+refuses to register backing files without that capability, turns
+passthrough off when the server also asks for the writeback cache, and
+makes the io modes of an inode exclusive, whereas MediaProvider opens
+one file in both modes at once (an open that must redact location Exif
+stays on the daemon, the same file opened by another app is passed
+through).
+
+The Android common kernel carries the changes that lift this. They are
+combined here behind the new CONFIG_FUSE_PASSTHROUGH_ANDROID, which only
+the Android product enables, so a desktop kernel compiles them out:
+
+- Allow passthrough without CAP_SYS_ADMIN. Android's SELinux policy
+  keeps every app but MediaProvider off /dev/fuse, and of the domains
+  that may issue ioctls on it only MediaProvider and system_server run
+  without CAP_SYS_ADMIN. The AppFuse of system_server never negotiates
+  passthrough, which a connection needs to register a backing file.
+- Allow a passthrough and a cached open of one inode, and count the
+  passthrough opens apart (iopassctr, IOM_PASSTHROUGH).
+- Allow passthrough with the writeback cache (a revert of upstream
+  3ab394b363c5) and keep the attributes consistent: a passthrough write
+  takes them from the backing file.
+- Keep the cache coherent: flush the dirty pages before a passthrough
+  read, invalidate the written range after a passthrough write, and
+  allow a cached mmap next to passthrough opens.
+- Add /sys/fs/fuse/features/fuse_passthrough, by which MediaProvider
+  finds that the kernel does all of this.
+
+Signed-off-by: Daniel Rosenberg <drosen@google.com>
+Signed-off-by: Carlos Llamas <cmllamas@google.com>
+(squash of the Android common kernel android17-6.18 commits
+6fb1128f2700, 3ae410445fb1, 65687870ee84, d30885a29d65, 24955a554f92,
+62c103092ea2 and 610f86469e66, all by Daniel Rosenberg; their test is
+atest android.scopedstorage.cts.general.ScopedStorageDeviceTest)
+[Adapted to 6.18.60: every change is keyed on the new
+CONFIG_FUSE_PASSTHROUGH_ANDROID. Two things differ from the Android
+kernel. Registering a backing file still requires a connection that
+negotiated passthrough, which the Android kernel dropped. A passthrough
+write and splice_write flush the dirty pages of the inode first, as the
+read side does: a cached writer's older page is then not written back
+over the write, and the size the write takes from the backing file does
+not drop the cached pages beyond it. The Android kernel's quirks in
+fuse_inode_uncached_io_end() and fuse_is_io_cache_wait() are kept, and
+MediaProvider cannot reach them, as it never asks for parallel direct
+writes: when a parallel direct write ends, the backing file of the
+inode is dropped although passthrough opens remain, and a cached open
+that arrives during a parallel direct write beside a passthrough open
+does not wait for it.]
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ Documentation/ABI/testing/sysfs-fs-fuse |  8 +++
+ fs/fuse/Kconfig                         | 22 +++++++
+ fs/fuse/backing.c                       | 16 ++++-
+ fs/fuse/file.c                          | 15 ++++-
+ fs/fuse/fuse_i.h                        | 16 ++++-
+ fs/fuse/inode.c                         | 47 ++++++++++++++-
+ fs/fuse/iomode.c                        | 77 +++++++++++++++++++++++--
+ fs/fuse/passthrough.c                   | 54 ++++++++++++++++-
+ 8 files changed, 242 insertions(+), 13 deletions(-)
+ create mode 100644 Documentation/ABI/testing/sysfs-fs-fuse
+
+diff --git a/Documentation/ABI/testing/sysfs-fs-fuse b/Documentation/ABI/testing/sysfs-fs-fuse
+new file mode 100644
+index 0000000000000000000000000000000000000000..1535a14fa6dec8387a8b9e17cf3d85950c06bb69
+--- /dev/null
++++ b/Documentation/ABI/testing/sysfs-fs-fuse
+@@ -0,0 +1,8 @@
++What:		/sys/fs/fuse/features/fuse_passthrough
++Date:		February 2025
++Contact:	Daniel Rosenberg <drosen@google.com>
++Description:
++		Read-only file that contains the word 'supported' if fuse
++		passthrough with Android modifications is supported, does not
++		exist otherwise. The modifications are those of
++		CONFIG_FUSE_PASSTHROUGH_ANDROID.
+diff --git a/fs/fuse/Kconfig b/fs/fuse/Kconfig
+index 23572fcafdd16a176ccf8bc659fe32b9b744e185..531276b3b59fe2d556f33f75904d57127d6d7fd7 100644
+--- a/fs/fuse/Kconfig
++++ b/fs/fuse/Kconfig
+@@ -83,6 +83,28 @@ config FUSE_CANONICAL_PATH
+ 
+ 	  Say N unless the guest is Android.
+ 
++config FUSE_PASSTHROUGH_ANDROID
++	bool "FUSE passthrough as Android's MediaProvider uses it"
++	depends on FUSE_PASSTHROUGH
++	help
++	  This lets a FUSE server without CAP_SYS_ADMIN register backing
++	  files, keeps passthrough on when the server also asks for the
++	  writeback cache, and lets one inode have passthrough and cached
++	  opens at the same time. Upstream refuses all three.
++
++	  Android's MediaProvider serves shared storage with all three, and
++	  tells that the kernel provides them by the file
++	  /sys/fs/fuse/features/fuse_passthrough, which this option adds.
++
++	  Registering a backing file then needs no CAP_SYS_ADMIN. Android's
++	  SELinux policy keeps every app but MediaProvider off /dev/fuse, and
++	  of the domains that may issue ioctls on it only MediaProvider and
++	  system_server run without CAP_SYS_ADMIN. The AppFuse of system_server
++	  never negotiates passthrough, which a connection needs to register a
++	  backing file.
++
++	  Say N unless the guest is Android.
++
+ config FUSE_IO_URING
+ 	bool "FUSE communication over io-uring"
+ 	default y
+diff --git a/fs/fuse/backing.c b/fs/fuse/backing.c
+index 4afda419dd14168ea1b2ec49f2e7f2bcb87d7774..0aa639d0f20ba31170bd3994664a4741f5240c4b 100644
+--- a/fs/fuse/backing.c
++++ b/fs/fuse/backing.c
+@@ -89,8 +89,18 @@ int fuse_backing_open(struct fuse_conn *fc, struct fuse_backing_map *map)
+ 	pr_debug("%s: fd=%d flags=0x%x\n", __func__, map->fd, map->flags);
+ 
+ 	/* TODO: relax CAP_SYS_ADMIN once backing files are visible to lsof */
++	/*
++	 * Android's SELinux policy keeps every app but the media provider off
++	 * /dev/fuse, and of the domains that may issue ioctls on it only the
++	 * media provider and system_server run without CAP_SYS_ADMIN. The
++	 * AppFuse of system_server never negotiates passthrough, which the
++	 * check below refuses, and the media provider is not to be given
++	 * CAP_SYS_ADMIN.
++	 */
+ 	res = -EPERM;
+-	if (!fc->passthrough || !capable(CAP_SYS_ADMIN))
++	if (!fc->passthrough ||
++	    (!IS_ENABLED(CONFIG_FUSE_PASSTHROUGH_ANDROID) &&
++	     !capable(CAP_SYS_ADMIN)))
+ 		goto out;
+ 
+ 	res = -EINVAL;
+@@ -146,7 +156,9 @@ int fuse_backing_close(struct fuse_conn *fc, int backing_id)
+ 
+ 	/* TODO: relax CAP_SYS_ADMIN once backing files are visible to lsof */
+ 	err = -EPERM;
+-	if (!fc->passthrough || !capable(CAP_SYS_ADMIN))
++	if (!fc->passthrough ||
++	    (!IS_ENABLED(CONFIG_FUSE_PASSTHROUGH_ANDROID) &&
++	     !capable(CAP_SYS_ADMIN)))
+ 		goto out;
+ 
+ 	err = -EINVAL;
+diff --git a/fs/fuse/file.c b/fs/fuse/file.c
+index 0812eee881519c119b62ea21b2c20615be1d03e0..87a471340cc9b23ab33725d88e6b94fb0ae91ea7 100644
+--- a/fs/fuse/file.c
++++ b/fs/fuse/file.c
+@@ -2341,10 +2341,20 @@ static int fuse_file_mmap(struct file *file, struct vm_area_struct *vma)
+ 	 * If inode is in passthrough io mode, because it has some file open
+ 	 * in passthrough mode, either mmap to backing file or fail mmap,
+ 	 * because mixing cached mmap and passthrough io mode is not allowed.
++	 *
++	 * Android's MediaProvider opens one inode in both modes and maps both,
++	 * so there a cached mmap is allowed next to passthrough opens. A shared
++	 * mapping of both kinds is not coherent between them. A passthrough
++	 * read or write first flushes the dirty pages of the cached opens and
++	 * a passthrough write then invalidates the range it wrote, so it sees
++	 * the cached writes that completed before it and the cached opens see
++	 * its write afterwards. A cached write racing with a passthrough write
++	 * has no order.
+ 	 */
+ 	if (fuse_file_passthrough(ff))
+ 		return fuse_passthrough_mmap(file, vma);
+-	else if (fuse_inode_backing(get_fuse_inode(inode)))
++	else if (!IS_ENABLED(CONFIG_FUSE_PASSTHROUGH_ANDROID) &&
++		 fuse_inode_backing(get_fuse_inode(inode)))
+ 		return -ENODEV;
+ 
+ 	/*
+@@ -3169,6 +3179,9 @@ void fuse_init_file_inode(struct inode *inode, unsigned int flags)
+ 	INIT_LIST_HEAD(&fi->queued_writes);
+ 	fi->writectr = 0;
+ 	fi->iocachectr = 0;
++#ifdef CONFIG_FUSE_PASSTHROUGH_ANDROID
++	fi->iopassctr = 0;
++#endif
+ 	init_waitqueue_head(&fi->page_waitq);
+ 	init_waitqueue_head(&fi->direct_io_waitq);
+ 
+diff --git a/fs/fuse/fuse_i.h b/fs/fuse/fuse_i.h
+index 56e0019ca7b492e4830c7776b595d67fd022498d..4bc85f34314aee228217daf6f2bedf37c25585da 100644
+--- a/fs/fuse/fuse_i.h
++++ b/fs/fuse/fuse_i.h
+@@ -157,6 +157,11 @@ struct fuse_inode {
+ 			/** Number of files/maps using page cache */
+ 			int iocachectr;
+ 
++#ifdef CONFIG_FUSE_PASSTHROUGH_ANDROID
++			/* Number of files using passthrough */
++			int iopassctr;
++#endif
++
+ 			/* Waitq for writepage completion */
+ 			wait_queue_head_t page_waitq;
+ 
+@@ -284,8 +289,15 @@ struct fuse_file {
+ 	/** Wait queue head for poll */
+ 	wait_queue_head_t poll_wait;
+ 
+-	/** Does file hold a fi->iocachectr refcount? */
+-	enum { IOM_NONE, IOM_CACHED, IOM_UNCACHED } iomode;
++	/** Does file hold a fi->iocachectr (or fi->iopassctr) refcount? */
++	enum {
++		IOM_NONE,
++		IOM_CACHED,
++		IOM_UNCACHED,
++#ifdef CONFIG_FUSE_PASSTHROUGH_ANDROID
++		IOM_PASSTHROUGH,
++#endif
++	} iomode;
+ 
+ #ifdef CONFIG_FUSE_PASSTHROUGH
+ 	/** Reference to backing file in passthrough mode */
+diff --git a/fs/fuse/inode.c b/fs/fuse/inode.c
+index 091a375c32a8dcaba370fa58884092feb341975a..43ae515522f08d79151822f71e233f6c6f95121b 100644
+--- a/fs/fuse/inode.c
++++ b/fs/fuse/inode.c
+@@ -193,6 +193,9 @@ static void fuse_evict_inode(struct inode *inode)
+ 	}
+ 	if (S_ISREG(inode->i_mode) && !fuse_is_bad(inode)) {
+ 		WARN_ON(fi->iocachectr != 0);
++#ifdef CONFIG_FUSE_PASSTHROUGH_ANDROID
++		WARN_ON(fi->iopassctr != 0);
++#endif
+ 		WARN_ON(!list_empty(&fi->write_files));
+ 		WARN_ON(!list_empty(&fi->queued_writes));
+ 	}
+@@ -1430,13 +1433,15 @@ static void process_init_reply(struct fuse_args *args, int error)
+ 			 *
+ 			 * Also don't allow the combination of FUSE_PASSTHROUGH
+ 			 * and FUSE_WRITEBACK_CACHE, current design doesn't handle
+-			 * them together.
++			 * them together, except for Android's MediaProvider,
++			 * which asks for both.
+ 			 */
+ 			if (IS_ENABLED(CONFIG_FUSE_PASSTHROUGH) &&
+ 			    (flags & FUSE_PASSTHROUGH) &&
+ 			    arg->max_stack_depth > 0 &&
+ 			    arg->max_stack_depth <= FILESYSTEM_MAX_STACK_DEPTH &&
+-			    !(flags & FUSE_WRITEBACK_CACHE))  {
++			    (IS_ENABLED(CONFIG_FUSE_PASSTHROUGH_ANDROID) ||
++			     !(flags & FUSE_WRITEBACK_CACHE)))  {
+ 				fc->passthrough = 1;
+ 				fc->max_stack_depth = arg->max_stack_depth;
+ 				fm->sb->s_stack_depth = arg->max_stack_depth;
+@@ -2244,6 +2249,32 @@ static void fuse_fs_cleanup(void)
+ 
+ static struct kobject *fuse_kobj;
+ 
++#ifdef CONFIG_FUSE_PASSTHROUGH_ANDROID
++static ssize_t fuse_passthrough_show(struct kobject *kobj,
++				     struct kobj_attribute *attr, char *buff)
++{
++	return sysfs_emit(buff, "supported\n");
++}
++
++static struct kobj_attribute fuse_passthrough_attr =
++		__ATTR_RO(fuse_passthrough);
++
++static struct attribute *fuse_features[] = {
++	&fuse_passthrough_attr.attr,
++	NULL,
++};
++
++static const struct attribute_group fuse_features_group = {
++	.name = "features",
++	.attrs = fuse_features,
++};
++
++static const struct attribute_group *attribute_groups[] = {
++	&fuse_features_group,
++	NULL
++};
++#endif
++
+ static int fuse_sysfs_init(void)
+ {
+ 	int err;
+@@ -2258,8 +2289,17 @@ static int fuse_sysfs_init(void)
+ 	if (err)
+ 		goto out_fuse_unregister;
+ 
++#ifdef CONFIG_FUSE_PASSTHROUGH_ANDROID
++	err = sysfs_create_groups(fuse_kobj, attribute_groups);
++	if (err)
++		goto out_fuse_remove_mount_point;
++#endif
+ 	return 0;
+ 
++#ifdef CONFIG_FUSE_PASSTHROUGH_ANDROID
++out_fuse_remove_mount_point:
++	sysfs_remove_mount_point(fuse_kobj, "connections");
++#endif
+  out_fuse_unregister:
+ 	kobject_put(fuse_kobj);
+  out_err:
+@@ -2268,6 +2308,9 @@ static int fuse_sysfs_init(void)
+ 
+ static void fuse_sysfs_cleanup(void)
+ {
++#ifdef CONFIG_FUSE_PASSTHROUGH_ANDROID
++	sysfs_remove_groups(fuse_kobj, attribute_groups);
++#endif
+ 	sysfs_remove_mount_point(fuse_kobj, "connections");
+ 	kobject_put(fuse_kobj);
+ }
+diff --git a/fs/fuse/iomode.c b/fs/fuse/iomode.c
+index 3728933188f307a07e019e0d64c05735ebbbe934..869ce415f2c714a27888e868b9dd955188ccfad9 100644
+--- a/fs/fuse/iomode.c
++++ b/fs/fuse/iomode.c
+@@ -50,14 +50,21 @@ int fuse_file_cached_io_open(struct inode *inode, struct fuse_file *ff)
+ 	/*
+ 	 * Check if inode entered passthrough io mode while waiting for parallel
+ 	 * dio write completion.
++	 *
++	 * Android's MediaProvider opens an inode in both modes at once (a
++	 * redacted open stays cached), so there it is no failure.
+ 	 */
+-	if (fuse_inode_backing(fi)) {
++	if (!IS_ENABLED(CONFIG_FUSE_PASSTHROUGH_ANDROID) &&
++	    fuse_inode_backing(fi)) {
+ 		clear_bit(FUSE_I_CACHE_IO_MODE, &fi->state);
+ 		spin_unlock(&fi->lock);
+ 		return -ETXTBSY;
+ 	}
+ 
+ 	WARN_ON(ff->iomode == IOM_UNCACHED);
++#ifdef CONFIG_FUSE_PASSTHROUGH_ANDROID
++	WARN_ON(ff->iomode == IOM_PASSTHROUGH);
++#endif
+ 	if (ff->iomode == IOM_NONE) {
+ 		ff->iomode = IOM_CACHED;
+ 		if (fi->iocachectr == 0)
+@@ -81,6 +88,15 @@ static void fuse_file_cached_io_release(struct fuse_file *ff,
+ 	spin_unlock(&fi->lock);
+ }
+ 
++/*
++ * On Android a passthrough open is counted apart (iopassctr) and excludes no
++ * cached open, which MediaProvider needs for the opens it must redact.
++ */
++static inline bool fuse_io_passthrough_apart(struct fuse_backing *fb)
++{
++	return IS_ENABLED(CONFIG_FUSE_PASSTHROUGH_ANDROID) && fb;
++}
++
+ /* Start strictly uncached io mode where cache access is not allowed */
+ int fuse_inode_uncached_io_start(struct fuse_inode *fi, struct fuse_backing *fb)
+ {
+@@ -94,10 +110,15 @@ int fuse_inode_uncached_io_start(struct fuse_inode *fi, struct fuse_backing *fb)
+ 		err = -EBUSY;
+ 		goto unlock;
+ 	}
+-	if (fi->iocachectr > 0) {
++	if (fi->iocachectr > 0 && !fuse_io_passthrough_apart(fb)) {
+ 		err = -ETXTBSY;
+ 		goto unlock;
+ 	}
++#ifdef CONFIG_FUSE_PASSTHROUGH_ANDROID
++	if (fb)
++		fi->iopassctr++;
++	else
++#endif
+ 	fi->iocachectr--;
+ 
+ 	/* fuse inode holds a single refcount of backing file */
+@@ -125,7 +146,11 @@ static int fuse_file_uncached_io_open(struct inode *inode,
+ 		return err;
+ 
+ 	WARN_ON(ff->iomode != IOM_NONE);
++#ifdef CONFIG_FUSE_PASSTHROUGH_ANDROID
++	ff->iomode = IOM_PASSTHROUGH;
++#else
+ 	ff->iomode = IOM_UNCACHED;
++#endif
+ 	return 0;
+ }
+ 
+@@ -154,16 +179,50 @@ static void fuse_file_uncached_io_release(struct fuse_file *ff,
+ 	fuse_inode_uncached_io_end(fi);
+ }
+ 
++#ifdef CONFIG_FUSE_PASSTHROUGH_ANDROID
++static void fuse_inode_passthrough_io_end(struct fuse_inode *fi)
++{
++	struct fuse_backing *oldfb = NULL;
++
++	spin_lock(&fi->lock);
++	WARN_ON(fi->iopassctr == 0);
++	fi->iopassctr--;
++	if (!fi->iopassctr)
++		oldfb = fuse_inode_backing_set(fi, NULL);
++	spin_unlock(&fi->lock);
++	if (oldfb)
++		fuse_backing_put(oldfb);
++}
++
++/* Drop passthrough io reference from passthrough open */
++static void fuse_file_passthrough_io_release(struct fuse_file *ff,
++					     struct fuse_inode *fi)
++{
++	WARN_ON(ff->iomode != IOM_PASSTHROUGH);
++	ff->iomode = IOM_NONE;
++	fuse_inode_passthrough_io_end(fi);
++}
++#endif
++
+ /*
+  * Open flags that are allowed in combination with FOPEN_PASSTHROUGH.
+  * A combination of FOPEN_PASSTHROUGH and FOPEN_DIRECT_IO means that read/write
+  * operations go directly to the server, but mmap is done on the backing file.
+  * FOPEN_PASSTHROUGH mode should not co-exist with any users of the fuse inode
+  * page cache, so FOPEN_KEEP_CACHE is a strange and undesired combination.
++ *
++ * On Android it is the normal one: MediaProvider keeps the cache of a file that
++ * is open in both modes.
+  */
++#ifdef CONFIG_FUSE_PASSTHROUGH_ANDROID
++#define FOPEN_PASSTHROUGH_ANDROID_MASK	FOPEN_KEEP_CACHE
++#else
++#define FOPEN_PASSTHROUGH_ANDROID_MASK	0
++#endif
++
+ #define FOPEN_PASSTHROUGH_MASK \
+ 	(FOPEN_PASSTHROUGH | FOPEN_DIRECT_IO | FOPEN_PARALLEL_DIRECT_WRITES | \
+-	 FOPEN_NOFLUSH)
++	 FOPEN_NOFLUSH | FOPEN_PASSTHROUGH_ANDROID_MASK)
+ 
+ static int fuse_file_passthrough_open(struct inode *inode, struct file *file)
+ {
+@@ -208,10 +267,13 @@ int fuse_file_io_open(struct file *file, struct inode *inode)
+ 
+ 	/*
+ 	 * Server is expected to use FOPEN_PASSTHROUGH for all opens of an inode
+-	 * which is already open for passthrough.
++	 * which is already open for passthrough, except on Android, where the
++	 * writeback cache allows both.
+ 	 */
+ 	err = -EINVAL;
+-	if (fuse_inode_backing(fi) && !(ff->open_flags & FOPEN_PASSTHROUGH))
++	if (fuse_inode_backing(fi) && !(ff->open_flags & FOPEN_PASSTHROUGH) &&
++	    !(IS_ENABLED(CONFIG_FUSE_PASSTHROUGH_ANDROID) &&
++	      get_fuse_conn(inode)->writeback_cache))
+ 		goto fail;
+ 
+ 	/*
+@@ -271,5 +333,10 @@ void fuse_file_io_release(struct fuse_file *ff, struct inode *inode)
+ 	case IOM_CACHED:
+ 		fuse_file_cached_io_release(ff, fi);
+ 		break;
++#ifdef CONFIG_FUSE_PASSTHROUGH_ANDROID
++	case IOM_PASSTHROUGH:
++		fuse_file_passthrough_io_release(ff, fi);
++		break;
++#endif
+ 	}
+ }
+diff --git a/fs/fuse/passthrough.c b/fs/fuse/passthrough.c
+index f2d08ac2459b7e05578edd56960e1028d6d1bb49..6f625cfc18111f35e4f1a59a9be5b1b5e1610130 100644
+--- a/fs/fuse/passthrough.c
++++ b/fs/fuse/passthrough.c
+@@ -10,6 +10,7 @@
+ #include <linux/file.h>
+ #include <linux/backing-file.h>
+ #include <linux/splice.h>
++#include <linux/pagemap.h>
+ 
+ static void fuse_file_accessed(struct file *file)
+ {
+@@ -22,7 +23,35 @@ static void fuse_passthrough_end_write(struct kiocb *iocb, ssize_t ret)
+ {
+ 	struct inode *inode = file_inode(iocb->ki_filp);
+ 
+-	fuse_write_update_attr(inode, iocb->ki_pos, ret);
++#ifdef CONFIG_FUSE_PASSTHROUGH_ANDROID
++	if (get_fuse_conn(inode)->writeback_cache) {
++		/*
++		 * With the writeback cache the kernel, not the server, is the
++		 * arbiter of the attributes: fuse_write_update_attr() would
++		 * only invalidate them and the server's update would then be
++		 * ignored. Take them from the backing file instead.
++		 */
++		struct fuse_file *ff = iocb->ki_filp->private_data;
++		struct inode *backing_inode =
++			file_inode(fuse_file_passthrough(ff));
++
++		inode_set_mtime_to_ts(inode, inode_get_mtime(backing_inode));
++		inode_set_ctime_to_ts(inode, inode_get_ctime(backing_inode));
++		inode->i_blocks = backing_inode->i_blocks;
++		i_size_write(inode, i_size_read(backing_inode));
++	} else
++#endif
++	{
++		fuse_write_update_attr(inode, iocb->ki_pos, ret);
++	}
++
++#ifdef CONFIG_FUSE_PASSTHROUGH_ANDROID
++	/* Pages cached by a cached open of the file are stale after a write */
++	if (ret > 0)
++		invalidate_inode_pages2_range(inode->i_mapping,
++					      (iocb->ki_pos - ret) >> PAGE_SHIFT,
++					      iocb->ki_pos >> PAGE_SHIFT);
++#endif
+ }
+ 
+ ssize_t fuse_passthrough_read_iter(struct kiocb *iocb, struct iov_iter *iter)
+@@ -44,6 +73,13 @@ ssize_t fuse_passthrough_read_iter(struct kiocb *iocb, struct iov_iter *iter)
+ 	if (!count)
+ 		return 0;
+ 
++#ifdef CONFIG_FUSE_PASSTHROUGH_ANDROID
++	/*
++	 * A cached open of the file may have dirty pages that only the server
++	 * can write back, and the backing file would not show them.
++	 */
++	write_inode_now(file_inode(file), 1);
++#endif
+ 	ret = backing_file_read_iter(backing_file, iter, iocb, iocb->ki_flags,
+ 				     &ctx);
+ 
+@@ -70,6 +106,14 @@ ssize_t fuse_passthrough_write_iter(struct kiocb *iocb,
+ 	if (!count)
+ 		return 0;
+ 
++#ifdef CONFIG_FUSE_PASSTHROUGH_ANDROID
++	/*
++	 * A cached open of the file may have dirty pages. Written back after
++	 * this write they would overwrite it, and the size taken from the
++	 * backing file afterwards would drop those beyond its end.
++	 */
++	write_inode_now(inode, 1);
++#endif
+ 	inode_lock(inode);
+ 	ret = backing_file_write_iter(backing_file, iter, iocb, iocb->ki_flags,
+ 				      &ctx);
+@@ -94,6 +138,10 @@ ssize_t fuse_passthrough_splice_read(struct file *in, loff_t *ppos,
+ 	pr_debug("%s: backing_file=0x%p, pos=%lld, len=%zu, flags=0x%x\n", __func__,
+ 		 backing_file, *ppos, len, flags);
+ 
++#ifdef CONFIG_FUSE_PASSTHROUGH_ANDROID
++	/* Flush the dirty pages of cached opens, as the read does */
++	write_inode_now(file_inode(in), 1);
++#endif
+ 	init_sync_kiocb(&iocb, in);
+ 	iocb.ki_pos = *ppos;
+ 	ret = backing_file_splice_read(backing_file, &iocb, pipe, len, flags, &ctx);
+@@ -119,6 +167,10 @@ ssize_t fuse_passthrough_splice_write(struct pipe_inode_info *pipe,
+ 	pr_debug("%s: backing_file=0x%p, pos=%lld, len=%zu, flags=0x%x\n", __func__,
+ 		 backing_file, *ppos, len, flags);
+ 
++#ifdef CONFIG_FUSE_PASSTHROUGH_ANDROID
++	/* Flush the dirty pages of cached opens, as the write does */
++	write_inode_now(inode, 1);
++#endif
+ 	inode_lock(inode);
+ 	init_sync_kiocb(&iocb, out);
+ 	iocb.ki_pos = *ppos;

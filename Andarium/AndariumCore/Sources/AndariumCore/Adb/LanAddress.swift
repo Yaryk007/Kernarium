@@ -76,6 +76,21 @@ public enum LanAddress {
     public static func current() -> String? {
         choose(from: interfaceAddresses())
     }
+
+    /// Whether `peer` (the four octets of an IPv4 address) is the device's
+    /// own: an address some interface of `addresses` holds, up or down, or any
+    /// address of the loopback block when a loopback interface holds one. A
+    /// connection from such an address comes from a process of the device
+    /// itself, whichever of its addresses it connected to. Anything that is
+    /// not four octets cannot be judged and counts as the device's own.
+    public static func isOwn(_ peer: [UInt8], among addresses: [InterfaceAddress]) -> Bool {
+        guard peer.count == 4 else { return true }
+        return addresses.contains { held in
+            guard held.octets.count == 4 else { return false }
+            if held.octets == peer { return true }
+            return held.isLoopback && held.octets[0] == 127 && peer[0] == 127
+        }
+    }
 }
 
 /// The guest's own "USB debugging" setting, which ADB over the network needs

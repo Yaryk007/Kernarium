@@ -68,10 +68,10 @@ void theLaunchStatesTheLimit()
 	/* The iPad mini 6's limit, by option: an eighth of it is 358 MiB, above
 	 * the cap of one vCPU and of eight. */
 	result = run(emulator.get(), "--memory-limit=2867M");
-	require(result.limit == 2867 * mib && result.budget == 128 * mib,
+	require(result.limit == 2867 * mib && result.budget == 160 * mib,
 		"the option did not state the limit, or one vCPU's cap");
 	result = run(emulator.get(), "--memory-limit=2867M", "ncpus=8");
-	require(result.limit == 2867 * mib && result.budget == 272 * mib,
+	require(result.limit == 2867 * mib && result.budget == 304 * mib,
 		"eight vCPUs' cap");
 	require(2867 * mib / 8 / mib == 358);
 
@@ -83,7 +83,7 @@ void theLaunchStatesTheLimit()
 	/* The variable states it too, and the option beats it. */
 	require(::setenv(platform::memory_limit_variable, "2867", 1) == 0);
 	result = run(emulator.get());
-	require(result.limit == 2867 * mib && result.budget == 128 * mib,
+	require(result.limit == 2867 * mib && result.budget == 160 * mib,
 		"the variable did not state the limit");
 	result = run(emulator.get(), "--memory-limit=1024M");
 	require(result.limit == 1024 * mib && result.budget == 128 * mib,

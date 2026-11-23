@@ -1,0 +1,29 @@
+// SPDX-License-Identifier: Apache-2.0
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+// The thermal HAL of the guest: Android's thermal manager reads the host's
+// thermal state through it (the host application sends the severity over vsock
+// port 5559). It replaces the AOSP example HAL, whose APEX is not installed, and
+// its fragment declares IThermal/default on every device.
+cc_binary {
+    name: "android.hardware.thermal-service.andarium",
+    relative_install_path: "hw",
+    init_rc: ["android.hardware.thermal-service.andarium.rc"],
+    vintf_fragments: ["android.hardware.thermal-service.andarium.xml"],
+    vendor: true,
+    cpp_std: "c++20",
+    srcs: [
+        "HostLink.cpp",
+        "Thermal.cpp",
+        "main.cpp",
+    ],
+    shared_libs: [
+        "libbase",
+        "libbinder_ndk",
+        "liblog",
+        "android.hardware.thermal-V3-ndk",
+    ],
+    cflags: ["-Wall", "-Wextra", "-Werror"],
+}

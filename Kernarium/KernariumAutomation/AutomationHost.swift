@@ -329,9 +329,17 @@ private struct Executor {
             }
         }
         // Issues a command raises are taken from XCTest's record, so the
-        // host's log is the only place a failure stays visible.
+        // host's log is the only place a failure stays visible. Every line of
+        // the text carries the prefix: the supervisor reads xcodebuild's log
+        // for lines of xcodebuild's own, and a sender's words (a name it
+        // sent) must not be able to start one.
         if result["ok"] as? Bool != true {
-            print("AutomationHost: \(command["op"] as? String ?? "?") \(id) failed: \(result["error"] ?? "")")
+            let lines = "\(result["error"] ?? "")"
+                .split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
+            print("AutomationHost: \(command["op"] as? String ?? "?") \(id) failed: \(lines.first ?? "")")
+            for line in lines.dropFirst() {
+                print("AutomationHost:   \(line)")
+            }
         }
         return result
     }
@@ -512,7 +520,7 @@ private struct Executor {
                 case "control": flags.insert(.control)
                 case "option": flags.insert(.option)
                 case "command": flags.insert(.command)
-                default: throw Failure(message: "unknown modifier \(name)")
+                default: throw Failure(message: "unknown modifier \(name.debugDescription)")
                 }
             }
             // The script resolves key names to characters XCTest delivers.

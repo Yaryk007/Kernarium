@@ -1,0 +1,25 @@
+// SPDX-License-Identifier: Apache-2.0
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+// The gamepad relay of the guest: the host application's game controllers
+// become HID devices of the guest through /dev/uhid, which the kernel's own
+// drivers bind (the host application sends them over vsock port 5558). It is a
+// plain vendor daemon, not a HAL: it declares no interface, and it runs on every
+// device and creates nothing until a host controller connects.
+cc_binary {
+    name: "kernarium_gamepad",
+    init_rc: ["kernarium_gamepad.rc"],
+    vendor: true,
+    cpp_std: "c++20",
+    srcs: [
+        "Relay.cpp",
+        "main.cpp",
+    ],
+    shared_libs: [
+        "libbase",
+        "liblog",
+    ],
+    cflags: ["-Wall", "-Wextra", "-Werror"],
+}

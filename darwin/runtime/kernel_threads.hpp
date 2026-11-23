@@ -2,6 +2,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <mach/mach.h>
 #include <pthread.h>
 
@@ -38,6 +39,9 @@ struct KernelThreadSnapshot final {
 	 * has since ended stays listed until its slot is reused; stopping it
 	 * reports KERN_TERMINATED. */
 	mach_port_t threads[kernel_thread_capacity];
+	/* What each of those threads says it is waiting for
+	 * (platform/host_wait.hpp), in the same order. */
+	std::uint64_t waits[kernel_thread_capacity];
 	std::size_t thread_count;
 	/* Threads that are inside `kernel_pthread_create` and whose new thread
 	 * has not published itself yet. A creator must not be stopped until its
@@ -51,6 +55,13 @@ struct KernelThreadSnapshot final {
 
 /* Takes the registry's state without a lock. */
 void snapshot_kernel_threads(KernelThreadSnapshot &snapshot) noexcept;
+
+/* Counts the times a fence began or ended its reading of the thread ports
+ * (set_kernel_thread_reclaim_inhibited), which is when it holds the kernel's
+ * threads: a reader that sees the count change, or the inhibition set, knows
+ * that what it measured of the threads in between says nothing of the host. */
+[[nodiscard]] std::uint32_t kernel_thread_fence_epoch() noexcept;
+[[nodiscard]] bool kernel_thread_reclaim_inhibited() noexcept;
 
 /* Gives back the slots, and the port rights, of the kernel threads that have
  * ended, and returns how many slots are still in use: threads that run, and

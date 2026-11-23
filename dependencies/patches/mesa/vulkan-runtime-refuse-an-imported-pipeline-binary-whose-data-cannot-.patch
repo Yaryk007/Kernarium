@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 04:00:35 +0900
+Subject: [PATCH] vulkan/runtime: refuse an imported pipeline binary whose data
+ cannot be allocated
+
+vk_create_pipeline_binary allocates the binary and the data it imports in one
+object, sizeof(*binary) + data_size, and then copies data_size bytes into it.
+The size is the application's, and a size within sizeof(*binary) of SIZE_MAX
+wraps the sum to a small allocation that the copy then overruns. Refuse a
+size the sum cannot hold with the result an allocation that cannot be
+satisfied gives, VK_ERROR_OUT_OF_HOST_MEMORY, which is what the same function
+returns when the allocation fails.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/vulkan/runtime/vk_pipeline.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/src/vulkan/runtime/vk_pipeline.c b/src/vulkan/runtime/vk_pipeline.c
+index 44474f4e89c3fe39d767d01f40c0161914a565c7..8037fc4136149faab722f44727fc6d5dcc95175c 100644
+--- a/src/vulkan/runtime/vk_pipeline.c
++++ b/src/vulkan/runtime/vk_pipeline.c
+@@ -4132,6 +4132,13 @@ vk_create_pipeline_binary(struct vk_device *device,
+                        key_size, sizeof(blake3_hash));
+    }
+ 
++   /* The data follows the binary in one allocation, and its size is the
++    * application's: a size near SIZE_MAX wraps the sum below to a small
++    * allocation that the copy then overruns.  A size the allocation cannot
++    * hold is one it cannot satisfy. */
++   if (data_size > SIZE_MAX - sizeof(struct vk_pipeline_binary))
++      return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
++
+    struct vk_pipeline_binary *binary =
+       vk_object_alloc(device, alloc, sizeof(*binary) + data_size,
+                       VK_OBJECT_TYPE_PIPELINE_BINARY_KHR);

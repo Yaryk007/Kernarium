@@ -6,6 +6,8 @@
 	<array>
 		<string>com.imxieyi.Kernarium.guest.*</string>
 	</array>
+	<key>LSMinimumSystemVersion</key>
+	<string>27.0</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Kernarium records from the microphone only when you turn on Microphone in Emulator settings, so that programs in the guest can use it.</string>
 	<key>UIBackgroundModes</key>
