@@ -3,6 +3,7 @@
 import AndariumCore
 import CoreMotion
 import Foundation
+import ObjectiveC
 import os
 
 private nonisolated struct MotionConnector: GuestStreamOpener {
@@ -23,6 +24,16 @@ nonisolated enum CompassSource {
     static func isCalibrationNotice(_ error: any Error) -> Bool {
         let error = error as NSError
         return error.domain == CMErrorDomain && error.code == Int(CMErrorDeviceRequiresMovement.rawValue)
+    }
+
+    /// Keep the app buildable with SDKs that predate the optional query.
+    static func currentAuthorization() -> CMAuthorizationStatus? {
+        guard #available(iOS 27.2, *) else { return nil }
+        let selector = NSSelectorFromString("authorizationStatus")
+        guard let method = class_getClassMethod(CMMotionManager.self, selector) else { return nil }
+        typealias Query = @convention(c) (AnyClass, Selector) -> Int
+        let invoke = unsafeBitCast(method_getImplementation(method), to: Query.self)
+        return CMAuthorizationStatus(rawValue: invoke(CMMotionManager.self, selector))
     }
 
     /// Whether the person's motion permission leaves the field readable.
@@ -278,10 +289,7 @@ private final class CoreMotionDevice: MotionDevice, @unchecked Sendable {
         let assessment = CompassSource.assess(
             magnetometer: manager.isMagnetometerAvailable, deviceMotion: manager.isDeviceMotionAvailable,
             northFrame: { CMMotionManager.availableAttitudeReferenceFrames().contains(.xMagneticNorthZVertical) },
-            authorization: {
-                if #available(iOS 27.2, *) { return CMMotionManager.authorizationStatus }
-                return nil
-            })
+            authorization: CompassSource.currentAuthorization)
         // Once, so that a tester's log says whether this iOS states a motion
         // permission and what it was.
         if Self.reported.withLock({ let first = !$0; $0 = true; return first }) {
