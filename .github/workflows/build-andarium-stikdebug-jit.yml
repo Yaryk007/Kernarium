@@ -83,9 +83,12 @@ jobs:
           tar -xf "$RUNNER_TEMP/guest-aot.tar.gz" -C "$RUNNER_TEMP/guest-aot"
           aot_manifest="$(find "$RUNNER_TEMP/guest-aot" -name artifact.json -type f)"
           test -f "$aot_manifest"
-          android/lineage-24/tools/install-release.py \
-            --source "$RUNNER_TEMP/guest-release/$release_name" \
-            --aot-artifact "$(dirname "$aot_manifest")"
+          python -B tools/aot/release_artifact.py install \
+            --artifact "$(dirname "$aot_manifest")" \
+            --release "$RUNNER_TEMP/guest-release/$release_name"
+          python -B tools/aot/release_artifact.py verify \
+            --artifact ".build/android/aot/$release_name" \
+            --accepted android/lineage-24/metadata/accepted-aot.env
 
       - name: Prepare pinned dependency sources
         run: |
