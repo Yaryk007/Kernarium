@@ -35,7 +35,8 @@ jobs:
 
       - name: Install host tools
         run: |
-          brew install ninja meson mako pyyaml pkg-config rsync autoconf \
+          python -m pip install meson mako packaging PyYAML
+          brew install ninja pkg-config rsync autoconf \
             automake gettext libtool gperf groff cmake
 
       - name: Install the Metal toolchain
