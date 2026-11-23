@@ -28,6 +28,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install host tools
+        run: |
+          brew install ninja meson mako pyyaml pkg-config rsync autoconf \
+            automake gettext libtool gperf groff cmake
+
+      - name: Install the Metal toolchain
+        run: xcodebuild -downloadComponent MetalToolchain
+
       - name: Verify build tools
         run: |
           xcodebuild -version
