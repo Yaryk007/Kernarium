@@ -212,6 +212,7 @@ struct DisplayAreaProbe: View {
                 }
             }
             .onChange(of: model.sessionPlan?.guest.size) { publish() }
+            .onChange(of: model.usesNotchSpace) { publish() }
             .allowsHitTesting(false)
             .accessibilityHidden(true)
     }
@@ -229,7 +230,8 @@ struct DisplayAreaProbe: View {
         }
         model.displayPointsDidChange(
             SessionDisplayArea.size(
-                home: size, topInset: window.topInset, bottomInset: window.bottomInset, isPhone: window.isPhone))
+                home: size, topInset: window.topInset, bottomInset: window.bottomInset, isPhone: window.isPhone,
+                usesHousing: model.usesNotchSpace))
     }
 }
 

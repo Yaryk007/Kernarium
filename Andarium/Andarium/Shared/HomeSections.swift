@@ -367,6 +367,22 @@ struct HighRefreshRow: View {
     }
 }
 
+/// Whether Android's display takes the sensor housing's row
+/// (`AppModel.notchSpaceOn`). It is drawn only on a phone that has one.
+struct NotchSpaceRow: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        @Bindable var model = model
+        OptionRow(title: String(localized: "Notch space"), symbol: "iphone.gen3") {
+            Toggle("Notch space", isOn: $model.notchSpaceOn)
+                .labelsHidden()
+                .accessibilityIdentifier("home-notch-space-switch")
+        }
+        .id("notch-space")
+    }
+}
+
 /// The note beneath the 120 Hz group.
 enum HighRefreshWords {
     static let note = String(localized: "Smoother motion, more battery use.")
@@ -619,13 +635,18 @@ struct HomePerformanceSection: View {
 
     var body: some View {
         if model.guest != nil,
-            model.highRefreshOffered || model.translatedLibrariesAvailable || model.jitAvailable
+            model.highRefreshOffered || model.notchSpaceOffered || model.translatedLibrariesAvailable || model.jitAvailable
         {
             VStack(alignment: .leading, spacing: 8) {
                 Text("Performance").homeSectionHeading()
                 VStack(alignment: .leading, spacing: Self.groupSpacing) {
                     if model.highRefreshOffered {
                         HomeGroup { HighRefreshRow() } footer: { HighRefreshNote() }
+                    }
+                    if model.notchSpaceOffered {
+                        HomeGroup { NotchSpaceRow() } footer: {
+                            SectionNote(String(localized: "Android also uses the screen beside the camera. Applies when Android starts."))
+                        }
                     }
                     if model.translatedLibrariesAvailable {
                         HomeGroup { TranslatedLibrariesRow() } footer: { TranslatedLibrariesNote() }

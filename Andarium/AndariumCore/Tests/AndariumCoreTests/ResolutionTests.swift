@@ -351,6 +351,10 @@ struct SessionDisplayAreaTests {
         let phone = SessionDisplayArea.size(
             home: CGSize(width: 402, height: 778), topInset: 62, bottomInset: 34, isPhone: true)
         #expect(phone == CGSize(width: 402, height: 778))
+        // With the notch space the display takes the island's row too.
+        let notchSpace = SessionDisplayArea.size(
+            home: CGSize(width: 402, height: 778), topInset: 62, bottomInset: 34, isPhone: true, usesHousing: true)
+        #expect(notchSpace == CGSize(width: 402, height: 840))
         // iPad Pro 11-inch in portrait: the status bar's 24 points go to the display.
         let pad = SessionDisplayArea.size(
             home: CGSize(width: 834, height: 1166), topInset: 24, bottomInset: 20, isPhone: false)

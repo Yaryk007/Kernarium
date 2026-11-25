@@ -57,6 +57,11 @@ final class LiveRuntime: RuntimeDriver {
     /// Android reached `sys.boot_completed` in the boot under way, which a
     /// clean end records. Recovery never does.
     private var reachedBootCompleted = false
+    /// Whether the run's display takes the sensor housing's row, as the start
+    /// found the setting.
+    private var runNotchSpace = false
+    /// The phone's settings on their way to Android.
+    private var phoneTask: Task<Void, Never>?
     private let pause: PauseController
     /// The effects of the pause, on the one serial queue of the runtime calls
     /// that wait: a stop is delivered on it too.
@@ -693,6 +698,11 @@ final class LiveRuntime: RuntimeDriver {
         // Root: the release's Magisk ramdisk for every normal boot of this run;
         // the model decided it before the start and wrote it with the guest.
         let rootBoot = run.mode == .normal && run.guest.root.startRooted && rootRelease != nil
+        // What LineageOS says it runs on; the recovery and root ramdisks keep
+        // the image's own values.
+        let notchSpace = model?.usesNotchSpace == true
+        let properties = model?.phoneHardware?.properties(notchSpace: notchSpace)
+        runNotchSpace = notchSpace
         let memoryMiB = UInt32(run.guest.memoryMiB)
         runMemoryMiB = run.guest.memoryMiB
         let processorCount = UInt32(run.guest.cores)
@@ -727,7 +737,7 @@ final class LiveRuntime: RuntimeDriver {
                 width: width, height: height, dotsPerInch: dotsPerInch, memoryMiB: memoryMiB,
                 processorCount: processorCount, adbKeyLine: adbKeyLine, timeZone: timeZone,
                 sessionRecordPath: sessionRecordPath, hostFeatures: hostFeatures, cameraMode: cameraMode,
-                cameraPath: cameraPath, extras: extras, rootBoot: rootBoot
+                cameraPath: cameraPath, extras: extras, rootBoot: rootBoot, properties: properties
             )
             stop.end()
             Task { @MainActor in self.finished(result: result) }
@@ -740,7 +750,8 @@ final class LiveRuntime: RuntimeDriver {
         view: GuestMetalView, dataDiskPath: String, releasePath: String, dataGiB: UInt32, bootMode: UInt32,
         width: UInt32, height: UInt32, dotsPerInch: UInt32, memoryMiB: UInt32,
         processorCount: UInt32, adbKeyLine: String?, timeZone: String?, sessionRecordPath: String?,
-        hostFeatures: UInt32, cameraMode: UInt32, cameraPath: String?, extras: StartExtras, rootBoot: Bool
+        hostFeatures: UInt32, cameraMode: UInt32, cameraPath: String?, extras: StartExtras, rootBoot: Bool,
+        properties: String?
     ) -> Int32 {
         dataDiskPath.withCString { dataDisk in
             releasePath.withCString { release in
@@ -748,6 +759,7 @@ final class LiveRuntime: RuntimeDriver {
                     withOptionalCString(timeZone) { zone in
                         withOptionalCString(sessionRecordPath) { record in
                             withOptionalCString(cameraPath) { calibration in
+                              withOptionalCString(properties) { properties in
                                 var request = kernarium_runtime_boot()
                                 request.struct_size = UInt32(MemoryLayout<kernarium_runtime_boot>.size)
                                 request.width = width
@@ -786,7 +798,10 @@ final class LiveRuntime: RuntimeDriver {
                                 request.use_jit = extras.jit ? 1 : 0
                                 // The release's Magisk-patched ramdisk, or its own.
                                 request.android_root = rootBoot ? 1 : 0
+                                // The iPhone Android presents itself as, or its own identity.
+                                request.android_properties = properties
                                 return withUnsafePointer(to: &request) { kernarium_runtime_loader_run(view, $0) }
+                              }
                             }
                         }
                     }
@@ -1113,12 +1128,32 @@ final class LiveRuntime: RuntimeDriver {
             updateThermal()
             updateGuestRotation()
             updateSpaceWatch()
+            applyPhoneSettings()
             // An update counts as applied once its start has booted, whatever
             // happens to the application after that.
             do { try storage.bootCompleted() } catch { print("Andarium: the guest's record was not updated: \(error.localizedDescription)") }
         }
         for milestone in milestones where model.bootTracker.reach(milestone, atSeconds: seconds) {
             print("Andarium: boot reached \(milestone) at \(seconds) s")
+        }
+    }
+
+    /// Tells a booted LineageOS the phone's name and whether its display has
+    /// a cutout. The shell may not answer for a moment after the boot, so it
+    /// asks a few times.
+    private func applyPhoneSettings() {
+        guard normalRun, let phone = model?.phoneHardware else { return }
+        let operations = self.operations
+        var command = phone.deviceNameCommand
+        if phone.housing != nil { command += "; " + DisplayCutoutEmulation.command(on: runNotchSpace) }
+        phoneTask?.cancel()
+        phoneTask = Task {
+            for _ in 0..<6 {
+                if let result = try? await operations.shell(command, limit: .seconds(20)), result.exitCode == 0 { return }
+                try? await Task.sleep(for: .seconds(5))
+                if Task.isCancelled { return }
+            }
+            print("Andarium: Android did not take the phone's settings")
         }
     }
 
@@ -1158,6 +1193,8 @@ final class LiveRuntime: RuntimeDriver {
     private func finished(result: Int32) {
         partialSweep?.runEnded()
         partialSweep = nil
+        phoneTask?.cancel()
+        phoneTask = nil
         normalRun = false
         runActive = false
         inputRunReady = false

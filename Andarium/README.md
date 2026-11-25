@@ -563,6 +563,12 @@ address space holds, so this is a fallback.
   rate in one tap; Dismiss only dismisses. A harness launch runs with the
   default and keeps nothing; `ANDARIUM_HEAT_LIMIT` (`1` or `0`) states it for
   the run ([Automation](#automation)).
+  On an iPhone `PhoneHardware` knows, LineageOS presents itself as that iPhone:
+  the model, maker and chip are properties of the boot request
+  (`android_properties`) and the device name is set through the shell unless
+  the person gave one. Home's "Notch space" (`NotchSpacePreference`, off by
+  default), on a phone with a sensor housing, gives the display the housing's
+  row and switches the image's tall cutout overlay on at `sys.boot_completed`.
   Home's Performance section has "120 Hz" (`HighRefreshPreference`, off by
   default) above JIT, drawn only where the screen shows at least 100 frames a
   second (an iPhone Pro, an iPad Pro; a screen between 61 and 99 does not
@@ -679,8 +685,11 @@ address space holds, so this is a fallback.
   release this copy carries holds root (`RootRelease`: the manifest's `root`
   object and the files in the release's `root/`, which the
   [Android release](../android/lineage-24/README.md) makes and
-  `stage-system-image.py` stages); without it nothing of the feature shows and a
-  start boots the release's own ramdisk. A start with root asks the runtime for
+  `stage-system-image.py` stages); without it a start boots the release's own
+  ramdisk. An installed system that came without root files has a button in the
+  row's place: it downloads the pinned official Magisk app, makes the patched
+  ramdisk from the system's own `init_boot` on the device (`MagiskBoot`,
+  `MagiskInstaller`), records both in the installed manifest and turns root on. A start with root asks the runtime for
   the release's Magisk-patched ramdisk (`android_root`, runtime API 46;
   [boot selection](../darwin/device/block/README.md#boot-selection)).
   Before the boot screen ends, a start with root asks the guest whether the

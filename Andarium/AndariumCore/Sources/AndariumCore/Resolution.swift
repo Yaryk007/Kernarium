@@ -101,10 +101,13 @@ public enum SessionDisplayArea {
     /// the window controls' corner offset taken, as `GuestLayer` takes it;
     /// `topInset` and `bottomInset` are the safe area's, as Home sees it. A
     /// phone with a home indicator (`bottomInset` above zero) has a sensor
-    /// housing, which is its top inset and stays when the bar hides; a phone
-    /// with a home button has only the bar's.
-    public static func size(home: CGSize, topInset: CGFloat, bottomInset: CGFloat, isPhone: Bool) -> CGSize {
-        let keepsTopInset = isPhone && bottomInset > 0
+    /// housing, which is its top inset and stays when the bar hides, unless
+    /// the display takes its row (`usesHousing`); a phone with a home button
+    /// has only the bar's.
+    public static func size(
+        home: CGSize, topInset: CGFloat, bottomInset: CGFloat, isPhone: Bool, usesHousing: Bool = false
+    ) -> CGSize {
+        let keepsTopInset = isPhone && bottomInset > 0 && !usesHousing
         let top = max(topInset, 0)
         return CGSize(width: home.width, height: home.height + (keepsTopInset ? 0 : top))
     }

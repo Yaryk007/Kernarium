@@ -184,6 +184,13 @@ struct AppEntry {
             stated: HighRefreshLaunch.stated(in: environment))
         model.highRefreshOn = refresh.isOn
         model.highRefreshDecidedByLaunch = !refresh.keepsChanges
+        // LineageOS presents itself as this iPhone, and can draw beside its
+        // sensor housing; a harness launch keeps the image's own identity.
+        if launch.isEmpty, selectedSystem == .lineage || selectedSystem == .lineageGApps {
+            model.phoneHardware = PhoneHardware(machine: IPadAppHost.hardwareMachine())
+        }
+        model.notchSpaceOn = launch.isEmpty && NotchSpacePreference().isOn
+        model.notchSpaceDecidedByLaunch = !launch.isEmpty
         // Home's AOT row exists where the build carries the translated-code
         // framework (what Acknowledgements reads), and is the person's last
         // choice unless the launch is a harness's, whichever way it is told.
@@ -234,6 +241,22 @@ struct AppEntry {
             // row is not shown and a start boots the release's own ramdisk.
             runtime.rootRelease = carried?.root
             model.rootAvailable = carried?.root != nil
+            // An installed system can be given the root files it came without;
+            // one in the application's bundle cannot be written.
+            if launch.isEmpty, carried != nil, carried?.root == nil, let installed = SystemInstallation.installed {
+                model.rootSetup = { [weak model, weak runtime] phase in
+                    let root = try await MagiskInstaller.install(in: installed) { progress in
+                        switch progress {
+                        case .working(let label): phase(label)
+                        case .downloading(let label, let received, let total, _):
+                            guard let total, total > 0 else { return phase(label) }
+                            phase("\(label) \(Int(Double(received) / Double(total) * 100))%")
+                        }
+                    }
+                    runtime?.rootRelease = root
+                    model?.rootAvailable = true
+                }
+            }
             model.driver = runtime
             // A start with root that the last session's record shows ended
             // before Android booted was found before there was a driver.

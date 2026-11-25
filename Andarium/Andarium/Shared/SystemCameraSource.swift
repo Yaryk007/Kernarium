@@ -22,7 +22,7 @@ extension IPadAppHost {
 
     /// The hardware's own name: `uname`'s machine, which an iPad app on a
     /// Vision Pro reads as the Vision Pro's.
-    private nonisolated static func hardwareMachine() -> String {
+    nonisolated static func hardwareMachine() -> String {
         var name = utsname()
         guard uname(&name) == 0 else { return "" }
         return withUnsafeBytes(of: &name.machine) { raw in

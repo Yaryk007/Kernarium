@@ -6,9 +6,10 @@ import SwiftUI
 // MARK: Root
 
 /// Root access (Magisk) for the guest: one row with a switch and a note under
-/// it, in a section of its own after Capabilities. It is shown only while the
-/// release this copy carries has root (`AppModel.rootAvailable`), so a copy
-/// without it has no trace of the feature. The switch applies at the next
+/// it, in a section of its own after Capabilities. It is shown while the
+/// release this copy carries has root (`AppModel.rootAvailable`); a system that
+/// can be given root has a button there first (`RootSetupRow`), and any other
+/// has no trace of the feature. The switch applies at the next
 /// start; Home is only shown while Android is stopped.
 struct RootSection: View {
     @Environment(AppModel.self) private var model
@@ -21,6 +22,31 @@ struct RootSection: View {
                 SectionNote(RootWords.note)
             }
             .id("root")
+        } else if model.guest != nil, model.offersRootSetup {
+            HomeSection(title: RootWords.sectionTitle) {
+                RootSetupRow()
+            } footer: {
+                SectionNote(model.rootSetupFailure ?? RootWords.setupNote)
+            }
+            .id("root")
+        }
+    }
+}
+
+/// The button that downloads Magisk, patches the boot image and turns root on.
+struct RootSetupRow: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        OptionRow(title: RootWords.setupTitle, symbol: RootRow.symbol, detail: model.rootSetupPhase) {
+            if model.rootSetupPhase != nil {
+                Button("Cancel", role: .cancel) { model.cancelRootSetup() }
+                    .accessibilityIdentifier("home-root-setup-cancel")
+            } else {
+                Button(RootWords.setupButton) { model.setRoot(true) }
+                    .buttonStyle(.borderedProminent)
+                    .accessibilityIdentifier("home-root-setup")
+            }
         }
     }
 }

@@ -11,6 +11,10 @@ enum RootWords {
     static let sectionTitle: LocalizedStringKey = "Root"
     static let rowTitle = String(localized: "Root access")
     static let note = String(localized: "Apps you allow in Magisk can run as root. Takes effect at the next start.")
+    /// The button of a system that came without root.
+    static let setupTitle = String(localized: "Root with Magisk")
+    static let setupButton = String(localized: "Root")
+    static let setupNote = String(localized: "Downloads the official Magisk app (11 MB) and turns root on. Takes effect at the next start.")
     /// The line under the switch while a failed start has paused root.
     static let paused = String(localized: "Paused after a failed start")
 

@@ -19,7 +19,7 @@ extension AppModel {
     /// next start; turning it on asks first (`rootWarningShowing`), and the
     /// switch stays off until the person confirms.
     func setRoot(_ on: Bool) {
-        guard guest != nil, rootAvailable else { return }
+        guard guest != nil, rootAvailable || (on && offersRootSetup) else { return }
         if on {
             guard !rootOn else { return }
             rootWarningShowing = true
@@ -34,7 +34,11 @@ extension AppModel {
     /// The warning's Turn On.
     func confirmRoot() {
         rootWarningShowing = false
-        guard guest != nil, rootAvailable else { return }
+        guard guest != nil else { return }
+        guard rootAvailable else {
+            setUpRoot()
+            return
+        }
         guest?.root.setOn(true)
         rootPeriod &+= 1
         persistNow()
@@ -44,6 +48,33 @@ extension AppModel {
     func cancelRootWarning() {
         rootWarningShowing = false
     }
+
+    // MARK: Root for a system that came without it
+
+    /// The button is there for a system that can be given the root files.
+    var offersRootSetup: Bool { !rootAvailable && rootSetup != nil }
+
+    /// Downloads Magisk and patches the system's boot image, then turns root
+    /// on: the next start boots rooted and puts the Magisk app in.
+    private func setUpRoot() {
+        guard offersRootSetup, rootSetupTask == nil, let rootSetup else { return }
+        rootSetupFailure = nil
+        rootSetupPhase = String(localized: "Preparing…")
+        rootSetupTask = Task {
+            defer {
+                rootSetupTask = nil
+                rootSetupPhase = nil
+            }
+            do {
+                try await rootSetup { [weak self] in self?.rootSetupPhase = $0 }
+                confirmRoot()
+            } catch {
+                if !Task.isCancelled { rootSetupFailure = error.localizedDescription }
+            }
+        }
+    }
+
+    func cancelRootSetup() { rootSetupTask?.cancel() }
 
     // MARK: A failed or stopped start with root
 

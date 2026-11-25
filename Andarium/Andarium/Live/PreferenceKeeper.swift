@@ -34,6 +34,7 @@ final class PreferenceKeeper {
         if let on = model.pointerAsTouchToKeep { PointerPreference(defaults: defaults).keep(on) }
         if let on = model.heatLimitToKeep { HeatLimitPreference(defaults: defaults).keep(on) }
         if let on = model.highRefreshToKeep { HighRefreshPreference(defaults: defaults).keep(on) }
+        if let on = model.notchSpaceToKeep { NotchSpacePreference(defaults: defaults).keep(on) }
         if let on = model.translatedLibrariesToKeep { TranslatedLibrariesPreference(defaults: defaults).keep(on) }
         if let on = model.jitToKeep { JitPreference(defaults: defaults).keep(on) }
     }
@@ -42,7 +43,7 @@ final class PreferenceKeeper {
         guard let model else { return }
         withObservationTracking {
             _ = (model.displayOptionsToKeep, model.showStatsToKeep, model.pointerAsTouchToKeep, model.heatLimitToKeep)
-            _ = model.highRefreshToKeep
+            _ = (model.highRefreshToKeep, model.notchSpaceToKeep)
             _ = (model.translatedLibrariesToKeep, model.jitToKeep)
         } onChange: { [weak self] in
             // The model belongs to the main actor, so the change begins there;

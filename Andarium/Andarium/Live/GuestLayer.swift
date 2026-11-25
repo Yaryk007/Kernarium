@@ -40,7 +40,9 @@ struct GuestLayer: View {
                     }
                     .frame(width: geo.size.width, height: geo.size.height)
                 }
-                .ignoresSafeArea(plan == nil ? [] : .all)
+                .ignoresSafeArea(
+                    plan != nil ? .all : model.usesNotchSpace ? .container : [],
+                    edges: plan == nil ? .top : .all)
             }
         }
         .background {

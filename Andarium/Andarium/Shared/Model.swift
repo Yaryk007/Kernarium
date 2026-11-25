@@ -877,6 +877,25 @@ final class AppModel {
         guard on != highRefreshOn else { return }
         highRefreshOn = on
     }
+    /// Gives the system root files and says how far it is; afterwards
+    /// `rootAvailable` holds. Nil where the system cannot be given any.
+    var rootSetup: (@MainActor (_ phase: @escaping @MainActor @Sendable (String) -> Void) async throws -> Void)?
+    var rootSetupTask: Task<Void, Never>?
+    /// What the set-up under way is doing, and why the last one ended.
+    var rootSetupPhase: String?
+    var rootSetupFailure: String?
+    /// The iPhone Android presents itself as; nil where Andarium does not know
+    /// the device, or the system is not LineageOS, whose own init reads it.
+    var phoneHardware: PhoneHardware?
+    /// Home's "Notch space", kept for the install (`NotchSpacePreference`).
+    var notchSpaceOn = false
+    /// A harness's launch decides for its run alone.
+    var notchSpaceDecidedByLaunch = false
+    var notchSpaceToKeep: Bool? { notchSpaceDecidedByLaunch ? nil : notchSpaceOn }
+    /// The row is there on a phone with a sensor housing.
+    var notchSpaceOffered: Bool { phoneHardware?.housing != nil }
+    /// Whether Android's display takes the sensor housing's row.
+    var usesNotchSpace: Bool { notchSpaceOffered && notchSpaceOn && sessionPlan == nil }
     /// What this run's display is: the runtime granted the 120 Hz display, or
     /// did not (it checks the screen, the host and the size once at the start,
     /// whatever the start asked).
