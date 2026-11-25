@@ -15,8 +15,6 @@ nonisolated enum GuestSystemInstaller {
         let work = manager.temporaryDirectory.appendingPathComponent("andarium-system-" + UUID().uuidString)
         try manager.createDirectory(at: work, withIntermediateDirectories: true)
         defer { try? manager.removeItem(at: work) }
-        let scoped = local?.startAccessingSecurityScopedResource() ?? false
-        defer { if scoped { local?.stopAccessingSecurityScopedResource() } }
 
         let image: URL
         if let local {

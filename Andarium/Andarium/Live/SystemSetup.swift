@@ -292,10 +292,13 @@ struct SystemSetupView: View {
                     }
                 }
             }
-            .fileImporter(isPresented: $picking, allowedContentTypes: [.item]) { result in
+            .documentCopyPicker(isPresented: $picking, types: [.item]) { result in
                 switch result {
-                case .success(let source): start(local: source)
-                case .failure(let failure): error = failure.localizedDescription
+                case .success(let copies):
+                    guard let source = copies.urls.first else { return }
+                    start(local: source, keep: copies.folder)
+                case .failure(let failure):
+                    error = failure.localizedDescription
                 }
             }
         }
@@ -306,14 +309,17 @@ struct SystemSetupView: View {
         didInstall()
     }
 
-    private func start(local: URL? = nil) {
+    private func start(local: URL? = nil, keep folder: PickedFolder? = nil) {
         let selected = choice
         let address = customAddress
         let destination = SystemInstallation.directory(for: selected)
         error = nil
         phase = "Preparing…"
         job = Task {
-            defer { job = nil }
+            defer {
+                withExtendedLifetime(folder) {}
+                job = nil
+            }
             do {
                 try await GuestSystemInstaller.install(selected, address: address, local: local, at: destination) { update in
                     phase = update
