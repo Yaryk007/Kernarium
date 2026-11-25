@@ -116,12 +116,51 @@ nonisolated enum SystemImageImport {
         return output
     }
 
+    /// The space an install may count on: what is free, and what the system
+    /// says it would give up for something the person asked for. A guest's own
+    /// writes hold to the first alone (`HostStorage`), but an install that the
+    /// system does not make room for after all only fails and leaves nothing.
+    static func installableBytes(at folder: URL) -> UInt64 {
+        let values = try? folder.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+        let offered = values?.volumeAvailableCapacityForImportantUsage ?? 0
+        return max(HostStorage.freeBytes(on: folder), UInt64(clamping: offered))
+    }
+
     static func requireSpace(_ bytes: UInt64, at folder: URL) throws {
-        let free = HostStorage.freeBytes(on: folder)
-        if free > 0, free < bytes {
-            let size = ByteCountFormatter.string(fromByteCount: Int64(clamping: bytes), countStyle: .file)
-            throw SystemInstallation.Problem.invalid("Andarium needs \(size) of free storage for this system image.")
+        let free = installableBytes(at: folder)
+        guard free > 0, free < bytes else { return }
+        func text(_ value: UInt64) -> String {
+            ByteCountFormatter.string(fromByteCount: Int64(clamping: value), countStyle: .file)
         }
+        throw SystemInstallation.Problem.invalid(
+            "The next step needs \(text(bytes)) of free storage, and Andarium can use \(text(free)) now.")
+    }
+
+    /// What an install that the process did not live to end left behind: its
+    /// work in the temporary directory, and its stages beside the systems. Read
+    /// at the process's launch, before it can begin one of its own.
+    static func leftovers(
+        temporary: URL = FileManager.default.temporaryDirectory,
+        systems: URL = SystemInstallation.directory(for: .lineage).deletingLastPathComponent()
+    ) -> [URL] {
+        func entries(_ prefix: String, in folder: URL) -> [URL] {
+            ((try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? [])
+                .filter { $0.lastPathComponent.hasPrefix(prefix) }
+        }
+        return entries("andarium-system-", in: temporary) + entries(".android-install-", in: systems)
+            + GuestSystemChoice.allCases.flatMap {
+                entries(".root-install-", in: systems.appendingPathComponent($0.storageName, isDirectory: true))
+            }
+    }
+
+    /// Gives a read part of a file back to the volume. Both ends are block
+    /// aligned, and a volume that cannot do it keeps the bytes until the file goes.
+    private static func release(_ offset: UInt64, _ length: UInt64, of file: FileHandle) {
+        let block: UInt64 = 16384
+        guard offset % block == 0, length >= block else { return }
+        var hole = fpunchhole_t(
+            fp_flags: 0, reserved: 0, fp_offset: off_t(offset), fp_length: off_t(length / block * block))
+        _ = fcntl(file.fileDescriptor, F_PUNCHHOLE, &hole)
     }
 
     /// Change the copied init_boot ramdisk's first-stage mount before hashing the disk.
@@ -484,9 +523,10 @@ nonisolated enum SystemImageImport {
     }
 
     /// Builds a copy of the carried disk with `image` in partition `target`,
-    /// grown to hold it when it is larger.
-    static func assemble(replacing target: String, with image: URL, carried: DiskLayout, carriedDisk: URL,
-                         into output: URL, progress: Progress) throws -> DiskLayout {
+    /// grown to hold it when it is larger. With `consuming` the image is the
+    /// install's own work, and gives its space back as it is copied.
+    static func assemble(replacing target: String, with image: URL, consuming: Bool, carried: DiskLayout,
+                         carriedDisk: URL, into output: URL, progress: Progress) throws -> DiskLayout {
         let imageBytes = UInt64((try image.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
         guard imageBytes > 0 else { throw SystemInstallation.Problem.invalid("The image is empty.") }
         var disk = carried
@@ -511,7 +551,7 @@ nonisolated enum SystemImageImport {
         try writeGPT(disk, to: out)
         let source = try FileHandle(forReadingFrom: carriedDisk)
         defer { try? source.close() }
-        let replacement = try FileHandle(forReadingFrom: image)
+        let replacement = try consuming ? FileHandle(forUpdating: image) : FileHandle(forReadingFrom: image)
         defer { try? replacement.close() }
         var copied: UInt64 = 0
         for (index, partition) in disk.partitions.enumerated() {
@@ -526,6 +566,9 @@ nonisolated enum SystemImageImport {
                     throw SystemInstallation.Problem.invalid("A system partition ended early.")
                 }
                 try out.write(contentsOf: data)
+                if consuming, partition.name == target {
+                    release(imageBytes - left, UInt64(data.count), of: replacement)
+                }
                 left -= UInt64(data.count)
                 copied += UInt64(data.count)
                 progress(Double(copied) / Double(disk.size), "Writing the system disk")

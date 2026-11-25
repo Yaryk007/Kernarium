@@ -857,6 +857,8 @@ struct AppEntry {
 }
 
 extension AppEntry {
+    func sweepInstallLeftovers() {}
+
     @MainActor
     func presentSystemSetup(in window: UIWindow, onInstall: @escaping () -> Void) -> Bool { false }
 }

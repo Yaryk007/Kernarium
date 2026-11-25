@@ -225,10 +225,12 @@ nonisolated enum GuestSystemInstaller {
                 ? SystemImageImport.targetPartition(for: source.lastPathComponent, in: carried.disk) : "system"
             guard let partition = carried.disk.partitions.first(where: { $0.name == target })
             else { throw SystemInstallation.Problem.incompatible }
-            try SystemImageImport.requireSpace(carried.disk.size - partition.size
-                                               + SystemImageImport.alignUp(size, carried.disk.alignment), at: stage)
+            // An image of the install's own gives its space back as it is copied.
+            let consuming = input.deletingLastPathComponent().standardizedFileURL == work.standardizedFileURL
+            let copy = consuming ? 256 << 20 : SystemImageImport.alignUp(size, carried.disk.alignment)
+            try SystemImageImport.requireSpace(carried.disk.size - partition.size + copy, at: stage)
             layout = try SystemImageImport.assemble(
-                replacing: target, with: input, carried: carried.disk,
+                replacing: target, with: input, consuming: consuming, carried: carried.disk,
                 carriedDisk: base.appendingPathComponent(SystemFolder.systemDisk), into: disk
             ) { _, _ in }
             if kind == .ext4 { try SystemImageImport.mountExt4(target, disk: disk, layout: layout) }

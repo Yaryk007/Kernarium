@@ -51,6 +51,7 @@ final class AndariumProcess {
         // This is the process's launch: a test that builds a model does not
         // sweep the folders a running test stages its files in.
         Self.sweepLeftovers()
+        entry.sweepInstallLeftovers()
         model = entry.makeModel()
         // An App Intent that runs in this process hands its request to this model.
         AndroidAppsHub.shared.attach(model)

@@ -393,6 +393,16 @@ struct SystemSetupView: View {
 }
 
 extension AppEntry {
+    /// Interrupted installs hold gigabytes; a harness launch leaves the person's alone.
+    func sweepInstallLeftovers() {
+        guard overrides.isEmpty, ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil else { return }
+        // Listed before an install can begin, so that none of its own is in it.
+        let leftovers = SystemImageImport.leftovers()
+        Task.detached(priority: .utility) {
+            for leftover in leftovers { try? FileManager.default.removeItem(at: leftover) }
+        }
+    }
+
     @MainActor
     func presentSystemSetup(in window: UIWindow, onInstall: @escaping () -> Void) -> Bool {
         let installed = SystemInstallation.installed != nil
