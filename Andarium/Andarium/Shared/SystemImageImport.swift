@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+import AndariumCore
 import Compression
 import CryptoKit
 import Foundation
 
 /// Turns whatever image the person picked into a bootable Andarium release
-/// folder: a full GPT system disk (any name), an EROFS partition image such as
+/// folder: a full GPT system disk, an ext4 or EROFS partition image such as
 /// a GSI's `system.img` (written into a copy of the carried disk, growing its
 /// partition when it is larger), an Android sparse image of either, or any of
-/// those compressed with xz or gzip.
+/// those compressed with xz or gzip. ROM ZIPs can supply the system image.
 ///
 /// The host builds the system disk's GPT from `partition-layout.json` and
 /// compares it byte for byte with the disk (darwin/device/block/android_gpt),
@@ -76,7 +77,11 @@ nonisolated enum SystemImageImport {
         guard head.count > 10, head[2] == 8 else { throw SystemCatalog.ImportError.invalid("The gzip file is damaged.") }
         let flags = head[3]
         var offset = 10
-        if flags & 0x04 != 0, head.count > offset + 2 { offset += 2 + Int(head[offset]) + Int(head[offset + 1]) << 8 }
+        if flags & 0x04 != 0 {
+            guard offset + 2 <= head.count else { throw SystemCatalog.ImportError.invalid("The gzip header is truncated.") }
+            let extraLength = Int(head[offset]) | (Int(head[offset + 1]) << 8)
+            offset += 2 + extraLength
+        }
         for bit: UInt8 in [0x08, 0x10] where flags & bit != 0 {
             while offset < head.count, head[offset] != 0 { offset += 1 }
             offset += 1
@@ -86,35 +91,97 @@ nonisolated enum SystemImageImport {
         return UInt64(offset)
     }
 
+    static func extractZIP(_ archive: URL, into folder: URL, progress: Progress) throws -> URL {
+        let member = try SystemImageZIP.read(archive)
+        if let free = try? folder.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]).volumeAvailableCapacityForImportantUsage,
+           free > 0, UInt64(free) < member.imageBytes {
+            throw SystemCatalog.ImportError.invalid("There is too little free storage to unpack the system image.")
+        }
+        let output = folder.appendingPathComponent(member.fileName)
+        try copyPayload(archive, algorithm: member.compression == 8 ? .zlib : nil,
+                        start: member.offset, end: member.offset + member.compressedBytes,
+                        into: output, member: member, progress: progress)
+        return output
+    }
+
+    /// Change the copied init_boot ramdisk's first-stage mount before hashing the disk.
+    static func mountExt4(_ name: String, disk: URL, layout: DiskLayout) throws {
+        guard let boot = layout.partitions.first(where: { $0.name == "init_boot" }), boot.imageBytes >= 4096 else {
+            throw SkinImageError.ramdisk
+        }
+        let file = try FileHandle(forUpdating: disk)
+        defer { try? file.close() }
+        try file.seek(toOffset: boot.start)
+        guard let header = try file.read(upToCount: 44), header.count == 44,
+              header.prefix(8) == Data("ANDROID!".utf8), header[8..<12].allSatisfy({ $0 == 0 }),
+              header[40..<44] == Data([4, 0, 0, 0]) else { throw SkinImageError.ramdisk }
+        let size = header[12..<16].enumerated().reduce(0) { $0 | (Int($1.element) << (8 * $1.offset)) }
+        guard size > 0, UInt64(size) <= boot.imageBytes - 4096 else { throw SkinImageError.ramdisk }
+        let start = boot.start + 4096
+        try file.seek(toOffset: start)
+        guard let ramdisk = try file.read(upToCount: size), ramdisk.count == size else { throw SkinImageError.ramdisk }
+        let offset = try ext4MountOffset(for: name, in: ramdisk)
+        try file.seek(toOffset: start + UInt64(offset))
+        try file.write(contentsOf: Data("ext4 ".utf8))
+    }
+
     private static func decompress(_ source: URL, algorithm: Algorithm, skipping: UInt64, trailer: UInt64,
                                    into target: URL, progress: Progress) throws {
+        let length = UInt64((try source.resourceValues(forKeys: [.fileSizeKey])).fileSize ?? 0)
+        guard length > skipping + trailer else {
+            throw SystemCatalog.ImportError.invalid("The compressed file is empty.")
+        }
+        try copyPayload(source, algorithm: algorithm, start: skipping, end: length - trailer,
+                        into: target, progress: progress)
+    }
+
+    private static func copyPayload(_ source: URL, algorithm: Algorithm?, start: UInt64, end: UInt64,
+                                    into target: URL, member: SystemImageZIP? = nil, progress: Progress) throws {
         let input = try FileHandle(forReadingFrom: source)
         defer { try? input.close() }
-        let total = try input.seekToEnd()
-        guard total > skipping + trailer else { throw SystemCatalog.ImportError.invalid("The compressed file is empty.") }
-        let end = total - trailer
-        try input.seek(toOffset: skipping)
+        try input.seek(toOffset: start)
         guard FileManager.default.createFile(atPath: target.path, contents: nil) else {
             throw SystemCatalog.ImportError.invalid("Andarium cannot write into its Systems folder.")
         }
         let output = try FileHandle(forWritingTo: target)
         defer { try? output.close() }
         var writeError: (any Error)?
-        let filter = try OutputFilter(.decompress, using: algorithm) { data in
-            guard let data, writeError == nil else { return }
-            do { try output.write(contentsOf: data) } catch { writeError = error }
+        var written: UInt64 = 0
+        var crc: UInt32 = .max
+        func write(_ data: Data) throws {
+            written += UInt64(data.count)
+            if let member {
+                guard written <= member.imageBytes else { throw SkinImageError.archive }
+                crc = data.withUnsafeBytes { buffer in
+                    buffer.reduce(crc) { ($0 >> 8) ^ crcTable[Int(UInt8(truncatingIfNeeded: $0) ^ $1)] }
+                }
+            }
+            try output.write(contentsOf: data)
         }
-        var position = skipping
+        let filter = try algorithm.map { encoding in
+            try OutputFilter(.decompress, using: encoding) { data in
+                guard let data, writeError == nil else { return }
+                do { try write(data) } catch { writeError = error }
+            }
+        }
+        var position = start
         while position < end {
             let count = Int(min(UInt64(8 << 20), end - position))
-            guard let chunk = try input.read(upToCount: count), !chunk.isEmpty else { break }
-            try filter.write(chunk)
+            guard let chunk = try input.read(upToCount: count), !chunk.isEmpty else { throw SkinImageError.archive }
+            if let filter { try filter.write(chunk) } else { try write(chunk) }
             if let writeError { throw writeError }
             position += UInt64(chunk.count)
-            progress(Double(position) / Double(end), "Decompressing")
+            progress(Double(position - start) / Double(end - start), "Unpacking the system image")
         }
-        try filter.finalize()
+        try filter?.finalize()
         if let writeError { throw writeError }
+        if let member, written != member.imageBytes || ~crc != member.crc { throw SkinImageError.archive }
+    }
+
+    private static let crcTable: [UInt32] = (0..<256).map { seed in
+        (0..<8).reduce(UInt32(seed)) { value, _ in
+            (value >> 1) ^ (value & 1 == 0 ? 0 : 0xedb8_8320)
+        }
     }
 
     /// Android's sparse format (libsparse): a header, then raw, fill,

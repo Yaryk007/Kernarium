@@ -78,6 +78,11 @@ the window's interface orientation (`MotionMount`). Returning to a locked
 scene restores the guest's previous rotation preferences
 (`SessionOrientationPolicy`).
 
+In a running Android session, tap the guest with four fingers at once to open
+Andarium’s settings, including Install APK. An iPhone’s media-volume changes
+also send the corresponding volume key to Android. Recovery keeps its Up and
+Down controls for navigating the menu.
+
 ## Build
 
 Packaging the Android runtime alone, and staging the system from the accepted
@@ -197,9 +202,14 @@ control out.
 - **Systems.** A development build boots the carried release or one the person
   imported into `Documents/Systems/<id>/` (`SystemCatalog`,
   `SystemImageImport`): an Andarium release folder, a full GPT system disk of
-  any name, or an EROFS partition image (a GSI `system.img`, or `vendor.img`
+  any name, or an ext4 or EROFS partition image (a GSI `system.img`, or `vendor.img`
   and the like by file name) written into a copy of the carried disk, its
-  partition grown to fit. Sparse, xz and gzip images are unpacked first. An
+  partition grown to fit. Custom ROM ZIPs can supply a single `system.img`
+  member, including `.img.xz` and `.img.gz`. For ext4, the copied first-stage ramdisk mounts the
+  replacement partition read-only. Sparse, xz and gzip images are unpacked first.
+  **Download an Android skin** fetches a selected MysticGSI build of One UI,
+  HyperOS or ColorOS, verifies the publisher’s archive checksum and imports
+  its system image. Boot compatibility depends on the skin and the carried vendor partitions. An
   image import takes the carried boot command line, a layout read from the
   disk it writes, and an identity tied to that disk's bytes. Each import keeps
   its own guest in `Library/Guests/<id>`, so systems never share a data disk;
@@ -320,10 +330,9 @@ requires reopening Andarium.
   Debug serves the request only when the launch says a servicing debugger is
   attached (`ANDARIUM_JIT_DEBUGGER=1`). `ANDARIUM_JIT` (`1` or `0`) states the
   row for a harness launch, which keeps nothing; a launch with another setting
-  starts it off. The JIT compiles every process's code again for itself
-  ([cold code](../darwin/cpu/arm64/jit/README.md#cold-code)), so an Android
-  guest's boot, application launches and background work run several times
-  slower than on gadgets, and a long single-process computation runs faster. An
+  starts it off. Cold AArch64 translation reads instructions in short page-bounded batches.
+  Android boot and application launches still spend time compiling cold code
+  ([JIT cold code](../darwin/cpu/arm64/jit/README.md#cold-code)). An
   App Store build carries none of this: its runtime has no JIT and the
   application has no row, preference, entries or sentences.
 - **Motion.** Gyroscope needs no permission. The host reads a sensor only while

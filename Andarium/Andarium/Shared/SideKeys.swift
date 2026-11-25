@@ -16,9 +16,8 @@ struct SideKeyActions {
     var settings: () -> Void
 }
 
-/// The side keys on the screen edge: closed they are a pair of slim glass
-/// keys; tapped they swell in place into Power and a volume rocker, with
-/// Settings and a Back and Home pair right beside them as one small group.
+/// The slim handle on the screen edge opens Power, Settings, Back and Home.
+/// Recovery puts Up and Down next to Power.
 /// They move up and down the edge with a drag and across to the other edge.
 ///
 /// Only the keys take touches, and the tip beside the closed keys on its own
@@ -101,7 +100,7 @@ struct SideKeysOverlay: View {
                 .accessibilityAction(.escape) { setOpen(false) }
                 .position(x: edgeX + inward * (KeyMetrics.edgeGap + groupWidth / 2), y: openY)
             } else {
-                ClosedKeys(space: keysSpace, leading: leading)
+                ClosedKeys(space: keysSpace, leading: leading, recovery: recoveryMode)
                     // SwiftUI's own popover, not `popoverTip`: TipKit leaves
                     // its popover on screen when the keys it points at go
                     // away (opening, or the session ending), over the open
@@ -201,25 +200,27 @@ enum KeyMetrics {
     static let edgeGap: CGFloat = 8
 }
 
-/// The closed keys: Power and a longer volume rocker, each a plain glass key
-/// on the screen edge. They show nothing about Android's state.
+/// The collapsed side panel handle, with a second key in recovery.
 struct ClosedKeys: View {
     let space: Namespace.ID
     let leading: Bool
+    let recovery: Bool
 
     var body: some View {
         VStack(spacing: 6) {
             key(height: 30)
                 .matchedGeometryEffect(id: "power", in: space)
-            key(height: 58)
-                .matchedGeometryEffect(id: "rocker", in: space)
+            if recovery {
+                key(height: 58)
+                    .matchedGeometryEffect(id: "rocker", in: space)
+            }
         }
         .padding(leading ? .leading : .trailing, 3)
-        .frame(width: 36, height: 124, alignment: leading ? .leading : .trailing)
+        .frame(width: 36, height: recovery ? 124 : 56, alignment: leading ? .leading : .trailing)
         .contentShape(Rectangle())
         .accessibilityElement()
         .accessibilityLabel("Side keys")
-        .accessibilityHint("Opens Power, volume, Back, Home and Settings")
+        .accessibilityHint(recovery ? "Opens Power, Up and Down" : "Opens Power, Back, Home and Settings")
         .accessibilityAddTraits(.isButton)
     }
 
@@ -232,8 +233,7 @@ struct ClosedKeys: View {
     }
 }
 
-/// The open keys, swollen in place: Power (tap to press, hold for Android's
-/// power menu) above the volume rocker.
+/// Power and the recovery menu navigation keys.
 struct OpenKeys: View {
     let space: Namespace.ID
     let recovery: Bool
@@ -268,18 +268,17 @@ struct OpenKeys: View {
             .accessibilityAddTraits(.isButton)
             .accessibilityAction(named: "Power menu", powerHold)
 
-            KeyPair(
-                top: (recovery ? "chevron.up" : "plus", recovery ? "Up" : "Volume up", volumeUp),
-                bottom: (recovery ? "chevron.down" : "minus", recovery ? "Down" : "Volume down", volumeDown)
-            )
-            .matchedGeometryEffect(id: "rocker", in: space)
+            if recovery {
+                KeyPair(top: ("chevron.up", "Up", volumeUp),
+                        bottom: ("chevron.down", "Down", volumeDown))
+                    .matchedGeometryEffect(id: "rocker", in: space)
+            }
         }
         .foregroundStyle(.primary)
     }
 }
 
-/// The keys Android has and an iPhone does not, beside Power and volume:
-/// Settings across from Power, and Back above Home across from the rocker.
+/// Settings across from Power, with Back and Home below it.
 struct GuestKeys: View {
     let settings: () -> Void
     let back: () -> Void

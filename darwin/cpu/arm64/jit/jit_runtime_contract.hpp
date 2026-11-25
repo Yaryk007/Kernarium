@@ -3,6 +3,7 @@
 
 #include "cpu/arm64/aarch32/guest_key.hpp"
 #include "cpu/arm64/cpu_state.hpp"
+#include "jit_fetch_window.hpp"
 #include "cpu/arm64/detail/instruction_primitives.hpp"
 #include "cpu/engine.hpp"
 #include "uml_darwin_static_mmu.h"
@@ -80,15 +81,6 @@ floating_or_vector_primary_class(std::uint32_t instruction) noexcept {
   return op0 == 7U || op0 == 15U;
 }
 
-[[nodiscard]] constexpr bool
-obvious_translated_block_terminator(std::uint32_t instruction) noexcept {
-  return (instruction & 0x7c00'0000U) == 0x1400'0000U ||
-         (instruction & 0xff00'0000U) == 0x5400'0000U ||
-         (instruction & 0x7e00'0000U) == 0x3400'0000U ||
-         (instruction & 0x7e00'0000U) == 0x3600'0000U ||
-         (instruction & 0xfe00'0000U) == 0xd600'0000U ||
-         (instruction & 0xff00'0000U) == 0xd400'0000U;
-}
 
 static_assert(floating_or_vector_primary_class(0x6f40'0000U));
 static_assert(floating_or_vector_primary_class(0x4f00'1000U));

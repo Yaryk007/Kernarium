@@ -4,21 +4,15 @@ import AndariumCore
 import SwiftUI
 import UIKit
 
-/// A run: Android's display fills the screen, and the app keeps only a pair of
-/// side keys on the edge. Tapped, the keys swell in place into Power and a
-/// volume rocker, with Settings and a Back and Home pair right beside them
-/// as one small group.
+/// The preview of Android and Andarium's side controls.
 struct SessionView: View {
     @Environment(AppModel.self) private var model
     let mode: StartMode
 
-    @State private var settings = false
     @State private var powerMenu = false
     @State private var screen: GuestScreen = .home
-    @State private var volume = 9
     /// Android's own volume panel, shown after a volume key press.
     @State private var volumePanel = false
-    @State private var volumeToken = 0
     @State private var recovery = RecoveryState()
     @State private var prepared = false
 
@@ -52,7 +46,7 @@ struct SessionView: View {
                     power: pressPower, powerHold: holdPower,
                     volumeUp: { pressVolume(up: true) }, volumeDown: { pressVolume(up: false) },
                     back: pressBack, home: pressHome,
-                    settings: { settings = true }
+                    settings: { model.session.openSettings() }
                 )
             )
         }
@@ -60,11 +54,11 @@ struct SessionView: View {
         // The system honours the bottom edge's deferral only while the home
         // indicator is visible: with it hidden, one swipe goes Home.
         .persistentSystemOverlays(.visible)
-        .sessionSettings(isPresented: $settings, large: model.sessionPreset.settingsLarge, model: model)
+        .sessionSettings(isPresented: $model.session.settingsOpen, large: model.sessionPreset.settingsLarge, model: model)
         // The screen over the session says why the guest is paused, and a
         // sheet would cover it.
         .onChange(of: model.spacePause != nil) { _, paused in
-            if paused { settings = false }
+            if paused { model.session.settingsOpen = false }
         }
         .onAppear(perform: prepare)
         .task {
@@ -94,7 +88,7 @@ struct SessionView: View {
                     Color.black
                 }
                 if volumePanel && screen != .off {
-                    GuestVolumePanel(level: volume, maximum: 15)
+                    GuestVolumePanel(level: 9, maximum: 15)
                         .transition(.move(edge: .trailing).combined(with: .opacity))
                 }
                 if powerMenu {
@@ -130,24 +124,9 @@ struct SessionView: View {
     }
 
     private func pressVolume(up: Bool) {
-        if mode == .recovery {
-            let count = recovery.items.count
-            recovery.highlighted = (recovery.highlighted + (up ? count - 1 : 1)) % count
-            return
-        }
-        // Android answers with its own volume panel, which it hides again
-        // after a moment; while its screen is off, it changes the volume
-        // without one.
-        withAnimation(.snappy) {
-            volume = min(15, max(0, volume + (up ? 1 : -1)))
-            if screen != .off { volumePanel = true }
-        }
-        volumeToken += 1
-        let token = volumeToken
-        Task {
-            try? await Task.sleep(for: .seconds(2.5))
-            if token == volumeToken { withAnimation(.easeOut(duration: 0.25)) { volumePanel = false } }
-        }
+        guard mode == .recovery else { return }
+        let count = recovery.items.count
+        recovery.highlighted = (recovery.highlighted + (up ? count - 1 : 1)) % count
     }
 
     /// Android's Back: closes what is on top, as Android would. On the home
@@ -207,7 +186,7 @@ struct SessionView: View {
         volumePanel = preset.volumePanel
         powerMenu = preset.powerMenu
         if preset.settings {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { settings = true }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { model.session.openSettings() }
         }
     }
 }

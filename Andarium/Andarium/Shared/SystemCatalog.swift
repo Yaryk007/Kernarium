@@ -197,9 +197,14 @@ nonisolated enum SystemCatalog {
         return finish(target, id: id)
     }
 
+    static func importDownload(_ archive: URL, name: String, progress: SystemImageImport.Progress) throws -> Entry {
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        return try importImage(archive, id: uniqueID(for: name), name: name, deleteArchive: true, progress: progress)
+    }
+
     private static func stem(_ url: URL) -> String {
         var name = url.lastPathComponent
-        for suffix in [".xz", ".gz", ".img", ".raw"] where name.lowercased().hasSuffix(suffix) {
+        for suffix in [".zip", ".xz", ".gz", ".img", ".raw"] where name.lowercased().hasSuffix(suffix) {
             name = String(name.dropLast(suffix.count))
         }
         return name
@@ -221,38 +226,57 @@ nonisolated enum SystemCatalog {
 
     /// One image file: unpacked, then read as a whole disk or written into a
     /// copy of the carried disk as a partition.
-    private static func importImage(_ source: URL, id: String, progress: SystemImageImport.Progress) throws -> Entry {
+    private static func importImage(_ source: URL, id: String, name: String? = nil, deleteArchive: Bool = false,
+                                    progress: SystemImageImport.Progress) throws -> Entry {
         let manager = FileManager.default
         guard let bundled = bundledFolder else { throw ImportError.invalid("This copy of Andarium carries no system to build on.") }
         let carried = try SystemImageImport.carriedLayout()
         let staging = root.appendingPathComponent(".import-\(UUID().uuidString)", isDirectory: true)
         try manager.createDirectory(at: staging, withIntermediateDirectories: true)
         defer { try? manager.removeItem(at: staging) }
-        let target = root.appendingPathComponent(id, isDirectory: true)
-
-        let sourceBytes = UInt64((try? source.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
-        let values = try? root.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
-        let free: Int64 = values?.volumeAvailableCapacityForImportantUsage ?? 0
-        let needed: UInt64 = carried.disk.size + 2 * sourceBytes
-        if free > 0, UInt64(free) < needed {
-            let neededText = ByteCountFormatter.string(fromByteCount: Int64(needed), countStyle: .file)
-            let freeText = ByteCountFormatter.string(fromByteCount: free, countStyle: .file)
-            throw ImportError.invalid("Importing needs about \(neededText) free; \(freeText) is free.")
-        }
+        let target = staging.appendingPathComponent("release", isDirectory: true)
 
         var current = source
         var kind = try SystemImageImport.kind(of: current)
+        let fromZIP = kind == .zip
+        if fromZIP {
+            current = try SystemImageImport.extractZIP(source, into: staging) { value, what in
+                progress(value * 0.3, what)
+            }
+            kind = try SystemImageImport.kind(of: current)
+            if deleteArchive { try manager.removeItem(at: source) }
+        }
+        let inputName = current.lastPathComponent
+        let firstPhase = fromZIP ? 0.3 : 0.0
+        let beforeImage = current
         for round in 0 ..< 3 where [.xz, .gzip, .sparse].contains(kind) {
             let next = staging.appendingPathComponent("unpacked-\(round).img")
-            try SystemImageImport.unpack(current, kind: kind, into: next) { fraction, what in progress(fraction * 0.4, what) }
+            try SystemImageImport.unpack(current, kind: kind, into: next) { fraction, what in
+                progress(firstPhase + fraction * 0.3, what)
+            }
             if current.deletingLastPathComponent() == staging { try? manager.removeItem(at: current) }
             current = next
             kind = try SystemImageImport.kind(of: current)
         }
         let unpacked = current != source
-        let unpackedKind = kind
-        @Sendable func later(_ fraction: Double, _ what: String) { progress((unpacked ? 0.4 : 0) + fraction * (unpacked ? 0.6 : 1), what) }
+        let partitionImage = kind == .erofs || kind == .ext4
+        let prepared = current == beforeImage ? firstPhase : firstPhase + 0.3
+        @Sendable func later(_ fraction: Double, _ what: String) {
+            progress(prepared + fraction * (1 - prepared), what)
+        }
 
+        let imageBytes = size(of: current)
+        let partition = SystemImageImport.targetPartition(for: inputName, in: carried.disk)
+        let needed: UInt64
+        if partitionImage, let old = carried.disk.partitions.first(where: { $0.name == partition }) {
+            needed = carried.disk.size - old.size + SystemImageImport.alignUp(imageBytes, carried.disk.alignment)
+        } else {
+            needed = kind == .gptDisk && !unpacked ? imageBytes : 0
+        }
+        if let free = try? root.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]).volumeAvailableCapacityForImportantUsage,
+           free > 0, UInt64(free) < needed {
+            throw ImportError.invalid("The system disk needs \(ByteCountFormatter.string(fromByteCount: Int64(clamping: needed), countStyle: .file)) of free storage.")
+        }
         try makeFolders(target)
         do {
             let disk = target.appendingPathComponent(systemDisk)
@@ -271,22 +295,20 @@ nonisolated enum SystemCatalog {
                 }
                 guard let found else { throw ImportError.invalid(problem ?? "The disk's partitions cannot be read.") }
                 layoutDisk = found
-            case .erofs:
-                let partition = SystemImageImport.targetPartition(for: source.lastPathComponent, in: carried.disk)
+            case .erofs, .ext4:
                 layoutDisk = try SystemImageImport.assemble(
                     replacing: partition, with: current, carried: carried.disk,
                     carriedDisk: bundled.appendingPathComponent(systemDisk), into: disk) { fraction, what in later(fraction * 0.6, what) }
-            case .ext4:
-                throw ImportError.invalid("This is an ext4 partition image. Andarium mounts its system partitions as EROFS only; use an EROFS build of the image, or a full Andarium system disk.")
+                if kind == .ext4 { try SystemImageImport.mountExt4(partition, disk: disk, layout: layoutDisk) }
             case .zip:
-                throw ImportError.invalid("This is a .zip archive. Open it in Files to unzip it, then import the .img inside.")
+                throw ImportError.invalid("The ZIP does not contain a supported system image.")
             case .androidBoot:
                 throw ImportError.invalid("This is an Android boot image. Import a full system disk or a system partition image instead.")
             default:
-                throw ImportError.invalid("This file is neither an Android system disk nor an EROFS partition image.")
+                throw ImportError.invalid("This file is neither an Android system disk nor an ext4 or EROFS partition image.")
             }
             let wholeSHA = try SystemImageImport.hash(disk, layout: &layoutDisk) { fraction, what in
-                later((unpackedKind == .erofs ? 0.6 : 0.1) + fraction * (unpackedKind == .erofs ? 0.4 : 0.9), what)
+                later((partitionImage ? 0.6 : 0.1) + fraction * (partitionImage ? 0.4 : 0.9), what)
             }
             var document = carried.document
             document["system_disk"] = SystemImageImport.json(layoutDisk, wholeSHA256: wholeSHA)
@@ -294,14 +316,16 @@ nonisolated enum SystemCatalog {
                 .write(to: target.appendingPathComponent(layout), options: .atomic)
             try manager.copyItem(at: bundled.appendingPathComponent(commandLine), to: target.appendingPathComponent(commandLine))
             try writeIdentity(from: bundled.appendingPathComponent(manifest), to: target.appendingPathComponent(manifest),
-                              id: id, name: stem(source))
+                              id: id, name: name ?? stem(source))
             if let problem = check(target) { throw ImportError.invalid(problem) }
         } catch {
             try? manager.removeItem(at: target)
             throw error
         }
+        let destination = root.appendingPathComponent(id, isDirectory: true)
+        try manager.moveItem(at: target, to: destination)
         progress(1, "Done")
-        return finish(target, id: id)
+        return finish(destination, id: id)
     }
 
     /// The carried manifest under an identity of the import's own, so it can
@@ -366,18 +390,28 @@ struct SystemImageSection: View {
         HomeSection(title: "Android system") {
             VStack(spacing: 10) {
                 ForEach(entries) { entry in card(entry) }
+                if !importing {
+                    Menu("Download an Android skin", systemImage: "arrow.down.circle") {
+                        ForEach(MysticSkin.catalog) { skin in
+                            Button("\(skin.name) · \(ByteCountFormatter.string(fromByteCount: skin.bytes, countStyle: .file))") {
+                                begin { progress in try await SystemCatalog.download(skin, progress: progress) }
+                            }
+                        }
+                    }
+                    .buttonStyle(.glass)
+                }
                 importCard
             }
             .padding(10)
         } footer: {
             SectionNote(chosen == running
-                        ? "Import a full Andarium system disk, or an EROFS partition image such as a GSI system.img (sparse, .xz and .gz work too). Each system keeps its own guest and data."
+                        ? "Import a system disk, an ext4 or EROFS image, or a ROM ZIP containing system.img. Each system keeps its own guest and data."
                         : "Close and reopen Andarium to start the chosen system.")
         }
         .id("systems")
         .fileImporter(isPresented: $picking, allowedContentTypes: [.folder, .item]) { result in
             guard case .success(let url) = result else { return }
-            begin(url)
+            begin { progress in try SystemCatalog.importRelease(from: url, progress: progress) }
         }
         .alert("Android system", isPresented: Binding(get: { message != nil }, set: { if !$0 { message = nil } })) {
             Button("OK", role: .cancel) {}
@@ -469,7 +503,7 @@ struct SystemImageSection: View {
         }
     }
 
-    private func begin(_ url: URL) {
+    private func begin(_ operation: @escaping @Sendable (@escaping SystemImageImport.Progress) async throws -> SystemCatalog.Entry) {
         importing = true
         fraction = 0
         phase = "Preparing"
@@ -479,15 +513,16 @@ struct SystemImageSection: View {
         // async function would otherwise run here and freeze the app.
         let task = Task.detached(priority: .userInitiated) { () -> Result<SystemCatalog.Entry, any Error> in
             let last = LockedTime()
-            return Result {
-                try SystemCatalog.importRelease(from: url) { value, what in
+            do {
+                let entry = try await operation { value, what in
                     guard last.due() else { return }
                     Task { @MainActor in
                         fraction = min(max(value, 0), 1)
                         phase = what
                     }
                 }
-            }
+                return .success(entry)
+            } catch { return .failure(error) }
         }
         Task {
             let outcome = await task.value

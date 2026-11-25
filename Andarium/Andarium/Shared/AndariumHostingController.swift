@@ -11,8 +11,8 @@ protocol SceneGeometryObserver: AnyObject {
 }
 
 /// The scene's root controller owns the orientation preference and, in a
-/// run, the screen edges that defer system gestures. A child of SwiftUI's
-/// default root cannot reliably supply these scene-wide preferences.
+/// run, the four-finger Settings gesture and the edges that defer system gestures.
+/// A child of SwiftUI's default root cannot supply these scene-wide preferences.
 final class AndariumHostingController<Content: View>: UIHostingController<Content>, SceneGeometryObserver {
     private let model: AppModel
     private var lockRequested = false
@@ -20,6 +20,7 @@ final class AndariumHostingController<Content: View>: UIHostingController<Conten
     private var deferredEdges: ScreenEdges?
     private var updateScheduled = false
     private var phaseWatcher: PhaseWatcher?
+    private weak var settingsTap: UITapGestureRecognizer?
 
     init(rootView: Content, model: AppModel) {
         self.model = model
@@ -52,6 +53,21 @@ final class AndariumHostingController<Content: View>: UIHostingController<Conten
         deferredEdges == nil ? super.childForScreenEdgesDeferringSystemGestures : nil
     }
 
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        let settingsTap = UITapGestureRecognizer(target: self, action: #selector(openSessionSettings))
+        settingsTap.numberOfTouchesRequired = 4
+        settingsTap.delaysTouchesBegan = false
+        settingsTap.isEnabled = false
+        view.addGestureRecognizer(settingsTap)
+        self.settingsTap = settingsTap
+    }
+
+    @objc private func openSessionSettings() {
+        guard case .running(.normal) = model.phase, model.spacePause == nil, model.busy == nil else { return }
+        model.session.openSettings()
+    }
+
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         scheduleUpdate()
@@ -72,6 +88,7 @@ final class AndariumHostingController<Content: View>: UIHostingController<Conten
         Task { @MainActor [weak self] in
             guard let self else { return }
             updateScheduled = false
+            settingsTap?.isEnabled = model.phase == .running(.normal)
             guard let scene = view.window?.windowScene else { return }
             let size = scene.effectiveGeometry.coordinateSpace.bounds.size
             let policy = SessionOrientationPolicy(

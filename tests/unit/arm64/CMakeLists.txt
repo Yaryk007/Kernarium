@@ -93,6 +93,7 @@ uml_add_arm64_unit_test(a32_host WITHOUT_HARNESS
 # The tagged translation key both engines' caches share across A64, A32 and
 # T32, and the key-aware validation of a translation's saved guest units.
 uml_add_arm64_unit_test(a32_guest_key WITHOUT_HARNESS NO_OBJECTS)
+uml_add_arm64_unit_test(jit_fetch_window WITHOUT_HARNESS NO_OBJECTS)
 
 # The AArch32 decoder: its generated table, the IT rules, the profile's gates
 # and the operands of the Decode pseudocode, against the generator's
