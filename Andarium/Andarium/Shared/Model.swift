@@ -887,6 +887,8 @@ final class AppModel {
     /// The iPhone Android presents itself as; nil where Andarium does not know
     /// the device, or the system is not LineageOS, whose own init reads it.
     var phoneHardware: PhoneHardware?
+    /// The height of the sensor housing's row in points, as Home read it.
+    var housingHeight = 0
     /// Home's "Notch space", kept for the install (`NotchSpacePreference`).
     var notchSpaceOn = false
     /// A harness's launch decides for its run alone.

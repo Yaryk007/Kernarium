@@ -221,6 +221,9 @@ struct DisplayAreaProbe: View {
         // Until the window has said what its safe area is, the size is not the
         // session's.
         guard size.width > 0, size.height > 0, let window else { return }
+        // A session hides the status bar, and the housing keeps its row.
+        let housing = Int(window.topInset.rounded())
+        if housing > 0, model.housingHeight != housing { model.housingHeight = housing }
         // A folding display has a layout of its own (`SessionPlan`), which
         // knows the session's safe area whichever screen this is, and where
         // the device stands the upper half.

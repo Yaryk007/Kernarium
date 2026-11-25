@@ -120,15 +120,87 @@ public struct NotchSpacePreference {
     public func keep(_ on: Bool) { defaults.set(on, forKey: Self.key) }
 }
 
-/// The cutout Android lays its status bar and its applications out around: the
-/// image's own tall cutout overlay, which the shell may switch. Its 48 dp are
-/// the status bar's height too.
-public enum DisplayCutoutEmulation {
-    public static let overlay = "com.android.internal.display.cutout.emulation.tall"
+/// The cutout Android lays its status bar and its applications out around, and
+/// where the clock and the icons stand beside it. The image's own tall cutout
+/// overlay needs no root, but is one size; the overlays made here fit the phone
+/// and only root may make them. Once made they stay in the guest, and the shell
+/// may switch them in a start without root too.
+public struct DisplayCutoutEmulation: Equatable, Sendable {
+    public static let stockOverlay = "com.android.internal.display.cutout.emulation.tall"
+    static let cutoutName = "AndariumNotchCutout"
+    static let paddingName = "AndariumNotchPadding"
+    /// The guest's own note of what the overlays were made for.
+    static let marker = "andarium_notch"
 
-    public static func command(on: Bool) -> String {
-        on
-            ? "cmd overlay enable-exclusive --user 0 --category \(overlay)"
-            : "cmd overlay disable --user 0 \(overlay)"
+    let housing: PhoneHardware.Housing
+    /// The height of the housing's row in points, which are guest dp.
+    let height: Int
+
+    public init(housing: PhoneHardware.Housing, height: Int) {
+        self.housing = housing
+        self.height = min(max(height, 24), 100)
     }
+
+    /// The housing's width, in dp.
+    var width: Int {
+        switch housing {
+        case .wideNotch: 210
+        case .notch: 162
+        case .island: 126
+        case .smallIsland: 90
+        }
+    }
+
+    /// How far the clock and the icons stand from the screen's edges, in dp:
+    /// close to them beside the wide notch, and nearer the housing the more
+    /// room there is beside it.
+    var padding: Int {
+        switch housing {
+        case .wideNotch: 12
+        case .notch, .island: 24
+        case .smallIsland: 34
+        }
+    }
+
+    private var signature: String { "1-\(width)-\(height)-\(padding)" }
+
+    /// What the shell runs at each start with the notch space: the overlays
+    /// made for this phone where the guest has them, else the stock cutout.
+    public var enableCommand: String {
+        "{ [ \"$(settings get global \(Self.marker))\" = '\(signature)' ] && \(Self.enable)"
+            + " && cmd overlay disable --user 0 \(Self.stockOverlay); } >/dev/null 2>&1"
+            + " || cmd overlay enable-exclusive --user 0 --category \(Self.stockOverlay)"
+    }
+
+    /// What the shell runs at each start without it.
+    public static var disableCommand: String {
+        let overlays = ["com.android.shell:\(cutoutName)", "com.android.shell:\(paddingName)", stockOverlay]
+        return "{ " + overlays.map { "cmd overlay disable --user 0 \($0); " }.joined() + "true; } >/dev/null 2>&1"
+    }
+
+    /// Whether the guest already has the overlays made for this phone.
+    public var checkCommand: String { "[ \"$(settings get global \(Self.marker))\" = '\(signature)' ]" }
+
+    /// What a rooted start runs when it does not. Magisk asks the person
+    /// whether the shell may have root, and waits for the answer.
+    public var rootCommand: String {
+        let half = width / 2
+        let path = "M -\(half),0 L -\(half),\(height) L \(half),\(height) L \(half),0 Z @dp"
+        // TypedValue's complex form of whole dp: the mantissa, radix 23p0, dp.
+        let dimension = "0x" + String(padding << 8 | 1, radix: 16)
+        let commands = [
+            "cmd overlay fabricate --target android --name \(Self.cutoutName) "
+                + "android:string/config_mainBuiltInDisplayCutout 0x03 \"\(path)\"",
+            "cmd overlay fabricate --target android --name \(Self.paddingName) "
+                + "android:dimen/rounded_corner_content_padding 0x05 \(dimension)",
+            "cmd overlay disable --user 0 \(Self.stockOverlay)",
+            Self.enable,
+            "settings put global \(Self.marker) \(signature)",
+        ]
+        return "su -c '" + commands.joined(separator: " && ") + "'"
+    }
+
+    private static let enable =
+        "cmd overlay enable --user 0 com.android.shell:\(cutoutName)"
+        + " && cmd overlay enable --user 0 com.android.shell:\(paddingName)"
 }

@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-import AndariumCore
 import Foundation
 import Testing
+
+@testable import AndariumCore
 
 struct PhoneHardwareTests {
     @Test(arguments: [
@@ -48,8 +49,30 @@ struct PhoneHardwareTests {
         #expect(preference.isOn)
     }
 
-    @Test func theCutoutIsTheImagesOwnOverlay() {
-        #expect(DisplayCutoutEmulation.command(on: true).hasSuffix("--category \(DisplayCutoutEmulation.overlay)"))
-        #expect(DisplayCutoutEmulation.command(on: false) == "cmd overlay disable --user 0 \(DisplayCutoutEmulation.overlay)")
+    @Test func theClockMovesFurtherInTheMoreRoomThereIs() {
+        func padding(_ housing: PhoneHardware.Housing) -> Int {
+            DisplayCutoutEmulation(housing: housing, height: 59).padding
+        }
+        #expect(padding(.wideNotch) < padding(.notch))
+        #expect(padding(.notch) == padding(.island))
+        #expect(padding(.island) < padding(.smallIsland))
+    }
+
+    @Test func rootMakesOverlaysForThisPhone() {
+        let command = DisplayCutoutEmulation(housing: .island, height: 62).rootCommand
+        #expect(command.hasPrefix("su -c '"))
+        #expect(command.contains("0x03 \"M -63,0 L -63,62 L 63,62 L 63,0 Z @dp\""))
+        #expect(command.contains("android:dimen/rounded_corner_content_padding 0x05 0x1801 "))
+        #expect(command.contains("settings put global andarium_notch 1-126-62-24'"))
+        #expect(command.count { $0 == "'" } == 2)
+    }
+
+    @Test func aStartWithoutRootUsesThemOrTheStockCutout() {
+        let cutout = DisplayCutoutEmulation(housing: .notch, height: 47)
+        #expect(cutout.enableCommand.contains("= '1-162-47-24' ]"))
+        #expect(cutout.enableCommand.hasSuffix("--category \(DisplayCutoutEmulation.stockOverlay)"))
+        #expect(!cutout.enableCommand.contains("su -c"))
+        #expect(DisplayCutoutEmulation.disableCommand.contains("com.android.shell:AndariumNotchPadding"))
+        #expect(DisplayCutoutEmulation(housing: .notch, height: 0).height == 24)
     }
 }

@@ -1144,16 +1144,30 @@ final class LiveRuntime: RuntimeDriver {
     private func applyPhoneSettings() {
         guard normalRun, let phone = model?.phoneHardware else { return }
         let operations = self.operations
+        let cutout = runNotchSpace
+            ? phone.housing.map { DisplayCutoutEmulation(housing: $0, height: model?.housingHeight ?? 0) } : nil
         var command = phone.deviceNameCommand
-        if phone.housing != nil { command += "; " + DisplayCutoutEmulation.command(on: runNotchSpace) }
+        if phone.housing != nil { command += "; " + (cutout?.enableCommand ?? DisplayCutoutEmulation.disableCommand) }
+        let rooted = currentSessionRecord()?.ramdisk == .root
         phoneTask?.cancel()
         phoneTask = Task {
+            var taken = false
             for _ in 0..<6 {
-                if let result = try? await operations.shell(command, limit: .seconds(20)), result.exitCode == 0 { return }
+                taken = (try? await operations.shell(command, limit: .seconds(20)))?.exitCode == 0
+                if taken || Task.isCancelled { break }
                 try? await Task.sleep(for: .seconds(5))
-                if Task.isCancelled { return }
             }
-            print("Andarium: Android did not take the phone's settings")
+            if !taken, !Task.isCancelled { print("Andarium: Android did not take the phone's settings") }
+            guard rooted, let cutout else { return }
+            // Only root may make the overlays that fit this phone. Magisk asks
+            // the person, who may miss it, or the app may still be going in.
+            for _ in 0..<3 {
+                if Task.isCancelled { return }
+                if (try? await operations.shell(cutout.checkCommand, limit: .seconds(20)))?.exitCode == 0 { return }
+                if (try? await operations.shell(cutout.rootCommand, limit: .seconds(60)))?.exitCode == 0 { return }
+                try? await Task.sleep(for: .seconds(20))
+            }
+            print("Andarium: root was not given for the notch layout")
         }
     }
 

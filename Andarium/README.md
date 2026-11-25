@@ -568,7 +568,11 @@ address space holds, so this is a fallback.
   (`android_properties`) and the device name is set through the shell unless
   the person gave one. Home's "Notch space" (`NotchSpacePreference`, off by
   default), on a phone with a sensor housing, gives the display the housing's
-  row and switches the image's tall cutout overlay on at `sys.boot_completed`.
+  row and tells Android of a cutout at `sys.boot_completed`
+  (`DisplayCutoutEmulation`): the image's tall cutout overlay, or, once a rooted
+  start was given root for the shell in Magisk, overlays of the phone's own size
+  that also place the clock and the icons beside its housing. Only root may make
+  those; they stay in the guest and serve starts without root too.
   Home's Performance section has "120 Hz" (`HighRefreshPreference`, off by
   default) above JIT, drawn only where the screen shows at least 100 frames a
   second (an iPhone Pro, an iPad Pro; a screen between 61 and 99 does not
