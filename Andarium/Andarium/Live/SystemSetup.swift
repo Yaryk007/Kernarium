@@ -9,6 +9,7 @@ import UniformTypeIdentifiers
 
 nonisolated enum GuestSystemChoice: String, CaseIterable, Identifiable, Sendable {
     case lineage = "LineageOS 24"
+    case lineageGApps = "LineageOS 24 with GApps"
     case xos = "XOS"
     case hyperos = "HyperOS"
     case coloros = "ColorOS"
@@ -22,6 +23,7 @@ nonisolated enum GuestSystemChoice: String, CaseIterable, Identifiable, Sendable
     var storageName: String {
         switch self {
         case .lineage: "lineage"
+        case .lineageGApps: "lineage-gapps"
         case .xos: "xos"
         case .hyperos: "hyperos"
         case .coloros: "coloros"
@@ -39,6 +41,7 @@ nonisolated enum SystemInstallation {
     static let selectionFile = "selected-os"
     static let officialURL = URL(string: "https://github.com/imxieyi/Kernarium/releases/download/1.0b15-release/Andarium-1.0-15.ipa")!
     static let officialBytes: Int64 = 1_061_900_449
+    private static let officialRelease = "20261115-los24-r28"
     private static let officialSHA256 = "88327002e554190a6e4e084265bc69a1e097d52352824e5808eb28042b341ddc"
     private static let selectedKey = "andariumSelectedInstalledAndroid"
     static let showPickerKey = "andariumChooseAndroidNextLaunch"
@@ -64,6 +67,8 @@ nonisolated enum SystemInstallation {
         let legacy = URL.libraryDirectory.appendingPathComponent("InstalledAndroid", isDirectory: true)
         return selection(in: legacy) == nil ? nil : legacy
     }
+
+    static var activeChoice: GuestSystemChoice? { installed.flatMap(selection(in:)) }
 
     static func select(_ choice: GuestSystemChoice) {
         UserDefaults.standard.set(choice.rawValue, forKey: selectedKey)
@@ -119,12 +124,21 @@ nonisolated enum SystemInstallation {
         let manifestObject = try JSONSerialization.jsonObject(with: manifest) as? [String: Any]
         let kernel = manifestObject?["kernel"] as? [String: Any]
         let family = manifestObject?["product_family"] as? String
-        let expectedFamily = choice == .lineage ? "lineage-24" : choice.storageName
-        let matchesFamily = choice == .custom || family == expectedFamily || family?.hasPrefix(expectedFamily + "-") == true
-        let matchesKernel = choice == .lineage
-            ? info.release == "20261115-los24-r28" && kernel?["abi_version"] as? Int == 26
-            : kernel?["abi_version"] as? Int == 29
-        guard matchesFamily, matchesKernel, info.version == "17", info.abis.contains("arm64-v8a"),
+        let abi = kernel?["abi_version"] as? Int
+        let matchesRelease: Bool
+        switch choice {
+        case .lineage:
+            matchesRelease = family == "lineage-24" && info.release == officialRelease && abi == 26
+        case .lineageGApps:
+            matchesRelease = family == "lineage-24-gapps" && abi == 26
+                && manifestObject?["base_release_id"] as? String == officialRelease
+                && info.release != officialRelease
+        default:
+            let expectedFamily = choice.storageName
+            let matchesFamily = choice == .custom || family == expectedFamily || family?.hasPrefix(expectedFamily + "-") == true
+            matchesRelease = matchesFamily && abi == 29
+        }
+        guard matchesRelease, info.version == "17", info.abis.contains("arm64-v8a"),
               kernel?["page_size"] as? Int == 4096,
               (kernel?["release"] as? String)?.hasPrefix("6.18.") == true
         else { throw Problem.incompatible }
@@ -227,14 +241,15 @@ struct SystemSetupView: View {
     var canReturn: Bool
     var didInstall: () -> Void
 
-    @State private var choice = GuestSystemChoice.lineage
+    @State private var choice = SystemInstallation.activeChoice ?? .lineage
     @State private var customAddress = ""
     @State private var picking = false
     @State private var job: Task<Void, Never>?
-    @State private var phase = ""
+    @State private var progress = GuestSystemInstallProgress.working("Preparing…")
     @State private var error: String?
 
     private var available: [GuestSystemChoice] { [.lineage, .oneUI, .hyperos, .coloros, .custom] }
+    private var displayedChoice: GuestSystemChoice { choice == .lineageGApps ? .lineage : choice }
     private var alreadyInstalled: Bool {
         SystemInstallation.selection(in: SystemInstallation.directory(for: choice)) == choice
     }
@@ -243,17 +258,31 @@ struct SystemSetupView: View {
         NavigationStack {
             Form {
                 Section {
-                    Picker("Operating system", selection: $choice) {
+                    Picker("Operating system", selection: Binding(get: { displayedChoice }, set: { choice = $0 })) {
                         ForEach(available) { Text($0.title).tag($0) }
                     }
                     .disabled(job != nil)
                 } footer: {
-                    if choice == .lineage {
+                    if displayedChoice == .lineage {
                         Text("Downloads the official LineageOS 24 r28 guest on request. About 1.06 GB.")
                     } else if let skin = choice.skin {
                         Text("Downloads the \(skin.name) image from MysticGSI and uses LineageOS r28 for the guest’s boot and vendor partitions.")
                     } else {
                         Text("Choose a local system image or ROM ZIP, or enter a direct HTTPS download URL.")
+                    }
+                }
+                if displayedChoice == .lineage {
+                    Section {
+                        Toggle("GApps", isOn: Binding(
+                            get: { choice == .lineageGApps },
+                            set: { enabled in
+                                choice = enabled ? .lineageGApps : .lineage
+                                error = nil
+                            }
+                        ))
+                        .disabled(job != nil)
+                    } footer: {
+                        Text("LineageOS keeps separate Android apps and data with GApps on or off.")
                     }
                 }
                 if choice == .custom, !alreadyInstalled {
@@ -269,10 +298,15 @@ struct SystemSetupView: View {
                 }
                 Section {
                     if let job {
-                        ProgressView(phase)
+                        installProgress
                         Button("Cancel", role: .cancel) { job.cancel() }
                     } else if alreadyInstalled {
                         Button("Use installed system") { finish(choice) }
+                    } else if choice == .lineageGApps {
+                        Button("Import LineageOS with GApps", systemImage: "folder") { picking = true }
+                        Text("Choose an Andarium guest ZIP built from LineageOS r28 with GApps included.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
                     } else {
                         Button("Download and install") { start() }
                             .disabled(choice == .custom && customAddress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
@@ -304,6 +338,39 @@ struct SystemSetupView: View {
         }
     }
 
+    @ViewBuilder private var installProgress: some View {
+        switch progress {
+        case .working(let label):
+            ProgressView(label)
+        case .downloading(let label, let received, let total, let speed):
+            VStack(alignment: .leading, spacing: 8) {
+                if let total {
+                    ProgressView(value: Double(min(received, total)), total: Double(total)) { Text(label) }
+                } else {
+                    ProgressView(label)
+                }
+                HStack {
+                    if let total {
+                        Text("\(byteCount(received)) of \(byteCount(total))")
+                    } else {
+                        Text("\(byteCount(received)) downloaded")
+                    }
+                    Spacer()
+                    if let speed {
+                        Text("\(byteCount(speed))/s")
+                            .accessibilityLabel("\(byteCount(speed)) per second")
+                    }
+                }
+                .font(.footnote.monospacedDigit())
+                .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func byteCount(_ bytes: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+    }
+
     private func finish(_ selected: GuestSystemChoice) {
         SystemInstallation.select(selected)
         didInstall()
@@ -314,7 +381,7 @@ struct SystemSetupView: View {
         let address = customAddress
         let destination = SystemInstallation.directory(for: selected)
         error = nil
-        phase = "Preparing…"
+        progress = .working("Preparing…")
         job = Task {
             defer {
                 withExtendedLifetime(folder) {}
@@ -322,7 +389,7 @@ struct SystemSetupView: View {
             }
             do {
                 try await GuestSystemInstaller.install(selected, address: address, local: local, at: destination) { update in
-                    phase = update
+                    progress = update
                 }
                 finish(selected)
             } catch {
