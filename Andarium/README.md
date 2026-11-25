@@ -1,8 +1,12 @@
 # Andarium
 
 Andarium runs a locally installed Android guest on the Darwin runtime. On
-first launch, setup downloads and verifies a guest before presenting the
-emulator. [Kernarium](../Kernarium/README.md)
+first launch, choose the Android system and start its download or import.
+The install package carries the runtime and kernel. The official default is
+LineageOS 24 r28. MysticGSI skins and custom ext4, EROFS, and ROM ZIP images
+use the r28 boot and vendor base. Home’s appearance menu switches between
+the build 30 layout and the newer layout, and can reopen the Android chooser
+on the next launch. [Kernarium](../Kernarium/README.md)
 stays the developer application for Linux guests and for Android bundles.
 Andarium also runs on an Apple silicon Mac in Designed for iPad mode, whose
 minimum is macOS 27.0 (`LSMinimumSystemVersion`; the iOS minimum alone would

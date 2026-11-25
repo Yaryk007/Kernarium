@@ -44,6 +44,7 @@ final class AndariumHostingController<Content: View>: UIHostingController<Conten
     /// the scene and the model.
     var inputsSource: (@MainActor () -> SceneUpdateInputs?)?
     private var phaseWatcher: PhaseWatcher?
+    private weak var settingsTap: UITapGestureRecognizer?
     private var pointerLockWatcher: PointerLockWatcher?
     let foldReader = FoldSceneReader()
     /// The backing of the root view and of its window as they were before
@@ -101,6 +102,18 @@ final class AndariumHostingController<Content: View>: UIHostingController<Conten
         super.viewDidLoad()
         foldReader.hingeDidChange = { [weak self] in self?.updateFold() }
         foldReader.attach(to: view)
+        let settingsTap = UITapGestureRecognizer(target: self, action: #selector(openSessionSettings))
+        settingsTap.numberOfTouchesRequired = 4
+        settingsTap.delaysTouchesBegan = false
+        settingsTap.isEnabled = model.phase == .running(.normal)
+        view.addGestureRecognizer(settingsTap)
+        self.settingsTap = settingsTap
+    }
+
+    @objc private func openSessionSettings() {
+        guard case .running(.normal) = model.phase, model.spacePause == nil, model.busy == nil else { return }
+        model.session.closeSideKeys()
+        model.sessionSettingsOpen = true
     }
 
     override func viewWillAppear(_ animated: Bool) {
@@ -142,6 +155,7 @@ final class AndariumHostingController<Content: View>: UIHostingController<Conten
     }
 
     private func phaseDidChange() {
+        settingsTap?.isEnabled = model.phase == .running(.normal)
         updateBacking()
         sceneGeometryDidChange()
     }

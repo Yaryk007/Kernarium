@@ -5,6 +5,7 @@ import CryptoKit
 import Foundation
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
 
 nonisolated enum GuestSystemChoice: String, CaseIterable, Identifiable, Sendable {
     case lineage = "LineageOS 24"
@@ -12,8 +13,11 @@ nonisolated enum GuestSystemChoice: String, CaseIterable, Identifiable, Sendable
     case hyperos = "HyperOS"
     case coloros = "ColorOS"
     case oneUI = "One UI"
+    case custom = "Custom image"
 
     var id: String { rawValue }
+    var title: String { self == .lineage ? "LineageOS 24 (r28)" : rawValue }
+    var skin: MysticSkin? { MysticSkin.catalog.first { $0.name == rawValue } }
 
     var storageName: String {
         switch self {
@@ -22,21 +26,26 @@ nonisolated enum GuestSystemChoice: String, CaseIterable, Identifiable, Sendable
         case .hyperos: "hyperos"
         case .coloros: "coloros"
         case .oneUI: "one-ui"
+        case .custom: "custom"
         }
     }
 }
 
 nonisolated enum SystemInstallation {
     private static let archiveLimit: UInt64 = 8 * 1024 * 1024 * 1024
-    private static let diskLimit: UInt64 = 16 * 1024 * 1024 * 1024
+    static let diskLimit: UInt64 = 16 * 1024 * 1024 * 1024
     private static let metadataLimit = 1024 * 1024
     private static let chunkSize = 256 * 1024
-    private static let selectionFile = "selected-os"
-    static let officialURL = URL(string: "https://github.com/imxieyi/Kernarium/releases/download/andarium-1.1/Andarium-1.1-16.ipa")!
-    private static let officialSHA256 = "da277dced66f2208299232172168f71add6de4252a2cbb3f63d450626bf20ac7"
+    static let selectionFile = "selected-os"
+    static let officialURL = URL(string: "https://github.com/imxieyi/Kernarium/releases/download/1.0b15-release/Andarium-1.0-15.ipa")!
+    static let officialBytes: Int64 = 1_061_900_449
+    private static let officialSHA256 = "88327002e554190a6e4e084265bc69a1e097d52352824e5808eb28042b341ddc"
+    private static let selectedKey = "andariumSelectedInstalledAndroid"
+    static let showPickerKey = "andariumChooseAndroidNextLaunch"
 
-    static var directory: URL {
-        URL.libraryDirectory.appendingPathComponent("InstalledAndroid", isDirectory: true)
+    static func directory(for choice: GuestSystemChoice) -> URL {
+        URL.libraryDirectory.appendingPathComponent("AndroidSystems", isDirectory: true)
+            .appendingPathComponent(choice.storageName, isDirectory: true)
     }
 
     static func selection(in folder: URL) -> GuestSystemChoice? {
@@ -47,20 +56,33 @@ nonisolated enum SystemInstallation {
     }
 
     static var installed: URL? {
-        selection(in: directory) == nil ? nil : directory
+        if let value = UserDefaults.standard.string(forKey: selectedKey),
+           let choice = GuestSystemChoice(rawValue: value) {
+            let folder = directory(for: choice)
+            if selection(in: folder) == choice { return folder }
+        }
+        let legacy = URL.libraryDirectory.appendingPathComponent("InstalledAndroid", isDirectory: true)
+        return selection(in: legacy) == nil ? nil : legacy
+    }
+
+    static func select(_ choice: GuestSystemChoice) {
+        UserDefaults.standard.set(choice.rawValue, forKey: selectedKey)
+        UserDefaults.standard.removeObject(forKey: showPickerKey)
     }
 
     enum Problem: LocalizedError {
         case address, download, archive, incompatible, checksum, alreadyInstalled
+        case invalid(String)
 
         var errorDescription: String? {
             switch self {
-            case .address: "Enter a direct HTTPS link to an Andarium guest ZIP."
+            case .address: "Enter a direct HTTPS link to a system image or ROM ZIP."
             case .download: "The server did not return a usable download."
-            case .archive: "The download must contain one Andarium guest release and its required files."
-            case .incompatible: "The image must be an arm64 Android 17 guest for Andarium's 4 KiB kernel."
+            case .archive: "Choose an Andarium guest ZIP or a ROM archive containing a single system image."
+            case .incompatible: "This image does not match Andarium’s arm64 4 KiB guest format."
             case .checksum: "The download or its system disk failed the integrity check."
-            case .alreadyInstalled: "An Android system is already installed."
+            case .alreadyInstalled: "This Android system is already installed."
+            case .invalid(let message): message
             }
         }
     }
@@ -98,10 +120,12 @@ nonisolated enum SystemInstallation {
         let kernel = manifestObject?["kernel"] as? [String: Any]
         let family = manifestObject?["product_family"] as? String
         let expectedFamily = choice == .lineage ? "lineage-24" : choice.storageName
-        guard family == expectedFamily || family?.hasPrefix(expectedFamily + "-") == true,
-              info.version == "17", info.abis.contains("arm64-v8a"),
+        let matchesFamily = choice == .custom || family == expectedFamily || family?.hasPrefix(expectedFamily + "-") == true
+        let matchesKernel = choice == .lineage
+            ? info.release == "20261115-los24-r28" && kernel?["abi_version"] as? Int == 26
+            : kernel?["abi_version"] as? Int == 29
+        guard matchesFamily, matchesKernel, info.version == "17", info.abis.contains("arm64-v8a"),
               kernel?["page_size"] as? Int == 4096,
-              kernel?["abi_version"] as? Int == 29,
               (kernel?["release"] as? String)?.hasPrefix("6.18.") == true
         else { throw Problem.incompatible }
         let layout = try release.data(of: member(SystemFolder.layout, prefix: prefix, in: release), limit: metadataLimit)
@@ -183,7 +207,7 @@ nonisolated enum SystemInstallation {
         return hex(hash.finalize())
     }
 
-    private static func archiveDigest(_ file: URL) throws -> String {
+    static func archiveDigest(_ file: URL) throws -> String {
         let input = try FileHandle(forReadingFrom: file)
         defer { try? input.close() }
         var digest = SHA256()
@@ -200,31 +224,42 @@ nonisolated enum SystemInstallation {
 }
 
 struct SystemSetupView: View {
+    var canReturn: Bool
     var didInstall: () -> Void
 
     @State private var choice = GuestSystemChoice.lineage
     @State private var customAddress = ""
+    @State private var picking = false
     @State private var job: Task<Void, Never>?
-    @State private var installing = false
+    @State private var phase = ""
     @State private var error: String?
+
+    private var available: [GuestSystemChoice] { [.lineage, .oneUI, .hyperos, .coloros, .custom] }
+    private var alreadyInstalled: Bool {
+        SystemInstallation.selection(in: SystemInstallation.directory(for: choice)) == choice
+    }
 
     var body: some View {
         NavigationStack {
             Form {
                 Section {
                     Picker("Operating system", selection: $choice) {
-                        ForEach(GuestSystemChoice.allCases) { Text($0.rawValue).tag($0) }
+                        ForEach(available) { Text($0.title).tag($0) }
                     }
                     .disabled(job != nil)
                 } footer: {
                     if choice == .lineage {
-                        Text("Downloads the official LineageOS guest and keeps it on this device. About 1.25 GB to download.")
+                        Text("Downloads the official LineageOS 24 r28 guest on request. About 1.06 GB.")
+                    } else if let skin = choice.skin {
+                        Text("Downloads the \(skin.name) image from MysticGSI and uses LineageOS r28 for the guest’s boot and vendor partitions.")
                     } else {
-                        Text("Use a direct link to an Andarium-compatible guest ZIP. Phone firmware and OTA packages cannot boot here.")
+                        Text("Choose a local system image or ROM ZIP, or enter a direct HTTPS download URL.")
                     }
                 }
-                if choice != .lineage {
-                    Section("Guest ZIP URL") {
+                if choice == .custom, !alreadyInstalled {
+                    Section("Custom image") {
+                        Button("Choose from Files", systemImage: "folder") { picking = true }
+                            .disabled(job != nil)
                         TextField("https://", text: $customAddress)
                             .keyboardType(.URL)
                             .textInputAutocapitalization(.never)
@@ -234,47 +269,56 @@ struct SystemSetupView: View {
                 }
                 Section {
                     if let job {
-                        ProgressView(installing ? "Importing and verifying…" : "Downloading…")
+                        ProgressView(phase)
                         Button("Cancel", role: .cancel) { job.cancel() }
+                    } else if alreadyInstalled {
+                        Button("Use installed system") { finish(choice) }
                     } else {
-                        Button("Download and install", action: start)
+                        Button("Download and install") { start() }
+                            .disabled(choice == .custom && customAddress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     }
                     if let error { Text(error).foregroundStyle(.red) }
                 }
             }
-            .navigationTitle("Set up Andarium")
+            .navigationTitle("Choose Android")
+            .toolbar {
+                if canReturn {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Keep current system") {
+                            UserDefaults.standard.removeObject(forKey: SystemInstallation.showPickerKey)
+                            didInstall()
+                        }
+                        .disabled(job != nil)
+                    }
+                }
+            }
+            .fileImporter(isPresented: $picking, allowedContentTypes: [.item]) { result in
+                switch result {
+                case .success(let source): start(local: source)
+                case .failure(let failure): error = failure.localizedDescription
+                }
+            }
         }
     }
 
-    private func start() {
+    private func finish(_ selected: GuestSystemChoice) {
+        SystemInstallation.select(selected)
+        didInstall()
+    }
+
+    private func start(local: URL? = nil) {
         let selected = choice
+        let address = customAddress
+        let destination = SystemInstallation.directory(for: selected)
         error = nil
+        phase = "Preparing…"
         job = Task {
-            defer {
-                job = nil
-                installing = false
-            }
-            let owned = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-            defer { try? FileManager.default.removeItem(at: owned) }
+            defer { job = nil }
             do {
-                let url = try selected == .lineage ? SystemInstallation.officialURL : SystemInstallation.customURL(customAddress)
-                let (file, response) = try await URLSession.shared.download(from: url)
-                defer { try? FileManager.default.removeItem(at: file) }
-                guard let http = response as? HTTPURLResponse, http.statusCode == 200,
-                      let final = http.url, SystemInstallation.isHTTPS(final)
-                else { throw SystemInstallation.Problem.download }
-                try FileManager.default.moveItem(at: file, to: owned)
-                try Task.checkCancellation()
-                installing = true
-                let worker = Task.detached(priority: .utility) {
-                    try SystemInstallation.install(owned, choice: selected, at: SystemInstallation.directory)
+                try await GuestSystemInstaller.install(selected, address: address, local: local, at: destination) { update in
+                    phase = update
                 }
-                try await withTaskCancellationHandler {
-                    try await worker.value
-                } onCancel: {
-                    worker.cancel()
-                }
-                didInstall()
+                finish(selected)
             } catch {
                 if !Task.isCancelled {
                     self.error = error is ZipError ? SystemInstallation.Problem.archive.localizedDescription
@@ -288,12 +332,12 @@ struct SystemSetupView: View {
 extension AppEntry {
     @MainActor
     func presentSystemSetup(in window: UIWindow, onInstall: @escaping () -> Void) -> Bool {
-        guard SystemInstallation.installed == nil,
-              Bundle.main.url(forResource: SystemFolder.name, withExtension: nil) == nil,
-              overrides.isEmpty,
-              ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil
+        let installed = SystemInstallation.installed != nil
+            || Bundle.main.url(forResource: SystemFolder.name, withExtension: nil) != nil
+        guard (!installed || UserDefaults.standard.bool(forKey: SystemInstallation.showPickerKey)),
+              overrides.isEmpty, ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil
         else { return false }
-        window.rootViewController = UIHostingController(rootView: SystemSetupView(didInstall: onInstall))
+        window.rootViewController = UIHostingController(rootView: SystemSetupView(canReturn: installed, didInstall: onInstall))
         return true
     }
 }

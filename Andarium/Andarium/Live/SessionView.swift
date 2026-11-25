@@ -2,12 +2,14 @@
 
 import AndariumCore
 import SwiftUI
+import UIKit
 
 /// A run: Android's own display fills the screen, and Andarium keeps only
 /// the side keys on its edge. The keys are Android's: Power and volume, Back
 /// and Home, as the keyboard events a phone's hardware keys would raise.
 struct SessionView: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.scenePhase) private var scenePhase
     let mode: StartMode
 
     var body: some View {
@@ -15,6 +17,16 @@ struct SessionView: View {
         content
             // The text message bar, over Android and above the keyboard.
             .overlay(alignment: .bottom) { TextMessageBarOverlay() }
+            .background(alignment: .topLeading) {
+                if UIDevice.current.userInterfaceIdiom == .phone, scenePhase == .active,
+                   model.guestHasKeys, model.spacePause == nil {
+                    GuestVolumeKeys { runtime?.press($0) }
+                        .frame(width: 1, height: 1)
+                        .clipped()
+                        .opacity(0.02)
+                        .accessibilityHidden(true)
+                }
+            }
             .statusBarHidden(true)
             // The system honours the bottom edge's deferral only while the
             // home indicator is visible: with it hidden, one swipe goes Home.

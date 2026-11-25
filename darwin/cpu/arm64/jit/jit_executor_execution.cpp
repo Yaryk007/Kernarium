@@ -140,14 +140,10 @@ inline constexpr std::uint64_t key_state_bits =
     /* The span ends at the first block end; a lock sequence's is read on to
      * its store-exclusive (exclusive_run_span). A speculative fetch failure
      * leaves the ordinary prefix intact. */
-    const auto count = fetch_translation_words(
+    const auto count = fetch_translation_words_batched(
         cpu.pc, instructions,
-        [&](std::uint64_t address, std::uint32_t &word) {
-          std::array<std::byte, sizeof(std::uint32_t)> encoded{};
-          if (!memory.fetch(address, encoded))
-            return false;
-          std::memcpy(&word, encoded.data(), encoded.size());
-          return true;
+        [&](std::uint64_t address, std::span<std::byte> bytes) {
+          return memory.fetch(address, bytes);
         });
     if (count == 0) {
       record_fetch_fault(memory);

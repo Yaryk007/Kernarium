@@ -134,7 +134,7 @@ struct SideKeysOverlay: View {
                 }
                 .position(x: edgeX + inward * (KeyMetrics.edgeGap + groupWidth / 2), y: openY)
             } else {
-                ClosedKeys(space: keysSpace, leading: leading)
+                ClosedKeys(space: keysSpace, leading: leading, recovery: recoveryMode)
                     // SwiftUI's own popover, not `popoverTip`: TipKit leaves
                     // its popover on screen when the keys it points at go
                     // away (opening, or the session ending), over the open
@@ -273,20 +273,23 @@ enum KeyMetrics {
 struct ClosedKeys: View {
     let space: Namespace.ID
     let leading: Bool
+    let recovery: Bool
 
     var body: some View {
         VStack(spacing: 6) {
             key(height: 30)
                 .matchedGeometryEffect(id: "power", in: space)
-            key(height: 58)
-                .matchedGeometryEffect(id: "rocker", in: space)
+            if recovery {
+                key(height: 58)
+                    .matchedGeometryEffect(id: "rocker", in: space)
+            }
         }
         .padding(leading ? .leading : .trailing, 3)
-        .frame(width: 36, height: 124, alignment: leading ? .leading : .trailing)
+        .frame(width: 36, height: recovery ? 124 : 56, alignment: leading ? .leading : .trailing)
         .contentShape(Rectangle())
         .accessibilityElement()
         .accessibilityLabel("Side keys")
-        .accessibilityHint("Opens Power, volume, Back, Home and Settings")
+        .accessibilityHint(recovery ? "Opens Power, Up and Down" : "Opens Power, Back, Home and Settings")
         .accessibilityAddTraits(.isButton)
         .accessibilityIdentifier("side-keys")
     }
@@ -318,11 +321,11 @@ struct OpenKeys: View {
                 .matchedGeometryEffect(id: "power", in: space)
                 .accessibilityFocused(focus, equals: .power)
 
-            KeyPair(
-                top: (recovery ? "chevron.up" : "plus", recovery ? String(localized: "Up") : String(localized: "Volume up"), volumeUp),
-                bottom: (recovery ? "chevron.down" : "minus", recovery ? String(localized: "Down") : String(localized: "Volume down"), volumeDown)
-            )
-            .matchedGeometryEffect(id: "rocker", in: space)
+            if recovery {
+                KeyPair(top: ("chevron.up", String(localized: "Up"), volumeUp),
+                        bottom: ("chevron.down", String(localized: "Down"), volumeDown))
+                    .matchedGeometryEffect(id: "rocker", in: space)
+            }
         }
         .foregroundStyle(.primary)
     }
@@ -469,11 +472,11 @@ struct KeyRail: View {
         let key = CGSize(width: KeyMetrics.width, height: KeyMetrics.railKeyHeight)
         VStack(spacing: KeyMetrics.railGap) {
             PowerKey(recovery: recovery, lit: lit, size: key, power: { pressed(actions.power) }, powerHold: holdPower)
-            KeyPair(
-                top: (recovery ? "chevron.up" : "plus", recovery ? String(localized: "Up") : String(localized: "Volume up"), { pressed(actions.volumeUp) }),
-                bottom: (recovery ? "chevron.down" : "minus", recovery ? String(localized: "Down") : String(localized: "Volume down"), { pressed(actions.volumeDown) }),
-                keyHeight: key.height
-            )
+            if recovery {
+                KeyPair(top: ("chevron.up", String(localized: "Up"), { pressed(actions.volumeUp) }),
+                        bottom: ("chevron.down", String(localized: "Down"), { pressed(actions.volumeDown) }),
+                        keyHeight: key.height)
+            }
             if !recovery {
                 SettingsKey(size: key, action: actions.settings)
                 KeyPair(
@@ -526,14 +529,12 @@ struct KeyDeck: View {
             } else {
                 Spacer(minLength: 0)
             }
-            KeyPair(
-                top: (recovery ? "chevron.up" : "minus", recovery ? String(localized: "Up") : String(localized: "Volume down"),
-                      { pressed(recovery ? actions.volumeUp : actions.volumeDown) }),
-                bottom: (recovery ? "chevron.down" : "plus", recovery ? String(localized: "Down") : String(localized: "Volume up"),
-                         { pressed(recovery ? actions.volumeDown : actions.volumeUp) }),
-                axis: .horizontal
-            )
-            .padding(.trailing, 14)
+            if recovery {
+                KeyPair(top: ("chevron.up", String(localized: "Up"), { pressed(actions.volumeUp) }),
+                        bottom: ("chevron.down", String(localized: "Down"), { pressed(actions.volumeDown) }),
+                        axis: .horizontal)
+                    .padding(.trailing, 14)
+            }
             PowerKey(
                 recovery: recovery, lit: lit, size: KeyMetrics.deckKey,
                 power: { pressed(actions.power) }, powerHold: holdPower)

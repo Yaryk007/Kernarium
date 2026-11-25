@@ -89,7 +89,7 @@ public struct SystemInfo: Equatable, Sendable {
 
         let parts = family.split(separator: "-")
         let isLineage = parts.count >= 2 && parts[0] == "lineage" && Int(parts[1]) != nil
-        let isCustom = ["xos", "hyperos", "coloros", "one-ui"].contains {
+        let isCustom = ["xos", "hyperos", "coloros", "one-ui", "custom"].contains {
             family == $0 || family.hasPrefix($0 + "-")
         }
         guard isLineage || isCustom else {

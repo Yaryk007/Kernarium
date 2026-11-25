@@ -3,6 +3,8 @@
 
 #include "cpu/arm64/jit/jit_runtime_contract.hpp"
 
+#include <algorithm>
+#include <array>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -236,6 +238,35 @@ template <typename Fetch>
       break;
   }
   return count == 0U ? 0U : exclusive_run_span(pc, words, count, fetch);
+}
+
+/* Feed the ordinary and exclusive-run decoders from short page-local reads.
+ * A failed window still tries its first word so a readable prefix survives. */
+template <typename Fetch>
+[[nodiscard]] std::size_t fetch_translation_words_batched(
+    std::uint64_t pc, std::span<std::uint32_t> words, Fetch &&fetch) {
+  std::array<std::uint32_t, 8> buffer{};
+  std::uint64_t start = pc;
+  std::size_t size = 0;
+  return fetch_translation_words(pc, words,
+      [&](std::uint64_t address, std::uint32_t &word) {
+        if (address < start || (address - start) / sizeof(word) >= size) {
+          start = address;
+          const auto page_words = (page_size - (address & (page_size - 1))) / sizeof(word);
+          const auto remaining = words.size() - (address - pc) / sizeof(word);
+          size = std::min({buffer.size(), std::max<std::size_t>(1, page_words),
+                           static_cast<std::size_t>(remaining)});
+          auto window = std::span{buffer}.first(size);
+          if (!fetch(address, std::as_writable_bytes(window))) {
+            size = 1;
+            if (window.size() == 1 ||
+                !fetch(address, std::as_writable_bytes(window.first(1))))
+              return false;
+          }
+        }
+        word = buffer[(address - start) / sizeof(word)];
+        return true;
+      });
 }
 
 } // namespace uml::cpu::arm64

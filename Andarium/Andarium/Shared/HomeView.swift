@@ -10,6 +10,9 @@ struct HomeView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     /// The notes zoom out of the ribbon and back into it.
     @Namespace private var whatsNewZoom
+    @AppStorage("andariumNewHomeLayout") private var newHomeLayout = false
+    @AppStorage("andariumChooseAndroidNextLaunch") private var chooseAndroidAtLaunch = false
+    @State private var showSystemSelectionNotice = false
     let hints: ScreenHints
 
     var body: some View {
@@ -47,16 +50,35 @@ struct HomeView: View {
                     }
                 }
             }
-            .background(Color(.systemGroupedBackground))
+            .background {
+                if newHomeLayout { Color(.systemGroupedBackground).ignoresSafeArea() }
+                else { HomeBackdrop() }
+            }
             .navigationTitle("Andarium")
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     HomeInfoButton()
                 }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Menu {
+                        Toggle("New Home layout", isOn: $newHomeLayout)
+                        Button("Choose Android on next launch", systemImage: "internaldrive") {
+                            chooseAndroidAtLaunch = true
+                            showSystemSelectionNotice = true
+                        }
+                    } label: {
+                        Label("Appearance and Android system", systemImage: "ellipsis.circle")
+                    }
+                }
             }
             // Looks for a newer version of Andarium a few seconds after Home
             // shows; a start cancels it, and it never stands before Start.
             .task { await model.readAppUpdateWhenHomeShows() }
+        }
+        .alert("Choose Android on next launch", isPresented: $showSystemSelectionNotice) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("Close and reopen Andarium to choose an Android system.")
         }
         .sheet(item: $model.sheet) { kind in
             // On a Mac, SwiftUI reads a sheet's presentation preferences
@@ -112,6 +134,7 @@ struct HomeView: View {
     private func pagesLayout(_ pages: HomePages) -> some View {
         let first = ScrollView {
             VStack(spacing: 22) {
+                previousReleaseHero
                 notices
                 SystemSection()
                 if pages.upright { developmentSections }
@@ -162,6 +185,7 @@ struct HomeView: View {
 
     private var narrowLayout: some View {
         VStack(spacing: 22) {
+            previousReleaseHero
             notices
             SystemSection()
             developmentSections
@@ -178,6 +202,7 @@ struct HomeView: View {
     /// options and the Erase card beneath.
     private var tallLayout: some View {
         VStack(spacing: 28) {
+            previousReleaseHero
             notices
             SystemSection()
             developmentSections
@@ -195,6 +220,7 @@ struct HomeView: View {
     private var wideLayout: some View {
         HStack(alignment: .top, spacing: 24) {
             VStack(spacing: 22) {
+                previousReleaseHero
                 notices
                 SystemSection()
                 developmentSections
@@ -211,6 +237,11 @@ struct HomeView: View {
         .padding(.top, 8)
         .padding(.bottom, 20)
         .frame(maxWidth: .infinity)
+    }
+
+    @ViewBuilder
+    private var previousReleaseHero: some View {
+        if !newHomeLayout { HomeHero() }
     }
 
     /// Performance (120 Hz, AOT where the build carries it, and JIT), right below
