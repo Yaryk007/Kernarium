@@ -382,8 +382,11 @@ struct SystemSetupView: View {
         let destination = SystemInstallation.directory(for: selected)
         error = nil
         progress = .working("Preparing…")
+        // A locked phone stops the download.
+        UIApplication.shared.isIdleTimerDisabled = true
         job = Task {
             defer {
+                UIApplication.shared.isIdleTimerDisabled = false
                 withExtendedLifetime(folder) {}
                 job = nil
             }

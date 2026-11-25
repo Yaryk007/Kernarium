@@ -141,6 +141,18 @@ nonisolated enum GuestSystemInstaller {
             try SystemImageImport.requireSpace(UInt64(expectedBytes), at: target.deletingLastPathComponent())
         }
         await report(.downloading(label, received: 0, total: expectedBytes, bytesPerSecond: nil))
+        // What has a known size has a pinned digest too, which its caller checks.
+        if let expectedBytes {
+            do {
+                try await SegmentedDownload.run(url, to: target, bytes: expectedBytes) { received, speed in
+                    await report(.downloading(label, received: received, total: expectedBytes, bytesPerSecond: speed))
+                }
+                try Task.checkCancellation()
+                return target
+            } catch SegmentedDownload.Problem.rangesUnsupported {
+                try FileManager.default.removeItem(at: target)
+            }
+        }
         let (transfers, progress) = AsyncThrowingStream<GuestSystemDownload.Transfer, Error>.makeStream(
             bufferingPolicy: .bufferingNewest(1)
         )
