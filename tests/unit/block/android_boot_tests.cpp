@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "android_boot.hpp"
+#include "android_guest_properties.hpp"
 #include "require.hpp"
 #include "scratch_directory.hpp"
 
@@ -741,6 +742,48 @@ void testStorageBoot(const Fixture &fixture, const fs::path &directory)
 		"initrd_size=" + std::to_string(normalRamdiskSize),
 		"root=/dev/ram0",
 		"rootfstype=ramfs"}));
+
+	/* Guest properties join the stock ramdisk in an initrd of their own, which
+	 * the next boot replaces; recovery boots as it is. */
+	const std::string properties{
+		"ro.product.model=iPhone 17 Pro\nro.soc.model=A19 Pro\n"};
+	require(android::validGuestProperties(properties));
+	for (const std::string_view refused :
+	     {"", "ro.product.model=x", "ro.product.model=\n", "ro.debuggable=1\n",
+	      "ro.product.model= x\n", "ro.product.model=x\ty\n", "\n",
+	      "ro.product.model=x\nro.product.model=y\n", "ro.product.model\n"})
+		require(!android::validGuestProperties(refused));
+	const auto initrd = directory / "initrd.img";
+	for (int round = 0; round < 2; ++round) {
+		const auto composed = android::withGuestProperties(
+			storage, automatic, properties, initrd);
+		require(composed.kind() == android::RamdiskKind::stock);
+		require(composed.initrdSize == fs::file_size(initrd));
+		const auto composedArguments = storage.kernelArguments(composed);
+		require(composedArguments[2] == "initrd=" + initrd.string());
+		require(composedArguments[3] == "initrd_offset=0");
+		require(composedArguments[4] ==
+			"initrd_size=" + std::to_string(composed.initrdSize));
+		const auto whole = readRange(
+			initrd, 0, static_cast<std::size_t>(composed.initrdSize));
+		const auto stock = readRange(
+			fixture.release / android::releaseSystemDisk,
+			automatic.ramdisk.offset,
+			static_cast<std::size_t>(automatic.ramdisk.size));
+		require(std::equal(stock.begin(), stock.end(), whole.begin()));
+		require(whole.size() % 4U == 0);
+		const auto text = bytesOf(properties);
+		require(std::search(whole.begin(), whole.end(), text.begin(),
+				    text.end()) != whole.end());
+	}
+	require(android::withGuestProperties(storage, forced, properties, initrd)
+			.initrdFile.empty());
+	require(android::withGuestProperties(storage, automatic, "", initrd)
+			.initrdFile.empty());
+	requireThrows([&] {
+		(void)android::withGuestProperties(storage, automatic, "x=y\n", initrd);
+	});
+	fs::remove(initrd);
 
 	/* A damaged data disk stops the next boot. */
 	flipByte(data, sectorSize + 20U);

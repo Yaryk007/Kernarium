@@ -61,6 +61,7 @@
 #include "input/virtio/in_process_service.hpp"
 #include "input/virtio/touchscreen.hpp"
 #include "block/android_boot.hpp"
+#include "block/android_guest_properties.hpp"
 #include "block/boot_initramfs.hpp"
 #include "block/ubd_path.hpp"
 #include "gpu_budget_plan.hpp"
@@ -1475,6 +1476,10 @@ struct GuestRequest final {
     uml::android::BootMode androidBootMode {};
     /* Whether the guest boots the release's root ramdisk (android_root). */
     uml::android::RootMode androidRoot {};
+    /* The property values the guest's stock ramdisk carries, and the initrd
+     * that holds them (android_properties). */
+    std::string androidProperties;
+    std::filesystem::path androidInitrd;
 #else
     std::string rootfsPath;
     std::string overlayPath;
@@ -2106,15 +2111,32 @@ private:
         if (restarts == 0) {
             if (request_.androidStorage->consumeBootloaderCommand())
                 sayBootloaderConsumed();
-            androidBoot_ = request_.androidStorage->selectBoot(
-                request_.androidBootMode, request_.androidRoot);
+            androidBoot_ = withProperties(request_.androidStorage->selectBoot(
+                request_.androidBootMode, request_.androidRoot));
             return;
         }
         const auto next =
             request_.androidStorage->selectRestartBoot(request_.androidRoot);
         if (next.bootloaderConsumed)
             sayBootloaderConsumed();
-        androidBoot_ = next.boot;
+        androidBoot_ = withProperties(next.boot);
+    }
+
+    /* A property never fails a boot: without its initrd the guest boots the
+     * release's ramdisk as it is. */
+    uml::android::BootSelection withProperties(
+        const uml::android::BootSelection& boot) const
+    {
+        try {
+            return uml::android::withGuestProperties(
+                *request_.androidStorage, boot, request_.androidProperties,
+                request_.androidInitrd);
+        } catch (const std::exception& error) {
+            std::fprintf(
+                stderr, "Kernarium: the guest boots without its properties: %s\n",
+                error.what());
+            return boot;
+        }
     }
 
     static uml::runtime::BootRamdisk bootRamdisk(
@@ -2250,6 +2272,10 @@ constexpr std::size_t bootSizeBeforeJit =
  * them. */
 constexpr std::size_t bootSizeBeforeHostFeatures =
     offsetof(kernarium_runtime_boot, android_host_features);
+
+/* What a request states before the guest properties were added to it. */
+constexpr std::size_t bootSizeBeforeProperties =
+    offsetof(kernarium_runtime_boot, android_properties);
 #endif
 
 /* The JIT cache budget a boot that asks for the JIT runs with, or zero when it
@@ -2509,6 +2535,25 @@ int runtimeRun(
             /* The root ramdisk is the release's own file; a release that has
              * none cannot be asked for root. */
             request.androidRoot = kernarium::androidroot::rootMode(*boot);
+            if (boot->struct_size >= bootSizeBeforeProperties +
+                    sizeof(boot->android_properties) &&
+                boot->android_properties != nullptr) {
+                const std::size_t length = ::strnlen(
+                    boot->android_properties,
+                    uml::android::maximumGuestPropertiesLength + 1U);
+                if (uml::android::validGuestProperties(
+                        {boot->android_properties, length})) {
+                    request.androidProperties.assign(
+                        boot->android_properties, length);
+                    request.androidInitrd =
+                        dataDisk.parent_path() /
+                        "initrd.img";
+                } else {
+                    std::fputs(
+                        "Kernarium: ignoring invalid guest properties\n",
+                        stderr);
+                }
+            }
             if (request.androidRoot == uml::android::RootMode::on) {
                 if (!request.androidStorage->carriesRoot()) {
                     std::fputs(

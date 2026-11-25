@@ -206,7 +206,9 @@ ahead-of-time component needs; a request keeps it out with
 sends none. It also asks whether the guest boots the release's root ramdisk
 (`android_root`, API 46; zero, which Kernarium sends, boots the release's own):
 the ramdisk is the release's Magisk-patched file and no request names a path
-([the boot selection](../darwin/device/block/README.md#boot-selection)).
+([the boot selection](../darwin/device/block/README.md#boot-selection)). Property
+values of a request join the stock ramdisk (`android_properties`, API 47), which
+Kernarium sends none of.
 
 ## Devices and display
 

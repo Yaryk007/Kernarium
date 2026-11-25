@@ -118,3 +118,8 @@ link and checked on the descriptor it was opened on. It is at most 256 MiB with
 the same kernel-less v4 header as the partition and a ramdisk in a format the
 kernel unpacks, and its kernel and command line are never read. Recovery keeps the release's own ramdisk, and a
 release without the file refuses the request.
+
+A launch can give the stock ramdisk property values over the image's own
+(`withGuestProperties`): the kernel then loads a composed initrd, the release's
+ramdisk followed by one archive, from a file beside the data disk. Root and
+recovery boots never take them.

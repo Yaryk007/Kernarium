@@ -53,15 +53,20 @@ void aRequestThatEndsBeforeTheWordNeverStatesIt()
     require(rootMode(boot) == RootMode::on);
 }
 
-void theWordIsTheLastMemberAndTheApiIsTheOneThatAddedIt()
+void theWordIsFollowedByThePropertiesAndTheApiIsTheOneThatAddedThem()
 {
-    /* A later field is a later API: nothing may follow the word unnoticed,
-     * because every request that ends before it would then state it too. */
+    /* A later field is a later API: nothing may come after the properties
+     * unnoticed, because every request that ends before it would then state
+     * it too. The properties (API 47) follow the word directly. */
     require(bootSizeBeforeRoot + sizeof(std::uint32_t) <=
-            sizeof(kernarium_runtime_boot));
-    require(sizeof(kernarium_runtime_boot) - bootSizeBeforeRoot <=
+            offsetof(kernarium_runtime_boot, android_properties));
+    require(offsetof(kernarium_runtime_boot, android_properties) -
+                bootSizeBeforeRoot <=
             sizeof(void*));
-    require(KERNARIUM_RUNTIME_API_VERSION >= 46U);
+    require(offsetof(kernarium_runtime_boot, android_properties) +
+                sizeof(kernarium_runtime_boot::android_properties) ==
+            sizeof(kernarium_runtime_boot));
+    require(KERNARIUM_RUNTIME_API_VERSION >= 47U);
 }
 
 } // namespace
@@ -75,8 +80,8 @@ int main()
          anyNonzeroWordAsksForTheRootBoot},
         {"a-request-that-ends-before-the-word-never-states-it",
          aRequestThatEndsBeforeTheWordNeverStatesIt},
-        {"the-word-is-the-last-member-and-the-api-is-the-one-that-added-it",
-         theWordIsTheLastMemberAndTheApiIsTheOneThatAddedIt},
+        {"the-word-is-followed-by-the-properties-and-the-api-is-the-one-that-added-them",
+         theWordIsFollowedByThePropertiesAndTheApiIsTheOneThatAddedThem},
     };
     return uml::testing::runNamedTests(tests);
 }

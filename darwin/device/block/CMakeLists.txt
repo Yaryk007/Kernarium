@@ -12,13 +12,15 @@ add_library(uml_android_boot STATIC
     android_boot.cpp
     android_data_disk.cpp
     android_gpt.cpp
+    android_guest_properties.cpp
     android_identity.cpp
     android_layout.cpp
     android_release_identity.cpp)
 add_library(UML::AndroidBoot ALIAS uml_android_boot)
 uml_declare_architecture_target(uml_android_boot device)
 target_include_directories(uml_android_boot PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(uml_android_boot PUBLIC UML::DeviceUbdPath)
+target_link_libraries(uml_android_boot PUBLIC UML::DeviceUbdPath
+    PRIVATE UML::BootInitramfs)
 
 add_library(uml_boot_initramfs STATIC boot_initramfs.cpp)
 add_library(UML::BootInitramfs ALIAS uml_boot_initramfs)

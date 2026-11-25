@@ -305,16 +305,19 @@ RestartBoot Storage::selectRestartBoot(RootMode root) const
 
 std::vector<std::string> Storage::kernelArguments(const BootSelection &boot) const
 {
+	const bool composed = !boot.initrdFile.empty();
+	const auto &ramdiskFile = boot.ramdiskFile.empty() ? systemDisk_
+							 : boot.ramdiskFile;
 	return {
 		"ubd0r=" + systemDisk_.string(),
 		"ubd1=" + dataDisk_.string(),
 		/* The kernel reopens this path when it loads the ramdisk. A file
 		 * replaced after the selection is not defended here, as for the
 		 * system disk's ramdisk: the release folder is trusted storage. */
-		"initrd=" + (boot.ramdiskFile.empty() ? systemDisk_ : boot.ramdiskFile)
-				    .string(),
-		"initrd_offset=" + std::to_string(boot.ramdisk.offset),
-		"initrd_size=" + std::to_string(boot.ramdisk.size),
+		"initrd=" + (composed ? boot.initrdFile : ramdiskFile).string(),
+		"initrd_offset=" + std::to_string(composed ? 0 : boot.ramdisk.offset),
+		"initrd_size=" + std::to_string(composed ? boot.initrdSize
+							 : boot.ramdisk.size),
 		"root=/dev/ram0",
 		"rootfstype=ramfs",
 	};

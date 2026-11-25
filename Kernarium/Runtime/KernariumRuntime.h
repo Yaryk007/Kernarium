@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define KERNARIUM_RUNTIME_API_VERSION 46U
+#define KERNARIUM_RUNTIME_API_VERSION 47U
 
 #if defined(__OBJC__)
 @class MTKView;
@@ -213,7 +213,17 @@ enum {
  * Kernarium is unchanged. The runtime never takes a ramdisk from any other
  * file: a request for root against a release that carries none fails the run
  * with -UML_EMULATOR_INVALID_ARGUMENT, and recovery keeps its own ramdisk. A
- * Linux guest ignores the field. */
+ * Linux guest ignores the field.
+ *
+ * android_properties (runtime API 47) gives an Android guest property values
+ * over its image's own for this run: lines of key=value with the keys that
+ * darwin/device/block/android_guest_properties.hpp allows, or null for none.
+ * The runtime adds them to the stock ramdisk of every normal boot, in an initrd
+ * it keeps beside the data disk; a root or recovery boot runs without them.
+ * Text that is not valid is dropped with a line on stderr, and so is an initrd
+ * that cannot be written: a property never fails a boot. The runtime reads the
+ * field only from a request whose struct_size covers it, and no further than
+ * the longest text; a Linux guest ignores it. */
 typedef struct kernarium_runtime_boot {
     uint32_t struct_size;
     uint32_t width;
@@ -242,6 +252,7 @@ typedef struct kernarium_runtime_boot {
     const char* android_ethernet_mac;
     uint32_t android_aot_disabled;
     uint32_t android_root;
+    const char* android_properties;
 } kernarium_runtime_boot;
 
 /* What a launch's host GPU budget comes to, as the runtime evaluates it for

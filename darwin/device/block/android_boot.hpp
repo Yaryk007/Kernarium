@@ -50,6 +50,10 @@ struct BootSelection {
 	/* The boot image the ramdisk lies in, when it is not the system disk's
 	 * partition: the release's root image. Empty for the system disk. */
 	std::filesystem::path ramdiskFile;
+	/* The whole initrd the kernel is given instead, when a launch added to
+	 * the stock ramdisk (withGuestProperties). Empty for `ramdisk` itself. */
+	std::filesystem::path initrdFile{};
+	std::uint64_t initrdSize = 0;
 
 	/* What the boot that this selection starts runs: recovery's own
 	 * ramdisk, the root image's, or the system disk's `init_boot`. */
