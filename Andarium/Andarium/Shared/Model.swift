@@ -879,7 +879,7 @@ final class AppModel {
     }
     /// Gives the system root files and says how far it is; afterwards
     /// `rootAvailable` holds. Nil where the system cannot be given any.
-    var rootSetup: (@MainActor (_ phase: @escaping @MainActor @Sendable (String) -> Void) async throws -> Void)?
+    @ObservationIgnored var rootSetup: (@MainActor (_ phase: @escaping @MainActor @Sendable (String) -> Void) async throws -> Void)?
     var rootSetupTask: Task<Void, Never>?
     /// What the set-up under way is doing, and why the last one ended.
     var rootSetupPhase: String?
