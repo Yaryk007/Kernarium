@@ -120,28 +120,15 @@ nonisolated enum SystemInstallation {
         guard manifests.count == 1, let entry = manifests.first else { throw Problem.archive }
         let prefix = String(entry.name.dropLast(SystemFolder.manifest.count))
         let manifest = try release.data(of: entry, limit: metadataLimit)
-        let info = try SystemInfo(manifest: manifest, appVersion: "")
-        let manifestObject = try JSONSerialization.jsonObject(with: manifest) as? [String: Any]
-        let kernel = manifestObject?["kernel"] as? [String: Any]
-        let family = manifestObject?["product_family"] as? String
-        let abi = kernel?["abi_version"] as? Int
-        let matchesRelease: Bool
-        switch choice {
-        case .lineage:
-            matchesRelease = family == "lineage-24" && info.release == officialRelease && abi == 26
-        case .lineageGApps:
-            matchesRelease = family == "lineage-24-gapps" && abi == 26
-                && manifestObject?["base_release_id"] as? String == officialRelease
-                && info.release != officialRelease
-        default:
-            let expectedFamily = choice.storageName
-            let matchesFamily = choice == .custom || family == expectedFamily || family?.hasPrefix(expectedFamily + "-") == true
-            matchesRelease = matchesFamily && abi == 29
+        let kind: GuestManifest.Kind = switch choice {
+        case .lineage: .official(release: officialRelease)
+        case .lineageGApps: .gapps(base: officialRelease)
+        case .custom: .other(family: nil)
+        default: .other(family: choice.storageName)
         }
-        guard matchesRelease, info.version == "17", info.abis.contains("arm64-v8a"),
-              kernel?["page_size"] as? Int == 4096,
-              (kernel?["release"] as? String)?.hasPrefix("6.18.") == true
-        else { throw Problem.incompatible }
+        guard GuestManifest.fits(manifest, as: kind) else { throw Problem.incompatible }
+        // Home reads the same manifest again, so one it cannot read is refused here.
+        _ = try SystemInfo(manifest: manifest, appVersion: "")
         let layout = try release.data(of: member(SystemFolder.layout, prefix: prefix, in: release), limit: metadataLimit)
         let identity = try ReleaseIdentity(manifest: manifest, layout: layout)
         let layoutObject = try JSONSerialization.jsonObject(with: layout) as? [String: Any]
